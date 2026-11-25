@@ -16,6 +16,7 @@ import {
   type AdapterHealth,
   type DiscoveredSession,
   type EnrichedEvent,
+  type ParseSessionOptions,
   type PassiveIdeAdapter,
   type UsageDelta,
 } from "../types.js";
@@ -27,6 +28,7 @@ import {
 interface VSCodeResponseItem {
   kind?: string;
   value?: string;
+  content?: string | { value?: string };
   toolId?: string;
   toolName?: string;
   toolCallId?: string;
@@ -406,7 +408,10 @@ export class CopilotVSCodeAdapter implements PassiveIdeAdapter {
     return sessions.slice(0, opts?.limit ?? 100);
   }
 
-  async parseSession(session: DiscoveredSession): Promise<EnrichedEvent[]> {
+  async parseSession(
+    session: DiscoveredSession,
+    opts?: ParseSessionOptions,
+  ): Promise<EnrichedEvent[]> {
     let fst;
     try {
       fst = await fs.stat(session.filePath);
@@ -532,6 +537,8 @@ export class CopilotVSCodeAdapter implements PassiveIdeAdapter {
         isSelfDaemon?: boolean;
         isError?: boolean;
         waitingReason?: EnrichedEvent["waitingReason"];
+        fullBody?: string;
+        inlineBody?: string;
       }): void => {
         const id = computeDeterministicEventId({
           ide: this.ide,
@@ -551,6 +558,12 @@ export class CopilotVSCodeAdapter implements PassiveIdeAdapter {
           toolName: input.toolName,
           epoch: input.epoch,
         });
+        const hasBody =
+          typeof input.fullBody === "string" && input.fullBody.length > 0;
+        const bodyLength = hasBody ? input.fullBody!.length : undefined;
+        const bodyTruncated = hasBody
+          ? input.fullBody!.length > (input.inlineBody?.length ?? 0)
+          : undefined;
         events.push({
           id,
           mergeKey,
@@ -569,22 +582,30 @@ export class CopilotVSCodeAdapter implements PassiveIdeAdapter {
           targetAgentId: input.targetAgentId,
           summary: input.summary,
           payload: input.payload,
+          ...(bodyLength !== undefined ? { bodyLength } : {}),
+          ...(bodyTruncated !== undefined ? { bodyTruncated } : {}),
           status: input.status,
           isSelfDaemon: input.isSelfDaemon,
           isError: input.isError,
           waitingReason: input.waitingReason,
         });
+        if (hasBody) {
+          opts?.onFullBody?.(id, input.fullBody!);
+        }
       };
 
       // 1. User prompt
       const promptText = req.message?.text?.trim() ?? "";
       if (promptText) {
+        const inlineBody = promptText.slice(0, 1400);
         emit({
           epoch: reqEpoch,
           kind: "user_input",
           targetAgentId: agentId,
           summary: `Human: ${promptText.replace(/\s+/g, " ").slice(0, 90)}`,
-          payload: { body: promptText.slice(0, 1400), requestId: req.requestId },
+          payload: { body: inlineBody, requestId: req.requestId },
+          fullBody: promptText,
+          inlineBody,
         });
       }
 
@@ -628,6 +649,27 @@ export class CopilotVSCodeAdapter implements PassiveIdeAdapter {
             const subLabel =
               String(item.toolSpecificData?.agentName ?? item.generatedTitle ?? "Subagent");
             const subId = subLabel.toLowerCase().replace(/[^a-z0-9_-]+/g, "-") || "subagent";
+            const rawSubPrompt =
+              typeof item.toolSpecificData?.prompt === "string"
+                ? item.toolSpecificData.prompt
+                : typeof item.toolSpecificData?.instructions === "string"
+                  ? item.toolSpecificData.instructions
+                  : typeof item.toolSpecificData?.description === "string"
+                    ? item.toolSpecificData.description
+                    : extractMessageText(item.invocationMessage);
+            const subPrompt = rawSubPrompt.trim();
+            const inlinePrompt = subPrompt ? subPrompt.slice(0, 1000) : "";
+            const compactSpecificData = item.toolSpecificData
+              ? {
+                  ...item.toolSpecificData,
+                  ...(typeof item.toolSpecificData.prompt === "string"
+                    ? { prompt: item.toolSpecificData.prompt.slice(0, 1000) }
+                    : {}),
+                  ...(typeof item.toolSpecificData.instructions === "string"
+                    ? { instructions: item.toolSpecificData.instructions.slice(0, 1000) }
+                    : {}),
+                }
+              : undefined;
             emit({
               epoch: stepEpoch,
               kind: "subagent_spawn",
@@ -635,9 +677,20 @@ export class CopilotVSCodeAdapter implements PassiveIdeAdapter {
               toolCallId: callId,
               targetAgentId: subId,
               summary: `Spawned ${subLabel}`,
-              payload: { toolSpecificData: item.toolSpecificData },
+              payload: {
+                toolSpecificData: compactSpecificData,
+                ...(inlinePrompt ? { prompt: inlinePrompt } : {}),
+              },
+              ...(subPrompt
+                ? { fullBody: subPrompt, inlineBody: inlinePrompt }
+                : {}),
             });
             if (item.isComplete) {
+              const doneText = (
+                extractMessageText(item.pastTenseMessage) ||
+                (typeof item.resultDetails === "string" ? item.resultDetails : "")
+              ).trim();
+              const inlineDone = doneText ? doneText.slice(0, 1000) : "";
               emit({
                 epoch: stepEpoch + 0.005,
                 kind: "subagent_done",
@@ -645,6 +698,10 @@ export class CopilotVSCodeAdapter implements PassiveIdeAdapter {
                 toolCallId: callId,
                 targetAgentId: subId,
                 summary: `Subagent finished: ${subLabel}`,
+                ...(inlineDone ? { payload: { body: inlineDone } } : {}),
+                ...(doneText
+                  ? { fullBody: doneText, inlineBody: inlineDone }
+                  : {}),
               });
             }
           } else if (lowTool === "vscode_askquestions") {
@@ -742,6 +799,28 @@ export class CopilotVSCodeAdapter implements PassiveIdeAdapter {
           reqEpoch + (responses.length + 1) * 0.01,
         );
         const hasErr = Boolean(req.result?.errorDetails);
+        const markdownChunks = responses
+          .filter(
+            (r) => !r.kind || r.kind === "markdownContent" || r.kind === "text",
+          )
+          .map((r) =>
+            (extractMessageText(r.value) || extractMessageText(r.content)).trim(),
+          )
+          .filter(Boolean);
+        const turnText = (
+          markdownChunks.join("\n\n") ||
+          req.result?.errorDetails?.message ||
+          req.result?.details ||
+          ""
+        ).trim();
+        const inlineTurnBody = turnText ? turnText.slice(0, 1000) : "";
+        const turnPayload: Record<string, unknown> | undefined =
+          req.result || inlineTurnBody
+            ? {
+                ...(req.result ? { result: req.result } : {}),
+                ...(inlineTurnBody ? { body: inlineTurnBody } : {}),
+              }
+            : undefined;
         emit({
           epoch: Math.max(endEpoch, reqEpoch + (responses.length + 1) * 0.01),
           kind: "assistant_turn_end",
@@ -750,7 +829,10 @@ export class CopilotVSCodeAdapter implements PassiveIdeAdapter {
             : "Turn completed",
           status: hasErr ? "error" : "ok",
           isError: hasErr,
-          payload: req.result ? { result: req.result } : undefined,
+          payload: turnPayload,
+          ...(turnText
+            ? { fullBody: turnText, inlineBody: inlineTurnBody }
+            : {}),
         });
       }
     }

@@ -57,6 +57,8 @@ export interface NormalizedEvent {
   toolCallId?: string;
   targetAgentId?: string;
   summary: string;
+  bodyLength?: number;
+  bodyTruncated?: boolean;
   payload?: Record<string, unknown>;
 }
 

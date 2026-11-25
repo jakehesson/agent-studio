@@ -108,8 +108,20 @@ body {
 :root[data-theme="light"] .feed-mode-btn[aria-pressed="true"],
 :root[data-theme="light"] .filter-chip[aria-selected="true"],
 :root[data-theme="light"] .filter-chip[aria-pressed="true"],
-:root[data-theme="light"] .ev-row.selected {
+:root[data-theme="light"] .ev-row.selected,
+:root[data-theme="light"] .ev-item.selected {
   background: #dbeafe;
+  color: #0f172a;
+}
+
+:root[data-theme="light"] .ev-read-btn {
+  background: rgba(2, 132, 199, 0.1);
+  color: #0369a1;
+  border-color: rgba(2, 132, 199, 0.35);
+}
+
+:root[data-theme="light"] .ev-read-btn:hover {
+  background: rgba(2, 132, 199, 0.2);
   color: #0f172a;
 }
 
@@ -144,12 +156,48 @@ body {
 :root[data-theme="light"] .session-popover,
 :root[data-theme="light"] .bottom-sheet-dialog,
 :root[data-theme="light"] .inspector-dialog,
+:root[data-theme="light"] .reader-dialog,
 :root[data-theme="light"] .team-detail-dialog,
 :root[data-theme="light"] .model-index-dialog,
 :root[data-theme="light"] .insp-sheet-head,
+:root[data-theme="light"] .reader-head,
+:root[data-theme="light"] .reader-meta-bar,
+:root[data-theme="light"] .reader-toc,
+:root[data-theme="light"] .reader-toc-drawer,
+:root[data-theme="light"] .reader-raw-drawer,
 :root[data-theme="light"] .session-pop-head {
   background: var(--panel);
   color: var(--text);
+}
+
+:root[data-theme="light"] .reader-md :not(pre) > code {
+  background: #e2e8f0;
+  color: #0f172a;
+}
+
+:root[data-theme="light"] .reader-code-block,
+:root[data-theme="light"] .reader-raw-pre,
+:root[data-theme="light"] .reader-table-wrap {
+  background: #f8fafc;
+  color: #0f172a;
+}
+
+:root[data-theme="light"] .reader-code-bar,
+:root[data-theme="light"] .reader-table-wrap thead th {
+  background: #e2e8f0;
+  color: #0f172a;
+}
+
+:root[data-theme="light"] .reader-code-pre,
+:root[data-theme="light"] .reader-table-wrap tbody td,
+:root[data-theme="light"] .reader-toc-link {
+  color: #1e293b;
+}
+
+:root[data-theme="light"] .reader-file-chip {
+  background: rgba(2, 132, 199, 0.1);
+  color: #0369a1;
+  border-color: rgba(2, 132, 199, 0.35);
 }
 
 :root[data-theme="light"] .mr-controls-row,

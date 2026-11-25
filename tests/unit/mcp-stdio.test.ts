@@ -188,6 +188,7 @@ describe("MCP stdio server (node dist/cli/index.js mcp)", () => {
           "telemetry",
           "open_studio",
           "app_get_state",
+          "app_get_event_body",
           "app_get_board",
           "app_get_team",
           "app_get_doctor",
@@ -209,6 +210,7 @@ describe("MCP stdio server (node dist/cli/index.js mcp)", () => {
 
       for (const appOnlyName of [
         "app_get_state",
+        "app_get_event_body",
         "app_get_board",
         "app_get_team",
         "app_get_doctor",
@@ -482,6 +484,23 @@ describe("MCP stdio server (node dist/cli/index.js mcp)", () => {
       assert.ok(Array.isArray(appStateRes.structuredContent?.sessions));
       assert.ok(Array.isArray(appStateRes.structuredContent?.board_projects));
       assert.ok((appStateRes.structuredContent?.events?.length ?? 0) >= 1);
+
+      // Verify app_get_event_body returns structured error for unknown event and works on ingested body
+      const missingBodyResp = await client.request("tools/call", {
+        name: "app_get_event_body",
+        arguments: { session: "doctor-probe", event: "does-not-exist" },
+      });
+      const missingBodyRes = missingBodyResp.result as {
+        isError?: boolean;
+        content?: Array<{ text: string }>;
+        structuredContent?: { ok?: boolean; error?: string };
+      };
+      assert.equal(missingBodyRes.isError, true);
+      assert.equal(missingBodyRes.structuredContent?.ok, false);
+      assert.equal(
+        JSON.parse(missingBodyRes.content?.[0]?.text ?? "{}").error,
+        "Event body not found",
+      );
 
       // 11. Verify every single line on stdout was valid JSON-RPC 2.0
       for (const line of client.rawStdoutLines) {

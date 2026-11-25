@@ -18,6 +18,7 @@ import {
   type DiscoveredSession,
   type EnrichedEvent,
   type ModelSource,
+  type ParseSessionOptions,
   type PassiveIdeAdapter,
   type UsageDelta,
 } from "../types.js";
@@ -359,7 +360,10 @@ export class AntigravityAdapter implements PassiveIdeAdapter {
     return topLevel.slice(0, limit);
   }
 
-  async parseSession(session: DiscoveredSession): Promise<EnrichedEvent[]> {
+  async parseSession(
+    session: DiscoveredSession,
+    opts?: ParseSessionOptions,
+  ): Promise<EnrichedEvent[]> {
     const rootCid = session.sessionId;
     const rootRows = await readJsonlRows(session.filePath);
     if (rootRows.length === 0) return [];
@@ -417,6 +421,7 @@ export class AntigravityAdapter implements PassiveIdeAdapter {
     const visited = new Set<string>();
     const queue: string[] = [rootCid];
     const rawEvents: EnrichedEvent[] = [];
+    const fullBodies = new Map<EnrichedEvent, string>();
 
     const sampleWorkspaces = (): string[] => {
       const all = [...session.workspaces];
@@ -454,6 +459,8 @@ export class AntigravityAdapter implements PassiveIdeAdapter {
       isSelfDaemon?: boolean;
       isError?: boolean;
       waitingReason?: EnrichedEvent["waitingReason"];
+      fullBody?: string;
+      inlineBody?: string;
     }): EnrichedEvent => {
       const ts = toIsoUtc(input.epoch);
       const id = computeDeterministicEventId({
@@ -474,7 +481,13 @@ export class AntigravityAdapter implements PassiveIdeAdapter {
         toolName: input.toolName,
         epoch: input.epoch,
       });
-      return {
+      const hasBody =
+        typeof input.fullBody === "string" && input.fullBody.length > 0;
+      const bodyLength = hasBody ? input.fullBody!.length : undefined;
+      const bodyTruncated = hasBody
+        ? input.fullBody!.length > (input.inlineBody?.length ?? 0)
+        : undefined;
+      const ev: EnrichedEvent = {
         id,
         mergeKey,
         ts,
@@ -493,11 +506,17 @@ export class AntigravityAdapter implements PassiveIdeAdapter {
         targetAgentId: input.targetAgentId,
         summary: input.summary,
         payload: input.payload,
+        ...(bodyLength !== undefined ? { bodyLength } : {}),
+        ...(bodyTruncated !== undefined ? { bodyTruncated } : {}),
         status: input.status,
         isSelfDaemon: input.isSelfDaemon,
         isError: input.isError,
         waitingReason: input.waitingReason,
       };
+      if (hasBody) {
+        fullBodies.set(ev, input.fullBody!);
+      }
+      return ev;
     };
 
     while (queue.length > 0) {
@@ -697,6 +716,7 @@ export class AntigravityAdapter implements PassiveIdeAdapter {
         if (rtype === "USER_INPUT" && content.trim()) {
           const clean = cleanHumanSummary(content, 130);
           if (clean) {
+            const inlineBody = content.slice(0, 1400);
             rawEvents.push(
               makeEvent({
                 epoch,
@@ -704,7 +724,9 @@ export class AntigravityAdapter implements PassiveIdeAdapter {
                 targetAgentId: senderId,
                 kind: "user_input",
                 summary: `Human: ${clean}`,
-                payload: { body: content.slice(0, 1400), conv: cid },
+                payload: { body: inlineBody, conv: cid },
+                fullBody: content,
+                inlineBody,
               }),
             );
           }
@@ -811,6 +833,7 @@ export class AntigravityAdapter implements PassiveIdeAdapter {
               }
               agentParent.set(targetSlug, senderId);
               const spawnSummary = cleanHumanSummary(`Spawned ${role}`, 140);
+              const inlinePrompt = prompt.slice(0, 1000);
               const spawnEvent = makeEvent({
                 epoch: epoch + tcIdx * 0.0001,
                 agentId: senderId,
@@ -822,9 +845,11 @@ export class AntigravityAdapter implements PassiveIdeAdapter {
                 payload: {
                   role,
                   ...(requestedModel ? { requestedModel } : {}),
-                  prompt: prompt.slice(0, 1000),
+                  prompt: inlinePrompt,
                   conv: cid,
                 },
+                fullBody: prompt,
+                inlineBody: inlinePrompt,
               });
               rawEvents.push(spawnEvent);
               pendingSpawns.push({
@@ -849,6 +874,7 @@ export class AntigravityAdapter implements PassiveIdeAdapter {
               const firstLine = body.split(/\r?\n/, 1)[0] ?? "";
               const msgSummary =
                 cleanHumanSummary(firstLine || body, 140) || "Peer message";
+              const inlineBody = body.slice(0, 1400);
               rawEvents.push(
                 makeEvent({
                   epoch: epoch + tcIdx * 0.0001,
@@ -859,10 +885,12 @@ export class AntigravityAdapter implements PassiveIdeAdapter {
                   toolCallId,
                   summary: msgSummary,
                   payload: {
-                    body: body.slice(0, 1400),
+                    body: inlineBody,
                     recipientRaw,
                     conv: cid,
                   },
+                  fullBody: body,
+                  inlineBody,
                 }),
               );
               openToolCalls.push({
@@ -875,6 +903,7 @@ export class AntigravityAdapter implements PassiveIdeAdapter {
               const body = unquoteArg(args.Message) || "Updated user";
               const firstLine = body.split(/\r?\n/, 1)[0] ?? body;
               const notifySummary = cleanHumanSummary(`To Human: ${firstLine}`, 140);
+              const inlineBody = body.slice(0, 1400);
               rawEvents.push(
                 makeEvent({
                   epoch: epoch + tcIdx * 0.0001,
@@ -884,7 +913,9 @@ export class AntigravityAdapter implements PassiveIdeAdapter {
                   toolName: tname,
                   toolCallId,
                   summary: notifySummary,
-                  payload: { body: body.slice(0, 1400), conv: cid },
+                  payload: { body: inlineBody, conv: cid },
+                  fullBody: body,
+                  inlineBody,
                 }),
               );
               openToolCalls.push({
@@ -953,13 +984,16 @@ export class AntigravityAdapter implements PassiveIdeAdapter {
           // Clean assistant yield without tool calls
           const kind =
             senderId === rootId ? "assistant_turn_end" : "subagent_done";
+          const inlineBody = content.slice(0, 1000);
           rawEvents.push(
             makeEvent({
               epoch,
               agentId: senderId,
               kind,
               summary: cleanHumanSummary(content, 140),
-              payload: { body: content.slice(0, 1000), conv: cid },
+              payload: { body: inlineBody, conv: cid },
+              fullBody: content,
+              inlineBody,
             }),
           );
         }
@@ -1035,6 +1069,12 @@ export class AntigravityAdapter implements PassiveIdeAdapter {
             childModelSource: acc.modelSource,
           };
         }
+      }
+    }
+
+    if (opts?.onFullBody) {
+      for (const [ev, raw] of fullBodies.entries()) {
+        opts.onFullBody(ev.id, raw);
       }
     }
 

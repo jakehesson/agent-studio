@@ -6,6 +6,7 @@ import type {
 import {
   classifyEventReadable,
   cleanSummaryText,
+  copyTextSafe,
   escHtml,
   fmtClock,
   fmtContextWindow,
@@ -20,38 +21,13 @@ import {
 
 export interface PayloadInspectorCallbacks {
   onClose?: () => void;
+  onOpenReader?: (event: NormalizedEvent) => void;
 }
 
 export interface InspectRenderOptions {
   openSheet?: boolean;
   definition?: TeamDefinitionEntry;
   labelMap?: Map<string, string>;
-}
-
-async function copyTextSafe(text: string): Promise<boolean> {
-  try {
-    if (navigator.clipboard && window.isSecureContext) {
-      await navigator.clipboard.writeText(text);
-      return true;
-    }
-  } catch {
-    // Fall through to legacy copy
-  }
-  try {
-    const ta = document.createElement("textarea");
-    ta.value = text;
-    ta.setAttribute("readonly", "");
-    ta.style.position = "fixed";
-    ta.style.opacity = "0";
-    ta.style.pointerEvents = "none";
-    document.body.appendChild(ta);
-    ta.select();
-    const ok = document.execCommand("copy");
-    ta.remove();
-    return ok;
-  } catch {
-    return false;
-  }
 }
 
 function extractFullNarrative(ev: NormalizedEvent): string {
@@ -73,6 +49,8 @@ export class PayloadInspector {
   private container: HTMLElement;
   private cb: PayloadInspectorCallbacks;
   private dialog: HTMLDialogElement;
+  private dlgReaderBtn: HTMLButtonElement | null = null;
+  private currentEvent: NormalizedEvent | null = null;
   private lastCopyText = "";
   private lastMarkup: {
     headerTitleHtml: string;
@@ -94,6 +72,7 @@ export class PayloadInspector {
         <div class="insp-sheet-head">
           <div class="insp-title-row" id="inspectorDialogTitle" data-dlg-title>Details</div>
           <div class="insp-head-actions">
+            <button type="button" class="copy-btn reader-launch-btn" data-open-reader hidden>Reader View</button>
             <button type="button" class="copy-btn" data-dlg-copy>Copy JSON</button>
             <button type="button" class="insp-icon-btn" data-dlg-close aria-label="Close details">✕</button>
           </div>
@@ -121,6 +100,13 @@ export class PayloadInspector {
     }
 
     dlg.querySelector("[data-dlg-close]")?.addEventListener("click", () => dlg.close());
+    this.dlgReaderBtn = dlg.querySelector<HTMLButtonElement>("[data-open-reader]");
+    this.dlgReaderBtn?.addEventListener("click", () => {
+      const ev = this.currentEvent;
+      if (!ev) return;
+      if (this.dialog.open) this.dialog.close();
+      this.cb.onOpenReader?.(ev);
+    });
     const dlgCopy = dlg.querySelector<HTMLButtonElement>("[data-dlg-copy]");
     dlgCopy?.addEventListener("click", () => {
       if (dlgCopy) void this.handleCopyClick(dlgCopy);
@@ -149,6 +135,8 @@ export class PayloadInspector {
   }
 
   public renderEmpty(): void {
+    this.currentEvent = null;
+    if (this.dlgReaderBtn) this.dlgReaderBtn.hidden = true;
     this.lastCopyText = "";
     this.lastMarkup = null;
     this.container.setAttribute("data-inspector-state", "empty");
@@ -162,6 +150,8 @@ export class PayloadInspector {
   }
 
   public renderEvent(ev: NormalizedEvent, opts: InspectRenderOptions = {}): void {
+    this.currentEvent = ev;
+    if (this.dlgReaderBtn) this.dlgReaderBtn.hidden = false;
     const ide = getIdeMeta(ev.ide);
     const cls = classifyEventReadable(ev);
     const labelMap = opts.labelMap;
@@ -214,6 +204,8 @@ export class PayloadInspector {
   }
 
   public renderAgent(agent: AgentNodeSnapshot, opts: InspectRenderOptions = {}): void {
+    this.currentEvent = null;
+    if (this.dlgReaderBtn) this.dlgReaderBtn.hidden = true;
     const ide = getIdeMeta(agent.ide);
     const st = getStatusStyle(agent.status);
     const def = opts.definition;
@@ -343,11 +335,13 @@ export class PayloadInspector {
   }
 
   private renderInline(headerTitleHtml: string, bodyHtml: string): void {
+    const hasEvent = this.currentEvent !== null;
     this.container.setAttribute("data-inspector-state", "open");
     this.container.innerHTML = `
       <div class="insp-head">
         <div class="insp-title-row">${headerTitleHtml}</div>
         <div class="insp-head-actions">
+          ${hasEvent ? `<button type="button" class="copy-btn reader-launch-btn" data-open-reader>Reader View</button>` : ""}
           <button type="button" class="copy-btn" data-copy-payload>Copy JSON</button>
           <button type="button" class="insp-icon-btn" data-expand-payload title="Expand full payload viewer" aria-label="Expand payload viewer">⤢</button>
           <button type="button" class="insp-icon-btn" data-close-payload title="Collapse inspector" aria-label="Close inspector">✕</button>
@@ -356,6 +350,12 @@ export class PayloadInspector {
       <div class="insp-inline-body">${bodyHtml}</div>
     `;
 
+    this.container.querySelector("[data-open-reader]")?.addEventListener("click", () => {
+      const ev = this.currentEvent;
+      if (!ev) return;
+      if (this.dialog.open) this.dialog.close();
+      this.cb.onOpenReader?.(ev);
+    });
     const copyBtn = this.container.querySelector<HTMLButtonElement>("[data-copy-payload]");
     copyBtn?.addEventListener("click", () => {
       if (copyBtn) void this.handleCopyClick(copyBtn);

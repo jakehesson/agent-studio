@@ -68,7 +68,7 @@ import {
   type MockupEntry,
 } from "./mockups.js";
 
-const MAX_INGEST_BODY_BYTES = 64 * 1024;
+const MAX_INGEST_BODY_BYTES = 512 * 1024;
 const MAX_MODEL_BODY_BYTES = 512 * 1024;
 const SSE_DEBOUNCE_MS = 150;
 const SSE_HEARTBEAT_MS = 1500;
@@ -654,6 +654,42 @@ export function createStudioServer(
       return;
     }
 
+    // 2b. GET /api/event-body
+    if (method === "GET" && pathname === "/api/event-body") {
+      const session = url.searchParams.get("session")?.trim();
+      const eventId = url.searchParams.get("event")?.trim();
+      if (!session || !eventId) {
+        sendJson(res, 400, {
+          ok: false,
+          error: "Missing session or event query parameter",
+        });
+        return;
+      }
+      const entry = await aggregator.getEventBody({
+        sessionId: session,
+        eventId,
+        ide: url.searchParams.get("ide") ?? undefined,
+        project: url.searchParams.get("project") ?? undefined,
+        workspace: url.searchParams.get("workspace") ?? undefined,
+      });
+      if (!entry) {
+        sendJson(res, 404, {
+          ok: false,
+          error: "Event body not found",
+        });
+        return;
+      }
+      sendJson(res, 200, {
+        ok: true,
+        sessionId: session,
+        eventId,
+        body: entry.body,
+        truncated: entry.truncated,
+        byteLength: entry.byteLength,
+      });
+      return;
+    }
+
     // 3. GET /api/stream (SSE)
     if (method === "GET" && pathname === "/api/stream") {
       res.writeHead(200, {
@@ -691,7 +727,7 @@ export function createStudioServer(
       } catch (err) {
         const code = err instanceof Error ? err.message : "";
         if (code === "PAYLOAD_TOO_LARGE") {
-          sendJson(res, 413, { ok: false, error: "Payload exceeds 64 KB limit" });
+          sendJson(res, 413, { ok: false, error: "Payload exceeds 512 KB limit" });
           return;
         }
         sendJson(res, 400, { ok: false, error: "Invalid JSON payload" });

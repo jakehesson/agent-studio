@@ -16,6 +16,7 @@ import {
   type AdapterHealth,
   type DiscoveredSession,
   type EnrichedEvent,
+  type ParseSessionOptions,
   type PassiveIdeAdapter,
   type UsageDelta,
 } from "../types.js";
@@ -299,7 +300,10 @@ export class ClaudeCodeAdapter implements PassiveIdeAdapter {
     return sessions.slice(0, opts?.limit ?? 100);
   }
 
-  async parseSession(session: DiscoveredSession): Promise<EnrichedEvent[]> {
+  async parseSession(
+    session: DiscoveredSession,
+    opts?: ParseSessionOptions,
+  ): Promise<EnrichedEvent[]> {
     const mainRows = await readClaudeJsonl(session.filePath);
     if (mainRows.length === 0) return [];
 
@@ -448,6 +452,8 @@ export class ClaudeCodeAdapter implements PassiveIdeAdapter {
           isError?: boolean;
           waitingReason?: EnrichedEvent["waitingReason"];
           offset?: number;
+          fullBody?: string;
+          inlineBody?: string;
         }): void => {
           const evEpoch = epoch + (input.offset ?? 0);
           const id = computeDeterministicEventId({
@@ -468,6 +474,12 @@ export class ClaudeCodeAdapter implements PassiveIdeAdapter {
             toolName: input.toolName,
             epoch: evEpoch,
           });
+          const hasBody =
+            typeof input.fullBody === "string" && input.fullBody.length > 0;
+          const bodyLength = hasBody ? input.fullBody!.length : undefined;
+          const bodyTruncated = hasBody
+            ? input.fullBody!.length > (input.inlineBody?.length ?? 0)
+            : undefined;
           events.push({
             id,
             mergeKey,
@@ -487,11 +499,16 @@ export class ClaudeCodeAdapter implements PassiveIdeAdapter {
             targetAgentId: input.targetAgentId,
             summary: input.summary,
             payload: input.payload,
+            ...(bodyLength !== undefined ? { bodyLength } : {}),
+            ...(bodyTruncated !== undefined ? { bodyTruncated } : {}),
             status: input.status,
             isSelfDaemon: input.isSelfDaemon,
             isError: input.isError,
             waitingReason: input.waitingReason,
           });
+          if (hasBody) {
+            opts?.onFullBody?.(id, input.fullBody!);
+          }
         };
 
         if (rtype === "user") {
@@ -505,6 +522,15 @@ export class ClaudeCodeAdapter implements PassiveIdeAdapter {
                 const spawnInfo = spawnToolUseMap.get(callId);
                 const isErr = Boolean(block.is_error);
                 if (spawnInfo) {
+                  const resultText =
+                    typeof block.content === "string"
+                      ? block.content.trim()
+                      : Array.isArray(block.content)
+                        ? extractTextFromContent(
+                            block.content as ClaudeContentBlock[],
+                          ).trim()
+                        : "";
+                  const inlineBody = resultText ? resultText.slice(0, 1000) : "";
                   emit({
                     kind: "subagent_done",
                     toolName: "Agent",
@@ -519,7 +545,9 @@ export class ClaudeCodeAdapter implements PassiveIdeAdapter {
                     payload: {
                       targetAgentId: spawnInfo.targetAgentId,
                       isError: isErr,
+                      ...(inlineBody ? { body: inlineBody } : {}),
                     },
+                    ...(resultText ? { fullBody: resultText, inlineBody } : {}),
                     offset: bIdx * 0.0001,
                   });
                 } else {
@@ -552,20 +580,26 @@ export class ClaudeCodeAdapter implements PassiveIdeAdapter {
             if (!hadToolResult) {
               const txt = extractTextFromContent(content).trim();
               if (txt) {
+                const inlineBody = txt.slice(0, 1400);
                 emit({
                   kind: "user_input",
                   targetAgentId: agentId,
                   summary: `Human: ${cleanHumanSummary(txt, 130)}`,
-                  payload: { body: txt.slice(0, 1400) },
+                  payload: { body: inlineBody },
+                  fullBody: txt,
+                  inlineBody,
                 });
               }
             }
           } else if (typeof content === "string" && content.trim()) {
+            const inlineBody = content.slice(0, 1400);
             emit({
               kind: "user_input",
               targetAgentId: agentId,
               summary: `Human: ${cleanHumanSummary(content, 130)}`,
-              payload: { body: content.slice(0, 1400) },
+              payload: { body: inlineBody },
+              fullBody: content,
+              inlineBody,
             });
           }
         } else if (rtype === "assistant") {
@@ -606,13 +640,37 @@ export class ClaudeCodeAdapter implements PassiveIdeAdapter {
                   targetAgentId: subId,
                   agentLabel: subLabel,
                 });
+                const rawPrompt =
+                  typeof input.prompt === "string"
+                    ? input.prompt
+                    : typeof input.description === "string"
+                      ? input.description
+                      : "";
+                const inlinePrompt = rawPrompt ? rawPrompt.slice(0, 1000) : "";
+                const compactInput = {
+                  ...(typeof input.subagent_type === "string"
+                    ? { subagent_type: input.subagent_type }
+                    : {}),
+                  ...(typeof input.name === "string" ? { name: input.name } : {}),
+                  ...(typeof input.description === "string"
+                    ? { description: input.description.slice(0, 200) }
+                    : {}),
+                  ...(inlinePrompt ? { prompt: inlinePrompt } : {}),
+                };
                 emit({
                   kind: "subagent_spawn",
                   toolName: tname,
                   toolCallId: callId,
                   targetAgentId: subId,
                   summary: cleanHumanSummary(`Spawned ${subLabel}`, 140),
-                  payload: { input, subagentId: subId },
+                  payload: {
+                    input: compactInput,
+                    ...(inlinePrompt ? { prompt: inlinePrompt } : {}),
+                    subagentId: subId,
+                  },
+                  ...(rawPrompt
+                    ? { fullBody: rawPrompt, inlineBody: inlinePrompt }
+                    : {}),
                   offset: bIdx * 0.0001,
                 });
               } else if (tname === "SendMessage") {
@@ -621,6 +679,14 @@ export class ClaudeCodeAdapter implements PassiveIdeAdapter {
                 const msgSummary =
                   cleanHumanSummary(body.split(/\r?\n/, 1)[0] ?? body, 140) ||
                   "Sent message";
+                const inlineBody = body.slice(0, 1000);
+                const compactInput = {
+                  ...(typeof input.recipient === "string"
+                    ? { recipient: input.recipient }
+                    : {}),
+                  ...(typeof input.to === "string" ? { to: input.to } : {}),
+                  body: inlineBody,
+                };
                 toolSummaryMap.set(callId, { toolName: tname, summary: msgSummary });
                 emit({
                   kind: "message",
@@ -628,7 +694,8 @@ export class ClaudeCodeAdapter implements PassiveIdeAdapter {
                   toolCallId: callId,
                   targetAgentId: target,
                   summary: msgSummary,
-                  payload: { input, body: body.slice(0, 1000) },
+                  payload: { input: compactInput, body: inlineBody },
+                  ...(body ? { fullBody: body, inlineBody } : {}),
                   offset: bIdx * 0.0001,
                 });
               } else if (tname === "AskUserQuestion") {
@@ -667,11 +734,13 @@ export class ClaudeCodeAdapter implements PassiveIdeAdapter {
 
           if (row.message?.stop_reason === "end_turn" && !hasToolUse) {
             const txt = extractTextFromContent(content).trim();
+            const inlineBody = txt.slice(0, 1000);
             emit({
               kind:
                 agentId === "root" ? "assistant_turn_end" : "subagent_done",
               summary: cleanHumanSummary(txt, 140) || "Turn completed",
-              payload: { body: txt.slice(0, 1000) },
+              payload: { body: inlineBody },
+              ...(txt ? { fullBody: txt, inlineBody } : {}),
               offset: (blocks.length + 1) * 0.0001,
             });
           }

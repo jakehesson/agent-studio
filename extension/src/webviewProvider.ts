@@ -1,4 +1,9 @@
+import fs from "node:fs";
 import * as vscode from "vscode";
+import {
+  getDefaultAllowedRoots,
+  resolveAllowedFileUri,
+} from "./fileLinkBridge";
 import type { ServerManager } from "./serverManager";
 
 export type StudioViewName = "studio" | "board" | "team" | "mockups" | "doctor";
@@ -59,17 +64,90 @@ export class StudioPanel {
     this.panel = panel;
     this.panel.onDidDispose(() => this.dispose(), null, this.disposables);
     this.panel.webview.onDidReceiveMessage(
-      async (msg: { type?: string }) => {
+      async (msg: {
+        type?: string;
+        uri?: string;
+        startLine?: number;
+        endLine?: number;
+      }) => {
         if (msg?.type === "retry") {
           await this.serverManager.ensureRunning(true);
           await this.render(this.currentView);
         } else if (msg?.type === "openExternal") {
           await vscode.commands.executeCommand("agentStudio.openInBrowser");
+        } else if (msg?.type === "openFile" && typeof msg.uri === "string") {
+          await this.handleOpenFileMessage({
+            uri: msg.uri,
+            startLine: msg.startLine,
+            endLine: msg.endLine,
+          });
         }
       },
       null,
       this.disposables,
     );
+  }
+
+  private async handleOpenFileMessage(msg: {
+    uri: string;
+    startLine?: number;
+    endLine?: number;
+  }): Promise<void> {
+    const allowedRoots = getDefaultAllowedRoots(
+      (vscode.workspace.workspaceFolders ?? []).map((f) => f.uri.fsPath),
+    );
+    const resolved = resolveAllowedFileUri(msg.uri, allowedRoots, {
+      startLine: msg.startLine,
+      endLine: msg.endLine,
+    });
+    if (!resolved.ok) {
+      void vscode.window.showWarningMessage(resolved.reason);
+      return;
+    }
+
+    try {
+      const st = await fs.promises.stat(resolved.fsPath);
+      if (!st.isFile()) {
+        void vscode.window.showWarningMessage(
+          `Cannot open path (not a file): ${resolved.fsPath}`,
+        );
+        return;
+      }
+    } catch {
+      void vscode.window.showWarningMessage(
+        `File not found: ${resolved.fsPath}`,
+      );
+      return;
+    }
+
+    try {
+      const doc = await vscode.workspace.openTextDocument(
+        vscode.Uri.file(resolved.fsPath),
+      );
+      let selection: vscode.Range | undefined;
+      if (resolved.startLine !== undefined) {
+        const maxLine = Math.max(0, doc.lineCount - 1);
+        const start = Math.min(Math.max(0, resolved.startLine - 1), maxLine);
+        const end =
+          resolved.endLine !== undefined
+            ? Math.min(Math.max(start, resolved.endLine - 1), maxLine)
+            : start;
+        const endChar =
+          resolved.endLine !== undefined && end > start
+            ? doc.lineAt(end).text.length
+            : 0;
+        selection = new vscode.Range(start, 0, end, endChar);
+      }
+      await vscode.window.showTextDocument(doc, {
+        viewColumn: vscode.ViewColumn.Beside,
+        preserveFocus: true,
+        ...(selection ? { selection } : {}),
+      });
+    } catch (err) {
+      void vscode.window.showWarningMessage(
+        `Failed to open file: ${err instanceof Error ? err.message : String(err)}`,
+      );
+    }
   }
 
   public static async createOrShow(
@@ -121,6 +199,12 @@ export class StudioPanel {
 
     const nonce = getNonce();
     const safeUrl = escapeHtml(resolvedUrl);
+    let expectedOrigin = "";
+    try {
+      expectedOrigin = new URL(resolvedUrl).origin;
+    } catch {
+      expectedOrigin = "";
+    }
 
     this.panel.webview.html = `<!DOCTYPE html>
 <html lang="en">
@@ -241,6 +325,22 @@ export class StudioPanel {
     });
     document.getElementById("browserBtn").addEventListener("click", () => {
       vscode.postMessage({ type: "openExternal" });
+    });
+
+    const expectedOrigin = ${JSON.stringify(expectedOrigin)};
+    window.addEventListener("message", (event) => {
+      if (event.source !== frame.contentWindow) return;
+      if (!expectedOrigin || event.origin !== expectedOrigin) return;
+      const data = event.data;
+      if (!data || typeof data !== "object") return;
+      if (data.type === "agentStudio.openFile" && typeof data.uri === "string") {
+        vscode.postMessage({
+          type: "openFile",
+          uri: data.uri,
+          startLine: typeof data.startLine === "number" ? data.startLine : undefined,
+          endLine: typeof data.endLine === "number" ? data.endLine : undefined,
+        });
+      }
     });
   </script>
 </body>

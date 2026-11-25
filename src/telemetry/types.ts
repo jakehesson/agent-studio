@@ -125,6 +125,8 @@ export interface ActivityItem {
   kind: string;
   title: string;
   body: string;
+  bodyLength?: number;
+  bodyTruncated?: boolean;
   conv?: string;
   ide: IdeSource;
   toolName?: string;
@@ -163,6 +165,10 @@ export interface RichSessionSnapshot extends SessionSnapshot {
   }>;
 }
 
+export interface ParseSessionOptions {
+  onFullBody?: (eventId: string, body: string) => void;
+}
+
 export interface PassiveIdeAdapter {
   readonly ide: IdeSource;
   getHealth(): Promise<AdapterHealth>;
@@ -170,7 +176,10 @@ export interface PassiveIdeAdapter {
     limit?: number;
     workspaceRoots?: string[];
   }): Promise<DiscoveredSession[]>;
-  parseSession(session: DiscoveredSession): Promise<EnrichedEvent[]>;
+  parseSession(
+    session: DiscoveredSession,
+    opts?: ParseSessionOptions,
+  ): Promise<EnrichedEvent[]>;
 }
 
 export const PALETTE = [

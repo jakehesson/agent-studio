@@ -573,6 +573,10 @@ export function buildSessionSnapshot(
           kind: "human",
           title: ev.summary,
           body: String(ev.payload?.body ?? ev.summary),
+          ...(ev.bodyLength !== undefined ? { bodyLength: ev.bodyLength } : {}),
+          ...(ev.bodyTruncated !== undefined
+            ? { bodyTruncated: ev.bodyTruncated }
+            : {}),
           conv: convId,
           ide: ev.ide,
           channel: ev.channel,
@@ -775,6 +779,10 @@ export function buildSessionSnapshot(
           kind: "dispatch",
           title: ev.summary,
           body: String(ev.payload?.prompt ?? ev.summary),
+          ...(ev.bodyLength !== undefined ? { bodyLength: ev.bodyLength } : {}),
+          ...(ev.bodyTruncated !== undefined
+            ? { bodyTruncated: ev.bodyTruncated }
+            : {}),
           conv: convId,
           ide: ev.ide,
           toolName: ev.toolName,
@@ -853,6 +861,10 @@ export function buildSessionSnapshot(
           kind: msgClass,
           title: cleanTitle,
           body,
+          ...(ev.bodyLength !== undefined ? { bodyLength: ev.bodyLength } : {}),
+          ...(ev.bodyTruncated !== undefined
+            ? { bodyTruncated: ev.bodyTruncated }
+            : {}),
           conv: convId,
           ide: ev.ide,
           toolName: ev.toolName,

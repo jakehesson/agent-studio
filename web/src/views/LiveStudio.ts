@@ -1,4 +1,5 @@
 import { ActivityFeed } from "../components/ActivityFeed.js";
+import { CommReaderModal } from "../components/CommReaderModal.js";
 import { PayloadInspector } from "../components/PayloadInspector.js";
 import { TimelineScrubber } from "../components/TimelineScrubber.js";
 import { buildSnapshot } from "../state/snapshot.js";
@@ -16,6 +17,7 @@ export class LiveStudioView {
   private feed: ActivityFeed;
   private inspector: PayloadInspector;
   private scrubber: TimelineScrubber;
+  private readerModal: CommReaderModal;
 
   private snapshot: SessionSnapshot | null = null;
   private agentLabelMap: Map<string, string> = new Map();
@@ -56,6 +58,33 @@ export class LiveStudioView {
       },
     });
 
+    const embedMode = (() => {
+      try {
+        const v = new URLSearchParams(window.location.search).get("embed");
+        return v === "1" || v === "true";
+      } catch {
+        return false;
+      }
+    })();
+
+    this.readerModal = new CommReaderModal({
+      embedMode,
+      getSessionContext: () => {
+        let sp: URLSearchParams | null = null;
+        try {
+          sp = new URLSearchParams(window.location.search);
+        } catch {
+          sp = null;
+        }
+        return {
+          sessionId: this.snapshot?.sessionId || sp?.get("session") || undefined,
+          ide: this.snapshot?.ide || sp?.get("ide") || undefined,
+          project: this.snapshot?.projectId || sp?.get("project") || undefined,
+          workspace: this.snapshot?.workspacePath || sp?.get("workspace") || undefined,
+        };
+      },
+    });
+
     this.feed = new ActivityFeed(feedEl, {
       onSelectEvent: (ev) => {
         this.selectedEventId = ev.id;
@@ -72,6 +101,11 @@ export class LiveStudioView {
         this.feed.setSelectedEvent(null);
         this.inspectCurrentAgent(agentId, this.isCoverScreen());
       },
+      onOpenReader: (ev) => {
+        this.selectedEventId = ev.id;
+        this.feed.setSelectedEvent(ev.id);
+        this.readerModal.open(ev, { labelMap: this.agentLabelMap });
+      },
     });
 
     this.inspector = new PayloadInspector(inspEl, {
@@ -84,6 +118,9 @@ export class LiveStudioView {
           this.feed.setAgentFilter(null);
         }
       },
+      onOpenReader: (ev) => {
+        this.readerModal.open(ev, { labelMap: this.agentLabelMap });
+      },
     });
 
     this.scrubber = new TimelineScrubber(tlEl, {
@@ -94,6 +131,7 @@ export class LiveStudioView {
   }
 
   public dispose(): void {
+    this.readerModal.dispose();
     this.topology.dispose();
     this.inspector.dispose();
     this.scrubber.dispose();

@@ -413,11 +413,11 @@ describe("Unified Single-Port HTTP & SSE Server", () => {
         ),
       );
 
-      // 7. Reject oversized (>64KB) ingest payload with 413
+      // 7. Reject oversized (>512KB) ingest payload with 413
       const bigResp = await fetch(`${base}/api/ingest`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ summary: "x".repeat(70_000) }),
+        body: JSON.stringify({ summary: "x".repeat(530_000) }),
       });
       assert.equal(bigResp.status, 413);
 

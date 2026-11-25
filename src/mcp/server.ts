@@ -91,7 +91,7 @@ function resolveServerVersion(): string {
   } catch {
     // Fall through to default version
   }
-  return "0.5.0";
+  return "0.6.0";
 }
 
 export const MCP_PROTOCOL_VERSION = "2024-11-05";
@@ -463,6 +463,27 @@ export const MCP_TOOLS = [
         workspace: { type: "string" },
         multiOnly: { type: "boolean" },
       },
+    },
+    _meta: {
+      ui: {
+        visibility: ["app"],
+      },
+    },
+  },
+  {
+    name: "app_get_event_body",
+    description:
+      "App-only data bridge returning the full untruncated body for a specific session event.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        session: { type: "string" },
+        event: { type: "string" },
+        ide: { type: "string" },
+        project: { type: "string" },
+        workspace: { type: "string" },
+      },
+      required: ["session", "event"],
     },
     _meta: {
       ui: {
@@ -1196,6 +1217,59 @@ async function executeAppGetStateTool(
   };
 }
 
+async function executeAppGetEventBodyTool(
+  args: Record<string, unknown>,
+  options: McpServerOptions,
+): Promise<McpToolCallResult> {
+  const session = str(args.session);
+  const eventId = str(args.event);
+  if (!session || !eventId) {
+    const errPayload: Record<string, unknown> = {
+      ok: false,
+      error: "Missing session or event query parameter",
+    };
+    return {
+      isError: true,
+      content: [{ type: "text", text: JSON.stringify(errPayload) }],
+      structuredContent: errPayload,
+    };
+  }
+
+  const aggregator = getMcpAggregator();
+  const entry = await aggregator.getEventBody({
+    sessionId: session,
+    eventId,
+    ide: str(args.ide),
+    project: str(args.project) ?? options.defaultProject,
+    workspace: str(args.workspace),
+  });
+
+  if (!entry) {
+    const errPayload: Record<string, unknown> = {
+      ok: false,
+      error: "Event body not found",
+    };
+    return {
+      isError: true,
+      content: [{ type: "text", text: JSON.stringify(errPayload) }],
+      structuredContent: errPayload,
+    };
+  }
+
+  const payload: Record<string, unknown> = {
+    ok: true,
+    sessionId: session,
+    eventId,
+    body: entry.body,
+    truncated: entry.truncated,
+    byteLength: entry.byteLength,
+  };
+  return {
+    content: [{ type: "text", text: JSON.stringify(payload) }],
+    structuredContent: payload,
+  };
+}
+
 async function executeAppGetBoardTool(
   args: Record<string, unknown>,
   options: McpServerOptions,
@@ -1401,6 +1475,8 @@ export async function dispatchToolCall(
         return await executeOpenStudioTool(args, options);
       case "app_get_state":
         return await executeAppGetStateTool(args, options);
+      case "app_get_event_body":
+        return await executeAppGetEventBodyTool(args, options);
       case "app_get_board":
         return await executeAppGetBoardTool(args, options);
       case "app_get_team":

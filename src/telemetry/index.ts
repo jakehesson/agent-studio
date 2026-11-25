@@ -9,6 +9,11 @@ import {
   normalizeComparePath,
   pathMatchesRoot,
 } from "./adapters/project-match.js";
+import {
+  defaultEventBodyStore,
+  type EventBodyEntry,
+  type EventBodyStore,
+} from "./body-store.js";
 import { discoverTeamDetailsCached } from "./definitions.js";
 import { buildSessionSnapshot } from "./normalizer.js";
 import { PushBus, type IngestResult } from "./push-bus.js";
@@ -20,6 +25,7 @@ import {
 } from "./types.js";
 
 export * from "./types.js";
+export * from "./body-store.js";
 export * from "./definitions.js";
 export * from "./push-bus.js";
 export * from "./normalizer.js";
@@ -37,6 +43,7 @@ export interface TelemetryAggregatorOptions {
   extraWorkspaces?: string[];
   includeGlobalTelemetryFile?: boolean;
   adapters?: PassiveIdeAdapter[];
+  bodyStore?: EventBodyStore;
 }
 
 export interface SessionQueryFilter {
@@ -155,8 +162,10 @@ function sessionMatchesFilter(
 export class TelemetryAggregator {
   readonly adapters: PassiveIdeAdapter[];
   readonly pushBus: PushBus;
+  readonly bodyStore: EventBodyStore;
 
   constructor(options?: TelemetryAggregatorOptions) {
+    this.bodyStore = options?.bodyStore ?? defaultEventBodyStore;
     this.adapters = options?.adapters ?? [
       new AntigravityAdapter({ brainDir: options?.brainDir }),
       new ClaudeCodeAdapter({ projectsDir: options?.claudeDir }),
@@ -165,6 +174,7 @@ export class TelemetryAggregator {
     this.pushBus = new PushBus({
       extraWorkspaces: options?.extraWorkspaces,
       includeGlobalTelemetryFile: options?.includeGlobalTelemetryFile,
+      bodyStore: this.bodyStore,
     });
   }
 
@@ -271,7 +281,13 @@ export class TelemetryAggregator {
     const adapter = this.adapters.find((a) => a.ide === target.ide);
     const passiveEvents =
       adapter && target.filePath
-        ? await adapter.parseSession(target).catch(() => [])
+        ? await adapter
+            .parseSession(target, {
+              onFullBody: (eventId, body) => {
+                this.bodyStore.set(target.sessionId, eventId, body);
+              },
+            })
+            .catch(() => [])
         : [];
     const pushEvents = this.pushBus.getSessionEvents(target.sessionId);
 
@@ -303,5 +319,49 @@ export class TelemetryAggregator {
     target.isMultiAgent = target.isMultiAgent || snapshot.is_multi_agent;
 
     return { snapshot, sessions, boardProjects };
+  }
+
+  async getEventBody(params: {
+    sessionId: string;
+    eventId: string;
+    ide?: string;
+    project?: string;
+    workspace?: string;
+  }): Promise<EventBodyEntry | null> {
+    const { sessionId, eventId } = params;
+    if (!sessionId || !eventId) return null;
+
+    const cached = this.bodyStore.get(sessionId, eventId);
+    if (cached) return cached;
+
+    const sessions = await this.discoverSessions({
+      ide: params.ide,
+      project: params.project,
+      workspace: params.workspace,
+      limit: 200,
+    });
+
+    const afterPoll = this.bodyStore.get(sessionId, eventId);
+    if (afterPoll) return afterPoll;
+
+    const target = sessions.find((s) => s.sessionId === sessionId);
+    if (!target || !target.filePath) {
+      return null;
+    }
+
+    const adapter = this.adapters.find((a) => a.ide === target.ide);
+    if (!adapter) {
+      return null;
+    }
+
+    await adapter
+      .parseSession(target, {
+        onFullBody: (eid, body) => {
+          this.bodyStore.set(target.sessionId, eid, body);
+        },
+      })
+      .catch(() => []);
+
+    return this.bodyStore.get(sessionId, eventId) ?? null;
   }
 }

@@ -26,6 +26,7 @@ const FEED_MODE_STORAGE_KEY = "agent-studio:feed-mode";
 export interface ActivityFeedCallbacks {
   onSelectEvent: (event: NormalizedEvent) => void;
   onSelectAgent?: (agentId: string) => void;
+  onOpenReader?: (event: NormalizedEvent) => void;
 }
 
 const FILTER_TABS: Array<{ id: FeedFilter; label: string }> = [
@@ -192,9 +193,12 @@ export class ActivityFeed {
 
   private syncSelectedHighlight(): void {
     this.container
-      .querySelectorAll<HTMLButtonElement>("[data-ev-id]")
-      .forEach((btn) => {
-        btn.classList.toggle("selected", btn.dataset.evId === this.selectedEventId);
+      .querySelectorAll<HTMLElement>(".ev-item[data-ev-id]")
+      .forEach((item) => {
+        const isSel = item.dataset.evId === this.selectedEventId;
+        item.classList.toggle("selected", isSel);
+        const rowBtn = item.querySelector<HTMLButtonElement>(".ev-row-btn");
+        rowBtn?.setAttribute("aria-pressed", isSel ? "true" : "false");
       });
   }
 
@@ -407,38 +411,65 @@ export class ActivityFeed {
           ev.targetAgentId && ev.targetAgentId !== ev.agentId
             ? `${actorName} → ${formatActorName(ev.targetAgentId, this.labelMap)}`
             : actorName;
+        const isCommEvent =
+          ev.kind === "message" ||
+          ev.kind === "user_input" ||
+          ev.kind === "subagent_spawn";
         return `
-          <button
-            type="button"
-            class="ev-row ${row.cssClass} ${row.isLowSignal ? "ev-low-signal" : ""} ${isSel ? "selected" : ""}"
+          <div
+            class="ev-item ${row.cssClass} ${row.isLowSignal ? "ev-low-signal" : ""} ${isSel ? "selected" : ""}"
             data-ev-id="${escHtml(ev.id)}"
           >
-            <div class="ev-top">
-              <span class="ev-route">${escHtml(route)}</span>
-              <span class="ev-badges">
-                <span class="ide-mini" style="color:${ide.color}">${escHtml(ide.short)}</span>
-                <span class="pill ${row.cssClass}">${escHtml(row.badge)}</span>
-                <span class="ev-time">${escHtml(fmtClock(ev.ts || ev.epoch))}</span>
-              </span>
-            </div>
-            <div class="ev-title-row">
-              <span class="ev-title">${escHtml(row.summaryText)}</span>
-              <span class="ev-chevron" aria-hidden="true">›</span>
-            </div>
-            ${row.protoTag ? `<div class="ev-proto-tag">${escHtml(row.protoTag)}</div>` : ""}
-          </button>
+            <button
+              type="button"
+              class="ev-row-btn"
+              aria-pressed="${isSel ? "true" : "false"}"
+            >
+              <div class="ev-top">
+                <span class="ev-route">${escHtml(route)}</span>
+                <span class="ev-badges">
+                  <span class="ide-mini" style="color:${ide.color}">${escHtml(ide.short)}</span>
+                  <span class="pill ${row.cssClass}">${escHtml(row.badge)}</span>
+                  <span class="ev-time">${escHtml(fmtClock(ev.ts || ev.epoch))}</span>
+                </span>
+              </div>
+              <div class="ev-title-row">
+                <span class="ev-title">${escHtml(row.summaryText)}</span>
+                <span class="ev-chevron" aria-hidden="true">›</span>
+              </div>
+              ${row.protoTag ? `<div class="ev-proto-tag">${escHtml(row.protoTag)}</div>` : ""}
+            </button>
+            ${
+              isCommEvent
+                ? `<button type="button" class="ev-read-btn" data-read-ev="${escHtml(ev.id)}" aria-label="Read formatted ${escHtml(row.badge)} from ${escHtml(actorName)}">Read</button>`
+                : ""
+            }
+          </div>
         `;
       })
       .join("");
 
     const byId = new Map(visible.map((r) => [r.primaryEvent.id, r.primaryEvent]));
-    listEl.querySelectorAll<HTMLButtonElement>("[data-ev-id]").forEach((btn) => {
-      btn.addEventListener("click", () => {
-        const ev = btn.dataset.evId ? byId.get(btn.dataset.evId) : undefined;
+    listEl.querySelectorAll<HTMLElement>(".ev-item[data-ev-id]").forEach((item) => {
+      const rowBtn = item.querySelector<HTMLButtonElement>(".ev-row-btn");
+      rowBtn?.addEventListener("click", () => {
+        const ev = item.dataset.evId ? byId.get(item.dataset.evId) : undefined;
         if (ev) {
           this.selectedEventId = ev.id;
           this.syncSelectedHighlight();
           this.cb.onSelectEvent(ev);
+        }
+      });
+    });
+
+    listEl.querySelectorAll<HTMLButtonElement>("[data-read-ev]").forEach((btn) => {
+      btn.addEventListener("click", (e) => {
+        e.stopPropagation();
+        const ev = btn.dataset.readEv ? byId.get(btn.dataset.readEv) : undefined;
+        if (ev) {
+          this.selectedEventId = ev.id;
+          this.syncSelectedHighlight();
+          this.cb.onOpenReader?.(ev);
         }
       });
     });

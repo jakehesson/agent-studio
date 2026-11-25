@@ -77,9 +77,21 @@
   .team-detail-dialog button,
   .team-detail-dialog input:not([type="checkbox"], [type="radio"]),
   .team-detail-dialog select,
-  .roster-card-foot button {
+  .roster-card-foot button,
+  .ev-read-btn,
+  .reader-head button,
+  .reader-mode-btn,
+  .reader-code-copy,
+  .reader-file-chip,
+  .reader-retry-btn,
+  .reader-sections-toggle,
+  .reader-toc-drawer-nav .reader-toc-link {
     min-block-size: 44px;
     min-inline-size: 44px;
+  }
+  .reader-toc-drawer-nav .reader-toc-link {
+    display: flex;
+    align-items: center;
   }
   .model-index-dialog input:not([type="checkbox"], [type="radio"]),
   .model-index-dialog select,
@@ -524,5 +536,78 @@
 @media (max-width: 400px) {
   .timeline-bar [data-tl="home"] {
     display: none;
+  }
+}
+
+/* Reader Modal: Fold Open (640-1020px) & Cover Screen (< 640px) */
+@media (max-width: 1020px) {
+  .reader-dialog {
+    width: 100vw;
+    max-width: 100vw;
+    height: 100dvh;
+    max-height: 100dvh;
+    margin: 0;
+    border: 0;
+    border-radius: 0;
+  }
+
+  [data-reader-fullscreen] {
+    display: none;
+  }
+
+  .reader-head {
+    padding: max(10px, env(safe-area-inset-top, 0px)) max(12px, env(safe-area-inset-right, 0px))
+      10px max(12px, env(safe-area-inset-left, 0px));
+  }
+
+  .reader-meta-bar {
+    padding: 8px max(12px, env(safe-area-inset-right, 0px)) 8px
+      max(12px, env(safe-area-inset-left, 0px));
+  }
+
+  .reader-body.has-toc {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .reader-toc {
+    display: none;
+  }
+
+  .reader-toc-drawer:not([hidden]) {
+    display: block;
+  }
+
+  .reader-main-scroll {
+    padding: 16px max(14px, env(safe-area-inset-right, 0px))
+      max(24px, env(safe-area-inset-bottom, 0px)) max(14px, env(safe-area-inset-left, 0px));
+  }
+}
+
+@media (max-width: 639px) {
+  .reader-head {
+    gap: 8px;
+  }
+
+  .reader-head-actions {
+    width: 100%;
+    justify-content: flex-end;
+  }
+
+  .reader-md {
+    font-size: 13.5px;
+  }
+}
+
+@media (horizontal-viewport-segments: 2) {
+  /* Dual-segment Reader Modal: left segment TOC, right segment article aligned to crease */
+  .reader-body.has-toc {
+    grid-template-columns: env(viewport-segment-width 0 0) env(viewport-segment-width 1 0);
+    gap: max(16px, calc(env(viewport-segment-left 1 0) - env(viewport-segment-right 0 0)));
+  }
+  .reader-body.has-toc .reader-toc:not([hidden]) {
+    display: flex;
+  }
+  .reader-toc-drawer {
+    display: none !important;
   }
 }

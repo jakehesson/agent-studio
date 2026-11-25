@@ -3,6 +3,7 @@ import fs from "node:fs/promises";
 import path from "node:path";
 import { getAgentStudioHome, listProjects } from "../board/registry.js";
 import { NormalizedEventSchema } from "../schema/telemetry.js";
+import { defaultEventBodyStore, type EventBodyStore } from "./body-store.js";
 import {
   computeDeterministicEventId,
   computeMergeKey,
@@ -25,6 +26,28 @@ export interface IngestResult {
 export interface PushBusOptions {
   extraWorkspaces?: string[];
   includeGlobalTelemetryFile?: boolean;
+  bodyStore?: EventBodyStore;
+}
+
+function extractRawBodyText(raw: unknown): string | undefined {
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return undefined;
+  const obj = raw as Record<string, unknown>;
+  const payload =
+    obj.payload && typeof obj.payload === "object" && !Array.isArray(obj.payload)
+      ? (obj.payload as Record<string, unknown>)
+      : undefined;
+  if (payload) {
+    if (typeof payload.body === "string" && payload.body.length > 0) {
+      return payload.body;
+    }
+    if (typeof payload.prompt === "string" && payload.prompt.length > 0) {
+      return payload.prompt;
+    }
+  }
+  if (typeof obj.body === "string" && obj.body.length > 0) {
+    return obj.body;
+  }
+  return undefined;
 }
 
 export function coerceToEnrichedEvent(raw: unknown): EnrichedEvent {
@@ -74,6 +97,47 @@ export function coerceToEnrichedEvent(raw: unknown): EnrichedEvent {
           summary,
         });
 
+  const rawPayload =
+    obj.payload &&
+    typeof obj.payload === "object" &&
+    !Array.isArray(obj.payload)
+      ? (obj.payload as Record<string, unknown>)
+      : undefined;
+
+  let sanitizedPayload: Record<string, unknown> | undefined = rawPayload;
+  let computedBodyLength: number | undefined =
+    typeof obj.bodyLength === "number" &&
+    Number.isInteger(obj.bodyLength) &&
+    obj.bodyLength >= 0
+      ? obj.bodyLength
+      : undefined;
+  let computedBodyTruncated: boolean | undefined =
+    typeof obj.bodyTruncated === "boolean" ? obj.bodyTruncated : undefined;
+
+  if (rawPayload) {
+    if (typeof rawPayload.body === "string") {
+      const full = rawPayload.body;
+      const inline = full.slice(0, 1400);
+      if (full.length > inline.length) {
+        sanitizedPayload = { ...rawPayload, body: inline };
+      }
+      if (full.length > 0) {
+        computedBodyLength ??= full.length;
+        computedBodyTruncated ??= full.length > inline.length;
+      }
+    } else if (typeof rawPayload.prompt === "string") {
+      const full = rawPayload.prompt;
+      const inline = full.slice(0, 1000);
+      if (full.length > inline.length) {
+        sanitizedPayload = { ...rawPayload, prompt: inline };
+      }
+      if (full.length > 0) {
+        computedBodyLength ??= full.length;
+        computedBodyTruncated ??= full.length > inline.length;
+      }
+    }
+  }
+
   const validated = NormalizedEventSchema.parse({
     id,
     ts,
@@ -99,12 +163,13 @@ export function coerceToEnrichedEvent(raw: unknown): EnrichedEvent {
     kind,
     toolName,
     summary,
-    payload:
-      obj.payload &&
-      typeof obj.payload === "object" &&
-      !Array.isArray(obj.payload)
-        ? (obj.payload as Record<string, unknown>)
-        : undefined,
+    payload: sanitizedPayload,
+    ...(computedBodyLength !== undefined
+      ? { bodyLength: computedBodyLength }
+      : {}),
+    ...(computedBodyTruncated !== undefined
+      ? { bodyTruncated: computedBodyTruncated }
+      : {}),
   });
 
   const channel: TelemetryChannel =
@@ -177,11 +242,13 @@ export class PushBus extends EventEmitter {
   private readonly fileOffsets = new Map<string, number>();
   private readonly extraWorkspaces: string[];
   private readonly includeGlobalFile: boolean;
+  private readonly bodyStore: EventBodyStore;
 
   constructor(options?: PushBusOptions) {
     super();
     this.extraWorkspaces = options?.extraWorkspaces ?? [];
     this.includeGlobalFile = options?.includeGlobalTelemetryFile ?? true;
+    this.bodyStore = options?.bodyStore ?? defaultEventBodyStore;
   }
 
   ingest(rawItems: unknown[]): IngestResult {
@@ -191,6 +258,7 @@ export class PushBus extends EventEmitter {
 
     for (const raw of rawItems) {
       const ev = coerceToEnrichedEvent(raw);
+      const rawBody = extractRawBodyText(raw);
       let list = this.sessions.get(ev.sessionId);
       let ids = this.seenIds.get(ev.sessionId);
       if (!list || !ids) {
@@ -200,9 +268,17 @@ export class PushBus extends EventEmitter {
         this.seenIds.set(ev.sessionId, ids);
       }
 
+      if (rawBody !== undefined && !this.bodyStore.has(ev.sessionId, ev.id)) {
+        this.bodyStore.set(ev.sessionId, ev.id, rawBody);
+      }
+
       if (ids.has(ev.id)) {
         deduped += 1;
         continue;
+      }
+
+      if (rawBody !== undefined) {
+        this.bodyStore.set(ev.sessionId, ev.id, rawBody);
       }
 
       list.push(ev);

@@ -51,6 +51,8 @@ export const NormalizedEventSchema = z.object({
   toolName: z.string().optional(),
   summary: z.string(),
   payload: z.record(z.string(), z.unknown()).optional(),
+  bodyLength: z.number().int().nonnegative().optional(),
+  bodyTruncated: z.boolean().optional(),
 });
 export type NormalizedEvent = z.infer<typeof NormalizedEventSchema>;
 

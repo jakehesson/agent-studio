@@ -265,6 +265,70 @@ export async function fetchState(opts: {
   return normalizeServerSnapshot(raw);
 }
 
+export interface EventBodyResult {
+  ok: boolean;
+  sessionId?: string;
+  eventId?: string;
+  body?: string;
+  truncated?: boolean;
+  byteLength?: number;
+  error?: string;
+}
+
+export async function fetchEventBody(params: {
+  sessionId: string;
+  eventId: string;
+  ide?: string;
+  project?: string;
+  workspace?: string;
+}): Promise<EventBodyResult> {
+  try {
+    const raw = isMcpAppTransportActive()
+      ? await callMcpToolJson<Record<string, unknown>>("app_get_event_body", {
+          session: params.sessionId,
+          event: params.eventId,
+          ide: params.ide && params.ide !== "all" ? params.ide : undefined,
+          project: params.project,
+          workspace: params.workspace,
+        })
+      : await fetchJson<Record<string, unknown>>(
+          `/api/event-body${qs({
+            session: params.sessionId,
+            event: params.eventId,
+            ide: params.ide && params.ide !== "all" ? params.ide : undefined,
+            project: params.project || undefined,
+            workspace: params.workspace || undefined,
+          })}`
+        );
+
+    const ok = raw.ok !== false;
+    if (!ok) {
+      return {
+        ok: false,
+        sessionId: typeof raw.sessionId === "string" ? raw.sessionId : params.sessionId,
+        eventId: typeof raw.eventId === "string" ? raw.eventId : params.eventId,
+        error: typeof raw.error === "string" && raw.error ? raw.error : "Unable to load full message body",
+      };
+    }
+
+    return {
+      ok: true,
+      sessionId: typeof raw.sessionId === "string" ? raw.sessionId : params.sessionId,
+      eventId: typeof raw.eventId === "string" ? raw.eventId : params.eventId,
+      body: typeof raw.body === "string" ? raw.body : undefined,
+      truncated: typeof raw.truncated === "boolean" ? raw.truncated : undefined,
+      byteLength: typeof raw.byteLength === "number" ? raw.byteLength : undefined,
+    };
+  } catch (err) {
+    return {
+      ok: false,
+      sessionId: params.sessionId,
+      eventId: params.eventId,
+      error: err instanceof Error ? err.message : String(err),
+    };
+  }
+}
+
 export async function fetchBoard(opts: {
   project?: string;
   workspace?: string;
