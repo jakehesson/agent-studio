@@ -82,6 +82,7 @@ roster:
       - backend-engineer
       - frontend-engineer
       - qa-validator
+      - release-engineer
     description: Strict manager and dispatcher overseeing ready -> design -> dev ->
       test -> done and enforcing the QA gate via agent-studio MCP.
   - id: architect
@@ -154,6 +155,20 @@ roster:
       - mcp_testrun
     description: Automated test suites, formal MCP testruns, bug filing, and test ->
       done QA gate verification.
+  - id: release-engineer
+    name: CI/CD & Release Engineer
+    roleType: specialist
+    boardRole: ops
+    promptFile: agents/release-engineer.md
+    modelTier: balanced
+    capabilities:
+      - read
+      - search
+      - edit
+      - shell
+      - mcp_board
+    description: GitHub Actions CI/CD workflows, SemVer lockstep releases, CHANGELOG
+      curation, and pre-release packaging verification.
   - id: team-setup
     name: Team Setup Agent
     roleType: setup
@@ -175,4 +190,5 @@ skills:
   - skills/qa-validation
   - skills/token-efficiency
   - skills/model-routing
+  - skills/release-management
   - skills/team-setup

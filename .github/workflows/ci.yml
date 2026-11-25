@@ -73,3 +73,20 @@ jobs:
 
       - name: Verify npm package contents
         run: npm pack --dry-run
+
+      - name: Package Antigravity plugin zip artifact
+        if: github.event_name == 'push' && matrix.os == 'ubuntu-latest' && matrix.node == 22
+        shell: bash
+        run: |
+          VERSION=$(node -p "require('./package.json').version")
+          (cd antigravity-plugin/dist && zip -r "../../agent-studio-antigravity-plugin-${VERSION}.zip" .)
+
+      - name: Upload build artifacts on main push
+        if: github.event_name == 'push' && matrix.os == 'ubuntu-latest' && matrix.node == 22
+        uses: actions/upload-artifact@v4
+        with:
+          name: agent-studio-build-artifacts
+          retention-days: 14
+          path: |
+            extension/agent-studio-*.vsix
+            agent-studio-antigravity-plugin-*.zip

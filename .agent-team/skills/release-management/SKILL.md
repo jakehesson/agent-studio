@@ -1,0 +1,69 @@
+---
+name: release-management
+description: Step-by-step playbook for preparing an Agent Studio release (SemVer lockstep, CHANGELOG.md curation, full CI/packaging verification, release.yml verification, incremental session-scoped task/milestone commits, and pre-push checklist).
+---
+
+# Release Management Playbook
+
+## Ongoing: Session-Scoped Task & Milestone Commits
+
+1. **Draft Summary & Description Incrementally**
+   - Maintain a Conventional Commit summary (`<type>(<scope>): <summary>`) and a concise bulleted body describing the active task or milestone as changes land.
+2. **Select Only Current-Session Changes**
+   - Inspect `git status --short` and **never** run blind `git add .` or `git add -A`.
+   - Stage only the explicit file paths modified during the current session (`git add -- <session-files...>`), verify with `git diff --cached --stat`, and isolate any mixed-edit files before committing.
+3. **Create Local Milestone / Task Commit**
+   - Commit locally using `git commit -m "<type>(<scope>): <summary>" -m "<bulleted body>"`.
+   - Never push commits or tags without explicit user approval.
+
+## Preparing a Release
+
+Follow this sequence whenever preparing a new **Agent Studio** release:
+
+1. **Confirm Target Version (SemVer)**
+   - Minor bump (`0.x.0 -> 0.(x+1).0`) for new features; patch bump (`0.x.y -> 0.x.(y+1)`) for standalone bug fixes.
+   - Update `"version"` in strict lockstep across:
+     - `package.json`
+     - `web/package.json`
+     - `extension/package.json`
+     - `extension/src/mcpProvider.ts` (fallback version)
+     - `src/mcp/server.ts` (fallback version)
+     - `web/src/mcp-app-entry.ts` (`new App({ name: "Agent Studio", version: "..." })`)
+     - `README.md` / `docs/` version references (if applicable)
+   - Refresh lockfiles without changing dependencies:
+     ```bash
+     npm install --package-lock-only
+     npm --prefix web install --package-lock-only
+     npm --prefix extension install --package-lock-only
+     ```
+
+2. **Curate `CHANGELOG.md`**
+   - Add a `## [<version>] - YYYY-MM-DD` section at the top of `CHANGELOG.md` following [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) (`Added`, `Changed`, `Fixed`, `Security`).
+   - Verify `.github/workflows/release.yml` extracts the exact `## [<version>]` section cleanly (matching `TAG_VERSION="${GITHUB_REF_NAME#v}"`).
+
+3. **Run Full CI & Packaging Verification Pipeline**
+   ```bash
+   npm run check
+   npm --prefix web run check
+   npm --prefix extension run check
+   npm run build:all
+   npm --prefix extension run package
+   node antigravity-plugin/scripts/build-plugin.mjs
+   npm test
+   node dist/cli/index.js sync --check
+   python tests/smoke_test.py
+   npm pack --dry-run
+   ```
+   - Confirm `extension/agent-studio-<version>.vsix` exists and `antigravity-plugin/dist/plugin.json` reports `<version>`.
+
+4. **Verify Privacy & Release Hygiene**
+   - Ensure zero personal paths, hostnames, UUIDs, or `pipeline/board.json` are staged.
+   - Verify `SECURITY.md` lists the current minor branch (e.g. `0.5.x`) as supported.
+
+5. **Prepare Pre-Push / Pre-Tag Checklist for User Approval**
+   - Never run `git push` or force-push without explicit user confirmation.
+   - Present the exact commit, tag, and push commands for the user to approve or execute:
+     ```bash
+     git tag -a v<version> -m "Release v<version>"
+     git push origin main --follow-tags
+     ```

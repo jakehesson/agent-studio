@@ -91,9 +91,18 @@ jobs:
           fi
           (cd antigravity-plugin/dist && zip -r "../../agent-studio-antigravity-plugin-${TAG_VERSION}.zip" .)
 
+      - name: Extract curated release notes from CHANGELOG.md
+        shell: bash
+        env:
+          TAG_VERSION: ${{ steps.version.outputs.tag_version }}
+          OUT: ${{ runner.temp }}/release-notes.md
+        run: |
+          node -e 'const fs=require("fs"),v=process.env.TAG_VERSION,esc=v.replace(/[.*+?^${}()|[\]\\]/g,"\\$&"),c=fs.readFileSync("CHANGELOG.md","utf8"),m=c.match(new RegExp("(?:^|\\r?\\n)## \\["+esc+"\\][^\\r\\n]*\\r?\\n([\\s\\S]*?)(?=\\r?\\n## \\[|$)"));fs.writeFileSync(process.env.OUT,m?m[1].trim()+"\n":"Release v"+v+"\n");'
+
       - name: Publish GitHub Release
         uses: softprops/action-gh-release@v2
         with:
+          body_path: ${{ runner.temp }}/release-notes.md
           generate_release_notes: true
           files: |
             extension/agent-studio-${{ steps.version.outputs.tag_version }}.vsix
