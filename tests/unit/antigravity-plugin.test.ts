@@ -107,6 +107,7 @@ describe("Native Antigravity MCP App Plugin Packager", () => {
         "skills/token-efficiency/SKILL.md",
         "skills/code-review/SKILL.md",
         "skills/architecture-review/SKILL.md",
+        "skills/learn/SKILL.md",
         "rules/AGENTS.md",
       ];
       for (const rel of expectedFiles) {
@@ -123,6 +124,13 @@ describe("Native Antigravity MCP App Plugin Packager", () => {
         "rules/AGENTS.md must be plain Markdown without YAML frontmatter",
       );
       assert.ok(rulesText.includes("Token & Context Discipline"));
+
+      const bundledLearnText = fs.readFileSync(
+        path.join(tmpInstallDir, "skills", "learn", "SKILL.md"),
+        "utf8",
+      );
+      assert.ok(bundledLearnText.includes("name: learn"));
+      assert.ok(!bundledLearnText.includes("disable-slash-command"));
 
       const htmlText = fs.readFileSync(
         path.join(tmpInstallDir, "bin", "app.html"),

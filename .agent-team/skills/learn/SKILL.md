@@ -1,0 +1,43 @@
+---
+name: learn
+description: Capture durable session learnings (user corrections, bug root causes, invariants, repeated workflows) into AGENTS.md, .agent-team/ agents, or quickref skills and re-sync IDEs.
+argument-hint: "[optional focus]"
+---
+
+# Session Learning & Knowledge Capture (`/learn`)
+
+Use `/learn [optional focus]` at the end of a task—or whenever a user correction, root cause, architectural invariant, or repeated workflow emerges—to persist durable knowledge without bloating prompts or causing IDE drift.
+
+## 1. Extract Durable Learnings
+Focus on high-signal, reusable takeaways (honoring `[optional focus]` if provided):
+- **User corrections:** Explicit preferences, naming/style rules, or rejected approaches.
+- **Bug root causes:** Non-obvious failure modes, race/lock fixes, or platform quirks (with exact file/command context).
+- **Hard invariants:** Schema contracts, version locksteps, security/containment rules, or build/test ordering requirements.
+- **Repeated workflows:** Verified multi-step commands, port/endpoint details, or debugging recipes.
+- **Skip noise:** Do NOT record one-off typos, ephemeral task status, secrets, tokens, or credentials.
+
+## 2. Inspect & Deduplicate Before Proposing
+Check existing canonical memory so additions never contradict, duplicate, or bloat existing docs:
+1. Root `AGENTS.md` (and user sections of `CLAUDE.md` / `.github/copilot-instructions.md` outside `<!-- agent-studio:begin/end -->`).
+2. `.agent-team/team.yaml`, `.agent-team/agents/*.md`, and `.agent-team/skills/*/SKILL.md` (including `architecture-review/SKILL.md`).
+3. Workspace quickref skills (`*-quickref/SKILL.md` in `.agent-team/skills/`, `.agents/`, `.claude/`, or `.github/skills/`).
+- If an existing rule is stale or contradicted, propose **updating or pruning** it rather than appending a conflicting rule.
+
+## 3. Classify Target & Safety Constraints
+Route each learning to its single canonical home:
+- **Repo-wide invariants & workspace rules:** `AGENTS.md` (or user-managed sections of `CLAUDE.md` / `.github/copilot-instructions.md` strictly **outside** `<!-- agent-studio:begin --> ... <!-- agent-studio:end -->`).
+- **Role-specific behavior or checklist:** `.agent-team/agents/<role>.md`.
+- **Architecture boundaries & P0/P1/P2 rubric:** `.agent-team/skills/architecture-review/SKILL.md`.
+- **Runbooks, commands, quirks & quickrefs:** `.agent-team/skills/<name>/SKILL.md` (e.g., `<project>-quickref/SKILL.md`; if creating a new skill folder, register `"skills/<name>"` in `.agent-team/team.yaml`).
+- **Strict caps:** Keep quickref/skill files concise (**`< 8 KB`**) and verify **zero secrets, tokens, or personal credentials**.
+
+## 4. Propose, Confirm & Sync
+1. **Output a concise Learning Proposal** before editing files:
+   - **Finding:** One-line summary of the durable takeaway.
+   - **Target:** Exact file path (plus whether `.agent-team/team.yaml` needs a `skills/<name>` entry).
+   - **Exact Diff:** Minimal surgical diff showing additions/updates/pruning.
+2. **Wait for user confirmation** (unless the user explicitly authorized auto-apply).
+3. **Apply edits to canonical sources ONLY:** Never hand-edit compiled IDE outputs (`.agents/plugins/`, `.claude/agents/`, `.claude/skills/`, `.github/agents/`, `.github/skills/`, `.github/prompts/`, or inside `<!-- agent-studio:begin/end -->` blocks).
+4. **Recompile & verify zero drift:**
+   - Run `agent-studio sync` (or `npx agent-studio sync`).
+   - Run `agent-studio sync --check` and confirm exit code `0`.

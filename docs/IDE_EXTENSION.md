@@ -1,6 +1,6 @@
 # Agent Studio — VS Code & Antigravity IDE Extension (`.vsix`)
 
-The **Agent Studio Extension** (`extension/agent-studio-<version>.vsix`, currently `extension/agent-studio-0.9.1.vsix`) embeds the full Agent Studio live monitor, QA-gated Agile Board, Agent Team inspector, Mockups gallery, and Setup/Doctor tooling directly inside **Visual Studio Code** and **Antigravity IDE**—with zero duplicated business logic and zero runtime external dependencies.
+The **Agent Studio Extension** (`extension/agent-studio-<version>.vsix`, currently `extension/agent-studio-0.10.0.vsix`) embeds the full Agent Studio live monitor, QA-gated Agile Board, Agent Team inspector, Mockups gallery, and Setup/Doctor tooling directly inside **Visual Studio Code** and **Antigravity IDE**—with zero duplicated business logic and zero runtime external dependencies.
 
 ---
 
@@ -10,18 +10,18 @@ The **Agent Studio Extension** (`extension/agent-studio-<version>.vsix`, current
 1. Open the **Extensions** view (`Ctrl+Shift+X` / `Cmd+Shift+X`).
 2. Click the **`...`** (*Views and More Actions*) menu in the top-right corner of the Extensions sidebar.
 3. Choose **Install from VSIX...**.
-4. Select `./extension/agent-studio-<version>.vsix` (e.g. `agent-studio-0.9.1.vsix`, or download a prebuilt `.vsix` from [GitHub Releases](https://github.com/jakehesson/agent-studio/releases)).
+4. Select `./extension/agent-studio-<version>.vsix` (e.g. `agent-studio-0.10.0.vsix`, or download a prebuilt `.vsix` from [GitHub Releases](https://github.com/jakehesson/agent-studio/releases)).
 5. Reload the window if prompted, then click the **Agent Studio** icon in the Activity Bar.
 
 ### Option B: From the Command Line
-Download `agent-studio-0.9.1.vsix` from [GitHub Releases](https://github.com/jakehesson/agent-studio/releases) or build it locally into `./extension/`, then install:
+Download `agent-studio-0.10.0.vsix` from [GitHub Releases](https://github.com/jakehesson/agent-studio/releases) or build it locally into `./extension/`, then install:
 
 ```powershell
 # VS Code
-code --install-extension ./extension/agent-studio-0.9.1.vsix
+code --install-extension ./extension/agent-studio-0.10.0.vsix
 
 # Antigravity IDE
-agy --install-extension ./extension/agent-studio-0.9.1.vsix
+agy --install-extension ./extension/agent-studio-0.10.0.vsix
 ```
 
 ---
@@ -111,4 +111,4 @@ npm run check
 npm run package
 ```
 
-Output package: `extension/agent-studio-<version>.vsix` (currently `extension/agent-studio-0.9.1.vsix`, derived dynamically from `extension/package.json`; self-contained, zero `node_modules/` inside the VSIX).
+Output package: `extension/agent-studio-<version>.vsix` (currently `extension/agent-studio-0.10.0.vsix`, derived dynamically from `extension/package.json`; self-contained, zero `node_modules/` inside the VSIX).

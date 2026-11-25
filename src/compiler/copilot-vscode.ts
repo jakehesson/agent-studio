@@ -1,4 +1,5 @@
 import path from "node:path";
+import { parse as parseYaml } from "yaml";
 import {
   resolveRoleModel,
   type ResolvedRoleModel,
@@ -52,6 +53,47 @@ export function buildCopilotHooksConfig(): Record<string, unknown> {
     managedBy: "agent-studio",
     hooks,
   };
+}
+
+const DEFAULT_LEARN_DESCRIPTION =
+  "Capture durable session learnings (user corrections, bug root causes, invariants, repeated workflows) into AGENTS.md, .agent-team/ agents, or quickref skills and re-sync IDEs.";
+
+function extractFrontmatterDescription(frontmatter?: string): string | undefined {
+  if (!frontmatter || !frontmatter.trim()) return undefined;
+  try {
+    const parsed = parseYaml(frontmatter);
+    if (
+      parsed &&
+      typeof parsed === "object" &&
+      !Array.isArray(parsed) &&
+      typeof (parsed as Record<string, unknown>).description === "string"
+    ) {
+      const desc = (
+        (parsed as Record<string, unknown>).description as string
+      ).trim();
+      return desc.length > 0 ? desc : undefined;
+    }
+  } catch {
+    // Fall back to default description when frontmatter YAML is invalid.
+  }
+  return undefined;
+}
+
+/**
+ * Renders the SHA-256-wrapped VS Code Copilot prompt file (`learn.prompt.md`)
+ * with `description` and `agent: "agent"` frontmatter from the `learn` skill.
+ */
+export function renderCopilotLearnPrompt(
+  body: string,
+  frontmatter?: string,
+): string {
+  const description =
+    extractFrontmatterDescription(frontmatter) ?? DEFAULT_LEARN_DESCRIPTION;
+  const promptFm = serializeFrontmatter({
+    description,
+    agent: "agent",
+  });
+  return wrapGeneratedMarkdown(body, promptFm);
 }
 
 export function compileCopilotVsCode(
@@ -122,6 +164,14 @@ export function compileCopilotVsCode(
       kind: "generated",
       content: wrapGeneratedMarkdown(skill.body, fm),
     });
+    if (skill.id === "learn") {
+      files.push({
+        relPath: ".github/prompts/learn.prompt.md",
+        ide: "copilot-vscode",
+        kind: "generated",
+        content: renderCopilotLearnPrompt(skill.body, skill.frontmatter),
+      });
+    }
   }
 
   files.push({

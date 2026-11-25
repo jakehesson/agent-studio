@@ -219,6 +219,7 @@ async function main() {
     "token-efficiency",
     "code-review",
     "architecture-review",
+    "learn",
   ]) {
     const canonicalSkill = path.join(
       repoRoot,

@@ -9,6 +9,7 @@ import {
   mapCapabilitiesToClaudeCode,
   mapCapabilitiesToCopilotVsCode,
 } from "./capabilities.js";
+import { renderCopilotLearnPrompt } from "./copilot-vscode.js";
 import { wrapGeneratedMarkdown } from "./merge.js";
 import { serializeFrontmatter, splitFrontmatter } from "./shared.js";
 
@@ -87,7 +88,8 @@ export function installGlobalSetupAgent(
 
   const installedFiles: string[] = [];
   const setupPrompt = renderTeamSetupPrompt();
-  const setupSkill = getDefaultSkills().find((s) => s.id === "team-setup");
+  const defaultSkills = getDefaultSkills();
+  const setupSkill = defaultSkills.find((s) => s.id === "team-setup");
   const skillParts = setupSkill
     ? splitFrontmatter(setupSkill.content)
     : {
@@ -96,6 +98,18 @@ export function installGlobalSetupAgent(
           description: "Onboard any repository to Agent Studio.",
         }),
         body: "# Team Setup Skill\n",
+      };
+  const learnSkill = defaultSkills.find((s) => s.id === "learn");
+  const learnParts = learnSkill
+    ? splitFrontmatter(learnSkill.content)
+    : {
+        frontmatter: serializeFrontmatter({
+          name: "learn",
+          description:
+            "Capture durable session learnings (user corrections, bug root causes, invariants, repeated workflows) into AGENTS.md, .agent-team/ agents, or quickref skills and re-sync IDEs.",
+          "argument-hint": "[optional focus]",
+        }),
+        body: "# Session Learning & Knowledge Capture (`/learn`)\n",
       };
 
   const setupCapabilities = [
@@ -158,6 +172,13 @@ export function installGlobalSetupAgent(
         wrapGeneratedMarkdown(skillParts.body, skillParts.frontmatter),
       ),
     );
+
+    installedFiles.push(
+      writeFileEnsureDir(
+        path.join(pluginRoot, "skills", "learn", "SKILL.md"),
+        wrapGeneratedMarkdown(learnParts.body, learnParts.frontmatter),
+      ),
+    );
   }
 
   if (targets.includes("claude-code")) {
@@ -180,6 +201,12 @@ export function installGlobalSetupAgent(
       writeFileEnsureDir(
         path.join(claudeDir, "skills", "team-setup", "SKILL.md"),
         wrapGeneratedMarkdown(skillParts.body, skillParts.frontmatter),
+      ),
+    );
+    installedFiles.push(
+      writeFileEnsureDir(
+        path.join(claudeDir, "skills", "learn", "SKILL.md"),
+        wrapGeneratedMarkdown(learnParts.body, learnParts.frontmatter),
       ),
     );
   }
@@ -215,6 +242,12 @@ export function installGlobalSetupAgent(
               "Global Agent Studio team onboarding workflow and CLI rules.",
           }),
         ),
+      ),
+    );
+    installedFiles.push(
+      writeFileEnsureDir(
+        path.join(promptsDir, "learn.prompt.md"),
+        renderCopilotLearnPrompt(learnParts.body, learnParts.frontmatter),
       ),
     );
   }

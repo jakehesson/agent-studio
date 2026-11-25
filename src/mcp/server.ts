@@ -91,7 +91,7 @@ function resolveServerVersion(): string {
   } catch {
     // Fall through to default version
   }
-  return "0.9.1";
+  return "0.10.0";
 }
 
 export const MCP_PROTOCOL_VERSION = "2024-11-05";

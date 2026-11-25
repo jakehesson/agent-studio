@@ -190,6 +190,7 @@ export function buildDefaultTeamManifest(
       "skills/token-efficiency",
       "skills/model-routing",
       "skills/team-setup",
+      "skills/learn",
     ],
   });
 

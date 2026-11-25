@@ -480,16 +480,63 @@ describe("Multi-IDE Compiler (Golden Fixtures & Orchestrator Read-Only)", () => 
     assert.ok(fs.existsSync(path.join(agyPluginDir, "skills", "code-review", "SKILL.md")));
     assert.ok(fs.existsSync(path.join(agyPluginDir, "skills", "architecture-review", "SKILL.md")));
     assert.ok(fs.existsSync(path.join(agyPluginDir, "skills", "token-efficiency", "SKILL.md")));
+    assert.ok(fs.existsSync(path.join(agyPluginDir, "skills", "learn", "SKILL.md")));
     assert.ok(fs.existsSync(path.join(repo, ".claude", "agents", "ux-designer.md")));
     assert.ok(fs.existsSync(path.join(repo, ".claude", "skills", "ux-review", "SKILL.md")));
     assert.ok(fs.existsSync(path.join(repo, ".claude", "skills", "code-review", "SKILL.md")));
     assert.ok(fs.existsSync(path.join(repo, ".claude", "skills", "architecture-review", "SKILL.md")));
     assert.ok(fs.existsSync(path.join(repo, ".claude", "skills", "token-efficiency", "SKILL.md")));
+    assert.ok(fs.existsSync(path.join(repo, ".claude", "skills", "learn", "SKILL.md")));
     assert.ok(fs.existsSync(path.join(repo, ".github", "agents", "ux-designer.agent.md")));
     assert.ok(fs.existsSync(path.join(repo, ".github", "skills", "ux-review", "SKILL.md")));
     assert.ok(fs.existsSync(path.join(repo, ".github", "skills", "code-review", "SKILL.md")));
     assert.ok(fs.existsSync(path.join(repo, ".github", "skills", "architecture-review", "SKILL.md")));
     assert.ok(fs.existsSync(path.join(repo, ".github", "skills", "token-efficiency", "SKILL.md")));
+    assert.ok(fs.existsSync(path.join(repo, ".github", "skills", "learn", "SKILL.md")));
+    assert.ok(fs.existsSync(path.join(repo, ".github", "prompts", "learn.prompt.md")));
+
+    // Verify per-IDE learn adaptation & frontmatter
+    const agyLearnRaw = fs.readFileSync(
+      path.join(agyPluginDir, "skills", "learn", "SKILL.md"),
+      "utf8",
+    );
+    assert.ok(verifyGeneratedMarkdownHash(agyLearnRaw));
+    const agyLearnFm = parseYaml(splitFrontmatter(agyLearnRaw).frontmatter ?? "") as Record<
+      string,
+      unknown
+    >;
+    assert.equal(agyLearnFm.name, "learn");
+    assert.equal(agyLearnFm["disable-slash-command"], undefined);
+
+    const ccLearnRaw = fs.readFileSync(
+      path.join(repo, ".claude", "skills", "learn", "SKILL.md"),
+      "utf8",
+    );
+    assert.ok(verifyGeneratedMarkdownHash(ccLearnRaw));
+    const ccLearnFm = parseYaml(splitFrontmatter(ccLearnRaw).frontmatter ?? "") as Record<
+      string,
+      unknown
+    >;
+    assert.equal(ccLearnFm.name, "learn");
+    assert.equal(ccLearnFm["argument-hint"], "[optional focus]");
+
+    const vscLearnSkillRaw = fs.readFileSync(
+      path.join(repo, ".github", "skills", "learn", "SKILL.md"),
+      "utf8",
+    );
+    assert.ok(verifyGeneratedMarkdownHash(vscLearnSkillRaw));
+
+    const vscLearnPromptRaw = fs.readFileSync(
+      path.join(repo, ".github", "prompts", "learn.prompt.md"),
+      "utf8",
+    );
+    assert.ok(verifyGeneratedMarkdownHash(vscLearnPromptRaw));
+    const vscLearnPromptFm = parseYaml(
+      splitFrontmatter(vscLearnPromptRaw).frontmatter ?? "",
+    ) as Record<string, unknown>;
+    assert.equal(typeof vscLearnPromptFm.description, "string");
+    assert.ok((vscLearnPromptFm.description as string).length > 0);
+    assert.equal(vscLearnPromptFm.agent, "agent");
 
     // Verify always-on Token & Context Discipline rules appear in all 3 IDE rules files
     assert.ok(
@@ -860,6 +907,43 @@ describe("Drift Detection (sync --check)", () => {
     const afterFix = await runSync(["--project", repo, "--check", "--quiet"]);
     assert.equal(afterFix.ok, true);
     assert.equal(afterFix.exitCode, 0);
+
+    // Tamper with .github/prompts/learn.prompt.md and verify hash/drift detection + repair
+    const learnPromptPath = path.join(repo, ".github", "prompts", "learn.prompt.md");
+    fs.appendFileSync(learnPromptPath, "\n<!-- manual edit -->\n", "utf8");
+    const promptDrift = await runSync(["--project", repo, "--check", "--quiet"]);
+    assert.equal(promptDrift.ok, false);
+    assert.equal(promptDrift.exitCode, 1);
+    assert.ok(
+      promptDrift.drift?.entries.some(
+        (e) =>
+          e.path === ".github/prompts/learn.prompt.md" &&
+          e.status === "modified",
+      ),
+    );
+    process.exitCode = 0;
+
+    const promptResync = await runSync(["--project", repo, "--quiet"]);
+    assert.equal(promptResync.ok, true);
+    const promptAfterFix = await runSync(["--project", repo, "--check", "--quiet"]);
+    assert.equal(promptAfterFix.ok, true);
+    assert.equal(promptAfterFix.exitCode, 0);
+  });
+
+  it("omits .github/prompts/learn.prompt.md when skills/learn is absent from manifest", () => {
+    const repo = makeTempDir("av-no-learn-");
+    scaffoldAgentTeam(repo, { projectId: "no-learn", projectTitle: "No Learn" });
+    const teamYamlPath = path.join(repo, ".agent-team", "team.yaml");
+    const manifest: TeamManifest = parseTeamYaml(fs.readFileSync(teamYamlPath, "utf8"));
+    manifest.skills = manifest.skills.filter((s) => s !== "skills/learn");
+    fs.writeFileSync(teamYamlPath, serializeTeamYaml(manifest), "utf8");
+
+    compileTeam(repo);
+    assert.equal(
+      fs.existsSync(path.join(repo, ".github", "prompts", "learn.prompt.md")),
+      false,
+    );
+    assert.equal(checkTeamDrift(repo).ok, true);
   });
 
   it("round-trips verifyGeneratedMarkdownHash for frontmatter-less and frontmatter-bearing markdown and detects manual edits", () => {
@@ -1091,12 +1175,33 @@ describe("CLI Init, Global Install & Doctor", () => {
         ),
       ),
     );
+    const globalAgyLearnPath = path.join(
+      fakeHome,
+      ".gemini",
+      "config",
+      "plugins",
+      "agent-studio",
+      "skills",
+      "learn",
+      "SKILL.md",
+    );
+    assert.ok(fs.existsSync(globalAgyLearnPath));
+    assert.ok(verifyGeneratedMarkdownHash(fs.readFileSync(globalAgyLearnPath, "utf8")));
 
-    // Claude Code global agent & skill
+    // Claude Code global agent & skills
     assert.ok(fs.existsSync(path.join(fakeHome, ".claude", "agents", "team-setup.md")));
     assert.ok(
       fs.existsSync(path.join(fakeHome, ".claude", "skills", "team-setup", "SKILL.md")),
     );
+    const globalCcLearnPath = path.join(
+      fakeHome,
+      ".claude",
+      "skills",
+      "learn",
+      "SKILL.md",
+    );
+    assert.ok(fs.existsSync(globalCcLearnPath));
+    assert.ok(verifyGeneratedMarkdownHash(fs.readFileSync(globalCcLearnPath, "utf8")));
 
     // VS Code global prompts/instructions inside sandboxed HOME
     const directRes = installGlobalSetupAgent({ homeDir: fakeHome });
@@ -1106,6 +1211,17 @@ describe("CLI Init, Global Install & Doctor", () => {
     assert.ok(
       directRes.installedFiles.some((f) => f.endsWith("team-setup.instructions.md")),
     );
+    const globalVscLearnPath = directRes.installedFiles.find((f) =>
+      f.endsWith("learn.prompt.md"),
+    );
+    assert.ok(globalVscLearnPath && fs.existsSync(globalVscLearnPath));
+    const globalVscLearnRaw = fs.readFileSync(globalVscLearnPath, "utf8");
+    assert.ok(verifyGeneratedMarkdownHash(globalVscLearnRaw));
+    const globalVscLearnFm = parseYaml(
+      splitFrontmatter(globalVscLearnRaw).frontmatter ?? "",
+    ) as Record<string, unknown>;
+    assert.equal(globalVscLearnFm.agent, "agent");
+    assert.equal(typeof globalVscLearnFm.description, "string");
   });
 });
 
