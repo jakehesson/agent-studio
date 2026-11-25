@@ -5,6 +5,15 @@ All notable changes to **Agent Studio** will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.6.0] - 2026-11-25
+
+### Added
+- **Formatted Communication Reader Modal & Full-Body Telemetry (`S1-45`):**
+  - Added bounded in-memory `EventBodyStore` (`src/telemetry/body-store.ts`) and full untruncated message/prompt body capture across Antigravity, Claude Code, and VS Code Copilot telemetry adapters, exposed on demand via `GET /api/event-body` and MCP `app_get_event_body` while keeping SSE/state payloads lightweight.
+  - Added dedicated `<dialog closedby="any">` `CommReaderModal` (`web/src/components/CommReaderModal.ts`) accessible from 1-click **Read** buttons in `ActivityFeed` and **Reader View** in `PayloadInspector`, featuring ~92vw × 90dvh desktop sizing with a 1-click Fullscreen toggle (auto-fullscreen on Fold/Mobile) and Galaxy Z Fold 7 three-tier responsive ergonomics.
+  - Added zero-dependency, XSS-safe GFM Markdown renderer (`web/src/utils/markdown.ts`) supporting headings, emphasis, horizontal rules, lists/task lists, blockquotes, scrollable tables, fenced code blocks with language pills and per-block Copy buttons, sticky Table of Contents for 2+ headings, Formatted/Raw toggle, Copy Markdown, and a collapsible Raw JSON drawer.
+  - Added safe link handling (`https://` in new tab with `noopener noreferrer`; styled `file://` chips) and an IDE Extension `postMessage` file-link bridge (`extension/src/fileLinkBridge.ts`, `extension/src/webviewProvider.ts`) to open workspace/agent files in `ViewColumn.Beside` (`preserveFocus: true`) with line selection.
+
 ## [0.5.0] - 2026-11-25
 
 ### Added
