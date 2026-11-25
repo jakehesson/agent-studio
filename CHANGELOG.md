@@ -5,6 +5,23 @@ All notable changes to **Agent Studio** will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.8.2] - 2026-11-25
+
+### Added
+- **Private GitHub Packages Publishing (`S1-51`):**
+  - Configured `@jakehesson/agent-studio` (`publishConfig` for `https://npm.pkg.github.com`) while preserving the `agent-studio` CLI bin name.
+  - Added automated private `npm publish` step to `.github/workflows/release.yml` and documented installation/auth setup in `README.md`.
+
+### Fixed
+- **Cross-Platform CI & Launcher Hardening (`BUG-15` / `S1-51`):**
+  - Used `#!/bin/sh` in the POSIX PATH-fallback mock (`tests/unit/compiler.test.ts`) so Linux CI tests pass even when `/usr/bin` is stripped from `PATH`.
+  - Increased `tests/unit/mcp-stdio.test.ts` timeout to `20_000 ms` for reliable CI execution.
+  - Stripped `Path` / `PATH` case variants on Windows in launcher unit tests (`tests/unit/compiler.test.ts`, `tests/unit/extension.test.ts`) and added `SystemRoot\System32\cmd.exe` fallback in `src/compiler/launcher.ts`.
+
+### Changed
+- **Web Studio & Sidebar UI Copy (`S1-51`):**
+  - Updated all remaining CLI command hints across `web/src/` (`api.ts`, `IdeUsageGuides.ts`, `ModelIndexDialog.ts`, `AgileBoard.ts`, `Doctor.ts`, `Team.ts`) from `npx agent-studio` to `agent-studio`.
+
 ## [0.8.1] - 2026-11-25
 
 ### Fixed

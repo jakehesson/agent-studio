@@ -3,7 +3,7 @@
   "displayName": "Agent Studio — Multi-Agent Monitor & Agile Board",
   "description": "IDE-agnostic live multi-agent topology monitor, QA-gated Agile Board, Agent Team inspector, and Setup/Doctor studio for VS Code and Antigravity.",
   "publisher": "agent-studio",
-  "version": "0.8.1",
+  "version": "0.8.2",
   "license": "MIT",
   "author": "Jake Hesson",
   "repository": {
@@ -156,6 +156,7 @@
     "typescript": "^5.7.3"
   },
   "dependencies": {
+    "@jakehesson/agent-studio": "file:..",
     "agent-studio": "file:.."
   }
 }
