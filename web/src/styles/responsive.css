@@ -78,6 +78,8 @@
   .team-detail-dialog input:not([type="checkbox"], [type="radio"]),
   .team-detail-dialog select,
   .roster-card-foot button,
+  .team-custom-jump-pill,
+  .team-catalog-hint-btn,
   .ev-read-btn,
   .reader-head button,
   .reader-mode-btn,

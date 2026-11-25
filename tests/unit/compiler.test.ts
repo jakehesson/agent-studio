@@ -14,15 +14,19 @@ import { runSync } from "../../src/cli/commands/sync.js";
 import {
   checkTeamDrift,
   compileTeam,
+  computeDrift,
   extractGeneratedHash,
+  formatGeneratedMarker,
   installGlobalSetupAgent,
   MANAGED_BEGIN,
   MANAGED_END,
   mapCapabilitiesToAntigravity,
   mergeJsonKeyScoped,
   mergeManagedMarkdownBlock,
+  renderManagedMarkdownBlock,
   resolveEffectiveCapabilities,
   verifyGeneratedMarkdownHash,
+  wrapGeneratedMarkdown,
 } from "../../src/compiler/index.js";
 import { splitFrontmatter } from "../../src/compiler/shared.js";
 import {
@@ -647,6 +651,88 @@ describe("Drift Detection (sync --check)", () => {
     const afterFix = await runSync(["--project", repo, "--check", "--quiet"]);
     assert.equal(afterFix.ok, true);
     assert.equal(afterFix.exitCode, 0);
+  });
+
+  it("round-trips verifyGeneratedMarkdownHash for frontmatter-less and frontmatter-bearing markdown and detects manual edits", () => {
+    const body = "# Shared Team Rules\n\nFollow the Agile board.";
+
+    // Frontmatter-less (e.g., rules/AGENTS.md)
+    const noFm = wrapGeneratedMarkdown(body);
+    assert.equal(verifyGeneratedMarkdownHash(noFm), true);
+    assert.equal(verifyGeneratedMarkdownHash(noFm.replace(/\n/g, "\r\n")), true);
+
+    // Backward-compatible single-newline separator after marker
+    const singleNl = `${formatGeneratedMarker(`${body}\n`)}\n${body}\n`;
+    assert.equal(verifyGeneratedMarkdownHash(singleNl), true);
+
+    // Genuine manual edits on frontmatter-less markdown fail verification
+    assert.equal(verifyGeneratedMarkdownHash(`${noFm}\nExtra line\n`), false);
+    assert.equal(verifyGeneratedMarkdownHash(`# Prepended\n${noFm}`), false);
+    assert.equal(
+      verifyGeneratedMarkdownHash(noFm.replace("# Shared Team Rules", "# Edited Rules")),
+      false,
+    );
+
+    // Frontmatter-bearing (e.g., agents/*.md)
+    const withFm = wrapGeneratedMarkdown(body, "name: architect\nmodel: pro");
+    assert.equal(verifyGeneratedMarkdownHash(withFm), true);
+    assert.equal(
+      verifyGeneratedMarkdownHash(withFm.replace("model: pro", "model: flash")),
+      false,
+    );
+    assert.equal(
+      verifyGeneratedMarkdownHash(withFm.replace("Follow the Agile board.", "Edited body.")),
+      false,
+    );
+
+    // Managed markdown block (e.g., CLAUDE.md)
+    const managed = renderManagedMarkdownBlock(body);
+    assert.equal(verifyGeneratedMarkdownHash(managed), true);
+    assert.equal(
+      verifyGeneratedMarkdownHash(managed.replace("Follow the Agile board.", "Tampered.")),
+      false,
+    );
+  });
+
+  it("classifies outdated frontmatter-less files as out-of-date and manually edited ones as modified", () => {
+    const repo = makeTempDir("av-frontmatterless-drift-");
+    const relRules = ".agents/plugins/test-team/rules/AGENTS.md";
+    const absRules = path.join(repo, relRules);
+    fs.mkdirSync(path.dirname(absRules), { recursive: true });
+
+    const oldRules = wrapGeneratedMarkdown("# Rules v1\n\nOld rules.");
+    const newRules = wrapGeneratedMarkdown("# Rules v2\n\nNew rules.");
+    fs.writeFileSync(absRules, oldRules, "utf8");
+
+    const outdatedReport = computeDrift(repo, [
+      {
+        relPath: relRules,
+        ide: "antigravity",
+        kind: "generated",
+        content: newRules,
+      },
+    ]);
+    assert.equal(outdatedReport.ok, false);
+    assert.equal(outdatedReport.entries.length, 1);
+    assert.equal(outdatedReport.entries[0]?.status, "out-of-date");
+
+    // Manual edit to the file on disk must classify as modified
+    fs.writeFileSync(
+      absRules,
+      oldRules.replace("Old rules.", "Hand-edited rules."),
+      "utf8",
+    );
+    const modifiedReport = computeDrift(repo, [
+      {
+        relPath: relRules,
+        ide: "antigravity",
+        kind: "generated",
+        content: newRules,
+      },
+    ]);
+    assert.equal(modifiedReport.ok, false);
+    assert.equal(modifiedReport.entries.length, 1);
+    assert.equal(modifiedReport.entries[0]?.status, "modified");
   });
 });
 

@@ -5,6 +5,17 @@ All notable changes to **Agent Studio** will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.7.0] - 2026-11-24
+
+### Added
+- **Project & Custom Agent Visibility in Web Studio Team Tab (`S1-47`):**
+  - Surfaced project-specific and custom (non-roster) agents alongside team roster and global agents in the Web Studio Team tab (`web/src/views/Team.ts`) with `Project Agent`, `Team Roster`, and `Global` scope badges.
+  - Added dedicated `Project / Custom` and `Global` scope filter chips plus quick-jump summary pills while preserving `embed=1` host-IDE scoping and Galaxy Z Fold 7 three-tier responsive and forced-colors accessibility ergonomics (`web/src/styles/views.css`, `web/src/styles/responsive.css`, `web/src/styles/mcp-app-theme.css`).
+
+### Fixed
+- **Frontmatter-less Generated Markdown Drift Check (`BUG-12`):**
+  - Fixed `verifyGeneratedMarkdownHash` (`src/compiler/merge.ts`, `tests/unit/compiler.test.ts`) newline handling on frontmatter-less generated markdown files (such as `rules/AGENTS.md`) so unmodified files verify cleanly and outdated files report `out-of-date` rather than false `modified (SHA-256 marker mismatch)` drift.
+
 ## [0.6.0] - 2026-11-25
 
 ### Added

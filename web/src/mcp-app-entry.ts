@@ -41,7 +41,7 @@ async function bootMcpApp(): Promise<void> {
   const mountEl = document.getElementById("app");
   if (!mountEl) return;
 
-  const mcpApp = new App({ name: "Agent Studio", version: "0.6.0" }, {});
+  const mcpApp = new App({ name: "Agent Studio", version: "0.7.0" }, {});
   setMcpAppTransport(mcpApp as unknown as McpAppClientLike);
 
   let studioApp: AgentStudioApp | null = null;

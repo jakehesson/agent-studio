@@ -337,6 +337,47 @@ body {
   background: rgba(245, 158, 11, 0.16);
 }
 
+:root[data-theme="light"] .team-custom-jump-pill,
+:root[data-theme="light"] .team-catalog-hint-btn,
+:root[data-theme="light"] .def-scope-badge.is-project {
+  color: #0f766e;
+  border-color: rgba(15, 118, 110, 0.45);
+  background: rgba(20, 184, 166, 0.14);
+}
+
+:root[data-theme="light"] .team-custom-jump-pill:hover,
+:root[data-theme="light"] .team-catalog-hint-btn:hover {
+  background: rgba(20, 184, 166, 0.24);
+  color: #0f172a;
+}
+
+:root[data-theme="light"] .filter-chip.filter-chip-custom {
+  color: #0f766e;
+  border-color: rgba(15, 118, 110, 0.45);
+}
+
+:root[data-theme="light"] .filter-chip.filter-chip-custom[aria-pressed="true"] {
+  background: rgba(20, 184, 166, 0.2);
+  border-color: #0f766e;
+  color: #0f172a;
+}
+
+:root[data-theme="light"] .def-tile.is-project-custom {
+  border-left-color: #0d9488;
+}
+
+:root[data-theme="light"] .def-scope-badge.is-roster {
+  color: #3730a3;
+  border-color: rgba(67, 56, 202, 0.38);
+  background: rgba(99, 102, 241, 0.12);
+}
+
+:root[data-theme="light"] .def-scope-badge.is-global {
+  color: #92400e;
+  border-color: rgba(180, 83, 9, 0.42);
+  background: rgba(245, 158, 11, 0.16);
+}
+
 :root[data-theme="light"] .pill.tool {
   color: #334155;
   border-color: var(--border-strong);

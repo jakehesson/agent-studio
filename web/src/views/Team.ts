@@ -26,18 +26,113 @@ import type {
 } from "../types.js";
 import { escHtml, getIdeMeta, trunc } from "../utils.js";
 
-type SourceFilter = "all" | TeamSourceIde;
+type SourceFilter = "all" | "project-custom" | "global" | TeamSourceIde;
 type CatalogTab = "skills" | "definitions";
+type DefinitionScope = "project" | "global";
+
+interface DefinitionClassification {
+  isRoster: boolean;
+  scope: DefinitionScope;
+  isProjectCustom: boolean;
+}
 
 const ALL_HOST_IDES: HostIde[] = ["antigravity", "claude-code", "copilot-vscode"];
 
-const SOURCE_FILTERS: Array<{ id: SourceFilter; label: string }> = [
-  { id: "all", label: "All" },
+const IDE_SOURCE_FILTERS: Array<{ id: TeamSourceIde; label: string }> = [
   { id: "canonical", label: "Canonical" },
   { id: "antigravity", label: "Antigravity" },
   { id: "claude-code", label: "Claude Code" },
   { id: "copilot-vscode", label: "VS Code" },
 ];
+
+function normalizePosixPath(p: string): string {
+  return p.replace(/\\/g, "/").replace(/\/+$/, "").toLowerCase();
+}
+
+function getDefinitionScope(
+  def: TeamDefinitionEntry,
+  team: TeamDetailsResponse
+): DefinitionScope {
+  if (def.source_ide === "canonical") return "project";
+  const normPath = normalizePosixPath(def.source_path || "");
+  if (!normPath) return "project";
+
+  // Global IDE directories outside any workspace root
+  if (
+    normPath.includes("/.gemini/antigravity/agents/") ||
+    normPath.includes("/.gemini/config/plugins/")
+  ) {
+    return "global";
+  }
+
+  const normRoot = team.project.root ? normalizePosixPath(team.project.root) : "";
+  if (normRoot) {
+    if (normPath === normRoot || normPath.startsWith(`${normRoot}/`)) {
+      return "project";
+    }
+    if (
+      normPath.includes("/.agents/agents/") ||
+      normPath.includes("/.agents/plugins/") ||
+      normPath.includes("/.github/agents/") ||
+      normPath.includes("/.agent-team/agents/")
+    ) {
+      return "project";
+    }
+    return "global";
+  }
+
+  if (
+    /^([a-z]:)?\/(users|home)\/[^/]+\/\.claude\/agents\//.test(normPath) ||
+    normPath.startsWith("/root/.claude/agents/")
+  ) {
+    return "global";
+  }
+  return "project";
+}
+
+function classifyDefinition(
+  def: TeamDefinitionEntry,
+  team: TeamDetailsResponse,
+  rosterIds: Set<string>
+): DefinitionClassification {
+  const projectId = team.project.id?.toLowerCase() ?? "";
+  let isRoster = Boolean(def.roleType || def.boardRole) || rosterIds.has(def.id);
+  if (!isRoster && projectId) {
+    for (const rid of rosterIds) {
+      if (def.id === `${projectId}-${rid}`) {
+        isRoster = true;
+        break;
+      }
+    }
+  }
+  const scope = getDefinitionScope(def, team);
+  return {
+    isRoster,
+    scope,
+    isProjectCustom: !isRoster && scope === "project",
+  };
+}
+
+function renderDefinitionScopeBadges(info: DefinitionClassification): string {
+  const badges: string[] = [];
+  if (info.isProjectCustom) {
+    badges.push(`<span class="def-scope-badge is-project">Project Agent</span>`);
+  } else if (info.isRoster) {
+    badges.push(`<span class="def-scope-badge is-roster">Team Roster</span>`);
+  }
+  if (info.scope === "global") {
+    badges.push(`<span class="def-scope-badge is-global">Global</span>`);
+  }
+  return badges.join("");
+}
+
+function describeDefinitionScope(info: DefinitionClassification): string {
+  if (info.isProjectCustom) return "Project-local (Custom / non-roster)";
+  if (info.scope === "global") {
+    return info.isRoster ? "Global plugin (Team Roster)" : "Global (~/.gemini or ~/.claude)";
+  }
+  return "Project-local (Team Roster)";
+}
 
 function getPolicyOptionLabel(
   policy: ModelRoutingPolicy,
@@ -110,7 +205,14 @@ function defaultTierForRole(roleType: string, roleId: string): ModelTier {
   const rt = roleType.toLowerCase();
   if (rt === "orchestrator" || id === "orchestrator") return "fast";
   if (rt === "qa" || id === "qa-validator") return "fast";
-  if (id === "architect" || id === "ux-designer" || rt === "design" || rt === "ux") {
+  if (
+    id === "architect" ||
+    id === "ux-designer" ||
+    id === "code-reviewer" ||
+    rt === "design" ||
+    rt === "ux" ||
+    rt === "review"
+  ) {
     return "reasoning";
   }
   return "balanced";
@@ -313,6 +415,8 @@ export class TeamView {
     if (
       scope.lockedIde &&
       this.sourceFilter !== "all" &&
+      this.sourceFilter !== "project-custom" &&
+      this.sourceFilter !== "global" &&
       this.sourceFilter !== "canonical" &&
       this.sourceFilter !== scope.lockedIde
     ) {
@@ -947,8 +1051,11 @@ export class TeamView {
 
   private openDefinitionDetail(def: TeamDefinitionEntry): void {
     const m = sourceBadgeMeta(def.source_ide);
+    const rosterIds = new Set((this.data?.roster ?? []).map((r) => r.id));
+    const info = this.data ? classifyDefinition(def, this.data, rosterIds) : null;
     const titleHtml = `
       <span class="insp-title">${escHtml(def.name || def.id)}</span>
+      ${info ? renderDefinitionScopeBadges(info) : ""}
       <span class="ide-chip" style="color:${m.color};border-color:${m.border};background:${m.bg}">${escHtml(m.label)}</span>
       ${def.roleType ? `<span class="team-role-badge ${roleBadgeClass(def.roleType)}">${escHtml(def.roleType)}</span>` : ""}
     `;
@@ -959,6 +1066,7 @@ export class TeamView {
     const bodyHtml = `
       <div class="insp-meta">
         <span><b>ID:</b> <code>${escHtml(def.id)}</code></span>
+        ${info ? `<span><b>Scope:</b> ${escHtml(describeDefinitionScope(info))}</span>` : ""}
         ${def.boardRole ? `<span><b>Board Role:</b> ${escHtml(def.boardRole)}</span>` : ""}
         ${def.model ? `<span><b>Model:</b> <code>${escHtml(def.model)}</code></span>` : ""}
         <span><b>Size:</b> ~${def.est_tokens} tokens (${def.chars} chars)</span>
@@ -1338,11 +1446,11 @@ export class TeamView {
       ? [lockedIde]
       : team.targets;
 
-    const visibleSourceFilters = lockedIde
-      ? SOURCE_FILTERS.filter(
-          (f) => f.id === "all" || f.id === "canonical" || f.id === lockedIde
+    const visibleIdeFilters = lockedIde
+      ? IDE_SOURCE_FILTERS.filter(
+          (f) => f.id === "canonical" || f.id === lockedIde
         )
-      : SOURCE_FILTERS;
+      : IDE_SOURCE_FILTERS;
 
     const scopedSkills = lockedIde
       ? team.skills.filter(
@@ -1355,14 +1463,60 @@ export class TeamView {
         )
       : team.definitions;
 
+    const rosterIds = new Set(team.roster.map((r) => r.id));
+    const defClassifications = new Map<TeamDefinitionEntry, DefinitionClassification>();
+    let projectCustomCount = 0;
+    let globalCount = 0;
+    for (const d of scopedDefs) {
+      const info = classifyDefinition(d, team, rosterIds);
+      defClassifications.set(d, info);
+      if (info.isProjectCustom) projectCustomCount += 1;
+      if (info.scope === "global") globalCount += 1;
+    }
+
+    const activeSourceFilter: SourceFilter =
+      this.catalogTab === "skills" &&
+      (this.sourceFilter === "project-custom" || this.sourceFilter === "global")
+        ? "all"
+        : this.sourceFilter === "global" && globalCount === 0
+          ? "all"
+          : this.sourceFilter;
+
     const filteredSkills =
-      this.sourceFilter === "all"
+      activeSourceFilter === "all"
         ? scopedSkills
-        : scopedSkills.filter((s) => s.source_ide === this.sourceFilter);
+        : scopedSkills.filter((s) => s.source_ide === activeSourceFilter);
     const filteredDefs =
-      this.sourceFilter === "all"
+      activeSourceFilter === "all"
         ? scopedDefs
-        : scopedDefs.filter((d) => d.source_ide === this.sourceFilter);
+        : activeSourceFilter === "project-custom"
+          ? scopedDefs.filter((d) => defClassifications.get(d)?.isProjectCustom)
+          : activeSourceFilter === "global"
+            ? scopedDefs.filter((d) => defClassifications.get(d)?.scope === "global")
+            : scopedDefs.filter((d) => d.source_ide === activeSourceFilter);
+
+    const catalogFilterChips: Array<{ id: SourceFilter; label: string; isCustom?: boolean }> = [
+      {
+        id: "all",
+        label: `All (${this.catalogTab === "skills" ? scopedSkills.length : scopedDefs.length})`,
+      },
+    ];
+    if (this.catalogTab === "definitions") {
+      catalogFilterChips.push({
+        id: "project-custom",
+        label: `Project / Custom (${projectCustomCount})`,
+        isCustom: true,
+      });
+      if (globalCount > 0) {
+        catalogFilterChips.push({
+          id: "global",
+          label: `Global (${globalCount})`,
+        });
+      }
+    }
+    for (const f of visibleIdeFilters) {
+      catalogFilterChips.push({ id: f.id, label: f.label });
+    }
 
     this.root.innerHTML = `
       <div class="team-view">
@@ -1462,7 +1616,19 @@ export class TeamView {
 
         <section class="team-section" aria-labelledby="teamRosterHeading">
           <div class="team-section-head">
-            <h3 id="teamRosterHeading">Canonical Team Roster (${team.roster.length})</h3>
+            <div class="team-section-title-row">
+              <h3 id="teamRosterHeading">Canonical Team Roster (${team.roster.length})</h3>
+              ${
+                projectCustomCount > 0
+                  ? `<button
+                      type="button"
+                      class="team-custom-jump-pill"
+                      data-jump-project-custom
+                      title="Jump to project-specific non-roster agents"
+                    >+ ${projectCustomCount} Project Agent${projectCustomCount === 1 ? "" : "s"} ↓</button>`
+                  : ""
+              }
+            </div>
             <span class="muted">Single source of truth in <code>.agent-team/</code></span>
           </div>
           ${
@@ -1527,7 +1693,18 @@ export class TeamView {
         <section class="card team-catalog" aria-labelledby="teamCatalogHeading">
           <div class="team-catalog-head">
             <div class="team-catalog-top">
-              <h3 id="teamCatalogHeading">Skills &amp; Discovered IDE Definitions</h3>
+              <div class="team-catalog-title-wrap">
+                <h3 id="teamCatalogHeading">Skills &amp; Discovered IDE Definitions</h3>
+                ${
+                  projectCustomCount > 0
+                    ? `<button
+                        type="button"
+                        class="team-catalog-hint-btn"
+                        data-jump-project-custom
+                      >${projectCustomCount} project-specific non-roster agent${projectCustomCount === 1 ? "" : "s"}</button>`
+                    : ""
+                }
+              </div>
               <div class="guide-tabs" role="tablist" aria-label="Catalog view">
                 <button
                   type="button"
@@ -1545,15 +1722,15 @@ export class TeamView {
                 >Skills (${filteredSkills.length})</button>
               </div>
             </div>
-            <div class="source-filter-bar" role="group" aria-label="Filter by source IDE">
-              ${visibleSourceFilters
+            <div class="source-filter-bar" role="group" aria-label="Filter by source IDE or agent scope">
+              ${catalogFilterChips
                 .map(
                   (f) => `
                     <button
                       type="button"
-                      class="filter-chip"
+                      class="filter-chip ${f.isCustom ? "filter-chip-custom" : ""}"
                       data-source-filter="${f.id}"
-                      aria-pressed="${this.sourceFilter === f.id ? "true" : "false"}"
+                      aria-pressed="${activeSourceFilter === f.id ? "true" : "false"}"
                     >${escHtml(f.label)}</button>
                   `
                 )
@@ -1565,7 +1742,7 @@ export class TeamView {
             ${
               this.catalogTab === "skills"
                 ? this.renderSkillsGrid(filteredSkills)
-                : this.renderDefinitionsGrid(filteredDefs)
+                : this.renderDefinitionsGrid(filteredDefs, defClassifications, activeSourceFilter)
             }
           </div>
         </section>
@@ -1608,25 +1785,39 @@ export class TeamView {
     `;
   }
 
-  private renderDefinitionsGrid(defs: TeamDefinitionEntry[]): string {
+  private renderDefinitionsGrid(
+    defs: TeamDefinitionEntry[],
+    classifications: Map<TeamDefinitionEntry, DefinitionClassification>,
+    activeFilter: SourceFilter
+  ): string {
     if (defs.length === 0) {
-      return `<div class="empty-state">No agent definitions match the selected IDE filter.</div>`;
+      const msg =
+        activeFilter === "project-custom"
+          ? "No project-specific custom (non-roster) agents found in .agents/agents/, .claude/agents/, or .github/agents/."
+          : activeFilter === "global"
+            ? "No global agent definitions found in ~/.gemini/ or ~/.claude/agents/."
+            : "No agent definitions match the selected filter.";
+      return `<div class="empty-state">${escHtml(msg)}</div>`;
     }
     return `
       <div class="team-defs-grid">
         ${defs
           .map((d, idx) => {
             const m = sourceBadgeMeta(d.source_ide);
+            const info = classifications.get(d);
             const tools = (d.tools ?? d.capabilities ?? []).slice(0, 5);
             const extraTools = Math.max(0, (d.tools ?? d.capabilities ?? []).length - tools.length);
             return `
-              <button type="button" class="def-tile" data-def-idx="${idx}">
+              <button type="button" class="def-tile ${info?.isProjectCustom ? "is-project-custom" : ""}" data-def-idx="${idx}">
                 <div class="def-tile-top">
                   <div class="def-tile-name">
                     <strong>${escHtml(d.name || d.id)}</strong>
                     <code>${escHtml(d.id)}</code>
                   </div>
-                  <span class="ide-chip" style="color:${m.color};border-color:${m.border};background:${m.bg}">${escHtml(m.label)}</span>
+                  <div class="def-tile-badges">
+                    ${info ? renderDefinitionScopeBadges(info) : ""}
+                    <span class="ide-chip" style="color:${m.color};border-color:${m.border};background:${m.bg}">${escHtml(m.label)}</span>
+                  </div>
                 </div>
                 <p class="def-tile-desc">${escHtml(trunc(d.description || d.source_path, 110))}</p>
                 ${
@@ -1781,11 +1972,31 @@ export class TeamView {
       });
     });
 
+    this.root.querySelectorAll<HTMLButtonElement>("[data-jump-project-custom]").forEach((btn) => {
+      btn.addEventListener("click", () => {
+        this.catalogTab = "definitions";
+        this.sourceFilter = "project-custom";
+        this.render('[data-source-filter="project-custom"]');
+        const catalogEl = this.root.querySelector<HTMLElement>(".team-catalog");
+        catalogEl?.scrollIntoView({ behavior: "smooth", block: "start" });
+        const activeChip = this.root.querySelector<HTMLElement>(
+          '[data-source-filter="project-custom"]'
+        );
+        activeChip?.scrollIntoView({ block: "nearest", inline: "nearest" });
+      });
+    });
+
     this.root.querySelectorAll<HTMLButtonElement>("[data-catalog-tab]").forEach((btn) => {
       btn.addEventListener("click", () => {
         const tab = btn.dataset.catalogTab as CatalogTab | undefined;
         if (tab && tab !== this.catalogTab) {
           this.catalogTab = tab;
+          if (
+            tab === "skills" &&
+            (this.sourceFilter === "project-custom" || this.sourceFilter === "global")
+          ) {
+            this.sourceFilter = "all";
+          }
           this.render(`[data-catalog-tab="${tab}"]`);
         }
       });
@@ -1797,6 +2008,10 @@ export class TeamView {
         if (src && src !== this.sourceFilter) {
           this.sourceFilter = src;
           this.render(`[data-source-filter="${src}"]`);
+          const activeChip = this.root.querySelector<HTMLElement>(
+            `[data-source-filter="${src}"]`
+          );
+          activeChip?.scrollIntoView({ block: "nearest", inline: "nearest" });
         }
       });
     });
