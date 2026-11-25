@@ -320,24 +320,32 @@ describe("Unified Single-Port HTTP & SSE Server", () => {
       const reader = sseResp.body!.getReader();
       const decoder = new TextDecoder();
       let sseBuffer = "";
+      let pendingRead: ReturnType<typeof reader.read> | null = null;
 
       const readUntil = async (
         predicate: (buf: string) => boolean,
-        timeoutMs = 3000,
+        timeoutMs = 8000,
       ): Promise<void> => {
         const deadline = Date.now() + timeoutMs;
         while (!predicate(sseBuffer)) {
           if (Date.now() > deadline) {
             throw new Error(`Timed out waiting for SSE chunk. Buffer: ${sseBuffer}`);
           }
-          const chunk = await Promise.race([
-            reader.read(),
-            new Promise<{ done: true; value: undefined }>((resolve) =>
-              setTimeout(() => resolve({ done: true, value: undefined }), 250),
+          if (!pendingRead) {
+            pendingRead = reader.read();
+          }
+          const winner = await Promise.race([
+            pendingRead.then((res) => ({ kind: "read" as const, res })),
+            new Promise<{ kind: "tick" }>((resolve) =>
+              setTimeout(() => resolve({ kind: "tick" }), 100),
             ),
           ]);
-          if (chunk.value) {
-            sseBuffer += decoder.decode(chunk.value, { stream: true });
+          if (winner.kind === "read") {
+            pendingRead = null;
+            if (winner.res.value) {
+              sseBuffer += decoder.decode(winner.res.value, { stream: true });
+            }
+            if (winner.res.done) break;
           }
         }
       };
