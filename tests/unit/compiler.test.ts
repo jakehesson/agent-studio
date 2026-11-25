@@ -1164,7 +1164,7 @@ describe("Portable Hook & MCP Launcher", () => {
       );
     } else {
       const shBin = path.join(pathFallbackDir, "agent-studio");
-      fs.writeFileSync(shBin, "#!/usr/bin/env sh\nexit 2\n", "utf8");
+      fs.writeFileSync(shBin, "#!/bin/sh\nexit 2\n", "utf8");
       fs.chmodSync(shBin, 0o755);
     }
     const resPathFallback = spawnSync(hookCmd, {
