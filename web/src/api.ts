@@ -669,7 +669,7 @@ export async function putModelIndex(payload: {
 }): Promise<ModelIndexView> {
   if (mcpTransport) {
     throw new Error(
-      "Model Index writes are read-only in MCP App mode. Run `npx agent-studio models set-tier ...` in terminal."
+      "Model Index writes are read-only in MCP App mode. Run `agent-studio models set-tier ...` in terminal."
     );
   }
   const raw = await fetchJson<Record<string, unknown>>("/api/model-index", {
@@ -690,7 +690,7 @@ export async function patchModelIndex(payload: {
 }): Promise<ModelIndexView> {
   if (mcpTransport) {
     throw new Error(
-      "Model Index writes are read-only in MCP App mode. Run `npx agent-studio models upsert ...` in terminal."
+      "Model Index writes are read-only in MCP App mode. Run `agent-studio models upsert ...` in terminal."
     );
   }
   const raw = await fetchJson<Record<string, unknown>>("/api/model-index", {
@@ -725,7 +725,7 @@ export async function discoverModelIndex(payload: {
 }> {
   if (mcpTransport) {
     throw new Error(
-      "Model discovery requires HTTP Studio or CLI (`npx agent-studio models discover`)."
+      "Model discovery requires HTTP Studio or CLI (`agent-studio models discover`)."
     );
   }
   return fetchJson("/api/model-index/discover", {
@@ -753,7 +753,7 @@ export async function patchTeamRouting(payload: {
 }> {
   if (mcpTransport) {
     throw new Error(
-      "Routing updates are read-only in MCP App mode. Run `npx agent-studio models set-policy` or `set-role`."
+      "Routing updates are read-only in MCP App mode. Run `agent-studio models set-policy` or `set-role`."
     );
   }
   return fetchJson("/api/team/routing", {
@@ -930,7 +930,7 @@ export async function fetchDoctor(
         : typeof doc.manifestError === "string"
           ? doc.manifestError
           : "Manifest not initialized yet",
-      fixHint: teamYamlValid ? undefined : "npx agent-studio init",
+      fixHint: teamYamlValid ? undefined : "agent-studio init",
     });
 
     // Drift summary check
@@ -944,7 +944,7 @@ export async function fetchDoctor(
       detail: driftOk
         ? `${checkedCount} generated file(s) in sync`
         : `${driftFiles.length} file(s) drifted from .agent-team/`,
-      fixHint: driftOk ? undefined : "npx agent-studio sync",
+      fixHint: driftOk ? undefined : "agent-studio sync",
     });
 
     // MCP config check
@@ -956,7 +956,7 @@ export async function fetchDoctor(
       detail: mcpOk
         ? "agent-studio MCP configured for all enabled IDE targets"
         : "One or more enabled IDEs are missing agent-studio MCP entries",
-      fixHint: mcpOk ? undefined : "npx agent-studio sync",
+      fixHint: mcpOk ? undefined : "agent-studio sync",
     });
 
     // IDE Hooks check
@@ -968,7 +968,7 @@ export async function fetchDoctor(
       detail: hooksOk
         ? "Claude Code & VS Code hooks registered"
         : "Missing hook events for one or more enabled IDEs",
-      fixHint: hooksOk ? undefined : "npx agent-studio sync",
+      fixHint: hooksOk ? undefined : "agent-studio sync",
     });
   }
 

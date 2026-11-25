@@ -51,15 +51,15 @@ const GUIDE_SPECS: Record<GuideIdeId, IdeGuideSpec> = {
     setupCommands: [
       {
         label: "Per-project setup & compile",
-        code: `npx agent-studio init --ides antigravity\nnpx agent-studio sync --ides antigravity && npx agent-studio doctor`,
+        code: `agent-studio init --ides antigravity\nagent-studio sync --ides antigravity && agent-studio doctor`,
       },
       {
         label: "One-time global setup (installs team-setup everywhere)",
-        code: `npx agent-studio init --global`,
+        code: `agent-studio init --global`,
       },
       {
         label: "Launch unified Web Studio",
-        code: `npx agent-studio serve --open`,
+        code: `agent-studio serve --open`,
       },
     ],
     activationSteps: [
@@ -144,7 +144,7 @@ const GUIDE_SPECS: Record<GuideIdeId, IdeGuideSpec> = {
     overrideFlag: "--brain-dir <path>",
     overrideEnv: "ANTIGRAVITY_BRAIN_DIR",
     overrideCmd:
-      'ANTIGRAVITY_BRAIN_DIR="~/.gemini/antigravity/brain" npx agent-studio serve --brain-dir "~/.gemini/antigravity/brain"',
+      'ANTIGRAVITY_BRAIN_DIR="~/.gemini/antigravity/brain" agent-studio serve --brain-dir "~/.gemini/antigravity/brain"',
     troubleshootingNote:
       "Watches ~/.gemini/antigravity/brain/<uuid>/.system_generated/logs/transcript.jsonl. If your brain directory lives on a custom drive or profile, pass --brain-dir or set ANTIGRAVITY_BRAIN_DIR. MCP board/testrun events always stream via .agent-studio/telemetry.jsonl even if brain transcripts are delayed.",
   },
@@ -157,15 +157,15 @@ const GUIDE_SPECS: Record<GuideIdeId, IdeGuideSpec> = {
     setupCommands: [
       {
         label: "Per-project setup & compile",
-        code: `npx agent-studio init --ides claude-code\nnpx agent-studio sync --ides claude-code && npx agent-studio doctor`,
+        code: `agent-studio init --ides claude-code\nagent-studio sync --ides claude-code && agent-studio doctor`,
       },
       {
         label: "One-time global setup (installs ~/.claude/agents/team-setup.md)",
-        code: `npx agent-studio init --global`,
+        code: `agent-studio init --global`,
       },
       {
         label: "Verify zero config drift & launch Studio",
-        code: `npx agent-studio sync --check && npx agent-studio serve --open`,
+        code: `agent-studio sync --check && agent-studio serve --open`,
       },
     ],
     activationSteps: [
@@ -178,7 +178,7 @@ const GUIDE_SPECS: Record<GuideIdeId, IdeGuideSpec> = {
         badge: "@team-setup",
         title: "Onboard or customize repository",
         prompt:
-          "@team-setup Inspect this repository, configure .agent-team/team.yaml with tailored specialist agents and test checkpoints, then run npx agent-studio sync and npx agent-studio doctor.",
+          "@team-setup Inspect this repository, configure .agent-team/team.yaml with tailored specialist agents and test checkpoints, then run agent-studio sync and agent-studio doctor.",
       },
       {
         badge: "@orchestrator",
@@ -250,7 +250,7 @@ const GUIDE_SPECS: Record<GuideIdeId, IdeGuideSpec> = {
     overrideFlag: "--claude-dir <path>",
     overrideEnv: "CLAUDE_PROJECTS_DIR",
     overrideCmd:
-      'CLAUDE_PROJECTS_DIR="~/.claude/projects" npx agent-studio serve --claude-dir "~/.claude/projects"',
+      'CLAUDE_PROJECTS_DIR="~/.claude/projects" agent-studio serve --claude-dir "~/.claude/projects"',
     troubleshootingNote:
       "Passive adapter scans ~/.claude/projects/<encoded-cwd>/<session>.jsonl and subagents/agent-*.jsonl, deduplicating live hook pings with richer transcript payloads via tool_use_id. Override with --claude-dir or CLAUDE_PROJECTS_DIR if Claude uses a custom config home.",
   },
@@ -263,15 +263,15 @@ const GUIDE_SPECS: Record<GuideIdeId, IdeGuideSpec> = {
     setupCommands: [
       {
         label: "Per-project setup & compile",
-        code: `npx agent-studio init --ides copilot-vscode\nnpx agent-studio sync --ides copilot-vscode && npx agent-studio doctor`,
+        code: `agent-studio init --ides copilot-vscode\nagent-studio sync --ides copilot-vscode && agent-studio doctor`,
       },
       {
         label: "One-time global setup (installs VS Code user prompt agent)",
-        code: `npx agent-studio init --global`,
+        code: `agent-studio init --global`,
       },
       {
         label: "Launch unified Web Studio",
-        code: `npx agent-studio serve --open`,
+        code: `agent-studio serve --open`,
       },
     ],
     activationSteps: [
@@ -284,7 +284,7 @@ const GUIDE_SPECS: Record<GuideIdeId, IdeGuideSpec> = {
         badge: "Team Setup Agent",
         title: "Onboard or customize repository",
         prompt:
-          "Inspect this workspace, tailor .agent-team/team.yaml with our specialist roster and QA checkpoints, then run npx agent-studio sync and npx agent-studio doctor.",
+          "Inspect this workspace, tailor .agent-team/team.yaml with our specialist roster and QA checkpoints, then run agent-studio sync and agent-studio doctor.",
       },
       {
         badge: "Team Orchestrator",
@@ -356,7 +356,7 @@ const GUIDE_SPECS: Record<GuideIdeId, IdeGuideSpec> = {
     overrideFlag: "--vscode-dir <path>",
     overrideEnv: "VSCODE_STORAGE_DIR",
     overrideCmd:
-      'VSCODE_STORAGE_DIR="%APPDATA%/Code/User/workspaceStorage" npx agent-studio serve --vscode-dir "%APPDATA%/Code/User/workspaceStorage"',
+      'VSCODE_STORAGE_DIR="%APPDATA%/Code/User/workspaceStorage" agent-studio serve --vscode-dir "%APPDATA%/Code/User/workspaceStorage"',
     troubleshootingNote:
       "Reads both legacy .json snapshots and modern delta-encoded .jsonl chatSessions (including Code - Insiders). If VS Code runs remotely or delays flushing chatSessions, active hooks (.github/hooks/agent-studio.json) and MCP events continue streaming full live activity via /api/ingest + .agent-studio/telemetry.jsonl.",
   },
@@ -450,7 +450,7 @@ export class IdeUsageGuides {
                 : "Setup &amp; Usage Guides by IDE"
             }</h3>
             <p class="muted">
-              Author your team once in <code>.agent-team/</code>, compile natively with <code>npx agent-studio sync</code>, and follow the playbook ${
+              Author your team once in <code>.agent-team/</code>, compile natively with <code>agent-studio sync</code>, and follow the playbook ${
                 this.lockedIde ? `for ${escHtml(spec.name)}` : "for your IDE"
               } below.
             </p>

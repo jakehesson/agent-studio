@@ -550,14 +550,19 @@ describe("VS Code / Antigravity IDE Extension (.vsix)", () => {
 
       // Invoke generated shim directly with --version
       const nodeBinDir = path.dirname(process.execPath);
-      const shimEnv = {
-        ...process.env,
-        PATH: `${nodeBinDir}${path.delimiter}${process.env.PATH ?? ""}`,
-      };
+      const basePath = process.env.PATH ?? "";
+      const shimEnv: NodeJS.ProcessEnv = { ...process.env };
+      for (const k of Object.keys(shimEnv)) {
+        if (k.toLowerCase() === "path") delete shimEnv[k];
+      }
+      shimEnv.PATH = `${nodeBinDir}${path.delimiter}${basePath}`;
+      const comSpec =
+        process.env.ComSpec ||
+        path.join(process.env.SystemRoot || "C:\\Windows", "System32", "cmd.exe");
       const runRes =
         process.platform === "win32"
           ? spawnSync(
-              process.env.ComSpec || "cmd.exe",
+              comSpec,
               ["/d", "/s", "/c", `""${cmdPath}" --version"`],
               {
                 env: shimEnv,

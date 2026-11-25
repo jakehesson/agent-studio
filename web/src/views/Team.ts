@@ -692,7 +692,7 @@ export class TeamView {
       <span class="tier-pill tier-${currentTier}">${escHtml(currentTier.toUpperCase())}</span>
     `;
 
-    const cliCmd = `npx agent-studio models set-role ${entry.id} --tier ${currentTier} --ide ${visibleIdes[0] ?? "antigravity"} --model inherit --sync`;
+    const cliCmd = `agent-studio models set-role ${entry.id} --tier ${currentTier} --ide ${visibleIdes[0] ?? "antigravity"} --model inherit --sync`;
 
     const ideSectionsHtml = visibleIdes
       .map((ide) => {
@@ -1209,7 +1209,7 @@ export class TeamView {
     const lockedIde = this.embedScope.lockedIde;
     const policyDesc = getPolicyDescription(wf.policy, lockedIde);
     const respectLabel = getRespectOrchestratorLabel(lockedIde);
-    const cliPolicyCmd = `npx agent-studio models set-policy ${wf.policy} --respect-host ${wf.respectBuiltInOrchestrators ? "true" : "false"} --sync`;
+    const cliPolicyCmd = `agent-studio models set-policy ${wf.policy} --respect-host ${wf.respectBuiltInOrchestrators ? "true" : "false"} --sync`;
 
     return `
       <section
@@ -1364,7 +1364,7 @@ export class TeamView {
 
         ${
           isMcp
-            ? `<div class="ro-mcp-cli"><code>npx agent-studio models set-role ${escHtml(r.id)} --tier ${escHtml(activeTier)}</code></div>`
+            ? `<div class="ro-mcp-cli"><code>agent-studio models set-role ${escHtml(r.id)} --tier ${escHtml(activeTier)}</code></div>`
             : `
               <div class="roster-model-controls">
                 <div class="rm-ctrl">
@@ -1421,7 +1421,7 @@ export class TeamView {
           <div class="view-empty-card">
             <h2>Agent Team Details Unavailable</h2>
             <p>${escHtml(this.errorMsg)}</p>
-            <p class="muted">Run <code>npx agent-studio init</code> to create <code>.agent-team/team.yaml</code> and compile native IDE adapters.</p>
+            <p class="muted">Run <code>agent-studio init</code> to create <code>.agent-team/team.yaml</code> and compile native IDE adapters.</p>
             <button type="button" class="btn-primary" data-team-refresh>Retry</button>
           </div>
         </div>
@@ -1633,7 +1633,7 @@ export class TeamView {
           </div>
           ${
             team.roster.length === 0
-              ? `<div class="card"><div class="board-panel-body muted">No canonical roster entries found in <code>.agent-team/team.yaml</code>. Run <code>npx agent-studio init</code> to scaffold the blueprint.</div></div>`
+              ? `<div class="card"><div class="board-panel-body muted">No canonical roster entries found in <code>.agent-team/team.yaml</code>. Run <code>agent-studio init</code> to scaffold the blueprint.</div></div>`
               : `<div class="team-roster-grid">
                   ${team.roster
                     .map(

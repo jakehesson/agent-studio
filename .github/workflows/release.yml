@@ -7,6 +7,7 @@ on:
 
 permissions:
   contents: write
+  packages: write
 
 jobs:
   release:
@@ -21,6 +22,8 @@ jobs:
         uses: actions/setup-node@v7
         with:
           node-version: 22
+          registry-url: "https://npm.pkg.github.com"
+          scope: "@jakehesson"
           cache: npm
           cache-dependency-path: |
             package-lock.json
@@ -79,6 +82,11 @@ jobs:
 
       - name: Verify npm package contents
         run: npm pack --dry-run
+
+      - name: Publish @jakehesson/agent-studio to GitHub Packages
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: npm publish
 
       - name: Package release artifacts
         shell: bash

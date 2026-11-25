@@ -1,7 +1,10 @@
 {
-  "name": "agent-studio",
+  "name": "@jakehesson/agent-studio",
   "version": "0.8.1",
   "description": "IDE-agnostic multi-agent orchestration, QA-gated Agile Board MCP, and live monitoring studio",
+  "publishConfig": {
+    "registry": "https://npm.pkg.github.com"
+  },
   "license": "MIT",
   "author": "Jake Hesson",
   "repository": {
@@ -50,6 +53,7 @@
     "build": "tsc -p tsconfig.json",
     "build:all": "npm run build && npm --prefix web run build",
     "build:plugin": "node antigravity-plugin/scripts/build-plugin.mjs",
+    "prepublishOnly": "npm run build:all",
     "check": "tsc -p tsconfig.json --noEmit && tsc -p tsconfig.test.json --noEmit",
     "test": "npm run build && tsc -p tsconfig.test.json && node -e \"const fs=require('fs'),p=require('path'),cp=require('child_process'),d='dist-test/tests/unit',f=fs.readdirSync(d).filter(x=>x.endsWith('.test.js')).sort().map(x=>p.join(d,x));process.exit(f.length?(cp.spawnSync(process.execPath,['--test',...f],{stdio:'inherit'}).status??1):1)\""
   },

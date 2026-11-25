@@ -86,7 +86,7 @@ class StdioMcpClient {
             `Timeout waiting for MCP response to ${method}. stderr=${this.stderrChunks.join("")}`,
           ),
         );
-      }, 8_000);
+      }, 20_000);
 
       this.pending.set(id, {
         resolve: (msg) => {

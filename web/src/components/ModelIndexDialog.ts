@@ -317,10 +317,10 @@ export class ModelIndexDialog {
     const cliTargetIde = visibleIdes[0] ?? "antigravity";
     const cliCmd =
       this.activeTab === "roles"
-        ? `npx agent-studio models set-role architect --tier reasoning --sync`
+        ? `agent-studio models set-role architect --tier reasoning --sync`
         : this.activeTab === "raw-json"
-          ? `npx agent-studio models show --ide ${cliTargetIde} --json`
-          : `npx agent-studio models set-tier ${this.activeTab} balanced ${shellQuote(this.draftTiers[this.activeTab].balanced.primary)} ${cliScopeFlag} --sync`;
+          ? `agent-studio models show --ide ${cliTargetIde} --json`
+          : `agent-studio models set-tier ${this.activeTab} balanced ${shellQuote(this.draftTiers[this.activeTab].balanced.primary)} ${cliScopeFlag} --sync`;
 
     body.innerHTML = `
       <div class="mi-toolbar">

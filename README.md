@@ -26,6 +26,22 @@ Author your team roster, skills, workflow guardrails, and verification checkpoin
 
 ## Quick Start
 
+### Private GitHub Packages Install (`@jakehesson/agent-studio`)
+
+Add the GitHub Packages registry and a `read:packages` token to `~/.npmrc`:
+
+```ini
+@jakehesson:registry=https://npm.pkg.github.com
+//npm.pkg.github.com/:_authToken=<GITHUB_PAT>
+```
+
+Then install or run globally (the installed CLI binary remains `agent-studio`):
+
+```bash
+npm install -g @jakehesson/agent-studio
+npx @jakehesson/agent-studio --version
+```
+
 ### Install & Build from Source
 
 ```bash

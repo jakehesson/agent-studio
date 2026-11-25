@@ -394,7 +394,7 @@ export class DoctorView {
                         (d) => `
                           <div class="issue-row warn">
                             <span class="check-tag">DRIFT</span>
-                            <div><code>${escHtml(d.file)}</code> (${escHtml(d.status)})${d.reason ? ` — ${escHtml(d.reason)}` : ""} · run <code>npx agent-studio sync</code></div>
+                            <div><code>${escHtml(d.file)}</code> (${escHtml(d.status)})${d.reason ? ` — ${escHtml(d.reason)}` : ""} · run <code>agent-studio sync</code></div>
                           </div>
                         `
                       ),
@@ -480,8 +480,8 @@ export class DoctorView {
     const statusBadgeClass = hasErr ? "cp-failed" : hasWarn ? "cp-running" : "cp-passed";
     const statusBadgeText = hasErr ? "✕ ERRORS" : hasWarn ? "⚠ WARNINGS" : "✓ HEALTHY";
     const quickCli = lockedIde
-      ? `npx agent-studio models show --ide ${lockedIde}`
-      : "npx agent-studio models show";
+      ? `agent-studio models show --ide ${lockedIde}`
+      : "agent-studio models show";
 
     return `
       <section class="card model-index-health" aria-labelledby="docModelIndexHeading">

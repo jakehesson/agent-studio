@@ -1100,13 +1100,14 @@ describe("Portable Hook & MCP Launcher", () => {
 
     const hookCmd = buildPortableHookCommand("copilot-vscode", "PreToolUse");
     const nodeDir = path.dirname(process.execPath);
-    const isolatedEnv = {
-      ...process.env,
-      HOME: tmpBase,
-      USERPROFILE: tmpBase,
-      AGENT_STUDIO_HOME: studioHome,
-      PATH: nodeDir,
-    };
+    const isolatedEnv: NodeJS.ProcessEnv = { ...process.env };
+    for (const k of Object.keys(isolatedEnv)) {
+      if (k.toLowerCase() === "path") delete isolatedEnv[k];
+    }
+    isolatedEnv.HOME = tmpBase;
+    isolatedEnv.USERPROFILE = tmpBase;
+    isolatedEnv.AGENT_STUDIO_HOME = studioHome;
+    isolatedEnv.PATH = nodeDir;
 
     // 1. Mock studio-cli.mjs returning exit 0 and echoing args + stdin
     const mockCli = path.join(binDir, "studio-cli.mjs");

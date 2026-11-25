@@ -17,7 +17,7 @@ function buildLauncherBody(argsExpr: string, onMissing: "fail-open" | "mcp-error
     "if(f.existsSync(s)){const r=c.spawnSync(process.execPath,[s,...a],{stdio:'inherit'});if(!r.error)process.exit(r.status===null?1:r.status);}",
     "const w=process.platform==='win32';",
     "const q=String.fromCharCode(34);",
-    "const run=(x)=>{const l=x.toLowerCase();const r=w&&(l.endsWith('.cmd')||l.endsWith('.bat'))?c.spawnSync(process.env.ComSpec||'cmd.exe',['/d','/s','/c',q+q+x+q+' '+a.join(' ')+q],{stdio:'inherit',windowsVerbatimArguments:true}):c.spawnSync(x,a,{stdio:'inherit'});if(!r.error)process.exit(r.status===null?1:r.status);};",
+    "const run=(x)=>{const l=x.toLowerCase();const r=w&&(l.endsWith('.cmd')||l.endsWith('.bat'))?c.spawnSync(process.env.ComSpec||p.join(process.env.SystemRoot||p.join('C:','Windows'),'System32','cmd.exe'),['/d','/s','/c',q+q+x+q+' '+a.join(' ')+q],{stdio:'inherit',windowsVerbatimArguments:true}):c.spawnSync(x,a,{stdio:'inherit'});if(!r.error)process.exit(r.status===null?1:r.status);};",
     "const lb=p.join(process.cwd(),'node_modules','.bin',w?'agent-studio.cmd':'agent-studio');",
     "if(f.existsSync(lb))run(lb);",
     "const ns=w?['agent-studio.cmd','agent-studio.exe']:['agent-studio'];",

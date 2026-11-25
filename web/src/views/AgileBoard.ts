@@ -79,7 +79,7 @@ export class AgileBoardView {
           <div class="view-empty-card">
             <h2>Agile Board Unavailable</h2>
             <p>${escHtml(this.errorMsg)}</p>
-            <p class="muted">Run <code>npx agent-studio init</code> in your repository to initialize <code>pipeline/board.json</code>, or select another project.</p>
+            <p class="muted">Run <code>agent-studio init</code> in your repository to initialize <code>pipeline/board.json</code>, or select another project.</p>
             <button type="button" class="btn-primary" data-board-retry>Retry</button>
           </div>
         </div>
@@ -96,7 +96,7 @@ export class AgileBoardView {
         <div class="view-empty-wrap">
           <div class="view-empty-card">
             <h2>No Agile Board Initialized</h2>
-            <p class="muted">No <code>pipeline/board.json</code> was found for this project yet. Initialize one with <code>npx agent-studio init</code> to track sprints, bugs, and QA checkpoints.</p>
+            <p class="muted">No <code>pipeline/board.json</code> was found for this project yet. Initialize one with <code>agent-studio init</code> to track sprints, bugs, and QA checkpoints.</p>
             <button type="button" class="btn-primary" data-board-retry>Refresh</button>
           </div>
         </div>
