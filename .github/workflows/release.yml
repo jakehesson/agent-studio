@@ -15,10 +15,10 @@ jobs:
 
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Setup Node.js 22
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v7
         with:
           node-version: 22
           cache: npm
@@ -28,7 +28,7 @@ jobs:
             extension/package-lock.json
 
       - name: Setup Python 3.12
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v7
         with:
           python-version: "3.12"
 
@@ -100,7 +100,7 @@ jobs:
           node -e 'const fs=require("fs"),v=process.env.TAG_VERSION,esc=v.replace(/[.*+?^${}()|[\]\\]/g,"\\$&"),c=fs.readFileSync("CHANGELOG.md","utf8"),m=c.match(new RegExp("(?:^|\\r?\\n)## \\["+esc+"\\][^\\r\\n]*\\r?\\n([\\s\\S]*?)(?=\\r?\\n## \\[|$)"));fs.writeFileSync(process.env.OUT,m?m[1].trim()+"\n":"Release v"+v+"\n");'
 
       - name: Publish GitHub Release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           body_path: ${{ runner.temp }}/release-notes.md
           generate_release_notes: true
