@@ -585,4 +585,137 @@ describe("Unified Single-Port HTTP & SSE Server", () => {
       await srv.close();
     }
   });
+
+  it("honors workspace query param in /api/board and /api/doctor before default project fallback, and streams passive transcript updates over SSE heartbeat", async () => {
+    const emptyDir = path.join(tmpDir, "empty-adapters-2");
+    const brainDir = path.join(emptyDir, "brain");
+    const cid = "abababab-abab-abab-abab-abababababab";
+    const tpath = path.join(
+      brainDir,
+      cid,
+      ".system_generated",
+      "logs",
+      "transcript.jsonl",
+    );
+    await fs.mkdir(path.dirname(tpath), { recursive: true });
+    await fs.writeFile(
+      tpath,
+      JSON.stringify({
+        step_index: 0,
+        type: "USER_INPUT",
+        created_at: "2026-11-24T22:00:00Z",
+        content: `Active Workspaces:\n- ${projDir}\nInitial passive prompt`,
+      }) + "\n",
+      "utf8",
+    );
+
+    // Create a second unregistered workspace to verify ?workspace= takes precedence over default studio-demo
+    const ws2 = path.join(tmpDir, "ws-two");
+    await initBoardFile(path.join(ws2, "pipeline", "board.json"), {
+      projectId: "ws-two",
+      suites: { smoke: ["CP0"] },
+    });
+    await boardAdd(
+      { project: resolveProject(ws2) },
+      { type: "story", title: "Workspace Two Story", role: "backend" },
+    );
+
+    const srv = createStudioServer({
+      brainDir,
+      claudeDir: path.join(emptyDir, "claude"),
+      vscodeDir: path.join(emptyDir, "vscode"),
+      webDir: path.join(emptyDir, "web"),
+      extraWorkspaces: [projDir],
+      includeGlobalTelemetryFile: false,
+      doctorProvider: async (root) => ({
+        status: "pass",
+        checkedRoot: root,
+      }),
+    });
+
+    const { port } = await srv.listen(0, "127.0.0.1");
+    const base = `http://127.0.0.1:${port}`;
+
+    try {
+      const boardWs2 = await fetch(
+        `${base}/api/board?workspace=${encodeURIComponent(ws2)}`,
+      );
+      assert.equal(boardWs2.status, 200);
+      const boardWs2Json = (await boardWs2.json()) as {
+        project: { id: string };
+        board: { items: Array<{ title: string }> };
+      };
+      assert.equal(boardWs2Json.project.id, "ws-two");
+      assert.equal(boardWs2Json.board.items[0]?.title, "Workspace Two Story");
+
+      const docWs2 = await fetch(
+        `${base}/api/doctor?workspace=${encodeURIComponent(ws2)}`,
+      );
+      assert.equal(docWs2.status, 200);
+      const docWs2Json = (await docWs2.json()) as {
+        doctor: { checkedRoot: string };
+      };
+      assert.equal(
+        path.resolve(docWs2Json.doctor.checkedRoot),
+        path.resolve(ws2),
+      );
+
+      // Connect SSE /api/stream to passive session and append a new row on disk -> heartbeat pushes new state!
+      const sseController = new AbortController();
+      const sseResp = await fetch(`${base}/api/stream?session=${cid}`, {
+        signal: sseController.signal,
+      });
+      assert.equal(sseResp.status, 200);
+      const reader = sseResp.body!.getReader();
+      const decoder = new TextDecoder();
+      let buf = "";
+      let pendingRead: ReturnType<typeof reader.read> | null = null;
+      const readUntil = async (
+        pred: (s: string) => boolean,
+        timeoutMs = 5000,
+      ): Promise<void> => {
+        const deadline = Date.now() + timeoutMs;
+        while (!pred(buf)) {
+          if (Date.now() > deadline) {
+            throw new Error(`SSE passive timeout. buf=${buf}`);
+          }
+          if (!pendingRead) {
+            pendingRead = reader.read();
+          }
+          const winner = await Promise.race([
+            pendingRead.then((res) => ({ kind: "read" as const, res })),
+            new Promise<{ kind: "tick" }>((resolve) =>
+              setTimeout(() => resolve({ kind: "tick" }), 100),
+            ),
+          ]);
+          if (winner.kind === "read") {
+            pendingRead = null;
+            if (winner.res.value) {
+              buf += decoder.decode(winner.res.value, { stream: true });
+            }
+            if (winner.res.done) break;
+          }
+        }
+      };
+
+      await readUntil((s) => s.includes("Initial passive prompt"));
+
+      // Append a new passive transcript row directly to disk
+      await fs.appendFile(
+        tpath,
+        JSON.stringify({
+          step_index: 1,
+          type: "PLANNER_RESPONSE",
+          created_at: "2026-11-24T22:00:05Z",
+          content: "Passive heartbeat update streamed!",
+        }) + "\n",
+        "utf8",
+      );
+
+      await readUntil((s) => s.includes("Passive heartbeat update streamed!"));
+      sseController.abort();
+    } finally {
+      await srv.close();
+    }
+  });
 });

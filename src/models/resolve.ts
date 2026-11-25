@@ -304,6 +304,29 @@ export function resolveRoleModel(
   }
 
   // Antigravity & Claude Code under prefer-fallback
+  if (ide === "antigravity") {
+    const respectBuiltIn =
+      manifest.workflow.modelRouting?.respectBuiltInOrchestrators ?? true;
+    const roleRec = modelIndex.roleRecommendations[role.id];
+    if (
+      !override &&
+      respectBuiltIn &&
+      roleRec?.deferToHostOrchestrator
+    ) {
+      return {
+        ide,
+        roleId: role.id,
+        tier,
+        policy,
+        frontmatterModel: "inherit",
+        primaryModel: "inherit",
+        fallbackModels: ["inherit"],
+        omit: false,
+        source: effectiveSource,
+      };
+    }
+  }
+
   const resolvedPrimary =
     override?.primary ?? override?.fallback?.[0] ?? tierBinding.primary;
   const fallbackList = dedupeStrings([

@@ -265,12 +265,13 @@ describe("VS Code / Antigravity IDE Extension (.vsix)", () => {
       "C:/Projects/DemoRepo",
     );
 
-    // Embedded extension URL includes embed=1, ide, workspace, view, and project
+    // Embedded extension URL includes embed=1, ide, workspace, view, project, and optional session
     const embeddedUrl = new URL(
       buildScopedViewUrl({
         baseUrl: "http://127.0.0.1:8767/",
         view: "doctor",
         projectId: "agent-studio",
+        sessionId: "sess-123",
         embed: true,
         hostIde: "antigravity",
         workspaceRoot: "C:\\Projects\\DemoRepo",
@@ -284,8 +285,9 @@ describe("VS Code / Antigravity IDE Extension (.vsix)", () => {
     );
     assert.equal(embeddedUrl.searchParams.get("view"), "doctor");
     assert.equal(embeddedUrl.searchParams.get("project"), "agent-studio");
+    assert.equal(embeddedUrl.searchParams.get("session"), "sess-123");
 
-    // Standalone Open in Browser URL omits embed, ide, and workspace
+    // Standalone Open in Browser URL omits embed, ide, workspace, and session when unset
     const standaloneUrl = new URL(
       buildScopedViewUrl({
         baseUrl: "https://studio.example.ts.net:8767",
@@ -300,6 +302,7 @@ describe("VS Code / Antigravity IDE Extension (.vsix)", () => {
     assert.equal(standaloneUrl.searchParams.get("ide"), null);
     assert.equal(standaloneUrl.searchParams.get("workspace"), null);
     assert.equal(standaloneUrl.searchParams.get("project"), "agent-studio");
+    assert.equal(standaloneUrl.searchParams.get("session"), null);
 
     // Scoped sessions query used by Sidebar & StatusBar
     const q = new URLSearchParams(
@@ -315,7 +318,7 @@ describe("VS Code / Antigravity IDE Extension (.vsix)", () => {
     assert.equal(q.get("project"), "my-app");
     assert.equal(q.get("limit"), "15");
 
-    // Verify extension webview & status bar wire embed=true and scoped session queries
+    // Verify extension webview & status bar wire embed=true, sessionId deep-linking, reload skip, and scoped session queries
     const webviewSrc = fs.readFileSync(
       path.join(EXT_ROOT, "src", "webviewProvider.ts"),
       "utf8",
@@ -324,7 +327,9 @@ describe("VS Code / Antigravity IDE Extension (.vsix)", () => {
       path.join(EXT_ROOT, "src", "statusBar.ts"),
       "utf8",
     );
-    assert.ok(webviewSrc.includes("{ embed: true }"));
+    assert.ok(webviewSrc.includes("{ embed: true, sessionId: effectiveSessionId }"));
+    assert.ok(webviewSrc.includes("resolvedUrl === this.currentResolvedUrl"));
+    assert.ok(webviewSrc.includes("!opts?.force"));
     assert.ok(webviewSrc.includes("buildScopedSessionsQuery("));
     assert.ok(statusBarSrc.includes("buildScopedSessionsQuery("));
   });

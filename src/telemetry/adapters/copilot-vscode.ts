@@ -1,6 +1,8 @@
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
+import { listProjects } from "../../board/registry.js";
+import { MAX_TRANSCRIPT_BYTES, validateTranscriptPath } from "../push-bus.js";
 import {
   cleanHumanSummary,
   computeDeterministicEventId,
@@ -24,6 +26,29 @@ import {
   getKnownProjects,
   matchProjectIdForWorkspaces,
 } from "./project-match.js";
+
+interface VSCodeUsageObject {
+  promptTokens?: number;
+  completionTokens?: number;
+  inputTokens?: number;
+  outputTokens?: number;
+  input_tokens?: number;
+  output_tokens?: number;
+  prompt_tokens?: number;
+  completion_tokens?: number;
+  cachedTokens?: number;
+  cachedPromptTokens?: number;
+  cacheReadInputTokens?: number;
+  cacheReadTokens?: number;
+  cache_read_input_tokens?: number;
+  cacheCreationInputTokens?: number;
+  cache_creation_input_tokens?: number;
+  contextTokens?: number;
+  context_tokens?: number;
+  totalTokens?: number;
+  costUsd?: number;
+  cost_usd?: number;
+}
 
 interface VSCodeResponseItem {
   kind?: string;
@@ -55,15 +80,18 @@ interface VSCodeRequest {
   result?: {
     details?: string;
     errorDetails?: { message?: string };
+    usage?: VSCodeUsageObject;
     metadata?: {
-      usage?: {
-        promptTokens?: number;
-        completionTokens?: number;
-        inputTokens?: number;
-        outputTokens?: number;
-        cachedTokens?: number;
-        totalTokens?: number;
-      };
+      promptTokens?: number;
+      completionTokens?: number;
+      cachedTokens?: number;
+      cachedPromptTokens?: number;
+      cacheReadInputTokens?: number;
+      usage?: VSCodeUsageObject;
+      toolCallRounds?: Array<{
+        usage?: VSCodeUsageObject;
+        modelId?: string;
+      }>;
     };
   };
 }
@@ -73,6 +101,16 @@ interface VSCodeChatSessionState {
   customTitle?: string;
   creationDate?: number;
   lastMessageDate?: number;
+  inputState?: {
+    selectedModel?:
+      | string
+      | {
+          identifier?: string;
+          id?: string;
+          name?: string;
+          metadata?: { id?: string; name?: string };
+        };
+  };
   requests?: VSCodeRequest[];
 }
 
@@ -87,25 +125,125 @@ export interface CopilotVSCodeAdapterOptions {
   storageDir?: string;
 }
 
-function defaultVSCodeStorageDir(): string {
-  const envOverride = process.env.VSCODE_STORAGE_DIR?.trim();
-  if (envOverride) return envOverride;
+export interface CopilotTranscriptParseOptions extends ParseSessionOptions {
+  agentIdOverride?: string;
+  agentLabelOverride?: string;
+  parentAgentIdOverride?: string;
+  workspacePath?: string;
+  projectId?: string;
+  allowedRoots?: ReadonlyArray<string>;
+}
+
+interface CachedTranscriptDiscoveryMeta {
+  mtimeMs: number;
+  sizeBytes: number;
+  sessionId: string;
+  title: string;
+  isMultiAgent: boolean;
+  isSubagentTranscript: boolean;
+  distinctAgentsCount: number;
+}
+
+const VSCODE_VARIANTS = ["Code", "Code - Insiders", "VSCodium"] as const;
+
+function variantStorageDir(variant: string): string {
   if (process.platform === "win32") {
     const appData =
       process.env.APPDATA ?? path.join(os.homedir(), "AppData", "Roaming");
-    return path.join(appData, "Code", "User", "workspaceStorage");
+    return path.join(appData, variant, "User", "workspaceStorage");
   }
   if (process.platform === "darwin") {
     return path.join(
       os.homedir(),
       "Library",
       "Application Support",
-      "Code",
+      variant,
       "User",
       "workspaceStorage",
     );
   }
-  return path.join(os.homedir(), ".config", "Code", "User", "workspaceStorage");
+  return path.join(os.homedir(), ".config", variant, "User", "workspaceStorage");
+}
+
+function defaultVSCodeStorageDirs(): string[] {
+  const envOverride = process.env.VSCODE_STORAGE_DIR?.trim();
+  if (envOverride) return [envOverride];
+  return VSCODE_VARIANTS.map((v) => variantStorageDir(v));
+}
+
+function isSubagentToolName(lowTool: string): boolean {
+  return (
+    lowTool === "agent" ||
+    lowTool === "runsubagent" ||
+    lowTool === "agent/runsubagent" ||
+    lowTool.includes("subagent")
+  );
+}
+
+function extractSelectedModel(
+  selectedModel: NonNullable<VSCodeChatSessionState["inputState"]>["selectedModel"],
+): string | undefined {
+  if (!selectedModel) return undefined;
+  if (typeof selectedModel === "string") {
+    return selectedModel.trim() || undefined;
+  }
+  return (
+    selectedModel.metadata?.id?.trim() ||
+    selectedModel.id?.trim() ||
+    selectedModel.identifier?.trim() ||
+    selectedModel.metadata?.name?.trim() ||
+    selectedModel.name?.trim() ||
+    undefined
+  );
+}
+
+function extractUsageNumbers(
+  u: Record<string, unknown> | VSCodeUsageObject | undefined,
+): {
+  inTok?: number;
+  outTok?: number;
+  cachedTok: number;
+  contextTok?: number;
+  costUsd?: number;
+} {
+  if (!u || typeof u !== "object") {
+    return { cachedTok: 0 };
+  }
+  const rec = u as Record<string, unknown>;
+  const num = (...keys: string[]): number | undefined => {
+    for (const k of keys) {
+      const v = rec[k];
+      if (typeof v === "number" && Number.isFinite(v)) return v;
+    }
+    return undefined;
+  };
+  const inTok = num("promptTokens", "inputTokens", "input_tokens", "prompt_tokens");
+  const outTok = num(
+    "completionTokens",
+    "outputTokens",
+    "output_tokens",
+    "completion_tokens",
+  );
+  const cacheRead =
+    num(
+      "cachedTokens",
+      "cachedPromptTokens",
+      "cacheReadInputTokens",
+      "cacheReadTokens",
+      "cache_read_input_tokens",
+      "cache_read_tokens",
+    ) ?? 0;
+  const cacheCreate =
+    num("cacheCreationInputTokens", "cache_creation_input_tokens") ?? 0;
+  const contextTok = num("contextTokens", "context_tokens");
+  const costUsd = num("costUsd", "cost_usd", "totalCostUSD");
+  return {
+    inTok,
+    outTok,
+    cachedTok: Math.max(0, Math.round(cacheRead + cacheCreate)),
+    contextTok,
+    costUsd,
+  };
 }
 
 function extractMessageText(
@@ -239,16 +377,92 @@ async function readWorkspaceJsonFolder(
   return undefined;
 }
 
+interface TranscriptRow {
+  type?: string;
+  event?: string;
+  id?: string;
+  timestamp?: string | number;
+  sessionId?: string;
+  parentSessionId?: string;
+  model?: string;
+  modelId?: string;
+  content?: string;
+  prompt?: string;
+  agentId?: string;
+  agentName?: string;
+  agentType?: string;
+  usage?: Record<string, unknown>;
+  data?: Record<string, unknown>;
+}
+
+function isTranscriptJsonlPath(filePath: string): boolean {
+  const norm = filePath.replace(/\\/g, "/").toLowerCase();
+  return norm.includes("/transcripts/") && norm.endsWith(".jsonl");
+}
+
+function parseJsonlRows(raw: string): TranscriptRow[] {
+  const rows: TranscriptRow[] = [];
+  for (const line of raw.split(/\r?\n/)) {
+    const trimmed = line.trim();
+    if (!trimmed) continue;
+    try {
+      const parsed: unknown = JSON.parse(trimmed);
+      if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+        rows.push(parsed as TranscriptRow);
+      }
+    } catch {
+      // Ignore partial lines during active writes.
+    }
+  }
+  return rows;
+}
+
 export class CopilotVSCodeAdapter implements PassiveIdeAdapter {
   readonly ide = "copilot-vscode" as const;
   private readonly storageDir: string;
+  private readonly storageDirs: string[];
   private readonly stateCache = new Map<
     string,
     { mtimeMs: number; sizeBytes: number; state: VSCodeChatSessionState }
   >();
+  private readonly transcriptDiscoveryCache = new Map<
+    string,
+    CachedTranscriptDiscoveryMeta
+  >();
 
   constructor(options?: CopilotVSCodeAdapterOptions) {
-    this.storageDir = options?.storageDir ?? defaultVSCodeStorageDir();
+    const explicit =
+      options?.storageDir?.trim() || process.env.VSCODE_STORAGE_DIR?.trim();
+    if (explicit) {
+      this.storageDir = explicit;
+      this.storageDirs = [explicit];
+    } else {
+      this.storageDirs = defaultVSCodeStorageDirs();
+      this.storageDir = this.storageDirs[0]!;
+    }
+  }
+
+  getStorageDirs(): string[] {
+    return [...this.storageDirs];
+  }
+
+  private getDefaultAllowedTranscriptRoots(workspacePath?: string): string[] {
+    const roots = new Set<string>(this.storageDirs);
+    const home = os.homedir();
+    roots.add(path.join(home, ".copilot"));
+    roots.add(path.join(home, ".claude"));
+    roots.add(path.join(home, ".gemini"));
+    try {
+      for (const proj of listProjects()) {
+        if (proj.root) roots.add(proj.root);
+      }
+    } catch {
+      // Registry unreadable
+    }
+    if (workspacePath && workspacePath.trim()) {
+      roots.add(workspacePath.trim());
+    }
+    return [...roots];
   }
 
   private async loadChatSessionState(
@@ -288,25 +502,16 @@ export class CopilotVSCodeAdapter implements PassiveIdeAdapter {
   }
 
   async getHealth(): Promise<AdapterHealth> {
-    try {
-      const st = await fs.stat(this.storageDir);
-      if (!st.isDirectory()) {
-        return {
-          ide: this.ide,
-          status: "degraded",
-          rootDir: this.storageDir,
-          sessionsFound: 0,
-          message: "VS Code workspaceStorage path is not a directory",
-        };
+    const existingDirs: string[] = [];
+    for (const dir of this.storageDirs) {
+      try {
+        const st = await fs.stat(dir);
+        if (st.isDirectory()) existingDirs.push(dir);
+      } catch {
+        // Variant not installed
       }
-      const sessions = await this.discoverSessions({ limit: 50 });
-      return {
-        ide: this.ide,
-        status: "ok",
-        rootDir: this.storageDir,
-        sessionsFound: sessions.length,
-      };
-    } catch {
+    }
+    if (existingDirs.length === 0) {
       return {
         ide: this.ide,
         status: "degraded",
@@ -315,103 +520,833 @@ export class CopilotVSCodeAdapter implements PassiveIdeAdapter {
         message: "VS Code workspaceStorage directory not found",
       };
     }
+    const sessions = await this.discoverSessions({ limit: 50 });
+    return {
+      ide: this.ide,
+      status: "ok",
+      rootDir: existingDirs[0]!,
+      sessionsFound: sessions.length,
+    };
   }
 
   async discoverSessions(opts?: {
     limit?: number;
     workspaceRoots?: string[];
   }): Promise<DiscoveredSession[]> {
-    let hashDirs: string[];
-    try {
-      hashDirs = await fs.readdir(this.storageDir);
-    } catch {
-      return [];
-    }
-
     const knownProjects = getKnownProjects();
-    const sessions: DiscoveredSession[] = [];
+    const byId = new Map<string, DiscoveredSession>();
+    const limit = opts?.limit ?? 100;
 
-    for (const hdir of hashDirs) {
-      const wsDir = path.join(this.storageDir, hdir);
-      const chatDir = path.join(wsDir, "chatSessions");
-      let chatFiles: string[];
+    interface TranscriptCandidate {
+      filePath: string;
+      fname: string;
+      mtimeMs: number;
+      sizeBytes: number;
+      workspacePath?: string;
+      projectId?: string;
+    }
+    const transcriptCandidates: TranscriptCandidate[] = [];
+
+    for (const baseStorageDir of this.storageDirs) {
+      let hashDirs: string[];
       try {
-        chatFiles = await fs.readdir(chatDir);
+        hashDirs = await fs.readdir(baseStorageDir);
       } catch {
         continue;
       }
 
-      const workspacePath = await readWorkspaceJsonFolder(wsDir);
-      const workspaces = workspacePath ? [workspacePath] : [];
-      const projectId =
-        matchProjectIdForWorkspaces(workspaces, knownProjects) ??
-        (workspacePath ? path.basename(workspacePath) : undefined);
+      for (const hdir of hashDirs) {
+        const wsDir = path.join(baseStorageDir, hdir);
+        const workspacePath = await readWorkspaceJsonFolder(wsDir);
+        const workspaces = workspacePath ? [workspacePath] : [];
+        const projectId =
+          matchProjectIdForWorkspaces(workspaces, knownProjects) ??
+          (workspacePath ? path.basename(workspacePath) : undefined);
 
-      for (const fname of chatFiles) {
-        if (!fname.endsWith(".json") && !fname.endsWith(".jsonl")) continue;
-        const filePath = path.join(chatDir, fname);
-        let fst;
+        // 1. chatSessions/*.json(l)
+        const chatDir = path.join(wsDir, "chatSessions");
+        let chatFiles: string[] = [];
         try {
-          fst = await fs.stat(filePath);
-          if (!fst.isFile() || fst.size === 0) continue;
+          chatFiles = await fs.readdir(chatDir);
         } catch {
-          continue;
+          chatFiles = [];
         }
 
-        const state = await this.loadChatSessionState(
-          filePath,
-          fst.mtimeMs,
-          fst.size,
-        );
-        if (!state) continue;
+        for (const fname of chatFiles) {
+          if (!fname.endsWith(".json") && !fname.endsWith(".jsonl")) continue;
+          const filePath = path.join(chatDir, fname);
+          let fst;
+          try {
+            fst = await fs.stat(filePath);
+            if (!fst.isFile() || fst.size === 0) continue;
+          } catch {
+            continue;
+          }
 
-        const requests = Array.isArray(state.requests) ? state.requests : [];
-        const sessionId =
-          state.sessionId ||
-          fname.replace(/\.jsonl?$/i, "");
+          const state = await this.loadChatSessionState(
+            filePath,
+            fst.mtimeMs,
+            fst.size,
+          );
+          if (!state) continue;
 
-        const firstPrompt = requests[0]?.message?.text
-          ?.replace(/\s+/g, " ")
-          .trim();
-        const title =
-          state.customTitle?.trim() ||
-          firstPrompt?.slice(0, 80) ||
-          `Copilot ${sessionId.slice(0, 8)}`;
+          const requests = Array.isArray(state.requests) ? state.requests : [];
+          const sessionId =
+            state.sessionId || fname.replace(/\.jsonl?$/i, "");
 
-        const distinctAgents = new Set<string>();
-        let hasSubagent = false;
-        for (const req of requests) {
-          const aid = req.modeInfo?.modeName || req.agent?.name || req.agent?.id;
-          if (aid) distinctAgents.add(aid);
-          for (const resp of req.response ?? []) {
-            const tid = (resp.toolId ?? resp.toolName ?? "").toLowerCase();
-            if (tid.includes("subagent")) hasSubagent = true;
+          const firstPrompt = requests[0]?.message?.text
+            ?.replace(/\s+/g, " ")
+            .trim();
+          const title =
+            state.customTitle?.trim() ||
+            firstPrompt?.slice(0, 80) ||
+            `Copilot ${sessionId.slice(0, 8)}`;
+
+          const distinctAgents = new Set<string>();
+          let hasSubagent = false;
+          for (const req of requests) {
+            const aid = req.modeInfo?.modeName || req.agent?.name || req.agent?.id;
+            if (aid) distinctAgents.add(aid);
+            for (const resp of req.response ?? []) {
+              const tid = (resp.toolId ?? resp.toolName ?? "").toLowerCase();
+              if (isSubagentToolName(tid)) hasSubagent = true;
+            }
+          }
+
+          const candidate: DiscoveredSession = {
+            ide: this.ide,
+            sessionId,
+            filePath,
+            workspacePath,
+            workspaces: workspacePath ? [workspacePath] : [],
+            projectId,
+            title,
+            mtimeMs: fst.mtimeMs,
+            sizeBytes: fst.size,
+            isMultiAgent: hasSubagent || distinctAgents.size > 1,
+          };
+          const prev = byId.get(sessionId);
+          if (!prev || candidate.mtimeMs > prev.mtimeMs) {
+            byId.set(sessionId, candidate);
           }
         }
 
-        sessions.push({
-          ide: this.ide,
+        // 2. Collect GitHub.copilot-chat/transcripts/*.jsonl stats first
+        const transcriptsDir = path.join(
+          wsDir,
+          "GitHub.copilot-chat",
+          "transcripts",
+        );
+        let transcriptFiles: string[] = [];
+        try {
+          transcriptFiles = await fs.readdir(transcriptsDir);
+        } catch {
+          transcriptFiles = [];
+        }
+
+        for (const fname of transcriptFiles) {
+          if (!fname.endsWith(".jsonl")) continue;
+          const filePath = path.join(transcriptsDir, fname);
+          let fst;
+          try {
+            fst = await fs.stat(filePath);
+            if (!fst.isFile() || fst.size === 0 || fst.size > MAX_TRANSCRIPT_BYTES) {
+              continue;
+            }
+          } catch {
+            continue;
+          }
+          transcriptCandidates.push({
+            filePath,
+            fname,
+            mtimeMs: fst.mtimeMs,
+            sizeBytes: fst.size,
+            workspacePath,
+            projectId,
+          });
+        }
+      }
+    }
+
+    // Stat-sort transcripts desc and slice before reading/parsing, using (mtimeMs, sizeBytes) cache
+    transcriptCandidates.sort((a, b) => b.mtimeMs - a.mtimeMs);
+    for (const cand of transcriptCandidates.slice(0, Math.max(limit * 2, 50))) {
+      let meta = this.transcriptDiscoveryCache.get(cand.filePath);
+      if (
+        !meta ||
+        meta.mtimeMs !== cand.mtimeMs ||
+        meta.sizeBytes !== cand.sizeBytes
+      ) {
+        let raw = "";
+        try {
+          raw = await fs.readFile(cand.filePath, "utf8");
+        } catch {
+          continue;
+        }
+        const rows = parseJsonlRows(raw);
+        if (rows.length === 0) continue;
+
+        let sessionId = cand.fname.replace(/\.jsonl$/i, "");
+        let title = `Copilot ${sessionId.slice(0, 8)}`;
+        let isMultiAgent = false;
+        let isSubagentTranscript = false;
+        const distinctAgents = new Set<string>();
+
+        for (const row of rows) {
+          const rtype = (row.type ?? row.event ?? "").toLowerCase();
+          const d =
+            row.data && typeof row.data === "object" ? row.data : undefined;
+          if (rtype === "session.start") {
+            const sid =
+              (typeof d?.sessionId === "string" && d.sessionId.trim()) ||
+              (typeof row.sessionId === "string" && row.sessionId.trim());
+            if (sid) sessionId = sid;
+            if (
+              (typeof d?.parentSessionId === "string" &&
+                d.parentSessionId.trim()) ||
+              (typeof row.parentSessionId === "string" &&
+                row.parentSessionId.trim())
+            ) {
+              isSubagentTranscript = true;
+            }
+          }
+          if (rtype === "user.message" && title.startsWith("Copilot ")) {
+            const txt =
+              (typeof d?.content === "string" && d.content) ||
+              (typeof d?.transformedContent === "string" &&
+                d.transformedContent) ||
+              (typeof row.content === "string" && row.content) ||
+              (typeof row.prompt === "string" && row.prompt) ||
+              "";
+            const clean = txt.replace(/\s+/g, " ").trim();
+            if (clean) title = clean.slice(0, 80);
+          }
+          if (rtype.startsWith("subagent.")) {
+            isMultiAgent = true;
+          }
+          const aid =
+            (typeof d?.agentName === "string" && d.agentName) ||
+            (typeof row.agentName === "string" && row.agentName) ||
+            undefined;
+          if (aid) distinctAgents.add(aid);
+        }
+
+        meta = {
+          mtimeMs: cand.mtimeMs,
+          sizeBytes: cand.sizeBytes,
           sessionId,
-          filePath,
-          workspacePath,
-          workspaces: workspacePath ? [workspacePath] : [],
-          projectId,
           title,
-          mtimeMs: fst.mtimeMs,
-          sizeBytes: fst.size,
-          isMultiAgent: hasSubagent || distinctAgents.size > 1,
+          isMultiAgent,
+          isSubagentTranscript,
+          distinctAgentsCount: distinctAgents.size,
+        };
+        this.transcriptDiscoveryCache.set(cand.filePath, meta);
+      }
+
+      if (meta.isSubagentTranscript) continue;
+
+      const prev = byId.get(meta.sessionId);
+      if (prev) {
+        prev.mtimeMs = Math.max(prev.mtimeMs, cand.mtimeMs);
+        prev.isMultiAgent =
+          prev.isMultiAgent ||
+          meta.isMultiAgent ||
+          meta.distinctAgentsCount > 1;
+        if (prev.title?.startsWith("Copilot ") && !meta.title.startsWith("Copilot ")) {
+          prev.title = meta.title;
+        }
+      } else {
+        byId.set(meta.sessionId, {
+          ide: this.ide,
+          sessionId: meta.sessionId,
+          filePath: cand.filePath,
+          workspacePath: cand.workspacePath,
+          workspaces: cand.workspacePath ? [cand.workspacePath] : [],
+          projectId: cand.projectId,
+          title: meta.title,
+          mtimeMs: cand.mtimeMs,
+          sizeBytes: cand.sizeBytes,
+          isMultiAgent: meta.isMultiAgent || meta.distinctAgentsCount > 1,
         });
       }
     }
 
+    const sessions = [...byId.values()];
     sessions.sort((a, b) => b.mtimeMs - a.mtimeMs);
-    return sessions.slice(0, opts?.limit ?? 100);
+    return sessions.slice(0, limit);
+  }
+
+  async parseTranscriptFile(
+    filePath: string,
+    sessionId: string,
+    agentIdOrOpts?: string | CopilotTranscriptParseOptions,
+    maybeOpts?: CopilotTranscriptParseOptions,
+  ): Promise<EnrichedEvent[]> {
+    const opts: CopilotTranscriptParseOptions =
+      typeof agentIdOrOpts === "string"
+        ? { ...(maybeOpts ?? {}), agentIdOverride: agentIdOrOpts }
+        : { ...(agentIdOrOpts ?? {}) };
+
+    const allowedRoots =
+      opts.allowedRoots ??
+      this.getDefaultAllowedTranscriptRoots(opts.workspacePath);
+    const validPath = await validateTranscriptPath(filePath, allowedRoots, {
+      maxBytes: MAX_TRANSCRIPT_BYTES,
+    });
+    if (!validPath) return [];
+
+    let raw: string;
+    let mtimeMs = Date.now();
+    try {
+      const fst = await fs.stat(validPath);
+      if (!fst.isFile() || fst.size > MAX_TRANSCRIPT_BYTES) {
+        return [];
+      }
+      mtimeMs = fst.mtimeMs;
+      raw = await fs.readFile(validPath, "utf8");
+    } catch {
+      return [];
+    }
+
+    const rows = parseJsonlRows(raw);
+    if (rows.length === 0) return [];
+
+    const knownProjects = getKnownProjects();
+    const workspacePath = opts.workspacePath;
+    const projectId =
+      opts.projectId ??
+      (workspacePath
+        ? matchProjectIdForWorkspaces([workspacePath], knownProjects) ??
+          path.basename(workspacePath)
+        : undefined);
+
+    const events: EnrichedEvent[] = [];
+    const defaultAgentId = opts.agentIdOverride?.trim() || "root";
+    const defaultParentId =
+      opts.parentAgentIdOverride ??
+      (defaultAgentId !== "root" ? "root" : undefined);
+
+    interface TranscriptUsageAcc {
+      model?: string;
+      hasExact: boolean;
+      inputTokens: number;
+      outputTokens: number;
+      cachedTokens: number;
+      lastTurnContext: number;
+      estInputChars: number;
+      estOutputChars: number;
+      costUsd?: number;
+      agentLabel?: string;
+    }
+    const usageAccByAgent = new Map<string, TranscriptUsageAcc>();
+    const ensureAcc = (aid: string): TranscriptUsageAcc => {
+      let acc = usageAccByAgent.get(aid);
+      if (!acc) {
+        acc = {
+          hasExact: false,
+          inputTokens: 0,
+          outputTokens: 0,
+          cachedTokens: 0,
+          lastTurnContext: 0,
+          estInputChars: 0,
+          estOutputChars: 0,
+        };
+        usageAccByAgent.set(aid, acc);
+      }
+      return acc;
+    };
+
+    const toolSummaryMap = new Map<
+      string,
+      { toolName: string; summary: string; agentId: string }
+    >();
+    const subagentIdByCallId = new Map<
+      string,
+      { subId: string; subLabel: string }
+    >();
+    let fallbackEpoch = mtimeMs / 1000 - Math.max(rows.length, 1);
+
+    for (let idx = 0; idx < rows.length; idx++) {
+      const row = rows[idx]!;
+      const rtype = (row.type ?? row.event ?? "").toLowerCase();
+      const d =
+        row.data && typeof row.data === "object" && !Array.isArray(row.data)
+          ? row.data
+          : (row as Record<string, unknown>);
+      const epoch = parseEpochSeconds(
+        (d.timestamp as string | number | undefined) ?? row.timestamp,
+        fallbackEpoch + idx,
+      );
+      fallbackEpoch = epoch;
+
+      const rowAgentRaw =
+        (typeof d.agentId === "string" && d.agentId.trim()) ||
+        (typeof row.agentId === "string" && row.agentId.trim()) ||
+        undefined;
+      const agentId = opts.agentIdOverride
+        ? defaultAgentId
+        : rowAgentRaw && rowAgentRaw !== "root"
+          ? rowAgentRaw
+          : defaultAgentId;
+      const parentAgentId =
+        agentId !== "root" ? defaultParentId ?? "root" : undefined;
+
+      const acc = ensureAcc(agentId);
+      if (opts.agentLabelOverride && !acc.agentLabel) {
+        acc.agentLabel = opts.agentLabelOverride;
+      }
+
+      const rawLabel =
+        (typeof d.agentDisplayName === "string" && d.agentDisplayName.trim()) ||
+        (typeof d.agentName === "string" && d.agentName.trim()) ||
+        (typeof d.agentType === "string" && d.agentType.trim()) ||
+        (typeof row.agentName === "string" && row.agentName.trim()) ||
+        (typeof row.agentType === "string" && row.agentType.trim()) ||
+        undefined;
+      if (rawLabel && !rtype.startsWith("subagent.") && !acc.agentLabel) {
+        acc.agentLabel = rawLabel;
+      }
+
+      const rowModelRaw =
+        (typeof d.newModel === "string" && d.newModel.trim()) ||
+        (typeof d.selectedModel === "string" && d.selectedModel.trim()) ||
+        (typeof d.model === "string" && d.model.trim()) ||
+        (typeof d.modelId === "string" && d.modelId.trim()) ||
+        (typeof row.model === "string" && row.model.trim()) ||
+        (typeof row.modelId === "string" && row.modelId.trim()) ||
+        undefined;
+      if (rowModelRaw && !rtype.startsWith("subagent.")) {
+        const pretty = prettifyModelName(rowModelRaw) || rowModelRaw;
+        if (pretty) acc.model = pretty;
+      }
+
+      const usageCandidate =
+        (d.usage && typeof d.usage === "object" && !Array.isArray(d.usage)
+          ? (d.usage as Record<string, unknown>)
+          : undefined) ??
+        (row.usage &&
+        typeof row.usage === "object" &&
+        !Array.isArray(row.usage)
+          ? row.usage
+          : undefined) ??
+        d;
+      const u = extractUsageNumbers(usageCandidate);
+      if (
+        u.inTok !== undefined ||
+        u.outTok !== undefined ||
+        u.contextTok !== undefined
+      ) {
+        acc.hasExact = true;
+        const inTok = Math.max(0, Math.round(u.inTok ?? 0));
+        const outTok = Math.max(0, Math.round(u.outTok ?? 0));
+        const cachedTok = u.cachedTok;
+        acc.inputTokens += inTok;
+        acc.outputTokens += outTok;
+        acc.cachedTokens += cachedTok;
+        acc.lastTurnContext =
+          u.contextTok !== undefined
+            ? Math.max(0, Math.round(u.contextTok))
+            : inTok + cachedTok + outTok;
+      }
+      if (u.costUsd !== undefined && u.costUsd >= 0) {
+        acc.costUsd = (acc.costUsd ?? 0) + u.costUsd;
+      }
+
+      const agentLabel =
+        acc.agentLabel ||
+        (agentId === "root" ? "Copilot Agent" : prettifyAgentLabel(agentId));
+
+      const emit = (input: {
+        epoch?: number;
+        kind: EnrichedEvent["kind"];
+        toolName?: string;
+        toolCallId?: string;
+        targetAgentId?: string;
+        summary: string;
+        payload?: Record<string, unknown>;
+        status?: EnrichedEvent["status"];
+        isSelfDaemon?: boolean;
+        isError?: boolean;
+        waitingReason?: EnrichedEvent["waitingReason"];
+        fullBody?: string;
+        inlineBody?: string;
+        overrideAgentId?: string;
+        overrideAgentLabel?: string;
+        overrideParentAgentId?: string;
+      }): void => {
+        const evEpoch = input.epoch ?? epoch;
+        const evAgentId = input.overrideAgentId ?? agentId;
+        const evAgentLabel = input.overrideAgentLabel ?? agentLabel;
+        const evParentId =
+          input.overrideParentAgentId ??
+          (evAgentId !== "root" ? parentAgentId ?? "root" : undefined);
+        const id = computeDeterministicEventId({
+          ide: this.ide,
+          sessionId,
+          agentId: evAgentId,
+          kind: input.kind,
+          toolCallId: input.toolCallId,
+          toolName: input.toolName,
+          epoch: evEpoch,
+          summary: input.summary,
+        });
+        const mergeKey = computeMergeKey({
+          sessionId,
+          agentId: evAgentId,
+          kind: input.kind,
+          toolCallId: input.toolCallId,
+          toolName: input.toolName,
+          epoch: evEpoch,
+        });
+        const hasBody =
+          typeof input.fullBody === "string" && input.fullBody.length > 0;
+        const bodyLength = hasBody ? input.fullBody!.length : undefined;
+        const bodyTruncated = hasBody
+          ? input.fullBody!.length > (input.inlineBody?.length ?? 0)
+          : undefined;
+        events.push({
+          id,
+          mergeKey,
+          ts: toIsoUtc(evEpoch),
+          epoch: evEpoch,
+          ide: this.ide,
+          channel: "passive",
+          sessionId,
+          workspacePath,
+          projectId,
+          agentId: evAgentId,
+          agentLabel: evAgentLabel,
+          ...(evParentId ? { parentAgentId: evParentId } : {}),
+          kind: input.kind,
+          toolName: input.toolName,
+          toolCallId: input.toolCallId,
+          targetAgentId: input.targetAgentId,
+          summary: input.summary,
+          payload: input.payload,
+          ...(bodyLength !== undefined ? { bodyLength } : {}),
+          ...(bodyTruncated !== undefined ? { bodyTruncated } : {}),
+          status: input.status,
+          isSelfDaemon: input.isSelfDaemon,
+          isError: input.isError,
+          waitingReason: input.waitingReason,
+        });
+        if (hasBody) {
+          opts.onFullBody?.(id, input.fullBody!);
+        }
+      };
+
+      if (rtype === "session.start") {
+        emit({
+          kind: "session_start",
+          summary: "Session started",
+          payload: {
+            ...(rowModelRaw ? { model: rowModelRaw } : {}),
+          },
+        });
+      } else if (rtype === "user.message") {
+        const txt = (
+          (typeof d.content === "string" && d.content) ||
+          (typeof d.transformedContent === "string" && d.transformedContent) ||
+          (typeof row.content === "string" && row.content) ||
+          (typeof row.prompt === "string" && row.prompt) ||
+          ""
+        ).trim();
+        if (txt) {
+          acc.estInputChars += txt.length;
+          const inlineBody = txt.slice(0, 1400);
+          emit({
+            kind: "user_input",
+            targetAgentId: agentId,
+            summary: `Human: ${cleanHumanSummary(txt, 130)}`,
+            payload: { body: inlineBody, prompt: inlineBody },
+            fullBody: txt,
+            inlineBody,
+          });
+        }
+      } else if (rtype === "assistant.message") {
+        const msgText =
+          (typeof d.content === "string" && d.content.trim()) || "";
+        const reasoning =
+          (typeof d.reasoningText === "string" && d.reasoningText.trim()) || "";
+        acc.estOutputChars += msgText.length + reasoning.length;
+        if (reasoning) {
+          emit({
+            kind: "thinking_start",
+            summary: cleanHumanSummary(reasoning, 100) || "Thinking…",
+          });
+        }
+        const toolReqs = Array.isArray(d.toolRequests) ? d.toolRequests : [];
+        if (toolReqs.length > 0) {
+          for (let ti = 0; ti < toolReqs.length; ti++) {
+            const tr = toolReqs[ti] as Record<string, unknown>;
+            const tname =
+              (typeof tr.name === "string" && tr.name) ||
+              (typeof tr.toolName === "string" && tr.toolName) ||
+              "tool";
+            const callId =
+              (typeof tr.toolCallId === "string" && tr.toolCallId) ||
+              `${idx}:${ti}:${tname}`;
+            const args =
+              tr.arguments &&
+              typeof tr.arguments === "object" &&
+              !Array.isArray(tr.arguments)
+                ? (tr.arguments as Record<string, unknown>)
+                : {};
+            const isBoardMut = isBoardMutationToolCall(tname, args);
+            const sum = summarizeToolCall(tname, args);
+            toolSummaryMap.set(callId, { toolName: tname, summary: sum, agentId });
+            emit({
+              epoch: epoch + ti * 0.0001,
+              kind: isBoardMut ? "board_mutation" : "tool_start",
+              toolName: tname,
+              toolCallId: callId,
+              summary: sum,
+              status: "running",
+              payload: { args },
+            });
+          }
+        } else if (msgText) {
+          const inlineBody = msgText.slice(0, 1000);
+          emit({
+            kind:
+              agentId === "root" ? "assistant_turn_end" : "subagent_done",
+            summary: cleanHumanSummary(msgText, 140) || "Turn completed",
+            status: "ok",
+            payload: { body: inlineBody },
+            fullBody: msgText,
+            inlineBody,
+          });
+        }
+      } else if (rtype === "assistant.turn_end") {
+        emit({
+          kind: agentId === "root" ? "assistant_turn_end" : "subagent_done",
+          summary: "Turn completed",
+          status: "ok",
+        });
+      } else if (rtype === "tool.execution_start") {
+        const tname =
+          (typeof d.mcpToolName === "string" && d.mcpToolName) ||
+          (typeof d.toolName === "string" && d.toolName) ||
+          "tool";
+        const callId =
+          (typeof d.toolCallId === "string" && d.toolCallId) ||
+          `${idx}:${tname}`;
+        const args =
+          d.arguments &&
+          typeof d.arguments === "object" &&
+          !Array.isArray(d.arguments)
+            ? (d.arguments as Record<string, unknown>)
+            : {};
+        const isBoardMut = isBoardMutationToolCall(tname, args);
+        const sum = summarizeToolCall(tname, args);
+        const selfDaemon = isSelfDaemonCommand(
+          sum + " " + JSON.stringify(args),
+        );
+        toolSummaryMap.set(callId, { toolName: tname, summary: sum, agentId });
+        emit({
+          kind: isBoardMut ? "board_mutation" : "tool_start",
+          toolName: tname,
+          toolCallId: callId,
+          summary: sum,
+          status: "running",
+          isSelfDaemon: selfDaemon,
+          payload: { args },
+        });
+      } else if (rtype === "tool.execution_complete") {
+        const callId =
+          (typeof d.toolCallId === "string" && d.toolCallId) || undefined;
+        const prev = callId ? toolSummaryMap.get(callId) : undefined;
+        const tname =
+          (typeof d.toolName === "string" && d.toolName) || prev?.toolName;
+        const isErr = d.success === false || d.isError === true || Boolean(d.error);
+        const baseLabel = prev?.summary ?? tname ?? "tool call";
+        emit({
+          kind: "tool_end",
+          toolName: tname,
+          toolCallId: callId,
+          summary: cleanHumanSummary(
+            isErr ? `Failed: ${baseLabel}` : `Completed: ${baseLabel}`,
+            140,
+          ),
+          status: isErr ? "error" : "ok",
+          isError: isErr,
+          payload: {
+            ...(d.result !== undefined ? { result: d.result } : {}),
+            ...(d.error !== undefined ? { error: d.error } : {}),
+            ...(!isErr ? { routineEnd: true } : {}),
+          },
+        });
+      } else if (
+        rtype === "subagent.started" ||
+        rtype === "subagent.start"
+      ) {
+        const callId =
+          (typeof d.toolCallId === "string" && d.toolCallId) || undefined;
+        const subLabel = String(
+          d.agentDisplayName ??
+            d.subAgentName ??
+            d.agentName ??
+            d.agentType ??
+            d.description ??
+            "Subagent",
+        ).trim();
+        const rawSubId =
+          (typeof d.agentId === "string" && d.agentId.trim()) ||
+          (typeof d.subagentId === "string" && d.subagentId.trim()) ||
+          subLabel.toLowerCase().replace(/[^a-z0-9_-]+/g, "-") ||
+          "subagent";
+        if (callId) {
+          subagentIdByCallId.set(callId, { subId: rawSubId, subLabel });
+        }
+        const subModel =
+          typeof d.model === "string" && d.model.trim()
+            ? prettifyModelName(d.model) || d.model.trim()
+            : undefined;
+        if (subModel) {
+          const subAcc = ensureAcc(rawSubId);
+          subAcc.model = subModel;
+          subAcc.agentLabel = subLabel;
+        }
+        const subPrompt =
+          typeof d.prompt === "string" ? d.prompt.trim() : "";
+        const inlinePrompt = subPrompt ? subPrompt.slice(0, 1000) : "";
+        const spawnActorLabel =
+          defaultAgentId === "root"
+            ? usageAccByAgent.get("root")?.agentLabel || "Copilot Agent"
+            : opts.agentLabelOverride || prettifyAgentLabel(defaultAgentId);
+        emit({
+          kind: "subagent_spawn",
+          toolName: "runSubagent",
+          toolCallId: callId,
+          targetAgentId: rawSubId,
+          overrideAgentId: defaultAgentId,
+          overrideAgentLabel: spawnActorLabel,
+          overrideParentAgentId:
+            defaultAgentId !== "root" ? defaultParentId ?? "root" : undefined,
+          summary: `Spawned ${subLabel}`,
+          payload: {
+            agentLabel: subLabel,
+            ...(subModel
+              ? { childModel: subModel, childModelSource: "exact" }
+              : {}),
+            ...(inlinePrompt ? { prompt: inlinePrompt } : {}),
+          },
+          ...(subPrompt
+            ? { fullBody: subPrompt, inlineBody: inlinePrompt }
+            : {}),
+        });
+      } else if (
+        rtype === "subagent.completed" ||
+        rtype === "subagent.stop" ||
+        rtype === "subagent.failed"
+      ) {
+        const callId =
+          (typeof d.toolCallId === "string" && d.toolCallId) || undefined;
+        const prevSub = callId ? subagentIdByCallId.get(callId) : undefined;
+        const subLabel =
+          prevSub?.subLabel ||
+          String(
+            d.agentDisplayName ??
+              d.subAgentName ??
+              d.agentName ??
+              d.agentType ??
+              "Subagent",
+          ).trim();
+        const rawSubId =
+          prevSub?.subId ||
+          (typeof d.agentId === "string" && d.agentId.trim()) ||
+          (typeof d.subagentId === "string" && d.subagentId.trim()) ||
+          subLabel.toLowerCase().replace(/[^a-z0-9_-]+/g, "-") ||
+          "subagent";
+        const isErr = rtype === "subagent.failed" || Boolean(d.error);
+        const doneText =
+          typeof d.result === "string"
+            ? d.result.trim()
+            : typeof d.error === "string"
+              ? d.error.trim()
+              : "";
+        const inlineDone = doneText ? doneText.slice(0, 1000) : "";
+        const doneActorLabel =
+          defaultAgentId === "root"
+            ? usageAccByAgent.get("root")?.agentLabel || "Copilot Agent"
+            : opts.agentLabelOverride || prettifyAgentLabel(defaultAgentId);
+        emit({
+          kind: "subagent_done",
+          toolName: "runSubagent",
+          toolCallId: callId,
+          targetAgentId: rawSubId,
+          overrideAgentId: defaultAgentId,
+          overrideAgentLabel: doneActorLabel,
+          overrideParentAgentId:
+            defaultAgentId !== "root" ? defaultParentId ?? "root" : undefined,
+          summary: isErr
+            ? `Subagent failed: ${subLabel}`
+            : `Subagent finished: ${subLabel}`,
+          status: isErr ? "error" : "ok",
+          isError: isErr,
+          ...(inlineDone ? { payload: { body: inlineDone } } : {}),
+          ...(doneText
+            ? { fullBody: doneText, inlineBody: inlineDone }
+            : {}),
+        });
+      }
+    }
+
+    // Attach finalized per-agent UsageDelta totals onto each agent's last emitted event
+    const lastEvByAgent = new Map<string, EnrichedEvent>();
+    for (const ev of events) {
+      lastEvByAgent.set(ev.agentId, ev);
+    }
+    for (const [aid, acc] of usageAccByAgent.entries()) {
+      const targetEv = lastEvByAgent.get(aid);
+      if (!targetEv) continue;
+      const inputTokens = acc.hasExact
+        ? acc.inputTokens
+        : Math.round(acc.estInputChars / 4);
+      const outputTokens = acc.hasExact
+        ? acc.outputTokens
+        : Math.round(acc.estOutputChars / 4);
+      const cachedTokens = acc.hasExact ? acc.cachedTokens : 0;
+      const contextTokens = acc.hasExact
+        ? acc.lastTurnContext
+        : inputTokens + outputTokens;
+      const usageDelta: UsageDelta = {
+        model: acc.model,
+        modelSource: acc.model ? "exact" : "unknown",
+        usageSource: acc.hasExact ? "exact" : "estimated",
+        inputTokens,
+        outputTokens,
+        cachedTokens,
+        contextTokens,
+        ...(acc.costUsd !== undefined ? { costUsd: acc.costUsd } : {}),
+        isTotal: true,
+      };
+      targetEv.usageDelta = usageDelta;
+      targetEv.payload = { ...(targetEv.payload ?? {}), _usageDelta: usageDelta };
+    }
+
+    return events;
   }
 
   async parseSession(
     session: DiscoveredSession,
     opts?: ParseSessionOptions,
   ): Promise<EnrichedEvent[]> {
+    if (
+      !session.filePath ||
+      path.basename(session.filePath).toLowerCase() === "telemetry.jsonl"
+    ) {
+      return [];
+    }
+
+    if (isTranscriptJsonlPath(session.filePath)) {
+      return this.parseTranscriptFile(session.filePath, session.sessionId, {
+        ...opts,
+        workspacePath: session.workspacePath,
+        projectId: session.projectId,
+      });
+    }
+
     let fst;
     try {
       fst = await fs.stat(session.filePath);
@@ -433,6 +1368,10 @@ export class CopilotVSCodeAdapter implements PassiveIdeAdapter {
         knownProjects,
       ) ?? session.projectId;
 
+    const selectedModelFallback = extractSelectedModel(
+      state.inputState?.selectedModel,
+    );
+
     const requests = Array.isArray(state.requests) ? state.requests : [];
     const events: EnrichedEvent[] = [];
 
@@ -445,6 +1384,7 @@ export class CopilotVSCodeAdapter implements PassiveIdeAdapter {
       lastTurnContext: number;
       estInputChars: number;
       estOutputChars: number;
+      costUsd?: number;
     }
     const usageAccByAgent = new Map<string, CopilotUsageAcc>();
     const ensureAcc = (aid: string): CopilotUsageAcc => {
@@ -485,40 +1425,81 @@ export class CopilotVSCodeAdapter implements PassiveIdeAdapter {
           : prettifyAgentLabel(rawAgent);
 
       const acc = ensureAcc(agentId);
-      if (typeof req.modelId === "string" && req.modelId.trim()) {
-        const pretty = prettifyModelName(req.modelId);
+      const rawModel =
+        (typeof req.modelId === "string" && req.modelId.trim()
+          ? req.modelId
+          : undefined) ?? selectedModelFallback;
+      if (rawModel) {
+        const pretty = prettifyModelName(rawModel);
         if (pretty) acc.model = pretty;
       }
-      const metaUsage = req.result?.metadata?.usage;
-      const exactIn =
-        typeof metaUsage?.promptTokens === "number"
-          ? metaUsage.promptTokens
-          : typeof metaUsage?.inputTokens === "number"
-            ? metaUsage.inputTokens
-            : undefined;
-      const exactOut =
-        typeof metaUsage?.completionTokens === "number"
-          ? metaUsage.completionTokens
-          : typeof metaUsage?.outputTokens === "number"
-            ? metaUsage.outputTokens
-            : typeof req.completionTokens === "number"
-              ? req.completionTokens
-              : undefined;
-      const exactCached =
-        typeof metaUsage?.cachedTokens === "number" ? metaUsage.cachedTokens : 0;
 
-      if (exactIn !== undefined || exactOut !== undefined) {
+      const rounds = Array.isArray(req.result?.metadata?.toolCallRounds)
+        ? req.result!.metadata!.toolCallRounds!
+        : [];
+      const roundUsages = rounds
+        .map((r) => extractUsageNumbers(r.usage))
+        .filter((u) => u.inTok !== undefined || u.outTok !== undefined);
+
+      const directUsage = extractUsageNumbers(
+        req.result?.usage ?? req.result?.metadata?.usage,
+      );
+      const metaFields = extractUsageNumbers(
+        req.result?.metadata as Record<string, unknown> | undefined,
+      );
+
+      if (
+        directUsage.inTok !== undefined ||
+        directUsage.outTok !== undefined ||
+        metaFields.inTok !== undefined ||
+        metaFields.outTok !== undefined ||
+        typeof req.completionTokens === "number"
+      ) {
         acc.hasExact = true;
-        const inTok = Math.max(0, Math.round(exactIn ?? 0));
-        const outTok = Math.max(0, Math.round(exactOut ?? 0));
-        const cachedTok = Math.max(0, Math.round(exactCached));
+        const inTok = Math.max(
+          0,
+          Math.round(directUsage.inTok ?? metaFields.inTok ?? 0),
+        );
+        const outTok = Math.max(
+          0,
+          Math.round(
+            directUsage.outTok ??
+              metaFields.outTok ??
+              req.completionTokens ??
+              0,
+          ),
+        );
+        const cachedTok =
+          directUsage.cachedTok > 0
+            ? directUsage.cachedTok
+            : metaFields.cachedTok;
         acc.inputTokens += inTok;
         acc.outputTokens += outTok;
         acc.cachedTokens += cachedTok;
-        acc.lastTurnContext = Math.max(
-          acc.lastTurnContext,
-          inTok + cachedTok + outTok,
-        );
+        acc.lastTurnContext =
+          directUsage.contextTok !== undefined
+            ? Math.max(0, Math.round(directUsage.contextTok))
+            : inTok + cachedTok + outTok;
+        const cost = directUsage.costUsd ?? metaFields.costUsd;
+        if (cost !== undefined && cost >= 0) {
+          acc.costUsd = (acc.costUsd ?? 0) + cost;
+        }
+      } else if (roundUsages.length > 0) {
+        acc.hasExact = true;
+        for (const ru of roundUsages) {
+          const inTok = Math.max(0, Math.round(ru.inTok ?? 0));
+          const outTok = Math.max(0, Math.round(ru.outTok ?? 0));
+          acc.inputTokens += inTok;
+          acc.outputTokens += outTok;
+          acc.cachedTokens += ru.cachedTok;
+          acc.lastTurnContext =
+            ru.contextTok !== undefined
+              ? Math.max(0, Math.round(ru.contextTok))
+              : inTok + ru.cachedTok + outTok;
+          if (ru.costUsd !== undefined && ru.costUsd >= 0) {
+            acc.costUsd = (acc.costUsd ?? 0) + ru.costUsd;
+          }
+        }
       }
       acc.estInputChars += (req.message?.text ?? "").length;
       if (Array.isArray(req.response) && req.response.length > 0) {
@@ -645,28 +1626,59 @@ export class CopilotVSCodeAdapter implements PassiveIdeAdapter {
             msg + " " + JSON.stringify(item.toolSpecificData ?? {}),
           );
 
-          if (lowTool.includes("subagent")) {
-            const subLabel =
-              String(item.toolSpecificData?.agentName ?? item.generatedTitle ?? "Subagent");
-            const subId = subLabel.toLowerCase().replace(/[^a-z0-9_-]+/g, "-") || "subagent";
+          if (isSubagentToolName(lowTool)) {
+            const tsd = item.toolSpecificData;
+            const subLabel = String(
+              tsd?.subAgentName ??
+                tsd?.agentName ??
+                tsd?.agentType ??
+                tsd?.description ??
+                item.generatedTitle ??
+                "Subagent",
+            ).trim();
+            const explicitSubId =
+              (typeof tsd?.subAgentInvocationId === "string" &&
+                tsd.subAgentInvocationId.trim() &&
+                tsd.subAgentInvocationId.trim() !== "root" &&
+                tsd.subAgentInvocationId.trim()) ||
+              (typeof tsd?.agentId === "string" &&
+                tsd.agentId.trim() &&
+                tsd.agentId.trim() !== "root" &&
+                tsd.agentId.trim()) ||
+              (typeof tsd?.subagentId === "string" &&
+                tsd.subagentId.trim() &&
+                tsd.subagentId.trim() !== "root" &&
+                tsd.subagentId.trim()) ||
+              undefined;
+            const subId =
+              explicitSubId ||
+              subLabel.toLowerCase().replace(/[^a-z0-9_-]+/g, "-") ||
+              "subagent";
+            const subModelRaw =
+              typeof tsd?.model === "string" && tsd.model.trim()
+                ? tsd.model.trim()
+                : undefined;
+            const subModel = subModelRaw
+              ? prettifyModelName(subModelRaw) || subModelRaw
+              : undefined;
             const rawSubPrompt =
-              typeof item.toolSpecificData?.prompt === "string"
-                ? item.toolSpecificData.prompt
-                : typeof item.toolSpecificData?.instructions === "string"
-                  ? item.toolSpecificData.instructions
-                  : typeof item.toolSpecificData?.description === "string"
-                    ? item.toolSpecificData.description
+              typeof tsd?.prompt === "string"
+                ? tsd.prompt
+                : typeof tsd?.instructions === "string"
+                  ? tsd.instructions
+                  : typeof tsd?.description === "string"
+                    ? tsd.description
                     : extractMessageText(item.invocationMessage);
             const subPrompt = rawSubPrompt.trim();
             const inlinePrompt = subPrompt ? subPrompt.slice(0, 1000) : "";
-            const compactSpecificData = item.toolSpecificData
+            const compactSpecificData = tsd
               ? {
-                  ...item.toolSpecificData,
-                  ...(typeof item.toolSpecificData.prompt === "string"
-                    ? { prompt: item.toolSpecificData.prompt.slice(0, 1000) }
+                  ...tsd,
+                  ...(typeof tsd.prompt === "string"
+                    ? { prompt: tsd.prompt.slice(0, 1000) }
                     : {}),
-                  ...(typeof item.toolSpecificData.instructions === "string"
-                    ? { instructions: item.toolSpecificData.instructions.slice(0, 1000) }
+                  ...(typeof tsd.instructions === "string"
+                    ? { instructions: tsd.instructions.slice(0, 1000) }
                     : {}),
                 }
               : undefined;
@@ -678,6 +1690,10 @@ export class CopilotVSCodeAdapter implements PassiveIdeAdapter {
               targetAgentId: subId,
               summary: `Spawned ${subLabel}`,
               payload: {
+                agentLabel: subLabel,
+                ...(subModel
+                  ? { childModel: subModel, childModelSource: "exact" }
+                  : {}),
                 toolSpecificData: compactSpecificData,
                 ...(inlinePrompt ? { prompt: inlinePrompt } : {}),
               },
@@ -863,6 +1879,7 @@ export class CopilotVSCodeAdapter implements PassiveIdeAdapter {
         outputTokens,
         cachedTokens,
         contextTokens,
+        ...(acc.costUsd !== undefined ? { costUsd: acc.costUsd } : {}),
         isTotal: true,
       };
       targetEv.usageDelta = usageDelta;

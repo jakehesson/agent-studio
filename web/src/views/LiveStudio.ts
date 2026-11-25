@@ -192,22 +192,28 @@ export class LiveStudioView {
     const isHistory = events.length > 0 && (!liveTail || cursor < events.length - 1);
 
     if (!isHistory && snap.agents.length > 0) {
-      // Live tail: merge server live states with reconstructed recent actions / externals
+      // Live tail: treat server roster (snap.agents) as authoritative; hydrate recentActions/thinkingEpoch from replay
       const reconstructed = buildSnapshot(events, events.length - 1, snap);
       const serverById = new Map(snap.agents.map((a) => [a.id, a]));
-      const mergedAgents = reconstructed.agents.map((ra) => {
-        const sa = serverById.get(ra.id);
-        return sa
+      const recById = new Map(reconstructed.agents.map((ra) => [ra.id, ra]));
+      const mergedAgents = snap.agents.map((sa) => {
+        const ra = recById.get(sa.id);
+        return ra
           ? {
               ...ra,
               ...sa,
-              recentActions: ra.recentActions,
+              recentActions: ra.recentActions?.length ? ra.recentActions : sa.recentActions,
               thinkingEpoch: ra.thinkingEpoch,
             }
-          : ra;
+          : sa;
       });
       this.agentLabelMap = this.buildLabelMap(mergedAgents, snap.agents);
-      const edges = snap.edges.length > 0 ? snap.edges : reconstructed.edges;
+      const edges =
+        snap.edges.length > 0
+          ? snap.edges
+          : reconstructed.edges.filter(
+              (e) => serverById.has(e.from) && serverById.has(e.to)
+            );
       this.topology.render(mergedAgents, edges, snap.counters);
       this.feed.update(
         events,
@@ -270,13 +276,17 @@ export class LiveStudioView {
     const recAgent = reconstructed.agents.find((a) => a.id === agentId);
     const srvAgent = snap.agents.find((a) => a.id === agentId);
     const found =
-      !isHistory && srvAgent && recAgent
-        ? {
-            ...recAgent,
-            ...srvAgent,
-            recentActions: recAgent.recentActions,
-            thinkingEpoch: recAgent.thinkingEpoch,
-          }
+      !isHistory && snap.agents.length > 0
+        ? srvAgent && recAgent
+          ? {
+              ...recAgent,
+              ...srvAgent,
+              recentActions: recAgent.recentActions?.length
+                ? recAgent.recentActions
+                : srvAgent.recentActions,
+              thinkingEpoch: recAgent.thinkingEpoch,
+            }
+          : srvAgent
         : recAgent ?? srvAgent;
     if (found) {
       const definition = this.findMatchingDefinition(found, snap.definitions);

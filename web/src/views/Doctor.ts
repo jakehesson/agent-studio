@@ -282,6 +282,7 @@ export class DoctorView {
     const checks = (doc?.checks ?? []).filter((c) => {
       if (!lockedIde) return true;
       if (c.id.startsWith("telemetry-") && c.id !== `telemetry-${lockedIde}`) return false;
+      if (lockedIde === "antigravity" && c.id === "ide-hooks") return false;
       if (c.id.includes("model") && !isModelMessageRelevantToIde(`${c.label} ${c.detail}`, lockedIde)) {
         return false;
       }
@@ -362,10 +363,14 @@ export class DoctorView {
                 <span>${guard?.qaGateRequired !== false ? "✓" : "⚠"}</span>
                 <span><strong>Server-Side MCP QA Gate</strong> — Rejects <code>test → done</code> transitions without a closed passing testrun.</span>
               </div>
-              <div class="issue-row ${guard?.blockDirectBoardEdits !== false ? "ok" : "warn"}">
-                <span>${guard?.blockDirectBoardEdits !== false ? "✓" : "⚠"}</span>
-                <span><strong>PreToolUse Hook Protection</strong> — Blocks direct edits to <code>pipeline/board.json</code> in Claude Code &amp; VS Code.</span>
-              </div>
+              ${
+                lockedIde === "antigravity"
+                  ? ""
+                  : `<div class="issue-row ${guard?.blockDirectBoardEdits !== false ? "ok" : "warn"}">
+                      <span>${guard?.blockDirectBoardEdits !== false ? "✓" : "⚠"}</span>
+                      <span><strong>PreToolUse Hook Protection</strong> — Blocks direct edits to <code>pipeline/board.json</code> in Claude Code &amp; VS Code.</span>
+                    </div>`
+              }
             </div>
           </section>
 

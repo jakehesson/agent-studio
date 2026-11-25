@@ -171,20 +171,20 @@ const GUIDE_SPECS: Record<GuideIdeId, IdeGuideSpec> = {
     activationSteps: [
       "Launch Claude Code inside the repository root and approve the project .mcp.json agent-studio server when prompted.",
       "Verify .claude/settings.json hooks are active (non-destructively merged alongside your existing permissions).",
-      "Invoke @team-setup to customize roles for your repo, or @orchestrator to kick off a sprint via the Agent tool.",
+      "Launch with `claude --agent team-setup` (or ask Claude to use the team-setup agent) to customize roles, or run `claude --agent orchestrator` / ask Claude to dispatch orchestrator via the Agent tool.",
     ],
     prompts: [
       {
-        badge: "@team-setup",
+        badge: "--agent team-setup",
         title: "Onboard or customize repository",
         prompt:
-          "@team-setup Inspect this repository, configure .agent-team/team.yaml with tailored specialist agents and test checkpoints, then run agent-studio sync and agent-studio doctor.",
+          "Use the team-setup agent (or launch with `claude --agent team-setup`): inspect this repository, configure .agent-team/team.yaml with tailored specialist agents and test checkpoints, then run agent-studio sync and agent-studio doctor.",
       },
       {
-        badge: "@orchestrator",
+        badge: "--agent orchestrator",
         title: "Run sprint via subagents + QA gate",
         prompt:
-          "@orchestrator Check the agent-studio board status, dispatch specialists for the next ready item using the Agent tool, and enforce qa-validator testrun verification before transitioning to done.",
+          "Use the orchestrator agent (or launch with `claude --agent orchestrator`): check the agent-studio board status, dispatch specialists for the next ready item using the Agent tool, and enforce qa-validator testrun verification before transitioning to done.",
       },
     ],
     files: [
@@ -224,7 +224,7 @@ const GUIDE_SPECS: Record<GuideIdeId, IdeGuideSpec> = {
         num: "1",
         title: "Board Check (MCP)",
         detail:
-          "@orchestrator calls mcp__agent-studio__board(status/next) and plans sprint work without edit/shell tools.",
+          "The orchestrator agent (launched via `claude --agent orchestrator` or dispatched via the Agent tool) calls mcp__agent-studio__board(status/next) and plans sprint work without edit/shell tools.",
       },
       {
         num: "2",

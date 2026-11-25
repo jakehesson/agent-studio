@@ -15,7 +15,7 @@ function readExtensionVersion(): string {
   } catch {
     // Fall back to current release version if package.json is unavailable
   }
-  return "0.8.2";
+  return "0.9.0";
 }
 
 interface McpProviderLike {

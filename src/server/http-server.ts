@@ -214,6 +214,7 @@ interface SseClient {
   workspace?: string;
   multiOnly?: boolean;
   lastPayloadHash: string;
+  inFlight?: boolean;
 }
 
 function isQuietSocketErr(err: unknown): boolean {
@@ -478,6 +479,8 @@ export function createStudioServer(
       sseClients.delete(client);
       return;
     }
+    if (client.inFlight) return;
+    client.inFlight = true;
     try {
       const payload = await aggregator.getSessionSnapshot(client.sessionId, {
         ide: client.ide,
@@ -485,20 +488,31 @@ export function createStudioServer(
         workspace: client.workspace,
         multiOnly: client.multiOnly,
       });
-      const serialized = JSON.stringify({
+      const fullBody = {
         ...payload.snapshot,
         sessions: payload.sessions,
         board_projects: payload.boardProjects,
-      });
-      if (!force && serialized === client.lastPayloadHash) {
+      };
+      // Strip volatile server_time (and per-second ageSec / empty-session updatedAt) before hashing
+      const hashableBody = {
+        ...fullBody,
+        server_time: undefined,
+        ...(payload.snapshot.events.length === 0 ? { updatedAt: undefined } : {}),
+        agents: payload.snapshot.agents.map(({ ageSec: _ageSec, ...rest }) => rest),
+      };
+      const payloadHash = JSON.stringify(hashableBody);
+      if (!force && payloadHash === client.lastPayloadHash) {
         return;
       }
-      client.lastPayloadHash = serialized;
+      client.lastPayloadHash = payloadHash;
+      const serialized = JSON.stringify(fullBody);
       if (!safeWrite(client.res, `event: state\ndata: ${serialized}\n\n`)) {
         sseClients.delete(client);
       }
     } catch {
       // Non-fatal push error
+    } finally {
+      client.inFlight = false;
     }
   };
 
@@ -767,9 +781,13 @@ export function createStudioServer(
     // 6. GET /api/board
     if (method === "GET" && pathname === "/api/board") {
       try {
-        const project = resolveProject(
-          url.searchParams.get("project") ?? undefined,
-        );
+        const workspaceParam = url.searchParams.get("workspace")?.trim() || undefined;
+        const projectParam = url.searchParams.get("project")?.trim() || undefined;
+        const ref =
+          projectParam && projectParam.toLowerCase() !== "all"
+            ? projectParam
+            : workspaceParam;
+        const project = resolveProject(ref, workspaceParam);
         const ctx = { project };
         const [board, statusRes, gateRes, runsRes] = await Promise.all([
           readBoard(project.boardPath),
@@ -1319,12 +1337,21 @@ export function createStudioServer(
 
     // 10. GET /api/doctor
     if (method === "GET" && pathname === "/api/doctor") {
-      const projectParam = url.searchParams.get("project") ?? undefined;
+      const workspaceParam = url.searchParams.get("workspace")?.trim() || undefined;
+      const projectParam = url.searchParams.get("project")?.trim() || undefined;
       let resolvedRoot: string | undefined;
-      try {
-        resolvedRoot = resolveProject(projectParam).root;
-      } catch {
-        resolvedRoot = projectParam;
+      if (workspaceParam) {
+        resolvedRoot = path.resolve(workspaceParam);
+      } else {
+        try {
+          resolvedRoot = resolveProject(
+            projectParam && projectParam.toLowerCase() !== "all"
+              ? projectParam
+              : undefined,
+          ).root;
+        } catch {
+          resolvedRoot = projectParam;
+        }
       }
 
       const adapters = await aggregator.getAdaptersHealth();
@@ -1461,12 +1488,16 @@ export function createStudioServer(
     });
 
     heartbeatTimer = setInterval(() => {
-      for (const client of [...sseClients]) {
-        if (!safeWrite(client.res, ": keepalive\n\n")) {
-          sseClients.delete(client);
+      void (async () => {
+        await aggregator.pollPushFiles().catch(() => undefined);
+        for (const client of [...sseClients]) {
+          if (!safeWrite(client.res, ": keepalive\n\n")) {
+            sseClients.delete(client);
+            continue;
+          }
+          void pushStateToClient(client, false);
         }
-      }
-      void aggregator.pollPushFiles().catch(() => undefined);
+      })();
     }, SSE_HEARTBEAT_MS);
     heartbeatTimer.unref();
 

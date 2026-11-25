@@ -30,6 +30,18 @@
       "tier": "reasoning",
       "rationale": "Deep code review for security vulnerabilities, architecture conformance, concurrency bugs, performance regressions, and test coverage."
     },
+    "vscode-copilot-specialist": {
+      "tier": "reasoning",
+      "rationale": "Read-only VS Code / GitHub Copilot validation across hooks, PushBus subagent re-homing, CopilotVSCodeAdapter enrichment, and live-follow SSE scoping."
+    },
+    "claude-code-specialist": {
+      "tier": "reasoning",
+      "rationale": "Read-only Claude Code validation across settings/hooks, PreToolUse deny contract, ClaudeCodeAdapter usage deduplication, /compact context tracking, and subagent correlation."
+    },
+    "antigravity-specialist": {
+      "tier": "reasoning",
+      "rationale": "Read-only Antigravity validation across plugin compilation, AntigravityAdapter full-file discovery, openToolCalls/pendingSpawns correlation, SSE streaming, and MCP App scoping."
+    },
     "qa-validator": {
       "tier": "fast",
       "rationale": "Deterministic checkpoint runs, MCP testrun recording, and pass/fail triage (#2 token-savings lever)."

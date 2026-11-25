@@ -285,7 +285,7 @@ describe("Per-Role Model Routing, 3-Layer Model Index & Compilers", () => {
     // 1. Default (prefer-fallback) compilation
     compileTeam(repo);
 
-    // Check Antigravity orchestrator -> flash_lite
+    // Check Antigravity orchestrator -> inherit (honoring deferToHostOrchestrator && respectBuiltInOrchestrators)
     const agyOrchFm = parseYaml(
       splitFrontmatter(
         fs.readFileSync(
@@ -294,7 +294,25 @@ describe("Per-Role Model Routing, 3-Layer Model Index & Compilers", () => {
         ),
       ).frontmatter ?? "",
     ) as { model?: unknown };
-    assert.equal(agyOrchFm.model, "flash_lite");
+    assert.equal(agyOrchFm.model, "inherit");
+
+    // When respectBuiltInOrchestrators is false, Antigravity orchestrator falls back to tier binding (flash_lite)
+    const policyManifest = parseTeamYaml(fs.readFileSync(getTeamYamlPath(repo), "utf8"));
+    const policyOrch = policyManifest.roster.find((r) => r.id === "orchestrator")!;
+    policyManifest.workflow.modelRouting = {
+      ...policyManifest.workflow.modelRouting,
+      policy: "prefer-fallback",
+      respectBuiltInOrchestrators: false,
+      allowSubagentModelHints: true,
+      copilotHandoffModels: false,
+    };
+    const agyOrchOptOut = resolveRoleModel(
+      policyManifest,
+      policyOrch,
+      "antigravity",
+      DEFAULT_MODEL_INDEX,
+    );
+    assert.equal(agyOrchOptOut.frontmatterModel, "flash_lite");
 
     // Check Claude Code architect -> opus
     const ccArchFm = parseYaml(

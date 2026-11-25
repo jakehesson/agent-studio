@@ -335,12 +335,55 @@ describe("Multi-IDE Compiler (Golden Fixtures & Orchestrator Read-Only)", () => 
 
     const ccSettings = JSON.parse(
       fs.readFileSync(path.join(repo, ".claude", "settings.json"), "utf8"),
-    ) as { hooks: Record<string, Array<{ hooks: Array<{ command: string }> }>> };
-    for (const ev of ["PreToolUse", "PostToolUse", "SubagentStart", "SubagentStop", "Stop"]) {
+    ) as { hooks: Record<string, Array<{ matcher?: string; hooks: Array<{ command: string }> }>> };
+    for (const ev of [
+      "PreToolUse",
+      "PostToolUse",
+      "PostToolUseFailure",
+      "SubagentStart",
+      "SubagentStop",
+      "Stop",
+    ]) {
       const list = ccSettings.hooks[ev];
       assert.ok(Array.isArray(list) && list.length === 1, `missing Claude hook ${ev}`);
       assert.ok(
         list[0]?.hooks[0]?.command.includes(`--ide claude-code --event ${ev}`),
+      );
+      if (ev === "PreToolUse" || ev === "PostToolUse" || ev === "PostToolUseFailure") {
+        assert.equal(list[0]?.matcher, "*", `${ev} must have matcher: "*"`);
+      }
+    }
+
+    // Verify backend-engineer Claude tools exclude deprecated MultiEdit
+    const ccBackendFm = parseYaml(
+      splitFrontmatter(
+        fs.readFileSync(path.join(repo, ".claude", "agents", "backend-engineer.md"), "utf8"),
+      ).frontmatter ?? "",
+    ) as { tools: string[] };
+    assert.ok(ccBackendFm.tools.includes("Edit"));
+    assert.ok(ccBackendFm.tools.includes("Write"));
+    assert.ok(!ccBackendFm.tools.includes("MultiEdit"));
+
+    // Verify Copilot hooks include SessionStart, UserPromptSubmit, PreCompact alongside tool/subagent/stop hooks
+    const vscHooks = JSON.parse(
+      fs.readFileSync(path.join(repo, ".github", "hooks", "agent-studio.json"), "utf8"),
+    ) as { hooks: Record<string, Array<{ command: string }>> };
+    for (const ev of [
+      "SessionStart",
+      "UserPromptSubmit",
+      "PreCompact",
+      "PreToolUse",
+      "PostToolUse",
+      "SubagentStart",
+      "SubagentStop",
+      "Stop",
+    ]) {
+      assert.ok(
+        Array.isArray(vscHooks.hooks[ev]) && vscHooks.hooks[ev]!.length === 1,
+        `missing Copilot hook ${ev}`,
+      );
+      assert.ok(
+        vscHooks.hooks[ev]![0]?.command.includes(`--ide copilot-vscode --event ${ev}`),
       );
     }
 

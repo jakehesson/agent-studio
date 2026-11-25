@@ -85,6 +85,9 @@ roster:
       - backend-engineer
       - frontend-engineer
       - code-reviewer
+      - vscode-copilot-specialist
+      - claude-code-specialist
+      - antigravity-specialist
       - qa-validator
       - release-engineer
     description: Strict manager and dispatcher overseeing ready -> design -> dev ->
@@ -159,6 +162,48 @@ roster:
       conformance, performance, concurrency, and test coverage before QA gate
       sign-off.
     modelTier: reasoning
+  - id: vscode-copilot-specialist
+    name: VS Code Copilot Specialist
+    roleType: specialist
+    boardRole: review
+    promptFile: agents/vscode-copilot-specialist.md
+    capabilities:
+      - read
+      - search
+      - shell
+      - mcp_board
+    description: Read-only VS Code / GitHub Copilot validation specialist auditing
+      .github/ compilation, hooks, PushBus subagent re-homing,
+      CopilotVSCodeAdapter enrichment, and live-follow SSE/UI scoping.
+    modelTier: reasoning
+  - id: claude-code-specialist
+    name: Claude Code Specialist
+    roleType: specialist
+    boardRole: review
+    promptFile: agents/claude-code-specialist.md
+    capabilities:
+      - read
+      - search
+      - shell
+      - mcp_board
+    description: Read-only Claude Code validation specialist auditing .claude/
+      compilation, PreToolUse deny contract, ClaudeCodeAdapter
+      dedup/compact/subagent correlation, and MCP App filtering.
+    modelTier: reasoning
+  - id: antigravity-specialist
+    name: Antigravity Specialist
+    roleType: specialist
+    boardRole: review
+    promptFile: agents/antigravity-specialist.md
+    capabilities:
+      - read
+      - search
+      - shell
+      - mcp_board
+    description: Read-only Antigravity validation specialist auditing plugin
+      compilation, AntigravityAdapter full-file discovery and spawn
+      correlation, SSE streaming, embed=1 scoping, and MCP App.
+    modelTier: reasoning
   - id: qa-validator
     name: QA Validator
     roleType: qa
@@ -208,6 +253,7 @@ skills:
   - skills/ux-review
   - skills/code-review
   - skills/architecture-review
+  - skills/platform-validation
   - skills/qa-validation
   - skills/token-efficiency
   - skills/model-routing

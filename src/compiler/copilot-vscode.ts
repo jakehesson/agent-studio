@@ -26,6 +26,9 @@ import {
 } from "./shared.js";
 
 export const COPILOT_HOOK_EVENTS = [
+  "SessionStart",
+  "UserPromptSubmit",
+  "PreCompact",
   "PreToolUse",
   "PostToolUse",
   "SubagentStart",

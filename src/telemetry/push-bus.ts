@@ -5,17 +5,119 @@ import { getAgentStudioHome, listProjects } from "../board/registry.js";
 import { NormalizedEventSchema } from "../schema/telemetry.js";
 import { defaultEventBodyStore, type EventBodyStore } from "./body-store.js";
 import {
+  cleanHumanSummary,
   computeDeterministicEventId,
   computeMergeKey,
   normalizeWsPath,
   parseEpochSeconds,
+  prettifyModelName,
   toIsoUtc,
   type DiscoveredSession,
   type EnrichedEvent,
   type TelemetryChannel,
+  type UsageDelta,
 } from "./types.js";
 
 export const MAX_EVENTS_PER_SESSION = 2000;
+export const MAX_TRANSCRIPT_BYTES = 20 * 1024 * 1024;
+export const MAX_TRANSCRIPT_PATHS_PER_SESSION = 64;
+
+/**
+ * Fast syntactic pre-check for transcriptPath / agentTranscriptPath values.
+ * Rejects non-strings, empty strings, null bytes/control chars, UNC/device
+ * prefixes, explicit `..` segments, relative paths, non-`.jsonl` suffixes,
+ * and `telemetry.jsonl`.
+ */
+export function isValidTranscriptPathSyntax(rawPath: unknown): rawPath is string {
+  if (typeof rawPath !== "string") return false;
+  if (/[\x00-\x1f\x7f]/.test(rawPath)) return false;
+  const trimmed = rawPath.trim();
+  if (!trimmed) return false;
+  // Reject UNC paths (\\host\share, //host/share) and Windows device paths (\\?\, \\.\)
+  if (/^(?:\\\\|\/\/|\\\\\?\\|\\\\\.\\|[\\/]{2})/.test(trimmed)) return false;
+  // Reject explicit parent-directory traversal segments
+  if (/(?:^|[\\/])\.\.(?:$|[\\/])/.test(trimmed)) return false;
+  if (!path.isAbsolute(trimmed)) return false;
+  if (!/\.jsonl$/i.test(trimmed)) return false;
+  if (path.basename(trimmed).toLowerCase() === "telemetry.jsonl") return false;
+  return true;
+}
+
+function isPathStrictlyInsideRoot(realRoot: string, realTarget: string): boolean {
+  const parsedRoot = path.parse(realRoot);
+  if (parsedRoot.root === realRoot) return false;
+  const normRoot =
+    process.platform === "win32" ? realRoot.toLowerCase() : realRoot;
+  const normTarget =
+    process.platform === "win32" ? realTarget.toLowerCase() : realTarget;
+  const rel = path.relative(normRoot, normTarget);
+  if (!rel || rel === "." || rel === "..") return false;
+  if (rel.startsWith(".." + path.sep)) return false;
+  if (path.isAbsolute(rel)) return false;
+  return true;
+}
+
+/**
+ * Validates that `rawPath` is a regular `.jsonl` file (<= maxBytes) whose
+ * resolved `fs.realpath` remains strictly contained within at least one
+ * directory in `allowedRoots`. Returns the canonical realpath or `null`.
+ */
+export async function validateTranscriptPath(
+  rawPath: unknown,
+  allowedRoots: ReadonlyArray<string>,
+  opts?: { maxBytes?: number },
+): Promise<string | null> {
+  if (!isValidTranscriptPathSyntax(rawPath)) return null;
+  const trimmed = rawPath.trim();
+  const maxBytes = opts?.maxBytes ?? MAX_TRANSCRIPT_BYTES;
+
+  let lst;
+  try {
+    lst = await fs.lstat(trimmed);
+  } catch {
+    return null;
+  }
+  if (!lst.isFile() && !lst.isSymbolicLink()) {
+    return null;
+  }
+
+  let realPath: string;
+  try {
+    realPath = await fs.realpath(trimmed);
+  } catch {
+    return null;
+  }
+  if (
+    !/\.jsonl$/i.test(realPath) ||
+    path.basename(realPath).toLowerCase() === "telemetry.jsonl"
+  ) {
+    return null;
+  }
+
+  let st;
+  try {
+    st = await fs.stat(realPath);
+  } catch {
+    return null;
+  }
+  if (!st.isFile() || st.size > maxBytes) {
+    return null;
+  }
+
+  for (const root of allowedRoots) {
+    if (typeof root !== "string" || !root.trim()) continue;
+    let realRoot: string;
+    try {
+      realRoot = await fs.realpath(root.trim());
+    } catch {
+      continue;
+    }
+    if (isPathStrictlyInsideRoot(realRoot, realPath)) {
+      return realPath;
+    }
+  }
+  return null;
+}
 
 export interface IngestResult {
   accepted: number;
@@ -222,6 +324,36 @@ export function coerceToEnrichedEvent(raw: unknown): EnrichedEvent {
       ? obj.waitingReason
       : undefined;
 
+  const rawUsageDelta =
+    obj.usageDelta &&
+    typeof obj.usageDelta === "object" &&
+    !Array.isArray(obj.usageDelta)
+      ? (obj.usageDelta as UsageDelta)
+      : rawPayload?._usageDelta &&
+          typeof rawPayload._usageDelta === "object" &&
+          !Array.isArray(rawPayload._usageDelta)
+        ? (rawPayload._usageDelta as UsageDelta)
+        : undefined;
+
+  const topModel =
+    typeof obj.model === "string" && obj.model.trim()
+      ? obj.model.trim()
+      : typeof rawPayload?.model === "string" && rawPayload.model.trim()
+        ? rawPayload.model.trim()
+        : undefined;
+
+  let usageDelta: UsageDelta | undefined = rawUsageDelta
+    ? { ...rawUsageDelta }
+    : undefined;
+  if (topModel && !usageDelta?.model) {
+    const pretty = prettifyModelName(topModel) || topModel;
+    usageDelta = {
+      ...(usageDelta ?? {}),
+      model: pretty,
+      modelSource: usageDelta?.modelSource ?? "exact",
+    };
+  }
+
   return {
     ...validated,
     epoch,
@@ -233,13 +365,24 @@ export function coerceToEnrichedEvent(raw: unknown): EnrichedEvent {
     isSelfDaemon,
     isError,
     waitingReason,
+    ...(usageDelta ? { usageDelta } : {}),
   };
+}
+
+export interface SubagentParentMapping {
+  parentSessionId: string;
+  agentId: string;
+  agentLabel?: string;
+  agentType?: string;
 }
 
 export class PushBus extends EventEmitter {
   private readonly sessions = new Map<string, EnrichedEvent[]>();
   private readonly seenIds = new Map<string, Set<string>>();
   private readonly fileOffsets = new Map<string, number>();
+  private readonly subagentToParent = new Map<string, SubagentParentMapping>();
+  private readonly sessionTranscriptPaths = new Map<string, Set<string>>();
+  private readonly agentTranscriptPaths = new Map<string, Map<string, string>>();
   private readonly extraWorkspaces: string[];
   private readonly includeGlobalFile: boolean;
   private readonly bodyStore: EventBodyStore;
@@ -251,6 +394,120 @@ export class PushBus extends EventEmitter {
     this.bodyStore = options?.bodyStore ?? defaultEventBodyStore;
   }
 
+  getExtraWorkspaces(): string[] {
+    return [...this.extraWorkspaces];
+  }
+
+  getTranscriptPaths(sessionId: string): string[] {
+    return [...(this.sessionTranscriptPaths.get(sessionId) ?? [])];
+  }
+
+  getAgentTranscriptPaths(sessionId: string): Map<string, string> {
+    return new Map(this.agentTranscriptPaths.get(sessionId) ?? []);
+  }
+
+  private recordTranscriptPath(
+    sessionId: string,
+    agentId: string,
+    transcriptPath: string | undefined,
+  ): void {
+    if (!isValidTranscriptPathSyntax(transcriptPath)) return;
+    const tp = transcriptPath.trim();
+    let set = this.sessionTranscriptPaths.get(sessionId);
+    if (!set) {
+      set = new Set();
+      this.sessionTranscriptPaths.set(sessionId, set);
+    }
+    if (!set.has(tp)) {
+      if (set.size >= MAX_TRANSCRIPT_PATHS_PER_SESSION) return;
+      set.add(tp);
+    }
+    let byAgent = this.agentTranscriptPaths.get(sessionId);
+    if (!byAgent) {
+      byAgent = new Map();
+      this.agentTranscriptPaths.set(sessionId, byAgent);
+    }
+    const targetKey = agentId && agentId.trim() ? agentId.trim() : "root";
+    if (
+      !byAgent.has(targetKey) &&
+      byAgent.size >= MAX_TRANSCRIPT_PATHS_PER_SESSION
+    ) {
+      return;
+    }
+    byAgent.set(targetKey, tp);
+  }
+
+  private migrateOrphanSession(
+    orphanSessionId: string,
+    mapping: SubagentParentMapping,
+  ): void {
+    if (!orphanSessionId || orphanSessionId === mapping.parentSessionId) return;
+    const orphanEvents = this.sessions.get(orphanSessionId);
+    const orphanPaths = this.sessionTranscriptPaths.get(orphanSessionId);
+    const orphanAgentPaths = this.agentTranscriptPaths.get(orphanSessionId);
+
+    if (orphanEvents && orphanEvents.length > 0) {
+      let parentList = this.sessions.get(mapping.parentSessionId);
+      let parentIds = this.seenIds.get(mapping.parentSessionId);
+      if (!parentList || !parentIds) {
+        parentList = [];
+        parentIds = new Set();
+        this.sessions.set(mapping.parentSessionId, parentList);
+        this.seenIds.set(mapping.parentSessionId, parentIds);
+      }
+
+      for (const oldEv of orphanEvents) {
+        if (parentIds.has(oldEv.id)) continue;
+        const body = this.bodyStore.get(orphanSessionId, oldEv.id);
+        if (body && !this.bodyStore.has(mapping.parentSessionId, oldEv.id)) {
+          this.bodyStore.set(mapping.parentSessionId, oldEv.id, body.body);
+        }
+
+        const migrated: EnrichedEvent = {
+          ...oldEv,
+          sessionId: mapping.parentSessionId,
+          agentId: mapping.agentId,
+          parentAgentId: "root",
+          agentLabel: oldEv.agentLabel || mapping.agentLabel,
+          mergeKey: computeMergeKey({
+            sessionId: mapping.parentSessionId,
+            agentId: mapping.agentId,
+            kind: oldEv.kind,
+            toolCallId: oldEv.toolCallId,
+            toolName: oldEv.toolName,
+            epoch: oldEv.epoch,
+          }),
+        };
+        parentList.push(migrated);
+        parentIds.add(migrated.id);
+      }
+
+      parentList.sort((a, b) => a.epoch - b.epoch);
+      while (parentList.length > MAX_EVENTS_PER_SESSION) {
+        const evicted = parentList.shift();
+        if (evicted) {
+          parentIds.delete(evicted.id);
+        }
+      }
+    }
+
+    if (orphanPaths) {
+      for (const tp of orphanPaths) {
+        this.recordTranscriptPath(mapping.parentSessionId, mapping.agentId, tp);
+      }
+    }
+    if (orphanAgentPaths) {
+      for (const tp of orphanAgentPaths.values()) {
+        this.recordTranscriptPath(mapping.parentSessionId, mapping.agentId, tp);
+      }
+    }
+
+    this.sessions.delete(orphanSessionId);
+    this.seenIds.delete(orphanSessionId);
+    this.sessionTranscriptPaths.delete(orphanSessionId);
+    this.agentTranscriptPaths.delete(orphanSessionId);
+  }
+
   ingest(rawItems: unknown[]): IngestResult {
     let accepted = 0;
     let deduped = 0;
@@ -259,6 +516,139 @@ export class PushBus extends EventEmitter {
     for (const raw of rawItems) {
       const ev = coerceToEnrichedEvent(raw);
       const rawBody = extractRawBodyText(raw);
+
+      // Re-home events belonging to a known subagent session (or carrying explicit parentSessionId)
+      const originalSessionId = ev.sessionId;
+      const parentMapping = this.subagentToParent.get(originalSessionId);
+      const explicitParentSid =
+        typeof ev.payload?.parentSessionId === "string" &&
+        ev.payload.parentSessionId.trim() &&
+        ev.payload.parentSessionId.trim() !== originalSessionId
+          ? ev.payload.parentSessionId.trim()
+          : undefined;
+
+      if (parentMapping) {
+        ev.sessionId = parentMapping.parentSessionId;
+        ev.agentId = parentMapping.agentId;
+        ev.parentAgentId = "root";
+        ev.agentLabel = ev.agentLabel || parentMapping.agentLabel;
+        ev.mergeKey = computeMergeKey({
+          sessionId: ev.sessionId,
+          agentId: ev.agentId,
+          kind: ev.kind,
+          toolCallId: ev.toolCallId,
+          toolName: ev.toolName,
+          epoch: ev.epoch,
+        });
+      } else if (explicitParentSid) {
+        const payloadAgentId =
+          typeof ev.payload?.agentId === "string" &&
+          ev.payload.agentId.trim() &&
+          ev.payload.agentId.trim() !== "root"
+            ? ev.payload.agentId.trim()
+            : undefined;
+        const resolvedAgentId =
+          ev.agentId !== "root"
+            ? ev.agentId
+            : payloadAgentId ?? originalSessionId;
+        const resolvedLabel =
+          ev.agentLabel ||
+          (typeof ev.payload?.agentLabel === "string" &&
+          ev.payload.agentLabel.trim()
+            ? ev.payload.agentLabel.trim()
+            : undefined);
+        const resolvedType =
+          typeof ev.payload?.agentType === "string" &&
+          ev.payload.agentType.trim()
+            ? ev.payload.agentType.trim()
+            : undefined;
+        ev.sessionId = explicitParentSid;
+        ev.agentId = resolvedAgentId;
+        ev.parentAgentId = "root";
+        ev.agentLabel = resolvedLabel;
+        ev.mergeKey = computeMergeKey({
+          sessionId: ev.sessionId,
+          agentId: ev.agentId,
+          kind: ev.kind,
+          toolCallId: ev.toolCallId,
+          toolName: ev.toolName,
+          epoch: ev.epoch,
+        });
+        if (
+          originalSessionId &&
+          originalSessionId !== "root" &&
+          originalSessionId !== "subagent" &&
+          originalSessionId !== "default"
+        ) {
+          const memoized: SubagentParentMapping = {
+            parentSessionId: explicitParentSid,
+            agentId: resolvedAgentId,
+            agentLabel: resolvedLabel,
+            agentType: resolvedType,
+          };
+          this.subagentToParent.set(originalSessionId, memoized);
+          this.migrateOrphanSession(originalSessionId, memoized);
+        }
+      }
+
+      // Register subagent-to-parent mapping on subagent_spawn and re-home any out-of-order orphan session
+      if (ev.kind === "subagent_spawn" && ev.targetAgentId) {
+        const rawSubId =
+          typeof ev.payload?.agentId === "string" && ev.payload.agentId.trim()
+            ? ev.payload.agentId.trim()
+            : undefined;
+        const agentType =
+          typeof ev.payload?.agentType === "string" &&
+          ev.payload.agentType.trim()
+            ? ev.payload.agentType.trim()
+            : undefined;
+        const agentLabel =
+          (typeof ev.payload?.agentLabel === "string" &&
+          ev.payload.agentLabel.trim()
+            ? ev.payload.agentLabel.trim()
+            : undefined) ?? agentType;
+        const mapping: SubagentParentMapping = {
+          parentSessionId: ev.sessionId,
+          agentId: ev.targetAgentId,
+          agentLabel,
+          agentType,
+        };
+        if (ev.targetAgentId !== "subagent" && ev.targetAgentId !== "root") {
+          this.subagentToParent.set(ev.targetAgentId, mapping);
+          this.migrateOrphanSession(ev.targetAgentId, mapping);
+        }
+        if (
+          rawSubId &&
+          rawSubId !== ev.targetAgentId &&
+          rawSubId !== "subagent" &&
+          rawSubId !== "root"
+        ) {
+          this.subagentToParent.set(rawSubId, mapping);
+          this.migrateOrphanSession(rawSubId, mapping);
+        }
+      }
+
+      if (
+        (ev.kind === "subagent_spawn" || ev.kind === "subagent_done") &&
+        ev.targetAgentId
+      ) {
+        if (typeof ev.payload?.agentTranscriptPath === "string") {
+          this.recordTranscriptPath(
+            ev.sessionId,
+            ev.targetAgentId,
+            ev.payload.agentTranscriptPath,
+          );
+        }
+      }
+
+      if (typeof ev.payload?.transcriptPath === "string") {
+        this.recordTranscriptPath(
+          ev.sessionId,
+          ev.agentId,
+          ev.payload.transcriptPath,
+        );
+      }
+
       let list = this.sessions.get(ev.sessionId);
       let ids = this.seenIds.get(ev.sessionId);
       if (!list || !ids) {
@@ -329,6 +719,25 @@ export class PushBus extends EventEmitter {
             e.kind === "board_mutation",
         );
 
+      const firstUser = evs.find((e) => e.kind === "user_input");
+      const rawPromptTitle = firstUser
+        ? (typeof firstUser.payload?.prompt === "string" &&
+          firstUser.payload.prompt.trim()
+            ? firstUser.payload.prompt
+            : typeof firstUser.payload?.body === "string" &&
+                firstUser.payload.body.trim()
+              ? firstUser.payload.body
+              : firstUser.summary.replace(/^Human:\s*/i, ""))
+        : undefined;
+      const nonSessionStart = evs.find((e) => e.kind !== "session_start");
+      const title =
+        (rawPromptTitle ? cleanHumanSummary(rawPromptTitle, 80) : "") ||
+        cleanHumanSummary(
+          (nonSessionStart ?? first).summary,
+          80,
+        ) ||
+        `Live ${sessionId.slice(0, 8)}`;
+
       out.push({
         ide: first.ide,
         sessionId,
@@ -338,7 +747,7 @@ export class PushBus extends EventEmitter {
         workspacePath: ws,
         workspaces: ws ? [ws] : [],
         projectId: pid,
-        title: first.summary.slice(0, 80) || `Live ${sessionId.slice(0, 8)}`,
+        title,
         mtimeMs: Math.round(last.epoch * 1000),
         sizeBytes: evs.length,
         isMultiAgent: isMulti,

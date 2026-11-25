@@ -28,6 +28,7 @@ import {
 export const CLAUDE_HOOK_EVENTS = [
   "PreToolUse",
   "PostToolUse",
+  "PostToolUseFailure",
   "SubagentStart",
   "SubagentStop",
   "Stop",
@@ -45,7 +46,11 @@ export function buildClaudeCodeHooks(): Record<string, ClaudeHookRule[]> {
         },
       ],
     };
-    if (eventName === "PreToolUse" || eventName === "PostToolUse") {
+    if (
+      eventName === "PreToolUse" ||
+      eventName === "PostToolUse" ||
+      eventName === "PostToolUseFailure"
+    ) {
       rule.matcher = "*";
     }
     hooks[eventName] = [rule];

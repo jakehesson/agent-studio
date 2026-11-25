@@ -80,9 +80,9 @@ export class AgentStudioApp {
       this.lockedIde = opts.lockedIde;
       this.ideFilter = opts.lockedIde;
     }
-    if (opts.initialProject) this.selectedProject = opts.initialProject;
-    if (opts.initialWorkspace) this.lockedWorkspace = opts.initialWorkspace;
-    if (opts.initialSession) this.selectedSessionId = opts.initialSession;
+    if (opts.initialProject?.trim()) this.selectedProject = opts.initialProject.trim();
+    if (opts.initialWorkspace?.trim()) this.lockedWorkspace = opts.initialWorkspace.trim();
+    if (opts.initialSession?.trim()) this.selectedSessionId = opts.initialSession.trim();
     if (this.mcpAppMode && (this.selectedProject || this.lockedWorkspace)) {
       this.embedMode = true;
     }
@@ -259,8 +259,11 @@ export class AgentStudioApp {
     }
 
     if (typeof directive.session === "string" && directive.session.trim()) {
-      this.selectedSessionId = directive.session.trim();
-      scopeChanged = true;
+      const nextSession = directive.session.trim();
+      if (nextSession !== this.selectedSessionId) {
+        this.selectedSessionId = nextSession;
+        scopeChanged = true;
+      }
     }
 
     if (scopeChanged) {
@@ -269,6 +272,12 @@ export class AgentStudioApp {
       this.teamView.setEmbedScope(scope);
       this.doctorView.setEmbedScope(scope);
       this.refreshContextBar();
+      this.stream.updateParams({
+        session: this.selectedSessionId,
+        ide: this.ideFilter,
+        project: this.selectedProject,
+        workspace: this.lockedWorkspace || undefined,
+      });
     }
 
     if (directive.snapshot && typeof directive.snapshot === "object") {
@@ -421,13 +430,46 @@ export class AgentStudioApp {
     this.refreshContextBar();
   }
 
+  private pickPreferredSession(sessions: DiscoveredSessionSummary[]): string {
+    const preferred =
+      sessions.find((s) => s.ide !== "mcp" && !s.sessionId.startsWith("mcp-")) ??
+      sessions[0];
+    return preferred?.sessionId ?? "";
+  }
+
   private handleIncomingSnapshot(snap: SessionSnapshot): void {
     if (snap.boardProjects) this.mergeProjects(snap.boardProjects);
     if (Array.isArray(snap.sessions)) {
+      const prevSelected = this.selectedSessionId
+        ? this.sessions.find((s) => s.sessionId === this.selectedSessionId)
+        : undefined;
       this.sessions = snap.sessions;
+      if (
+        this.multiOnly &&
+        prevSelected &&
+        !this.sessions.some((s) => s.sessionId === prevSelected.sessionId)
+      ) {
+        this.sessions = [prevSelected, ...this.sessions];
+      }
     }
     if (!this.selectedSessionId && snap.sessionId) {
       this.selectedSessionId = snap.sessionId;
+      this.syncUrlState();
+      if (this.stream.getSession() !== this.selectedSessionId) {
+        this.stream.updateParams({
+          session: this.selectedSessionId,
+          ide: this.ideFilter,
+          project: this.selectedProject,
+          workspace: this.lockedWorkspace || undefined,
+        });
+      }
+    } else if (
+      this.selectedSessionId &&
+      snap.sessionId &&
+      snap.sessionId !== this.selectedSessionId
+    ) {
+      this.refreshContextBar();
+      return;
     }
     this.studioView.setSnapshot(snap);
     this.doctorView.notifyLiveSnapshot(snap);
@@ -436,6 +478,9 @@ export class AgentStudioApp {
 
   private async refreshSessions(): Promise<void> {
     try {
+      const prevSelected = this.selectedSessionId
+        ? this.sessions.find((s) => s.sessionId === this.selectedSessionId)
+        : undefined;
       const res = await fetchSessions({
         ide: this.ideFilter,
         project: this.selectedProject,
@@ -443,12 +488,24 @@ export class AgentStudioApp {
         multiOnly: this.multiOnly,
       });
       this.sessions = res.sessions;
+      if (
+        this.multiOnly &&
+        prevSelected &&
+        !this.sessions.some((s) => s.sessionId === prevSelected.sessionId)
+      ) {
+        this.sessions = [prevSelected, ...this.sessions];
+      }
       this.mergeProjects(res.projects);
       if (
         !this.selectedSessionId ||
-        !this.sessions.some((s) => s.sessionId === this.selectedSessionId)
+        (!this.multiOnly &&
+          this.sessions.length > 0 &&
+          !this.sessions.some((s) => s.sessionId === this.selectedSessionId))
       ) {
-        this.selectedSessionId = this.sessions[0]?.sessionId ?? "";
+        this.selectedSessionId = this.pickPreferredSession(this.sessions);
+        if (this.selectedSessionId) {
+          this.syncUrlState();
+        }
       }
       this.refreshContextBar();
     } catch {

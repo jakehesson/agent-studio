@@ -256,6 +256,20 @@ interface MutableAgentState {
   contextTokens: number;
   costUsd?: number;
   fallbackChars: number;
+  fallbackInputChars: number;
+  fallbackOutputChars: number;
+}
+
+function payloadTextLen(val: unknown): number {
+  if (typeof val === "string") return val.length;
+  if (val && typeof val === "object") {
+    try {
+      return JSON.stringify(val).length;
+    } catch {
+      return 0;
+    }
+  }
+  return 0;
 }
 
 function formatHms(epochSec: number): string {
@@ -366,6 +380,8 @@ export function buildSessionSnapshot(
         cachedTokens: 0,
         contextTokens: 0,
         fallbackChars: 0,
+        fallbackInputChars: 0,
+        fallbackOutputChars: 0,
       };
       agentMap.set(id, st);
       agentOrder.push(id);
@@ -449,7 +465,46 @@ export function buildSessionSnapshot(
     ag.steps += 1;
     if (ag.firstEventEpoch === 0) ag.firstEventEpoch = ev.epoch;
     ag.lastEventEpoch = Math.max(ag.lastEventEpoch, ev.epoch);
-    ag.fallbackChars += ev.summary.length;
+    const bodyChars = Math.max(
+      ev.bodyLength ?? 0,
+      payloadTextLen(ev.payload?.body),
+      payloadTextLen(ev.payload?.prompt),
+    );
+    const toolInChars = Math.max(
+      payloadTextLen(ev.payload?.toolArgs),
+      payloadTextLen(ev.payload?.toolInput),
+      payloadTextLen(ev.payload?.args),
+      payloadTextLen(ev.payload?.input),
+    );
+    const toolOutChars = Math.max(
+      payloadTextLen(ev.payload?.toolResult),
+      payloadTextLen(ev.payload?.resultDetails),
+      payloadTextLen(ev.payload?.preview),
+    );
+    const evCharSpan = Math.max(
+      ev.summary.length,
+      bodyChars,
+      toolInChars,
+      toolOutChars,
+    );
+    ag.fallbackChars += evCharSpan;
+    if (ev.kind === "user_input") {
+      ag.fallbackInputChars += Math.max(ev.summary.length, bodyChars);
+    } else if (ev.kind === "tool_end") {
+      ag.fallbackInputChars += Math.max(ev.summary.length, toolOutChars, bodyChars);
+    } else if (ev.kind === "tool_start" || ev.kind === "board_mutation") {
+      ag.fallbackOutputChars += Math.max(ev.summary.length, toolInChars);
+    } else if (
+      ev.kind === "subagent_spawn" ||
+      ev.kind === "message" ||
+      ev.kind === "assistant_turn_end" ||
+      ev.kind === "subagent_done" ||
+      ev.kind === "thinking_start"
+    ) {
+      ag.fallbackOutputChars += Math.max(ev.summary.length, bodyChars);
+    } else {
+      ag.fallbackInputChars += ev.summary.length;
+    }
 
     // Fold per-event UsageDelta metadata if present
     const uDelta: UsageDelta | undefined =
@@ -517,6 +572,13 @@ export function buildSessionSnapshot(
     }
 
     // Apply child model hint attached to subagent_spawn payloads (e.g. spawned child with 0 rows)
+    const spawnLabelHint =
+      (typeof ev.payload?.agentLabel === "string" && ev.payload.agentLabel.trim()
+        ? ev.payload.agentLabel.trim()
+        : undefined) ||
+      (typeof ev.payload?.agentType === "string" && ev.payload.agentType.trim()
+        ? ev.payload.agentType.trim()
+        : undefined);
     if (
       ev.kind === "subagent_spawn" &&
       ev.targetAgentId &&
@@ -524,6 +586,7 @@ export function buildSessionSnapshot(
       ev.payload.childModel.trim()
     ) {
       const childSt = ensureAgent(ev.targetAgentId, {
+        label: spawnLabelHint,
         parentAgentId: ag.id,
         ide: ev.ide,
         epoch: ev.epoch,
@@ -756,10 +819,14 @@ export function buildSessionSnapshot(
         totalMessages += 1;
         const targetId = ev.targetAgentId || "subagent";
         const child = ensureAgent(targetId, {
+          label: spawnLabelHint,
           parentAgentId: ag.id,
           ide: ev.ide,
           epoch: ev.epoch,
         });
+        child.steps += 1;
+        if (child.firstEventEpoch === 0) child.firstEventEpoch = ev.epoch;
+        child.lastEventEpoch = Math.max(child.lastEventEpoch, ev.epoch);
         child.reportedDone = false;
         child.messagesReceived += 1;
         child.isThinking = true;
@@ -792,6 +859,10 @@ export function buildSessionSnapshot(
       }
 
       case "subagent_done": {
+        // Never mark root as reportedDone when targetAgentId is absent
+        if (!ev.targetAgentId && (ag.id === "root" || ag.id === rootId)) {
+          break;
+        }
         // Could be emitted either by the child itself or by the parent receiving tool_result for targetAgentId
         const doneId =
           ev.targetAgentId && ev.targetAgentId !== ag.id
@@ -1030,10 +1101,12 @@ export function buildSessionSnapshot(
     }
   }
 
-  // Resolve root model first so Antigravity subagents without explicit model can inherit it
+  // Resolve root model first so subagents without explicit model can inherit it
   const rootAgForModel = agentMap.get(rootId);
   if (rootAgForModel && !rootAgForModel.model) {
-    const defModel = defModelById.get(rootId.toLowerCase());
+    const defModel =
+      defModelById.get(rootId.toLowerCase()) ??
+      (rootId === "root" ? defModelById.get("orchestrator") : undefined);
     if (defModel) {
       rootAgForModel.model = defModel;
       rootAgForModel.modelSource = "definition";
@@ -1048,6 +1121,7 @@ export function buildSessionSnapshot(
   let sessionCostUsd = 0;
   let hasAnyCost = false;
   let peakContextPercent = 0;
+  let peakContextTokens = 0;
   let peakContextAgentId: string | null = null;
   let exactUsageAgents = 0;
   let estimatedUsageAgents = 0;
@@ -1074,7 +1148,7 @@ export function buildSessionSnapshot(
         completedAgentCount += 1;
       }
 
-      // Resolve model fallback chain: runtime exact/inherited -> definition -> root inherit (Antigravity) -> "Unknown"
+      // Resolve model fallback chain: runtime exact/inherited -> definition -> root inherit -> "Unknown"
       let finalModel = ag.model;
       let finalModelSource: ModelSource = ag.modelSource;
       if (!finalModel) {
@@ -1084,7 +1158,13 @@ export function buildSessionSnapshot(
         if (defMatch) {
           finalModel = defMatch;
           finalModelSource = "definition";
-        } else if (!ag.isRoot && ag.ide === "antigravity" && resolvedRootModel) {
+        } else if (
+          !ag.isRoot &&
+          (ag.ide === "antigravity" ||
+            ag.ide === "copilot-vscode" ||
+            ag.ide === "claude-code") &&
+          resolvedRootModel
+        ) {
           finalModel = resolvedRootModel;
           finalModelSource = "inherited";
         } else {
@@ -1094,19 +1174,41 @@ export function buildSessionSnapshot(
       }
       agentModel = finalModel;
 
-      const inputTokens = ag.hasExplicitUsage
-        ? ag.inputTokens
-        : Math.round(ag.fallbackChars / 4);
-      const outputTokens = ag.hasExplicitUsage ? ag.outputTokens : 0;
+      let inputTokens = 0;
+      let outputTokens = 0;
+      if (ag.hasExplicitUsage) {
+        inputTokens = ag.inputTokens;
+        outputTokens = ag.outputTokens;
+      } else {
+        const rawIn = Math.round(ag.fallbackInputChars / 4);
+        const rawOut = Math.round(ag.fallbackOutputChars / 4);
+        if (rawIn > 0 && rawOut === 0) {
+          inputTokens = rawIn >= 2 ? Math.round(rawIn * 0.7) : rawIn;
+          outputTokens = Math.max(1, rawIn - inputTokens);
+        } else if (rawOut > 0 && rawIn === 0) {
+          outputTokens = rawOut >= 2 ? Math.max(1, Math.round(rawOut * 0.4)) : rawOut;
+          inputTokens = Math.max(1, rawOut - outputTokens);
+        } else {
+          inputTokens = rawIn;
+          outputTokens = rawOut;
+        }
+      }
       const cachedTokens = ag.hasExplicitUsage ? ag.cachedTokens : 0;
       const totalTokens = inputTokens + outputTokens + cachedTokens;
-      const contextWindow = inferContextWindow(finalModel);
+      const contextWindow = inferContextWindow(finalModel, ag.ide);
       const contextTokens = ag.hasExplicitUsage
         ? ag.contextTokens
         : inputTokens + outputTokens;
+      const rawPct = contextWindow > 0 ? (contextTokens / contextWindow) * 100 : 0;
+      const rounded1 = Math.round(rawPct * 10) / 10;
       const contextPercent =
-        contextWindow > 0
-          ? Math.min(100, Math.round((contextTokens / contextWindow) * 1000) / 10)
+        contextTokens > 0 && contextWindow > 0
+          ? Math.min(
+              100,
+              rounded1 > 0
+                ? rounded1
+                : Math.max(0.01, Math.round(rawPct * 100) / 100),
+            )
           : 0;
       const usageSource: UsageSource = ag.hasExplicitUsage
         ? ag.usageSource
@@ -1139,8 +1241,15 @@ export function buildSessionSnapshot(
       } else {
         estimatedUsageAgents += 1;
       }
-      if (contextPercent > peakContextPercent) {
+      if (
+        contextTokens > 0 &&
+        (contextPercent > peakContextPercent ||
+          (contextPercent === peakContextPercent &&
+            contextTokens > peakContextTokens) ||
+          peakContextAgentId === null)
+      ) {
         peakContextPercent = contextPercent;
+        peakContextTokens = contextTokens;
         peakContextAgentId = ag.id;
       }
 

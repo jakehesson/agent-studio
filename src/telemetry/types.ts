@@ -861,9 +861,12 @@ export function matchProjectIdForWorkspace(
   return undefined;
 }
 
-export function inferContextWindow(model: string): number {
+export function inferContextWindow(model: string, ide?: IdeSource): number {
   const low = (model || "").trim().toLowerCase();
-  if (!low || low === "unknown") return 200_000;
+  if (low.includes("[1m]")) return 1_000_000;
+  if (!low || low === "unknown") {
+    return ide === "antigravity" ? 1_000_000 : 200_000;
+  }
   if (low.includes("gemini")) return 1_000_000;
   if (low.includes("claude")) return 200_000;
   if (low.includes("gpt-4.1") || low.includes("gpt 4.1")) return 1_000_000;
@@ -891,19 +894,29 @@ export function prettifyModelName(raw: string): string {
   const stripped = trimmed.replace(MODEL_PREFIX_RE, "").trim();
   if (!stripped) return "";
 
+  const m1m = /\s*\[1m\]\s*$/i.exec(stripped);
+  const core = m1m ? stripped.slice(0, m1m.index).trim() : stripped;
+  const suffix = m1m ? " [1m]" : "";
+  if (!core) return "";
+
   // Preserve already-descriptive display names like "Gemini 4 Neon (High)"
-  if (/\s/.test(stripped) && /[A-Z]/.test(stripped)) {
-    return stripped;
+  if (/\s/.test(core) && /[A-Z]/.test(core)) {
+    return core + suffix;
   }
 
-  const low = stripped.toLowerCase();
-  if (low === "flash") return "Gemini Flash";
-  if (low === "flash_lite" || low === "flash-lite") return "Gemini Flash Lite";
-  if (low === "pro") return "Gemini Pro";
+  const low = core.toLowerCase();
+  if (low === "flash") return "Gemini Flash" + suffix;
+  if (low === "flash_lite" || low === "flash-lite") {
+    return "Gemini Flash Lite" + suffix;
+  }
+  if (low === "pro") return "Gemini Pro" + suffix;
+  if (low === "haiku") return "Claude Haiku" + suffix;
+  if (low === "sonnet") return "Claude Sonnet" + suffix;
+  if (low === "opus") return "Claude Opus" + suffix;
 
   // Match Gemini tier suffix pattern e.g. "gemini-4-neon-high" -> "Gemini 4 Neon (High)"
   const geminiTierMatch = /^gemini[-_](\d+(?:\.\d+)?)[-_]([a-z0-9]+)[-_](high|medium|low)$/i.exec(
-    stripped,
+    core,
   );
   if (geminiTierMatch?.[1] && geminiTierMatch[2] && geminiTierMatch[3]) {
     const ver = geminiTierMatch[1];
@@ -913,19 +926,19 @@ export function prettifyModelName(raw: string): string {
     const tier =
       geminiTierMatch[3].charAt(0).toUpperCase() +
       geminiTierMatch[3].slice(1).toLowerCase();
-    return `Gemini ${ver} ${variant} (${tier})`;
+    return `Gemini ${ver} ${variant} (${tier})${suffix}`;
   }
 
   // Match GPT models cleanly
   if (low.startsWith("gpt-")) {
-    return "GPT-" + stripped.slice(4);
+    return "GPT-" + core.slice(4) + suffix;
   }
-  if (/^o[134](?:[-_].+)?$/i.test(stripped)) {
-    return stripped.replace(/_/g, "-");
+  if (/^o[134](?:[-_].+)?$/i.test(core)) {
+    return core.replace(/_/g, "-") + suffix;
   }
 
   // Strip trailing YYYYMMDD snapshot date suffixes (e.g. claude-sonnet-4-5-20250929)
-  const withoutDate = stripped.replace(/[-_]20\d{6}$/, "");
+  const withoutDate = core.replace(/[-_]20\d{6}$/, "");
 
   // Convert hyphen/underscore slugs (e.g. "claude-sonnet-4" -> "Claude Sonnet 4",
   // "claude-sonnet-4-5" -> "Claude Sonnet 4.5", "gemini-2.5-flash" -> "Gemini 2.5 Flash")
@@ -948,5 +961,5 @@ export function prettifyModelName(raw: string): string {
       formatted.push(tok.charAt(0).toUpperCase() + tok.slice(1).toLowerCase());
     }
   }
-  return formatted.join(" ");
+  return formatted.join(" ") + suffix;
 }

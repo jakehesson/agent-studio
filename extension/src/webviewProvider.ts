@@ -56,6 +56,9 @@ export class StudioPanel {
   private readonly panel: vscode.WebviewPanel;
   private readonly disposables: vscode.Disposable[] = [];
   private currentView: StudioViewName = "studio";
+  private currentSessionId: string | undefined;
+  private currentResolvedUrl = "";
+  private currentOnline = false;
 
   private constructor(
     panel: vscode.WebviewPanel,
@@ -72,7 +75,7 @@ export class StudioPanel {
       }) => {
         if (msg?.type === "retry") {
           await this.serverManager.ensureRunning(true);
-          await this.render(this.currentView);
+          await this.render(this.currentView, this.currentSessionId, { force: true });
         } else if (msg?.type === "openExternal") {
           await vscode.commands.executeCommand("agentStudio.openInBrowser");
         } else if (msg?.type === "openFile" && typeof msg.uri === "string") {
@@ -153,12 +156,13 @@ export class StudioPanel {
   public static async createOrShow(
     serverManager: ServerManager,
     view: StudioViewName = "studio",
+    sessionId?: string,
   ): Promise<void> {
     await serverManager.ensureRunning(true);
 
     if (StudioPanel.currentPanel) {
       StudioPanel.currentPanel.panel.reveal(vscode.ViewColumn.One);
-      await StudioPanel.currentPanel.render(view);
+      await StudioPanel.currentPanel.render(view, sessionId);
       return;
     }
 
@@ -174,17 +178,27 @@ export class StudioPanel {
 
     const instance = new StudioPanel(panel, serverManager);
     StudioPanel.currentPanel = instance;
-    await instance.render(view);
+    await instance.render(view, sessionId);
   }
 
-  public async render(view: StudioViewName): Promise<void> {
-    this.currentView = view;
+  public async render(
+    view: StudioViewName,
+    sessionId?: string,
+    opts?: { force?: boolean },
+  ): Promise<void> {
+    const effectiveSessionId =
+      sessionId !== undefined
+        ? sessionId
+        : view === this.currentView
+          ? this.currentSessionId
+          : undefined;
+
     const status = this.serverManager.getStatus();
     const rawTargetUrl = this.serverManager.buildViewUrl(
       status.online ? status.localBaseUrl : status.browserBaseUrl,
       view,
       undefined,
-      { embed: true },
+      { embed: true, sessionId: effectiveSessionId },
     );
 
     let resolvedUrl = rawTargetUrl;
@@ -196,6 +210,21 @@ export class StudioPanel {
     } catch {
       resolvedUrl = rawTargetUrl;
     }
+
+    if (
+      !opts?.force &&
+      this.currentResolvedUrl &&
+      view === this.currentView &&
+      resolvedUrl === this.currentResolvedUrl &&
+      status.online === this.currentOnline
+    ) {
+      return;
+    }
+
+    this.currentView = view;
+    this.currentSessionId = effectiveSessionId;
+    this.currentResolvedUrl = resolvedUrl;
+    this.currentOnline = status.online;
 
     const nonce = getNonce();
     const safeUrl = escapeHtml(resolvedUrl);
@@ -377,14 +406,18 @@ export class StudioSidebarProvider
     webviewView.webview.options = { enableScripts: true };
 
     webviewView.webview.onDidReceiveMessage(
-      async (msg: { command?: string }) => {
+      async (msg: { command?: string; sessionId?: string }) => {
         if (!msg?.command) return;
         if (msg.command === "refresh") {
           await this.serverManager.ensureRunning(false);
           await this.refresh();
           return;
         }
-        await vscode.commands.executeCommand(msg.command);
+        if (msg.sessionId) {
+          await vscode.commands.executeCommand(msg.command, msg.sessionId);
+        } else {
+          await vscode.commands.executeCommand(msg.command);
+        }
       },
       null,
       this.disposables,
@@ -487,7 +520,7 @@ export class StudioSidebarProvider
                         : "idle";
               const label = escapeHtml(s.title || s.sessionId.slice(0, 8));
               const ide = escapeHtml(s.ide || "ide");
-              return `<button class="session-row" data-cmd="agentStudio.openStudio" title="${escapeHtml(s.sessionId)}">
+              return `<button class="session-row" data-cmd="agentStudio.openStudio" data-session-id="${escapeHtml(s.sessionId)}" title="${escapeHtml(s.sessionId)}">
                 <span class="dot ${dotClass}"></span>
                 <span class="session-name">${label}</span>
                 <span class="pill">${ide}</span>
@@ -678,7 +711,10 @@ export class StudioSidebarProvider
     document.querySelectorAll("[data-cmd]").forEach((el) => {
       el.addEventListener("click", () => {
         const cmd = el.getAttribute("data-cmd");
-        if (cmd) vscode.postMessage({ command: cmd });
+        const sessionId = el.getAttribute("data-session-id");
+        if (cmd) {
+          vscode.postMessage(sessionId ? { command: cmd, sessionId } : { command: cmd });
+        }
       });
     });
   </script>

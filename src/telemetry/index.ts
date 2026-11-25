@@ -1,3 +1,4 @@
+import os from "node:os";
 import path from "node:path";
 import { listProjects, resolveProject } from "../board/registry.js";
 import type { IdeSource } from "../schema/telemetry.js";
@@ -16,10 +17,15 @@ import {
 } from "./body-store.js";
 import { discoverTeamDetailsCached } from "./definitions.js";
 import { buildSessionSnapshot } from "./normalizer.js";
-import { PushBus, type IngestResult } from "./push-bus.js";
+import {
+  PushBus,
+  validateTranscriptPath,
+  type IngestResult,
+} from "./push-bus.js";
 import {
   type AdapterHealth,
   type DiscoveredSession,
+  type EnrichedEvent,
   type PassiveIdeAdapter,
   type RichSessionSnapshot,
 } from "./types.js";
@@ -234,8 +240,126 @@ export class TelemetryAggregator {
     const filtered = [...byId.values()].filter((s) =>
       sessionMatchesFilter(s, filter, projCriteria),
     );
-    filtered.sort((a, b) => b.mtimeMs - a.mtimeMs);
+    const isSyntheticMcp = (s: DiscoveredSession): boolean =>
+      s.ide === "mcp" && s.sessionId.startsWith("mcp-");
+    filtered.sort((a, b) => {
+      const synthDiff = Number(isSyntheticMcp(a)) - Number(isSyntheticMcp(b));
+      if (synthDiff !== 0) return synthDiff;
+      return b.mtimeMs - a.mtimeMs;
+    });
     return filtered.slice(0, filter.limit ?? 100);
+  }
+
+  private getAllowedTranscriptRoots(trustedWorkspacePath?: string): string[] {
+    const roots = new Set<string>();
+    const copilotAdapter = this.adapters.find(
+      (a): a is CopilotVSCodeAdapter => a instanceof CopilotVSCodeAdapter,
+    );
+    if (copilotAdapter) {
+      for (const dir of copilotAdapter.getStorageDirs()) {
+        roots.add(dir);
+      }
+    }
+    const antigravityAdapter = this.adapters.find(
+      (a): a is AntigravityAdapter => a instanceof AntigravityAdapter,
+    );
+    if (antigravityAdapter) {
+      roots.add(antigravityAdapter.getBrainDir());
+    }
+    const claudeAdapter = this.adapters.find(
+      (a): a is ClaudeCodeAdapter => a instanceof ClaudeCodeAdapter,
+    );
+    if (claudeAdapter) {
+      roots.add(claudeAdapter.getProjectsDir());
+    }
+
+    const home = os.homedir();
+    roots.add(path.join(home, ".copilot"));
+    roots.add(path.join(home, ".claude"));
+    roots.add(path.join(home, ".gemini"));
+
+    try {
+      for (const proj of listProjects()) {
+        if (proj.root) roots.add(proj.root);
+      }
+    } catch {
+      // Registry unreadable; continue with configured roots.
+    }
+    for (const ws of this.pushBus.getExtraWorkspaces()) {
+      if (ws) roots.add(ws);
+    }
+    if (trustedWorkspacePath && trustedWorkspacePath.trim()) {
+      roots.add(trustedWorkspacePath.trim());
+    }
+    return [...roots];
+  }
+
+  private async loadPushTranscriptEvents(
+    sessionId: string,
+    opts: {
+      excludeFilePath?: string;
+      workspacePath?: string;
+      trustedWorkspacePath?: string;
+      projectId?: string;
+      ide?: IdeSource;
+    },
+  ): Promise<EnrichedEvent[]> {
+    const copilotAdapter = this.adapters.find(
+      (a): a is CopilotVSCodeAdapter => a instanceof CopilotVSCodeAdapter,
+    );
+    if (!copilotAdapter) return [];
+    const ide = opts.ide;
+    if (ide && ide !== "copilot-vscode" && ide !== "unknown") {
+      return [];
+    }
+
+    const allowedRoots = this.getAllowedTranscriptRoots(
+      opts.trustedWorkspacePath,
+    );
+    const excludeNorm = opts.excludeFilePath
+      ? path.resolve(opts.excludeFilePath).toLowerCase()
+      : "";
+    const parsedPaths = new Set<string>();
+    const out: EnrichedEvent[] = [];
+
+    const parseOne = async (
+      tp: string,
+      agentIdOverride?: string,
+    ): Promise<void> => {
+      const validPath = await validateTranscriptPath(tp, allowedRoots);
+      if (!validPath) return;
+      const low = validPath.toLowerCase();
+      if (
+        low === excludeNorm ||
+        parsedPaths.has(low) ||
+        path.basename(low) === "telemetry.jsonl"
+      ) {
+        return;
+      }
+      parsedPaths.add(low);
+      const evs = await copilotAdapter
+        .parseTranscriptFile(validPath, sessionId, {
+          agentIdOverride,
+          workspacePath: opts.workspacePath,
+          projectId: opts.projectId,
+          allowedRoots,
+          onFullBody: (eventId, body) => {
+            this.bodyStore.set(sessionId, eventId, body);
+          },
+        })
+        .catch(() => [] as EnrichedEvent[]);
+      out.push(...evs);
+    };
+
+    const agentPaths = this.pushBus.getAgentTranscriptPaths(sessionId);
+    for (const [aid, tp] of agentPaths.entries()) {
+      await parseOne(tp, aid === "root" ? undefined : aid);
+    }
+    for (const tp of this.pushBus.getTranscriptPaths(sessionId)) {
+      await parseOne(tp, undefined);
+    }
+
+    return out;
   }
 
   async getSessionSnapshot(
@@ -260,18 +384,33 @@ export class TelemetryAggregator {
     if (!target) {
       // Check if pushBus holds events for an explicitly requested sessionId
       const pushEvents = sessionId ? this.pushBus.getSessionEvents(sessionId) : [];
+      const pushIde = (pushEvents[0]?.ide ?? "unknown") as IdeSource;
+      const pushWs =
+        pushEvents.find((e) => e.workspacePath)?.workspacePath ??
+        filter.workspace;
+      const pushProj = pushEvents.find((e) => e.projectId)?.projectId;
+      const transcriptEvents = sessionId
+        ? await this.loadPushTranscriptEvents(sessionId, {
+            workspacePath: pushWs,
+            projectId: pushProj,
+            ide: pushIde,
+          })
+        : [];
       const fallbackRoots = [
+        ...(pushWs ? [pushWs] : []),
         ...(filter.workspace ? [filter.workspace] : []),
         process.cwd(),
       ];
       const team = await discoverTeamDetailsCached(
         fallbackRoots,
-        filter.workspace,
+        pushWs ?? filter.workspace,
         15_000,
       ).catch(() => null);
-      const snap = buildSessionSnapshot(pushEvents, {
+      const snap = buildSessionSnapshot([...transcriptEvents, ...pushEvents], {
         sessionId: sessionId ?? "",
-        ide: (pushEvents[0]?.ide ?? "unknown") as IdeSource,
+        ide: pushIde,
+        projectId: pushProj,
+        workspacePath: pushWs,
         definitions: team?.definitions,
       });
       snap.definitions = team?.definitions ?? [];
@@ -290,6 +429,21 @@ export class TelemetryAggregator {
             .catch(() => [])
         : [];
     const pushEvents = this.pushBus.getSessionEvents(target.sessionId);
+    const isPassiveSession =
+      Boolean(target.filePath) &&
+      path.basename(target.filePath).toLowerCase() !== "telemetry.jsonl";
+    const pushTranscriptEvents = await this.loadPushTranscriptEvents(
+      target.sessionId,
+      {
+        excludeFilePath: target.filePath,
+        workspacePath: target.workspacePath,
+        trustedWorkspacePath: isPassiveSession
+          ? target.workspacePath
+          : undefined,
+        projectId: target.projectId,
+        ide: target.ide,
+      },
+    );
 
     const sessionWorkspaces = [
       ...(target.workspacePath ? [target.workspacePath] : []),
@@ -302,13 +456,16 @@ export class TelemetryAggregator {
       15_000,
     ).catch(() => null);
 
-    const snapshot = buildSessionSnapshot([...passiveEvents, ...pushEvents], {
-      sessionId: target.sessionId,
-      ide: target.ide,
-      projectId: target.projectId,
-      workspacePath: target.workspacePath,
-      definitions: team?.definitions,
-    });
+    const snapshot = buildSessionSnapshot(
+      [...passiveEvents, ...pushTranscriptEvents, ...pushEvents],
+      {
+        sessionId: target.sessionId,
+        ide: target.ide,
+        projectId: target.projectId,
+        workspacePath: target.workspacePath,
+        definitions: team?.definitions,
+      },
+    );
     snapshot.definitions = team?.definitions ?? [];
 
     // Backfill summary status on matched session entry

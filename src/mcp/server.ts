@@ -91,7 +91,7 @@ function resolveServerVersion(): string {
   } catch {
     // Fall through to default version
   }
-  return "0.8.2";
+  return "0.9.0";
 }
 
 export const MCP_PROTOCOL_VERSION = "2024-11-05";
@@ -499,6 +499,7 @@ export const MCP_TOOLS = [
       type: "object",
       properties: {
         project: { type: "string" },
+        workspace: { type: "string" },
         sprint: { type: "string" },
         showDone: { type: "boolean" },
       },
@@ -1187,7 +1188,7 @@ async function executeAppGetStateTool(
   options: McpServerOptions,
 ): Promise<McpToolCallResult> {
   const aggregator = getMcpAggregator();
-  const ide = str(args.ide) ?? "antigravity";
+  const ide = str(args.ide);
   const project = str(args.project) ?? options.defaultProject;
   const workspace = str(args.workspace);
   const session = str(args.session);
@@ -1274,10 +1275,13 @@ async function executeAppGetBoardTool(
   args: Record<string, unknown>,
   options: McpServerOptions,
 ): Promise<McpToolCallResult> {
-  const project = resolveProject(
-    str(args.project) ?? options.defaultProject,
-    options.cwd,
-  );
+  const workspaceParam = str(args.workspace);
+  const projectParam = str(args.project);
+  const ref =
+    projectParam && projectParam.toLowerCase() !== "all"
+      ? projectParam
+      : workspaceParam ?? options.defaultProject;
+  const project = resolveProject(ref, workspaceParam ?? options.cwd);
   const ctx = { project };
   const [board, statusRes, gateRes, runsRes] = await Promise.all([
     readBoard(project.boardPath),

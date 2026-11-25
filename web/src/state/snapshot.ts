@@ -26,7 +26,48 @@ export interface ReconstructedSnapshot {
   activeEvent: NormalizedEvent | null;
 }
 
-const DEFAULT_CONTEXT_WINDOW = 1_000_000;
+interface UsageDeltaLike {
+  model?: string;
+  modelSource?: "exact" | "inherited" | "definition" | "unknown";
+  usageSource?: "exact" | "estimated";
+  inputTokens?: number;
+  outputTokens?: number;
+  cachedTokens?: number;
+  contextTokens?: number;
+  costUsd?: number;
+  isTotal?: boolean;
+}
+
+interface UsageAcc {
+  model?: string;
+  modelSource: "exact" | "inherited" | "definition" | "unknown";
+  usageSource: "exact" | "estimated";
+  hasExplicitUsage: boolean;
+  inputTokens: number;
+  outputTokens: number;
+  cachedTokens: number;
+  contextTokens: number;
+  costUsd?: number;
+}
+
+export function inferContextWindow(model?: string, ide?: IdeSource): number {
+  const low = (model ?? "").trim().toLowerCase();
+  if (low.includes("[1m]")) return 1_000_000;
+  if (low.includes("gemini")) return 1_000_000;
+  if (low.includes("claude")) return 200_000;
+  if (low.includes("gpt-4.1") || low.includes("gpt 4.1")) return 1_000_000;
+  if (
+    low.includes("gpt-4o") ||
+    low.includes("gpt 4o") ||
+    /\bo[134](?:\b|-|_)/.test(low)
+  ) {
+    return 128_000;
+  }
+  if ((!low || low === "unknown") && ide === "antigravity") {
+    return 1_000_000;
+  }
+  return 200_000;
+}
 
 function estimateEventChars(ev: NormalizedEvent): { inChars: number; outChars: number } {
   const sumLen = (ev.summary ?? "").length;
@@ -170,15 +211,22 @@ export function buildSnapshot(
   const hasBlocker = new Map<string, boolean>();
   const waitingReason = new Map<string, string | null>();
   const estTokenAcc = new Map<string, { inChars: number; outChars: number }>();
+  const usageAccById = new Map<string, UsageAcc>();
+  const baseUsageById = new Map<string, AgentUsageMetrics>();
   const edgeMap = new Map<string, AgentEdgeSnapshot>();
 
   // Seed roster from baseSnapshot so idle/undispatched agents retain their identity
+  // (stash final usage separately so historical scrubbing never freezes end-of-session totals)
   if (baseSnapshot?.agents) {
     for (const a of baseSnapshot.agents) {
+      if (a.usage) {
+        baseUsageById.set(a.id, a.usage);
+      }
       agentMap.set(a.id, {
         ...a,
         nodeType: a.nodeType ?? (a.id === "ext:human" ? "human" : a.id.startsWith("ext:") ? "external" : "agent"),
         status: "IDLE",
+        usage: undefined,
         activeTool: undefined,
         thinkingSince: undefined,
         thinkingEpoch: undefined,
@@ -232,7 +280,12 @@ export function buildSnapshot(
       };
       agentMap.set(id, existing);
     } else {
-      if (opts?.label && (existing.label === existing.id || existing.label === "Coordinator")) {
+      if (
+        opts?.label &&
+        (existing.label === existing.id ||
+          existing.label === "Coordinator" ||
+          existing.label === "subagent")
+      ) {
         existing.label = opts.label;
       }
       if (opts?.parentAgentId && !existing.parentAgentId) {
@@ -296,6 +349,76 @@ export function buildSnapshot(
     estTokenAcc.set(actor.id, acc);
     if (!actor.model && typeof ev.payload?.model === "string" && ev.payload.model.trim()) {
       actor.model = ev.payload.model.trim();
+    }
+
+    const rawDelta =
+      (ev as { usageDelta?: unknown }).usageDelta ?? ev.payload?._usageDelta;
+    if (rawDelta && typeof rawDelta === "object" && !Array.isArray(rawDelta)) {
+      const uDelta = rawDelta as UsageDeltaLike;
+      const uAcc: UsageAcc = usageAccById.get(actor.id) ?? {
+        modelSource: "unknown",
+        usageSource: "estimated",
+        hasExplicitUsage: false,
+        inputTokens: 0,
+        outputTokens: 0,
+        cachedTokens: 0,
+        contextTokens: 0,
+      };
+      if (typeof uDelta.model === "string" && uDelta.model.trim()) {
+        const incomingSrc = uDelta.modelSource ?? "exact";
+        if (
+          !uAcc.model ||
+          incomingSrc === "exact" ||
+          uAcc.modelSource === "unknown"
+        ) {
+          uAcc.model = uDelta.model.trim();
+          uAcc.modelSource = incomingSrc;
+          actor.model = uAcc.model;
+        }
+      }
+      if (
+        typeof uDelta.inputTokens === "number" ||
+        typeof uDelta.outputTokens === "number" ||
+        typeof uDelta.cachedTokens === "number"
+      ) {
+        uAcc.hasExplicitUsage = true;
+        if (uDelta.usageSource === "exact") {
+          uAcc.usageSource = "exact";
+        }
+        const inTok = Math.max(0, Math.round(uDelta.inputTokens ?? 0));
+        const outTok = Math.max(0, Math.round(uDelta.outputTokens ?? 0));
+        const cachedTok = Math.max(0, Math.round(uDelta.cachedTokens ?? 0));
+        if (uDelta.isTotal) {
+          uAcc.inputTokens = inTok;
+          uAcc.outputTokens = outTok;
+          uAcc.cachedTokens = cachedTok;
+          uAcc.contextTokens = Math.max(
+            0,
+            Math.round(uDelta.contextTokens ?? inTok + outTok)
+          );
+        } else {
+          uAcc.inputTokens += inTok;
+          uAcc.outputTokens += outTok;
+          uAcc.cachedTokens += cachedTok;
+          if (typeof uDelta.contextTokens === "number") {
+            uAcc.contextTokens = Math.max(
+              uAcc.contextTokens,
+              Math.round(uDelta.contextTokens)
+            );
+          } else {
+            uAcc.contextTokens = Math.max(
+              uAcc.contextTokens,
+              uAcc.inputTokens + uAcc.outputTokens
+            );
+          }
+        }
+      }
+      if (typeof uDelta.costUsd === "number" && Number.isFinite(uDelta.costUsd)) {
+        uAcc.costUsd = uDelta.isTotal
+          ? uDelta.costUsd
+          : (uAcc.costUsd ?? 0) + uDelta.costUsd;
+      }
+      usageAccById.set(actor.id, uAcc);
     }
 
     const toolSet = openTools.get(actor.id) ?? new Set<string>();
@@ -398,12 +521,12 @@ export function buildSnapshot(
         break;
       }
       case "subagent_spawn": {
-        const childId = ev.targetAgentId || `subagent-${ev.id.slice(0, 6)}`;
+        const childId = ev.targetAgentId || "subagent";
         const childLabel =
-          (typeof ev.payload?.agentLabel === "string" && ev.payload.agentLabel) ||
-          (typeof ev.payload?.role === "string" && ev.payload.role) ||
-          ev.agentLabel ||
-          childId;
+          (typeof ev.payload?.agentLabel === "string" && ev.payload.agentLabel.trim()) ||
+          (typeof ev.payload?.agentType === "string" && ev.payload.agentType.trim()) ||
+          (typeof ev.payload?.role === "string" && ev.payload.role.trim()) ||
+          undefined;
         const child = ensureNode(childId, {
           label: childLabel,
           parentAgentId: actor.id,
@@ -431,19 +554,47 @@ export function buildSnapshot(
         break;
       }
       case "subagent_done": {
-        toolSet.clear();
-        actor.activeTool = undefined;
-        reportedDone.set(actor.id, true);
-        hasBlocker.set(actor.id, false);
-        waitingReason.set(actor.id, null);
-        actor.summary = ev.summary || "Completed";
-        pushAction(actor, ev);
-
-        if (actor.parentAgentId) {
-          const kids = activeChildren.get(actor.parentAgentId);
-          kids?.delete(actor.id);
-          bumpEdge(actor.id, actor.parentAgentId, ev.kind, ev.ts);
+        if (!ev.targetAgentId && actor.id === "root") {
+          pushAction(actor, ev);
+          break;
         }
+        const doneId =
+          ev.targetAgentId && ev.targetAgentId !== actor.id
+            ? ev.targetAgentId
+            : actor.id;
+        const doneNode =
+          doneId === actor.id
+            ? actor
+            : ensureNode(doneId, {
+                ide: ev.ide,
+                parentAgentId: actor.id,
+                nodeType: "agent",
+              });
+        openTools.get(doneNode.id)?.clear();
+        doneNode.activeTool = undefined;
+        doneNode.thinkingSince = undefined;
+        doneNode.thinkingEpoch = undefined;
+        doneNode.lastEventAt = ev.ts;
+        doneNode.lastEpoch = ev.epoch;
+        reportedDone.set(doneNode.id, true);
+        waitingReason.set(doneNode.id, null);
+        if (ev.payload?.canceled === true) {
+          hasBlocker.set(doneNode.id, false);
+        } else if (isErrorEvent(ev)) {
+          hasBlocker.set(doneNode.id, true);
+        } else {
+          hasBlocker.set(doneNode.id, false);
+        }
+        doneNode.summary = ev.summary || "Completed";
+        pushAction(doneNode, ev);
+
+        const parentId =
+          doneNode.parentAgentId ?? (doneId !== actor.id ? actor.id : undefined);
+        if (parentId) {
+          activeChildren.get(parentId)?.delete(doneNode.id);
+          bumpEdge(doneNode.id, parentId, ev.kind, ev.ts);
+        }
+        activeChildren.get(actor.id)?.delete(doneNode.id);
         break;
       }
       case "message": {
@@ -547,19 +698,56 @@ export function buildSnapshot(
       completedAgents += 1;
     }
 
-    // Carry forward or synthesize lightweight fallback usage when backend usage is absent
-    if (!node.usage) {
+    // Reconstruct per-cursor usage from _usageDelta or char estimates; only fall back to baseUsage at live tail
+    const isAtLiveTail = safeIdx >= events.length - 1;
+    const uAcc = usageAccById.get(node.id);
+    const baseUsage = baseUsageById.get(node.id);
+    if (uAcc?.hasExplicitUsage) {
+      const model = uAcc.model || node.model || baseUsage?.model || "Unknown";
+      const totalTokens = uAcc.inputTokens + uAcc.outputTokens + uAcc.cachedTokens;
+      const contextWindow = inferContextWindow(model, node.ide);
+      const contextTokens = uAcc.contextTokens;
+      const contextPercent =
+        contextWindow > 0
+          ? Math.min(100, Math.round((contextTokens / contextWindow) * 1000) / 10)
+          : 0;
+      node.usage = {
+        model,
+        modelSource:
+          uAcc.modelSource !== "unknown"
+            ? uAcc.modelSource
+            : node.model
+              ? "exact"
+              : baseUsage?.modelSource ?? "unknown",
+        usageSource: uAcc.usageSource,
+        inputTokens: uAcc.inputTokens,
+        outputTokens: uAcc.outputTokens,
+        cachedTokens: uAcc.cachedTokens,
+        totalTokens,
+        contextTokens,
+        contextWindow,
+        contextPercent,
+        ...(uAcc.costUsd !== undefined
+          ? { costUsd: Math.round(uAcc.costUsd * 10000) / 10000 }
+          : {}),
+      };
+    } else if (isAtLiveTail && baseUsage) {
+      node.usage = baseUsage;
+    } else {
       const acc = estTokenAcc.get(node.id) ?? { inChars: 0, outChars: 0 };
       const inputTokens = Math.round(acc.inChars / 4);
       const outputTokens = Math.round(acc.outChars / 4);
       const totalTokens = inputTokens + outputTokens;
-      const contextWindow = DEFAULT_CONTEXT_WINDOW;
+      const model = uAcc?.model || node.model || baseUsage?.model || "Unknown";
+      const contextWindow = inferContextWindow(model, node.ide);
       const contextTokens = totalTokens;
       const contextPercent =
-        Math.min(100, Math.round((contextTokens / contextWindow) * 1000) / 10);
+        contextWindow > 0
+          ? Math.min(100, Math.round((contextTokens / contextWindow) * 1000) / 10)
+          : 0;
       const estUsage: AgentUsageMetrics = {
-        model: node.model || "Unknown",
-        modelSource: node.model ? "exact" : "unknown",
+        model,
+        modelSource: node.model ? "exact" : baseUsage?.modelSource ?? "unknown",
         usageSource: "estimated",
         inputTokens,
         outputTokens,

@@ -10,6 +10,7 @@ import {
   AntigravityAdapter,
   ClaudeCodeAdapter,
   CopilotVSCodeAdapter,
+  MAX_TRANSCRIPT_BYTES,
   PushBus,
   STALE_SESSION_SEC,
   TelemetryAggregator,
@@ -21,6 +22,7 @@ import {
   prettifyModelName,
   reconstructVSCodeDeltaJsonl,
   summarizeToolCall,
+  validateTranscriptPath,
   type EnrichedEvent,
 } from "../../src/telemetry/index.js";
 
@@ -342,7 +344,7 @@ describe("Hybrid Telemetry Adapters, Deduplication, State Machine & hook-emit", 
 
     const events = await adapter.parseSession(discovered[0]!);
     assert.ok(!events.some((e) => e.summary.includes("cost-state")));
-    assert.ok(events.some((e) => e.kind === "subagent_spawn" && e.targetAgentId === "backend"));
+    assert.ok(events.some((e) => e.kind === "subagent_spawn" && e.targetAgentId === "agent-1"));
     assert.ok(events.some((e) => e.kind === "subagent_done"));
 
     const snap = buildSessionSnapshot(events, {
@@ -353,8 +355,10 @@ describe("Hybrid Telemetry Adapters, Deduplication, State Machine & hook-emit", 
     const rootNode = snap.agents.find((a) => a.id === "root");
     assert.equal(rootNode?.status, "WAITING", "unanswered AskUserQuestion puts root in WAITING");
     assert.equal(snap.waitingOn, "user");
+    assert.ok(!snap.agents.some((a) => a.id === "backend"), "no orphan backend node");
     const subNode = snap.agents.find((a) => a.id === "agent-1");
     assert.equal(subNode?.status, "DONE");
+    assert.equal(subNode?.label, "Update auth");
   });
 
   it("VS Code Copilot fixtures: parses legacy .json, modern delta .jsonl (kind 0/1/2), questionCarousel, and degraded health", async () => {
@@ -671,7 +675,8 @@ describe("Hybrid Telemetry Adapters, Deduplication, State Machine & hook-emit", 
     assert.match(parsedDeny.hookSpecificOutput.permissionDecisionReason, /pipeline\/board\.json/);
     assert.match(denyStderr, /guardrail/i);
 
-    // 3. Orchestrator read-only guardrail blocking Bash -> exit 2
+    // 3. Orchestrator read-only guardrail blocking Bash for claude-code -> exit 0 + permissionDecision: deny JSON
+    let ccDenyStdout = "";
     const denyOrchRes = await runHookEmit(
       ["--ide", "claude-code", "--event", "PreToolUse", "--role", "orchestrator"],
       {
@@ -681,21 +686,45 @@ describe("Hybrid Telemetry Adapters, Deduplication, State Machine & hook-emit", 
           tool_name: "Bash",
           tool_input: { command: "rm -rf build" },
         }),
+        stdout: (s) => {
+          ccDenyStdout += s;
+        },
+        stderr: () => undefined,
+        fetchImpl: offlineFetch,
+      },
+    );
+    assert.equal(denyOrchRes.exitCode, 0);
+    assert.equal(denyOrchRes.denied, true);
+    const ccParsedDeny = JSON.parse(ccDenyStdout) as {
+      hookSpecificOutput: { permissionDecision: string };
+    };
+    assert.equal(ccParsedDeny.hookSpecificOutput.permissionDecision, "deny");
+
+    // 3b. NotebookEdit targeting boardPath or orchestrator is blocked too
+    const denyNotebookRes = await runHookEmit(
+      ["--ide", "claude-code", "--event", "PreToolUse", "--role", "orchestrator"],
+      {
+        stdinText: JSON.stringify({
+          session_id: "hook-s1",
+          cwd: wsDir,
+          tool_name: "NotebookEdit",
+          tool_input: { file_path: "notebook.ipynb" },
+        }),
         stdout: () => undefined,
         stderr: () => undefined,
         fetchImpl: offlineFetch,
       },
     );
-    assert.equal(denyOrchRes.exitCode, 2);
-    assert.equal(denyOrchRes.denied, true);
+    assert.equal(denyNotebookRes.exitCode, 0);
+    assert.equal(denyNotebookRes.denied, true);
 
-    // 4. PushBus byte-offset tailer picks up all 3 events from telemetry.jsonl
+    // 4. PushBus byte-offset tailer picks up all 4 events from telemetry.jsonl
     const bus = new PushBus({
       extraWorkspaces: [wsDir],
       includeGlobalTelemetryFile: false,
     });
     const polled = await bus.pollFiles();
-    assert.equal(polled.accepted, 3);
+    assert.equal(polled.accepted, 4);
     const evs = bus.getSessionEvents("hook-s1");
     assert.ok(evs.some((e) => e.status === "denied"));
   });
@@ -1421,5 +1450,1085 @@ describe("Hybrid Telemetry Adapters, Deduplication, State Machine & hook-emit", 
     assert.equal(vSnap.usage?.totalTokens, 8000);
     assert.equal(vSnap.usage?.models[0]?.model, "Claude Sonnet 4");
     assert.equal(vSnap.usage?.models[0]?.sharePercent, 100);
+  });
+
+  it("BUG-16/17 & S1-53: hook-emit actor/target, tool classification, PushBus out-of-order re-homing & transcript paths", async () => {
+    const wsDir = path.join(tmpDir, "rehome-ws");
+    await fs.mkdir(wsDir, { recursive: true });
+    const offlineFetch: typeof fetch = () =>
+      Promise.reject(new Error("ECONNREFUSED"));
+
+    // 1. Subagent tool hook arrives BEFORE SubagentStart (out-of-order orphan session)
+    const subPre = await runHookEmit(
+      ["--ide", "claude-code", "--event", "PreToolUse"],
+      {
+        stdinText: JSON.stringify({
+          session_id: "abc123",
+          agent_id: "abc123",
+          agent_type: "backend-engineer",
+          cwd: wsDir,
+          tool_name: "Edit",
+          tool_use_id: "tu-sub-1",
+          tool_args: { file_path: "src/api.ts" },
+          transcript_path: path.join(wsDir, "sub-transcript.jsonl"),
+          model: "claude-sonnet-4-5[1m]",
+        }),
+        stdout: () => undefined,
+        stderr: () => undefined,
+        fetchImpl: offlineFetch,
+      },
+    );
+    assert.equal(subPre.event?.agentId, "agent-abc123");
+    assert.equal(subPre.event?.parentAgentId, "root");
+    assert.equal(subPre.event?.status, "running");
+    assert.equal(subPre.event?.usageDelta?.model, "Claude Sonnet 4.5 [1m]");
+
+    // 2. PostToolUse with tool_response.is_error = true + PostToolUseFailure
+    const postErr = await runHookEmit(
+      ["--ide", "claude-code", "--event", "PostToolUse"],
+      {
+        stdinText: JSON.stringify({
+          session_id: "parent-s1",
+          cwd: wsDir,
+          tool_name: "Bash",
+          tool_use_id: "tu-p-1",
+          tool_response: { is_error: true, content: "exit 1" },
+        }),
+        stdout: () => undefined,
+        stderr: () => undefined,
+        fetchImpl: offlineFetch,
+      },
+    );
+    assert.equal(postErr.event?.kind, "tool_end");
+    assert.equal(postErr.event?.status, "error");
+    assert.equal(postErr.event?.isError, true);
+
+    const postFail = await runHookEmit(
+      ["--ide", "claude-code", "--event", "PostToolUseFailure"],
+      {
+        stdinText: JSON.stringify({
+          session_id: "parent-s1",
+          cwd: wsDir,
+          tool_name: "Bash",
+          tool_use_id: "tu-p-2",
+        }),
+        stdout: () => undefined,
+        stderr: () => undefined,
+        fetchImpl: offlineFetch,
+      },
+    );
+    assert.equal(postFail.event?.kind, "tool_end");
+    assert.equal(postFail.event?.status, "error");
+
+    // 3. SessionStart, UserPromptSubmit, PreCompact, and Tier-1 tool classifications
+    const sStart = await runHookEmit(
+      ["--ide", "copilot-vscode", "--event", "SessionStart"],
+      {
+        stdinText: JSON.stringify({ sessionId: "parent-s1", cwd: wsDir }),
+        stdout: () => undefined,
+        stderr: () => undefined,
+        fetchImpl: offlineFetch,
+      },
+    );
+    assert.equal(sStart.event?.kind, "session_start");
+
+    const uPrompt = await runHookEmit(
+      ["--ide", "copilot-vscode", "--event", "UserPromptSubmit"],
+      {
+        stdinText: JSON.stringify({
+          sessionId: "parent-s1",
+          cwd: wsDir,
+          prompt: "Fix VS Code session jumping",
+        }),
+        stdout: () => undefined,
+        stderr: () => undefined,
+        fetchImpl: offlineFetch,
+      },
+    );
+    assert.equal(uPrompt.event?.kind, "user_input");
+    assert.match(uPrompt.event?.summary ?? "", /Fix VS Code session jumping/);
+
+    const preCompact = await runHookEmit(
+      ["--ide", "copilot-vscode", "--event", "PreCompact"],
+      {
+        stdinText: JSON.stringify({ sessionId: "parent-s1", cwd: wsDir }),
+        stdout: () => undefined,
+        stderr: () => undefined,
+        fetchImpl: offlineFetch,
+      },
+    );
+    assert.equal(preCompact.event?.kind, "message");
+
+    const boardPre = await runHookEmit(
+      ["--ide", "claude-code", "--event", "PreToolUse"],
+      {
+        stdinText: JSON.stringify({
+          session_id: "parent-s1",
+          cwd: wsDir,
+          tool_name: "mcp__agent-studio__board",
+          tool_use_id: "tu-board-1",
+          tool_input: { op: "move", id: "BUG-16", state: "test" },
+        }),
+        stdout: () => undefined,
+        stderr: () => undefined,
+        fetchImpl: offlineFetch,
+      },
+    );
+    assert.equal(boardPre.event?.kind, "board_mutation");
+
+    // 4. PushBus ingests orphan first, then SubagentStart re-homes it into parent-s1
+    const bus = new PushBus({ includeGlobalTelemetryFile: false });
+    bus.ingest([preCompact.event!, uPrompt.event!, subPre.event!]);
+    assert.ok(bus.getAllSessionIds().includes("abc123"));
+
+    const subStart = await runHookEmit(
+      ["--ide", "claude-code", "--event", "SubagentStart"],
+      {
+        stdinText: JSON.stringify({
+          session_id: "parent-s1",
+          agent_id: "abc123",
+          agent_type: "Backend Engineer",
+          cwd: wsDir,
+        }),
+        stdout: () => undefined,
+        stderr: () => undefined,
+        fetchImpl: offlineFetch,
+      },
+    );
+    assert.equal(subStart.event?.agentId, "root");
+    assert.equal(subStart.event?.targetAgentId, "agent-abc123");
+    assert.equal(subStart.event?.kind, "subagent_spawn");
+
+    bus.ingest([subStart.event!]);
+    assert.ok(!bus.getAllSessionIds().includes("abc123"), "orphan session must be deleted after re-homing");
+    const parentEvs = bus.getSessionEvents("parent-s1");
+    assert.ok(
+      parentEvs.some((e) => e.agentId === "agent-abc123" && e.parentAgentId === "root"),
+      "migrated events must belong to agent-abc123 under parent-s1",
+    );
+    assert.equal(
+      bus.getAgentTranscriptPaths("parent-s1").get("agent-abc123"),
+      path.join(wsDir, "sub-transcript.jsonl"),
+    );
+
+    // Push-only session title prefers first user_input prompt over PreToolUse
+    const discoveredPush = bus.discoverPushSessions();
+    assert.equal(discoveredPush[0]?.title, "Fix VS Code session jumping");
+
+    // Subsequent subagent event arrives under subagent session ID -> re-homed immediately
+    const subStop = await runHookEmit(
+      ["--ide", "claude-code", "--event", "PreToolUse"],
+      {
+        stdinText: JSON.stringify({
+          session_id: "abc123",
+          cwd: wsDir,
+          tool_name: "Read",
+          tool_use_id: "tu-sub-2",
+        }),
+        stdout: () => undefined,
+        stderr: () => undefined,
+        fetchImpl: offlineFetch,
+      },
+    );
+    bus.ingest([subStop.event!]);
+    assert.ok(!bus.getAllSessionIds().includes("abc123"));
+    assert.ok(bus.getSessionEvents("parent-s1").some((e) => e.toolCallId === "tu-sub-2" && e.agentId === "agent-abc123"));
+  });
+
+  it("Copilot transcripts/*.jsonl, PushBus transcriptPath snapshot enrichment, expanded chatSessions usage & non-monotonic compaction", async () => {
+    const vscDir = path.join(tmpDir, "vscode-transcripts");
+    const wsHash = path.join(vscDir, "ws1");
+    const transcriptsDir = path.join(wsHash, "GitHub.copilot-chat", "transcripts");
+    await fs.mkdir(transcriptsDir, { recursive: true });
+    await fs.writeFile(
+      path.join(wsHash, "workspace.json"),
+      JSON.stringify({ folder: "file:///c%3A/Projects/VscApp" }),
+      "utf8",
+    );
+
+    const tFile = path.join(transcriptsDir, "vsc-tr-1.jsonl");
+    const tRows = [
+      {
+        type: "session.start",
+        timestamp: "2026-11-25T10:00:00Z",
+        data: { sessionId: "vsc-tr-1", selectedModel: "GPT-5.2 Astra" },
+      },
+      {
+        type: "user.message",
+        timestamp: "2026-11-25T10:00:01Z",
+        data: { content: "Investigate BreakGlass subagent" },
+      },
+      {
+        type: "subagent.started",
+        timestamp: "2026-11-25T10:00:02Z",
+        data: {
+          toolCallId: "tc-bg-1",
+          agentName: "BreakGlass",
+          model: "GPT-5.2 Astra",
+          prompt: "Inspect emergency path",
+        },
+      },
+      {
+        type: "assistant.message",
+        timestamp: "2026-11-25T10:00:05Z",
+        data: {
+          content: "Turn 1 complete",
+          usage: { promptTokens: 50_000, completionTokens: 1000, cachedTokens: 10_000 },
+        },
+      },
+      {
+        type: "assistant.message",
+        timestamp: "2026-11-25T10:00:10Z",
+        data: {
+          content: "Compacted turn 2",
+          usage: { promptTokens: 8000, completionTokens: 500, cachedTokens: 2000 },
+        },
+      },
+    ];
+    await fs.writeFile(
+      tFile,
+      tRows.map((r) => JSON.stringify(r)).join("\n") + "\n",
+      "utf8",
+    );
+
+    const adapter = new CopilotVSCodeAdapter({ storageDir: vscDir });
+    const discovered = await adapter.discoverSessions();
+    assert.equal(discovered.length, 1);
+    assert.equal(discovered[0]?.sessionId, "vsc-tr-1");
+    assert.equal(discovered[0]?.title, "Investigate BreakGlass subagent");
+    assert.equal(discovered[0]?.isMultiAgent, true);
+
+    const snap = buildSessionSnapshot(await adapter.parseSession(discovered[0]!), {
+      sessionId: "vsc-tr-1",
+      ide: "copilot-vscode",
+      nowEpochSec: Date.parse("2026-11-25T10:00:12Z") / 1000,
+    });
+    const rootNode = snap.agents.find((a) => a.id === "root");
+    assert.equal(rootNode?.model, "GPT-5.2 Astra");
+    assert.equal(rootNode?.usage?.inputTokens, 58_000);
+    assert.equal(rootNode?.usage?.outputTokens, 1500);
+    assert.equal(rootNode?.usage?.cachedTokens, 12_000);
+    // Latest turn occupancy (8000 + 2000 + 500 = 10500), NOT latched at 61000
+    assert.equal(rootNode?.usage?.contextTokens, 10_500);
+    const bgNode = snap.agents.find((a) => a.id === "breakglass");
+    assert.ok(bgNode);
+    assert.equal(bgNode.status, "THINKING", "spawned subagent enters THINKING, not IDLE");
+    assert.equal(bgNode.label, "BreakGlass");
+    assert.equal(bgNode.model, "GPT-5.2 Astra");
+
+    // PushBus transcript_path enrichment on an external transcript not in workspaceStorage
+    const extTranscript = path.join(tmpDir, "external-subagent-tr.jsonl");
+    await fs.writeFile(
+      extTranscript,
+      [
+        {
+          type: "session.start",
+          timestamp: "2026-11-25T10:05:00Z",
+          data: { selectedModel: "GPT-5.2 Astra", agentName: "BreakGlass" },
+        },
+        {
+          type: "assistant.message",
+          timestamp: "2026-11-25T10:05:03Z",
+          data: {
+            content: "External subagent finished",
+            usage: { input_tokens: 4000, output_tokens: 300, cachedTokens: 1000 },
+          },
+        },
+      ]
+        .map((r) => JSON.stringify(r))
+        .join("\n") + "\n",
+      "utf8",
+    );
+
+    const agg = new TelemetryAggregator({
+      brainDir: path.join(tmpDir, "empty-brain"),
+      claudeDir: path.join(tmpDir, "empty-claude"),
+      vscodeDir: vscDir,
+      extraWorkspaces: [tmpDir],
+      includeGlobalTelemetryFile: false,
+    });
+    agg.ingest([
+      {
+        id: "push-vsc-spawn",
+        ts: "2026-11-25T10:05:00Z",
+        ide: "copilot-vscode",
+        sessionId: "push-vsc-root",
+        agentId: "root",
+        targetAgentId: "sub-bg",
+        kind: "subagent_spawn",
+        summary: "Spawned BreakGlass",
+        payload: { agentLabel: "BreakGlass" },
+      },
+      {
+        id: "push-vsc-sub-ev",
+        ts: "2026-11-25T10:05:01Z",
+        ide: "copilot-vscode",
+        sessionId: "sub-bg",
+        agentId: "root",
+        kind: "tool_start",
+        toolName: "read_file",
+        summary: "Read config",
+        payload: { transcriptPath: extTranscript },
+      },
+    ]);
+    const extSnap = await agg.getSessionSnapshot("push-vsc-root");
+    const subBg = extSnap.snapshot.agents.find((a) => a.id === "sub-bg");
+    assert.ok(subBg);
+    assert.equal(subBg.model, "GPT-5.2 Astra");
+    assert.equal(subBg.usage?.usageSource, "exact");
+    assert.equal(subBg.usage?.inputTokens, 4000);
+    assert.equal(subBg.usage?.outputTokens, 300);
+
+    // Synthetic mcp-* sessions must sort below real IDE sessions
+    agg.ingest([
+      {
+        id: "mcp-hijack-1",
+        ts: "2099-01-01T00:00:00Z",
+        ide: "mcp",
+        sessionId: "mcp-demo",
+        agentId: "orchestrator",
+        kind: "board_mutation",
+        summary: "board.move S1-01",
+      },
+    ]);
+    const ordered = await agg.discoverSessions();
+    assert.notEqual(ordered[0]?.sessionId, "mcp-demo", "synthetic mcp-* must not hijack sessions[0]");
+    assert.equal(ordered[ordered.length - 1]?.sessionId, "mcp-demo");
+  });
+
+  it("Claude streaming usage deduplication, /compact drop, hyphenated encodeCwd, Antigravity >32KB/file:///decimal/manage_subagents, and normalizer fallback/peakContext", async () => {
+    // 1. Claude Code: streaming message.id dedupe + /compact + hyphenated workspace
+    const claudeDir = path.join(tmpDir, "claude-adv");
+    const hyphenWs = path.join(tmpDir, "my-hyphen-app");
+    await fs.mkdir(hyphenWs, { recursive: true });
+    const normWs = hyphenWs.replace(/\\/g, "/");
+    const encodedFolder = normWs
+      .replace(/^([A-Za-z]):\//, "$1--")
+      .replace(/\//g, "-");
+    const projFolder = path.join(claudeDir, encodedFolder);
+    await fs.mkdir(projFolder, { recursive: true });
+    const cSid = "dddd1111-2222-3333-4444-555566667777";
+    // Pad head > 32KB without cwd so encodeCwd fallback is exercised
+    const padding = "x".repeat(400);
+    const padRows = Array.from({ length: 90 }, (_, idx) => ({
+      type: "queue-operation",
+      timestamp: `2026-11-25T11:00:${String(idx % 60).padStart(2, "0")}Z`,
+      note: padding,
+    }));
+    const cRows = [
+      ...padRows,
+      {
+        type: "assistant",
+        uuid: "stream-1",
+        timestamp: "2026-11-25T11:02:00Z",
+        message: {
+          id: "msg_001",
+          role: "assistant",
+          model: "opus",
+          stop_reason: null,
+          content: [{ type: "thinking", thinking: "..." }],
+          usage: { input_tokens: 10000, output_tokens: 50, cache_read_input_tokens: 50000 },
+        },
+      },
+      {
+        type: "assistant",
+        uuid: "stream-2",
+        timestamp: "2026-11-25T11:02:02Z",
+        message: {
+          id: "msg_001",
+          role: "assistant",
+          model: "opus",
+          stop_reason: "end_turn",
+          content: [{ type: "text", text: "Turn 1 done" }],
+          usage: { input_tokens: 10000, output_tokens: 400, cache_read_input_tokens: 50000 },
+        },
+      },
+      {
+        type: "assistant",
+        uuid: "turn-2",
+        timestamp: "2026-11-25T11:03:00Z",
+        message: {
+          id: "msg_002",
+          role: "assistant",
+          model: "claude-opus-4-5[1m]",
+          stop_reason: "end_turn",
+          content: [{ type: "text", text: "After /compact" }],
+          usage: { input_tokens: 2000, output_tokens: 150, cache_read_input_tokens: 3000 },
+        },
+      },
+    ];
+    await fs.writeFile(
+      path.join(projFolder, `${cSid}.jsonl`),
+      cRows.map((r) => JSON.stringify(r)).join("\n") + "\n",
+      "utf8",
+    );
+
+    const claudeAdapter = new ClaudeCodeAdapter({ projectsDir: claudeDir });
+    const [cDisc] = await claudeAdapter.discoverSessions({
+      workspaceRoots: [hyphenWs],
+    });
+    assert.ok(cDisc);
+    assert.equal(cDisc.workspacePath?.toLowerCase(), normWs.toLowerCase());
+
+    const cSnap = buildSessionSnapshot(await claudeAdapter.parseSession(cDisc), {
+      sessionId: cSid,
+      ide: "claude-code",
+      nowEpochSec: Date.parse("2026-11-25T11:03:10Z") / 1000,
+    });
+    const cRoot = cSnap.agents.find((a) => a.id === "root");
+    assert.equal(cRoot?.usage?.inputTokens, 12_000, "streamed msg_001 must not double-count");
+    assert.equal(cRoot?.usage?.outputTokens, 550);
+    assert.equal(cRoot?.usage?.cachedTokens, 53_000);
+    assert.equal(cRoot?.usage?.contextTokens, 5150, "/compact drops lastTurnContext");
+    assert.equal(cRoot?.usage?.contextWindow, 1_000_000, "[1m] model gets 1M window");
+    assert.equal(prettifyModelName("haiku"), "Claude Haiku");
+    assert.equal(prettifyModelName("sonnet"), "Claude Sonnet");
+    assert.equal(prettifyModelName("opus"), "Claude Opus");
+    assert.equal(inferContextWindow("Unknown", "antigravity"), 1_000_000);
+
+    // 2. Antigravity: >32KB child discovery, file:/// workspaceUris, decimal MODEL_SELECTION_RE, manage_subagents cancel
+    const brainDir = path.join(tmpDir, "brain-adv");
+    const rootCid = "12121212-1212-1212-1212-121212121212";
+    const childCid = "34343434-3434-3434-3434-343434343434";
+    const mkAg = async (cid: string, rows: unknown[]): Promise<void> => {
+      const p = path.join(brainDir, cid, ".system_generated", "logs", "transcript.jsonl");
+      await fs.mkdir(path.dirname(p), { recursive: true });
+      await fs.writeFile(p, rows.map((r) => JSON.stringify(r)).join("\n") + "\n", "utf8");
+    };
+    const bigPad = Array.from({ length: 90 }, (_, idx) => ({
+      step_index: idx + 1,
+      type: "THINKING",
+      created_at: "2026-11-25T12:00:01Z",
+      content: "P".repeat(400),
+    }));
+    await mkAg(rootCid, [
+      {
+        step_index: 0,
+        type: "USER_SETTINGS_CHANGE",
+        created_at: "2026-11-25T12:00:00Z",
+        content: "User changed Model Selection to Gemini 3.5 Pro (High).",
+      },
+      ...bigPad,
+      {
+        step_index: 95,
+        type: "USER_INPUT",
+        created_at: "2026-11-25T12:00:10Z",
+        content: `{"workspaceUris":["file:///c%3A/Projects/AgyRepo"]}\nLaunch subagent`,
+      },
+      {
+        step_index: 96,
+        type: "PLANNER_RESPONSE",
+        created_at: "2026-11-25T12:00:11Z",
+        tool_calls: [
+          {
+            name: "invoke_subagent",
+            args: { TypeName: '"qa"', Role: '"QA"', Prompt: '"Verify"' },
+          },
+        ],
+      },
+      {
+        step_index: 97,
+        source: "MODEL",
+        type: "GENERIC",
+        status: "DONE",
+        created_at: "2026-11-25T12:00:12Z",
+        content: `Created the following subagent: {"conversationId": "${childCid}"}`,
+      },
+      {
+        step_index: 98,
+        type: "PLANNER_RESPONSE",
+        created_at: "2026-11-25T12:00:15Z",
+        tool_calls: [
+          {
+            name: "manage_subagents",
+            args: { Action: '"cancel"', ConversationId: `"${childCid}"` },
+          },
+        ],
+      },
+    ]);
+    await mkAg(childCid, [
+      {
+        step_index: 0,
+        type: "SYSTEM_MESSAGE",
+        created_at: "2026-11-25T12:00:13Z",
+        content: `[Message] sender=${rootCid} content=Verify`,
+      },
+    ]);
+
+    const agyAdapter = new AntigravityAdapter({ brainDir });
+    const agySessions = await agyAdapter.discoverSessions();
+    assert.equal(agySessions.length, 1, "child beyond 32KB must be excluded from top-level");
+    assert.equal(agySessions[0]?.isMultiAgent, true);
+    assert.ok(agySessions[0]?.workspaces.includes("c:/Projects/AgyRepo"));
+
+    const agySnap = buildSessionSnapshot(await agyAdapter.parseSession(agySessions[0]!), {
+      sessionId: rootCid,
+      ide: "antigravity",
+      nowEpochSec: Date.parse("2026-11-25T12:00:20Z") / 1000,
+    });
+    const agyRoot = agySnap.agents.find((a) => a.id === "root");
+    assert.equal(agyRoot?.model, "Gemini 3.5 Pro (High)", "decimal version preserved");
+    const agyChild = agySnap.agents.find((a) => a.id === "qa");
+    assert.equal(agyChild?.status, "DONE", "manage_subagents cancel marks subagent DONE");
+
+    // 3. Normalizer: fallback input/output split, root->orchestrator defModel, and <0.1% peakContextAgentId
+    const fallbackSnap = buildSessionSnapshot(
+      [
+        {
+          id: "fb-1",
+          ts: "2026-11-25T12:10:00Z",
+          epoch: 1_795_000_000,
+          ide: "copilot-vscode",
+          channel: "hook",
+          sessionId: "fb-s1",
+          agentId: "root",
+          kind: "user_input",
+          summary: "Human: check",
+          payload: { body: "A".repeat(400) },
+        },
+        {
+          id: "fb-2",
+          ts: "2026-11-25T12:10:01Z",
+          epoch: 1_795_000_001,
+          ide: "copilot-vscode",
+          channel: "hook",
+          sessionId: "fb-s1",
+          agentId: "root",
+          targetAgentId: "sub-x",
+          kind: "subagent_spawn",
+          summary: "Spawned Sub X",
+        },
+      ],
+      {
+        sessionId: "fb-s1",
+        ide: "copilot-vscode",
+        nowEpochSec: 1_795_000_005,
+        definitions: [{ id: "orchestrator", model: "Claude Sonnet 4.5 (copilot)" }],
+      },
+    );
+    const fbRoot = fallbackSnap.agents.find((a) => a.id === "root");
+    const fbSub = fallbackSnap.agents.find((a) => a.id === "sub-x");
+    assert.equal(fbRoot?.model, "Claude Sonnet 4.5 (copilot)");
+    assert.equal(fbSub?.model, "Claude Sonnet 4.5 (copilot)", "subagent inherits root model on copilot-vscode");
+    assert.ok((fbRoot?.usage?.outputTokens ?? 0) > 0, "fallback estimation splits outputTokens > 0");
+    assert.ok((fallbackSnap.usage?.peakContextPercent ?? 0) > 0);
+    assert.equal(fallbackSnap.usage?.peakContextAgentId, "root");
+  });
+
+  it("BUG-18 security: validateTranscriptPath, PushBus & CopilotVSCodeAdapter reject traversal, UNC, non-.jsonl, symlink escape, and oversized files", async () => {
+    const secRoot = path.join(tmpDir, "sec-check");
+    const allowedRoot = path.join(secRoot, "allowed");
+    const siblingRoot = path.join(secRoot, "allowed-sibling");
+    const outsideRoot = path.join(secRoot, "outside");
+    await fs.mkdir(allowedRoot, { recursive: true });
+    await fs.mkdir(siblingRoot, { recursive: true });
+    await fs.mkdir(outsideRoot, { recursive: true });
+
+    const validFile = path.join(allowedRoot, "sub.jsonl");
+    const siblingFile = path.join(siblingRoot, "sib.jsonl");
+    const outsideFile = path.join(outsideRoot, "secret.jsonl");
+    const nonJsonlFile = path.join(allowedRoot, "notes.txt");
+    const telemetryFile = path.join(allowedRoot, "telemetry.jsonl");
+    const bigFile = path.join(allowedRoot, "huge.jsonl");
+
+    const sampleRow = JSON.stringify({
+      type: "assistant.message",
+      timestamp: "2026-11-25T10:00:00Z",
+      data: { content: "ok", usage: { input_tokens: 10, output_tokens: 5 } },
+    });
+    await fs.writeFile(validFile, `${sampleRow}\n`, "utf8");
+    await fs.writeFile(siblingFile, `${sampleRow}\n`, "utf8");
+    await fs.writeFile(outsideFile, `${sampleRow}\n`, "utf8");
+    await fs.writeFile(nonJsonlFile, `${sampleRow}\n`, "utf8");
+    await fs.writeFile(telemetryFile, `${sampleRow}\n`, "utf8");
+    await fs.writeFile(bigFile, "x".repeat(256), "utf8");
+
+    // Positive containment
+    const okReal = await validateTranscriptPath(validFile, [allowedRoot]);
+    assert.ok(okReal);
+
+    // Negative syntactic & containment checks
+    assert.equal(
+      await validateTranscriptPath(`${allowedRoot}${path.sep}..${path.sep}outside${path.sep}secret.jsonl`, [allowedRoot]),
+      null,
+      "must reject explicit .. traversal",
+    );
+    assert.equal(
+      await validateTranscriptPath(outsideFile, [allowedRoot]),
+      null,
+      "must reject file outside allowedRoots",
+    );
+    assert.equal(
+      await validateTranscriptPath(siblingFile, [allowedRoot]),
+      null,
+      "must reject sibling prefix escape (/allowed-sibling vs /allowed)",
+    );
+    assert.equal(
+      await validateTranscriptPath("\\\\evil\\share\\x.jsonl", [allowedRoot]),
+      null,
+      "must reject UNC backslash path",
+    );
+    assert.equal(
+      await validateTranscriptPath("//evil/share/x.jsonl", [allowedRoot]),
+      null,
+      "must reject UNC slash path",
+    );
+    assert.equal(
+      await validateTranscriptPath("\\\\?\\C:\\temp\\x.jsonl", [allowedRoot]),
+      null,
+      "must reject Windows device prefix path",
+    );
+    assert.equal(
+      await validateTranscriptPath(nonJsonlFile, [allowedRoot]),
+      null,
+      "must reject non-.jsonl file",
+    );
+    assert.equal(
+      await validateTranscriptPath(telemetryFile, [allowedRoot]),
+      null,
+      "must reject telemetry.jsonl",
+    );
+    assert.equal(
+      await validateTranscriptPath("relative/sub.jsonl", [allowedRoot]),
+      null,
+      "must reject relative path",
+    );
+    assert.equal(
+      await validateTranscriptPath(`${validFile}\0.jsonl`, [allowedRoot]),
+      null,
+      "must reject null byte",
+    );
+    assert.equal(
+      await validateTranscriptPath(allowedRoot, [allowedRoot]),
+      null,
+      "must reject directory",
+    );
+
+    // Oversized file cap (using small explicit maxBytes + checking MAX_TRANSCRIPT_BYTES constant)
+    assert.ok(MAX_TRANSCRIPT_BYTES >= 20 * 1024 * 1024);
+    assert.equal(
+      await validateTranscriptPath(bigFile, [allowedRoot], { maxBytes: 128 }),
+      null,
+      "must reject oversized transcript before reading",
+    );
+
+    // Symlink escape outside allowedRoots (try file symlink, fallback to directory junction on restricted Windows)
+    const symlinkPath = path.join(allowedRoot, "escape-link.jsonl");
+    let createdLink = false;
+    try {
+      await fs.symlink(outsideFile, symlinkPath);
+      createdLink = true;
+    } catch {
+      const junctionDir = path.join(allowedRoot, "escape-dir");
+      try {
+        await fs.symlink(outsideRoot, junctionDir, "junction");
+        assert.equal(
+          await validateTranscriptPath(path.join(junctionDir, "secret.jsonl"), [allowedRoot]),
+          null,
+          "must reject directory junction escape outside allowedRoots",
+        );
+        createdLink = true;
+      } catch {
+        // Symlinks unavailable in this environment
+      }
+    }
+    if (createdLink) {
+      try {
+        const st = await fs.lstat(symlinkPath);
+        if (st.isSymbolicLink()) {
+          assert.equal(
+            await validateTranscriptPath(symlinkPath, [allowedRoot]),
+            null,
+            "must reject file symlink escape outside allowedRoots",
+          );
+        }
+      } catch {
+        // Junction path already asserted above
+      }
+    }
+
+    // PushBus early syntactic rejection + 64-entry cap
+    const bus = new PushBus({ includeGlobalTelemetryFile: false });
+    const batch: unknown[] = [
+      {
+        id: "sec-bad-1",
+        ts: "2026-11-25T10:00:00Z",
+        ide: "copilot-vscode",
+        sessionId: "sec-s1",
+        agentId: "root",
+        kind: "tool_start",
+        summary: "bad unc",
+        payload: { transcriptPath: "\\\\evil\\share\\x.jsonl" },
+      },
+      {
+        id: "sec-bad-2",
+        ts: "2026-11-25T10:00:01Z",
+        ide: "copilot-vscode",
+        sessionId: "sec-s1",
+        agentId: "root",
+        kind: "tool_start",
+        summary: "bad txt",
+        payload: { transcriptPath: nonJsonlFile },
+      },
+    ];
+    for (let i = 0; i < 80; i++) {
+      batch.push({
+        id: `sec-cap-${i}`,
+        ts: "2026-11-25T10:00:02Z",
+        ide: "copilot-vscode",
+        sessionId: "sec-cap-s1",
+        agentId: `ag-${i}`,
+        kind: "tool_start",
+        summary: `cap ${i}`,
+        payload: { transcriptPath: path.join(allowedRoot, `t-${i}.jsonl`) },
+      });
+    }
+    bus.ingest(batch);
+    assert.equal(bus.getTranscriptPaths("sec-s1").length, 0);
+    assert.equal(bus.getTranscriptPaths("sec-cap-s1").length, 64);
+
+    // TelemetryAggregator refuses uncontained transcriptPath outside allowed roots
+    const agg = new TelemetryAggregator({
+      brainDir: path.join(secRoot, "empty-brain"),
+      claudeDir: path.join(secRoot, "empty-claude"),
+      vscodeDir: path.join(secRoot, "empty-vsc"),
+      extraWorkspaces: [allowedRoot],
+      includeGlobalTelemetryFile: false,
+    });
+    agg.ingest([
+      {
+        id: "agg-sec-1",
+        ts: "2026-11-25T10:00:00Z",
+        ide: "copilot-vscode",
+        sessionId: "agg-sec-s1",
+        agentId: "root",
+        kind: "tool_start",
+        summary: "uncontained",
+        payload: { transcriptPath: outsideFile },
+      },
+    ]);
+    const snap = await agg.getSessionSnapshot("agg-sec-s1");
+    assert.equal(snap.snapshot.agents.find((a) => a.id === "root")?.usage?.usageSource ?? "estimated", "estimated");
+  });
+
+  it("P1-1: hook-emit PreToolUse/PostToolUse on Agent/Task without agent_id keeps tool_start/tool_end and normalizer never marks root DONE without targetAgentId", async () => {
+    const wsDir = path.join(tmpDir, "p1-1-ws");
+    await fs.mkdir(wsDir, { recursive: true });
+    const offlineFetch: typeof fetch = () =>
+      Promise.reject(new Error("ECONNREFUSED"));
+
+    const preAgent = await runHookEmit(
+      ["--ide", "claude-code", "--event", "PreToolUse"],
+      {
+        stdinText: JSON.stringify({
+          session_id: "p1-1-s1",
+          cwd: wsDir,
+          tool_name: "Agent",
+          tool_use_id: "tu-agent-1",
+          tool_input: { description: "Run backend" },
+        }),
+        stdout: () => undefined,
+        stderr: () => undefined,
+        fetchImpl: offlineFetch,
+      },
+    );
+    assert.equal(preAgent.event?.kind, "tool_start");
+    assert.equal(preAgent.event?.agentId, "root");
+    assert.equal(preAgent.event?.targetAgentId, undefined);
+
+    const postTask = await runHookEmit(
+      ["--ide", "copilot-vscode", "--event", "PostToolUse"],
+      {
+        stdinText: JSON.stringify({
+          sessionId: "p1-1-s1",
+          cwd: wsDir,
+          toolName: "Task",
+          toolCallId: "tu-task-1",
+        }),
+        stdout: () => undefined,
+        stderr: () => undefined,
+        fetchImpl: offlineFetch,
+      },
+    );
+    assert.equal(postTask.event?.kind, "tool_end");
+    assert.equal(postTask.event?.agentId, "root");
+    assert.equal(postTask.event?.targetAgentId, undefined);
+
+    const snap = buildSessionSnapshot([preAgent.event!, postTask.event!], {
+      sessionId: "p1-1-s1",
+      ide: "claude-code",
+      nowEpochSec: (postTask.event!.epoch ?? Date.now() / 1000) + 1,
+    });
+    assert.equal(snap.agents.find((a) => a.id === "subagent"), undefined, "must not spawn ghost subagent");
+    assert.notEqual(snap.agents.find((a) => a.id === "root")?.status, "DONE");
+
+    // Direct normalizer guard: subagent_done on root without targetAgentId must not mark root DONE
+    const directSnap = buildSessionSnapshot(
+      [
+        {
+          id: "d-root-start",
+          ts: "2026-11-25T10:00:00Z",
+          epoch: 1_795_100_000,
+          ide: "claude-code",
+          channel: "hook",
+          sessionId: "p1-1-s2",
+          agentId: "root",
+          kind: "user_input",
+          summary: "Human: check",
+        },
+        {
+          id: "d-root-subdone",
+          ts: "2026-11-25T10:00:01Z",
+          epoch: 1_795_100_001,
+          ide: "claude-code",
+          channel: "hook",
+          sessionId: "p1-1-s2",
+          agentId: "root",
+          kind: "subagent_done",
+          summary: "Task done",
+        },
+      ],
+      {
+        sessionId: "p1-1-s2",
+        ide: "claude-code",
+        nowEpochSec: 1_795_100_002,
+      },
+    );
+    assert.notEqual(directSnap.agents.find((a) => a.id === "root")?.status, "DONE");
+  });
+
+  it("P1-2 & P2-4: PushBus SubagentStop records agentTranscriptPath, explicitParentSid memoizes, and generic 'subagent' is never registered", async () => {
+    const wsDir = path.join(tmpDir, "p1-2-ws");
+    const subTrPath = path.join(wsDir, "agent-xyz.jsonl");
+    const bus = new PushBus({ includeGlobalTelemetryFile: false });
+
+    // 1. SubagentStop (subagent_done) records agentTranscriptPath for targetAgentId
+    bus.ingest([
+      {
+        id: "stop-1",
+        ts: "2026-11-25T10:00:05Z",
+        ide: "claude-code",
+        sessionId: "parent-p12",
+        agentId: "root",
+        targetAgentId: "agent-xyz",
+        kind: "subagent_done",
+        summary: "Completed backend",
+        payload: { agentTranscriptPath: subTrPath },
+      },
+    ]);
+    assert.equal(
+      bus.getAgentTranscriptPaths("parent-p12").get("agent-xyz"),
+      subTrPath,
+    );
+
+    // 2. explicitParentSid memoizes subagent sessionId -> parentSessionId for follow-up events missing parentSessionId
+    bus.ingest([
+      {
+        id: "exp-1",
+        ts: "2026-11-25T10:01:00Z",
+        ide: "copilot-vscode",
+        sessionId: "sub-sess-42",
+        agentId: "root",
+        kind: "tool_start",
+        toolName: "read_file",
+        summary: "Read file",
+        payload: {
+          parentSessionId: "parent-p12",
+          agentId: "bg-42",
+          agentLabel: "Research",
+        },
+      },
+      {
+        id: "exp-2",
+        ts: "2026-11-25T10:01:01Z",
+        ide: "copilot-vscode",
+        sessionId: "sub-sess-42",
+        agentId: "root",
+        kind: "tool_end",
+        toolName: "read_file",
+        summary: "Read done",
+      },
+    ]);
+    assert.ok(!bus.getAllSessionIds().includes("sub-sess-42"));
+    const parentEvs = bus.getSessionEvents("parent-p12");
+    assert.ok(parentEvs.some((e) => e.id === "exp-1" && e.agentId === "bg-42"));
+    assert.ok(parentEvs.some((e) => e.id === "exp-2" && e.agentId === "bg-42"));
+
+    // 3. Generic "subagent" must NEVER be registered in subagentToParent
+    bus.ingest([
+      {
+        id: "gen-spawn",
+        ts: "2026-11-25T10:02:00Z",
+        ide: "claude-code",
+        sessionId: "parent-a",
+        agentId: "root",
+        targetAgentId: "subagent",
+        kind: "subagent_spawn",
+        summary: "Spawned generic",
+        payload: { agentId: "subagent" },
+      },
+      {
+        id: "gen-other",
+        ts: "2026-11-25T10:02:01Z",
+        ide: "claude-code",
+        sessionId: "subagent",
+        agentId: "root",
+        kind: "tool_start",
+        summary: "Unrelated session literally named subagent",
+      },
+    ]);
+    assert.ok(
+      bus.getAllSessionIds().includes("subagent"),
+      "generic 'subagent' key must not be registered in subagentToParent",
+    );
+  });
+
+  it("P1-3 & P1-4: CopilotVSCodeAdapter avoids subagent self-loop, prefers subAgentInvocationId, and caches transcripts/*.jsonl discovery", async () => {
+    const vscDir = path.join(tmpDir, "vsc-p13-p14");
+    const wsHash = path.join(vscDir, "ws-hash-1");
+    const transcriptsDir = path.join(wsHash, "GitHub.copilot-chat", "transcripts");
+    const chatDir = path.join(wsHash, "chatSessions");
+    await fs.mkdir(transcriptsDir, { recursive: true });
+    await fs.mkdir(chatDir, { recursive: true });
+
+    // 1. Transcript with subagent.started / subagent.completed carrying d.agentId = "bg-1"
+    const trFile = path.join(transcriptsDir, "tr-selfloop.jsonl");
+    await fs.writeFile(
+      trFile,
+      [
+        {
+          type: "session.start",
+          timestamp: "2026-11-25T10:00:00Z",
+          data: { sessionId: "tr-selfloop" },
+        },
+        {
+          type: "user.message",
+          timestamp: "2026-11-25T10:00:01Z",
+          data: { content: "Check self-loop" },
+        },
+        {
+          type: "subagent.started",
+          timestamp: "2026-11-25T10:00:02Z",
+          data: {
+            toolCallId: "tc-bg-99",
+            agentId: "bg-1",
+            agentName: "Code Reviewer",
+            prompt: "Audit diff",
+          },
+        },
+        {
+          type: "subagent.completed",
+          timestamp: "2026-11-25T10:00:05Z",
+          data: {
+            toolCallId: "tc-bg-99",
+            agentId: "bg-1",
+            agentName: "Code Reviewer",
+            result: "Clean",
+          },
+        },
+      ]
+        .map((r) => JSON.stringify(r))
+        .join("\n") + "\n",
+      "utf8",
+    );
+
+    // 2. chatSession with subAgentInvocationId
+    const chatFile = path.join(chatDir, "chat-inv.json");
+    await fs.writeFile(
+      chatFile,
+      JSON.stringify({
+        sessionId: "chat-inv-1",
+        creationDate: Date.parse("2026-11-25T10:10:00Z"),
+        requests: [
+          {
+            requestId: "r1",
+            timestamp: Date.parse("2026-11-25T10:10:00Z"),
+            message: { text: "Delegate to specialist" },
+            response: [
+              {
+                kind: "toolInvocationSerialized",
+                toolId: "runSubagent",
+                toolCallId: "tc-inv-1",
+                isComplete: true,
+                toolSpecificData: {
+                  subAgentInvocationId: "uuid-sub-777",
+                  subAgentName: "Backend Engineer",
+                  prompt: "Implement fix",
+                },
+              },
+            ],
+          },
+        ],
+      }),
+      "utf8",
+    );
+
+    const adapter = new CopilotVSCodeAdapter({ storageDir: vscDir });
+    const parsedTr = await adapter.parseTranscriptFile(trFile, "tr-selfloop");
+    const spawnEv = parsedTr.find((e) => e.kind === "subagent_spawn");
+    const doneEv = parsedTr.find((e) => e.kind === "subagent_done");
+    assert.equal(spawnEv?.agentId, "root");
+    assert.equal(spawnEv?.targetAgentId, "bg-1");
+    assert.equal(doneEv?.agentId, "root");
+    assert.equal(doneEv?.targetAgentId, "bg-1");
+
+    const discovered1 = await adapter.discoverSessions();
+    assert.equal(discovered1.length, 2);
+    // Second discoverSessions call hits transcriptDiscoveryCache when (mtimeMs, sizeBytes) unchanged
+    const discovered2 = await adapter.discoverSessions();
+    assert.equal(discovered2.length, 2);
+    assert.equal(
+      discovered2.find((s) => s.sessionId === "tr-selfloop")?.title,
+      "Check self-loop",
+    );
+
+    const chatSession = discovered1.find((s) => s.sessionId === "chat-inv-1")!;
+    const chatEvs = await adapter.parseSession(chatSession);
+    const chatSpawn = chatEvs.find((e) => e.kind === "subagent_spawn");
+    assert.equal(chatSpawn?.targetAgentId, "uuid-sub-777");
+    assert.equal(chatSpawn?.payload?.agentLabel, "Backend Engineer");
+  });
+
+  it("ClaudeCodeAdapter.discoverSessions bumps mtimeMs when subagents/agent-*.jsonl is newer than main .jsonl", async () => {
+    const claudeDir = path.join(tmpDir, "claude-sub-mtime");
+    const projDir = path.join(claudeDir, "demo-proj");
+    const sid = "eeee1111-2222-3333-4444-555566667777";
+    const subDir = path.join(projDir, sid, "subagents");
+    await fs.mkdir(subDir, { recursive: true });
+
+    const mainFile = path.join(projDir, `${sid}.jsonl`);
+    const subFile = path.join(subDir, "agent-sub1.jsonl");
+    await fs.writeFile(
+      mainFile,
+      JSON.stringify({
+        type: "user",
+        timestamp: "2026-11-25T10:00:00Z",
+        message: { role: "user", content: "Start task" },
+      }) + "\n",
+      "utf8",
+    );
+    await fs.writeFile(
+      subFile,
+      JSON.stringify({
+        type: "assistant",
+        timestamp: "2026-11-25T10:05:00Z",
+        message: { role: "assistant", content: [{ type: "text", text: "Done" }] },
+      }) + "\n",
+      "utf8",
+    );
+
+    const oldDate = new Date("2026-11-25T10:00:00Z");
+    const newerDate = new Date("2026-11-25T10:05:00Z");
+    await fs.utimes(mainFile, oldDate, oldDate);
+    await fs.utimes(subFile, newerDate, newerDate);
+
+    const adapter = new ClaudeCodeAdapter({ projectsDir: claudeDir });
+    const [disc] = await adapter.discoverSessions();
+    assert.ok(disc);
+    assert.ok(
+      disc.mtimeMs >= newerDate.getTime() - 10,
+      `expected mtimeMs >= ${newerDate.getTime()}, got ${disc.mtimeMs}`,
+    );
+    assert.equal(disc.isMultiAgent, true);
   });
 });

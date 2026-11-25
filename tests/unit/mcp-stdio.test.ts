@@ -435,6 +435,23 @@ describe("MCP stdio server (node dist/cli/index.js mcp)", () => {
       assert.equal(appBoardRes.structuredContent?.project?.id, "mcp-demo");
       assert.ok(Array.isArray(appBoardRes.structuredContent?.board?.items));
 
+      // Verify app_get_board honors workspace argument before defaultProject fallback
+      const altWs = path.join(tmpDir, "alt-board-ws");
+      await initBoardFile(path.join(altWs, "pipeline", "board.json"), {
+        projectId: "alt-board",
+        suites: { smoke: ["CP0"] },
+      });
+      const appAltBoardResp = await client.request("tools/call", {
+        name: "app_get_board",
+        arguments: { workspace: altWs },
+      });
+      const appAltBoardRes = appAltBoardResp.result as {
+        isError?: boolean;
+        structuredContent?: { project?: { id: string } };
+      };
+      assert.notEqual(appAltBoardRes.isError, true);
+      assert.equal(appAltBoardRes.structuredContent?.project?.id, "alt-board");
+
       const appTeamResp = await client.request("tools/call", {
         name: "app_get_team",
         arguments: { workspace: projDir },

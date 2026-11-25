@@ -193,7 +193,7 @@ export async function fetchSessions(opts: {
 }): Promise<SessionsResponse> {
   const data = mcpTransport
     ? await callMcpToolJson<Record<string, unknown>>("app_get_state", {
-        ide: opts.ide && opts.ide !== "all" ? opts.ide : "antigravity",
+        ide: opts.ide && opts.ide !== "all" ? opts.ide : undefined,
         project: opts.project,
         workspace: opts.workspace,
         multiOnly: opts.multiOnly ? true : undefined,
@@ -1068,13 +1068,14 @@ export class StudioStreamClient {
   private pollInFlight = false;
   private retryDelayMs = 1000;
   private closed = false;
+  private started = false;
   private opts: StreamOptions;
   private onVisibilityChange: () => void;
 
   constructor(opts: StreamOptions) {
     this.opts = opts;
     this.onVisibilityChange = () => {
-      if (!this.closed && isMcpAppTransportActive() && !document.hidden) {
+      if (!this.closed && this.started && isMcpAppTransportActive() && !document.hidden) {
         void this.pollMcpOnce();
       }
     };
@@ -1083,7 +1084,12 @@ export class StudioStreamClient {
 
   public connect(): void {
     this.closed = false;
+    this.started = true;
     this.openTransport();
+  }
+
+  public getSession(): string | undefined {
+    return this.opts.session;
   }
 
   public updateParams(params: {
@@ -1092,11 +1098,18 @@ export class StudioStreamClient {
     project?: string;
     workspace?: string;
   }): void {
+    const unchanged =
+      this.opts.session === params.session &&
+      this.opts.ide === params.ide &&
+      this.opts.project === params.project &&
+      this.opts.workspace === params.workspace;
     this.opts.session = params.session;
     this.opts.ide = params.ide;
     this.opts.project = params.project;
     this.opts.workspace = params.workspace;
-    this.reconnectNow();
+    if (this.started && !unchanged) {
+      this.reconnectNow();
+    }
   }
 
   public reconnectNow(): void {
@@ -1104,13 +1117,14 @@ export class StudioStreamClient {
     this.es?.close();
     this.es = null;
     this.retryDelayMs = 1000;
-    if (!this.closed) {
+    if (!this.closed && this.started) {
       this.openTransport();
     }
   }
 
   public dispose(): void {
     this.closed = true;
+    this.started = false;
     document.removeEventListener("visibilitychange", this.onVisibilityChange);
     this.clearTimers();
     this.es?.close();

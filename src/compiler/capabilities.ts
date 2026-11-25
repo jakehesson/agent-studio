@@ -137,7 +137,7 @@ export function mapCapabilitiesToClaudeCode(
       case "edit":
       case "write_docs":
       case "edit_tests":
-        tools.push("Edit", "Write", "MultiEdit");
+        tools.push("Edit", "Write");
         break;
       case "shell":
         tools.push("Bash");

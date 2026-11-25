@@ -56,6 +56,18 @@
           }
         ]
       }
+    ],
+    "PostToolUseFailure": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node -e \"const f=require('node:fs'),p=require('node:path'),o=require('node:os'),c=require('node:child_process');const a='agent-studio hook-emit --ide claude-code --event PostToolUseFailure'.split(' ').slice(1);const h=(process.env.AGENT_STUDIO_HOME||'').trim()||p.join(o.homedir(),'.agent-studio');const s=p.join(h,'bin','studio-cli.mjs');if(f.existsSync(s)){const r=c.spawnSync(process.execPath,[s,...a],{stdio:'inherit'});if(!r.error)process.exit(r.status===null?1:r.status);}const w=process.platform==='win32';const q=String.fromCharCode(34);const run=(x)=>{const l=x.toLowerCase();const r=w&&(l.endsWith('.cmd')||l.endsWith('.bat'))?c.spawnSync(process.env.ComSpec||p.join(process.env.SystemRoot||p.join('C:','Windows'),'System32','cmd.exe'),['/d','/s','/c',q+q+x+q+' '+a.join(' ')+q],{stdio:'inherit',windowsVerbatimArguments:true}):c.spawnSync(x,a,{stdio:'inherit'});if(!r.error)process.exit(r.status===null?1:r.status);};const lb=p.join(process.cwd(),'node_modules','.bin',w?'agent-studio.cmd':'agent-studio');if(f.existsSync(lb))run(lb);const ns=w?['agent-studio.cmd','agent-studio.exe']:['agent-studio'];for(const d of (process.env.PATH||'').split(p.delimiter)){const t=d.trim().replaceAll(q,'');if(!t)continue;for(const n of ns){const e=p.join(t,n);try{f.accessSync(e,w?f.constants.F_OK:f.constants.X_OK);if(f.statSync(e).isFile())run(e);}catch{}}}process.exit(0);\"",
+            "timeout": 5
+          }
+        ],
+        "matcher": "*"
+      }
     ]
   }
 }

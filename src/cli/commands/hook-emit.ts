@@ -3,11 +3,15 @@ import path from "node:path";
 import { parseTeamYaml, type TeamManifest } from "../../schema/team.js";
 import type { EventKind, IdeSource } from "../../schema/telemetry.js";
 import {
+  cleanHumanSummary,
   computeDeterministicEventId,
   computeMergeKey,
+  isBoardMutationToolCall,
   normalizeWsPath,
+  prettifyModelName,
   toIsoUtc,
   type EnrichedEvent,
+  type UsageDelta,
 } from "../../telemetry/types.js";
 
 export interface HookEmitIo {
@@ -28,6 +32,7 @@ const EDIT_OR_WRITE_TOOLS = new Set([
   "edit",
   "write",
   "multiedit",
+  "notebookedit",
   "edit_file",
   "write_file",
   "edit/editfiles",
@@ -67,7 +72,7 @@ function parseFlags(args: string[]): Record<string, string> {
   return out;
 }
 
-function readStdinWithCap(timeoutMs = 100): Promise<string> {
+function readStdinWithCap(timeoutMs = 250): Promise<string> {
   if (process.stdin.isTTY) {
     return Promise.resolve("");
   }
@@ -117,19 +122,115 @@ function loadTeamManifestBestEffort(cwd: string): TeamManifest | null {
 
 function mapHookEventToKind(hookEvent: string): EventKind {
   switch (hookEvent.toLowerCase()) {
+    case "sessionstart":
+      return "session_start";
+    case "userpromptsubmit":
+      return "user_input";
     case "pretooluse":
       return "tool_start";
     case "posttooluse":
+    case "posttoolusefailure":
       return "tool_end";
     case "subagentstart":
       return "subagent_spawn";
     case "subagentstop":
       return "subagent_done";
+    case "precompact":
+      return "message";
     case "stop":
       return "assistant_turn_end";
     default:
       return "message";
   }
+}
+
+function slug(raw: string): string {
+  return raw
+    .trim()
+    .toLowerCase()
+    .replace(/[^a-z0-9_-]+/g, "-")
+    .replace(/^-+|-+$/g, "");
+}
+
+function numField(obj: Record<string, unknown>, ...keys: string[]): number | undefined {
+  for (const k of keys) {
+    const v = obj[k];
+    if (typeof v === "number" && Number.isFinite(v)) return v;
+  }
+  return undefined;
+}
+
+function anyField(obj: Record<string, unknown>, ...keys: string[]): unknown {
+  for (const k of keys) {
+    if (obj[k] !== undefined) return obj[k];
+  }
+  return undefined;
+}
+
+function extractHookUsageDelta(
+  payload: Record<string, unknown>,
+  model?: string,
+): UsageDelta | undefined {
+  const usageObj = objField(payload, "usage", "token_usage", "tokenUsage");
+  const src = Object.keys(usageObj).length > 0 ? usageObj : payload;
+
+  const inputTokens = numField(
+    src,
+    "input_tokens",
+    "inputTokens",
+    "prompt_tokens",
+    "promptTokens",
+  );
+  const outputTokens = numField(
+    src,
+    "output_tokens",
+    "outputTokens",
+    "completion_tokens",
+    "completionTokens",
+  );
+  const cacheRead = numField(
+    src,
+    "cache_read_input_tokens",
+    "cacheReadInputTokens",
+    "cached_tokens",
+    "cachedTokens",
+    "cached_prompt_tokens",
+    "cachedPromptTokens",
+    "cache_read_tokens",
+  );
+  const cacheCreate = numField(
+    src,
+    "cache_creation_input_tokens",
+    "cacheCreationInputTokens",
+    "cache_creation_tokens",
+  );
+  const cachedTokens =
+    cacheRead !== undefined || cacheCreate !== undefined
+      ? Math.max(0, Math.round((cacheRead ?? 0) + (cacheCreate ?? 0)))
+      : undefined;
+  const contextTokens = numField(src, "context_tokens", "contextTokens");
+  const costUsd = numField(src, "cost_usd", "costUsd", "total_cost_usd", "totalCostUSD");
+
+  const prettyModel = model ? prettifyModelName(model) || model : undefined;
+  const hasTokens =
+    inputTokens !== undefined ||
+    outputTokens !== undefined ||
+    cachedTokens !== undefined ||
+    contextTokens !== undefined;
+
+  if (!prettyModel && !hasTokens && costUsd === undefined) {
+    return undefined;
+  }
+
+  return {
+    ...(prettyModel ? { model: prettyModel, modelSource: "exact" as const } : {}),
+    ...(hasTokens ? { usageSource: "exact" as const } : {}),
+    ...(inputTokens !== undefined ? { inputTokens: Math.max(0, Math.round(inputTokens)) } : {}),
+    ...(outputTokens !== undefined ? { outputTokens: Math.max(0, Math.round(outputTokens)) } : {}),
+    ...(cachedTokens !== undefined ? { cachedTokens } : {}),
+    ...(contextTokens !== undefined ? { contextTokens: Math.max(0, Math.round(contextTokens)) } : {}),
+    ...(costUsd !== undefined && costUsd >= 0 ? { costUsd } : {}),
+  };
 }
 
 function strField(obj: Record<string, unknown>, ...keys: string[]): string | undefined {
@@ -248,7 +349,7 @@ export async function runHookEmit(
   const fetchFn = io?.fetchImpl ?? fetch;
 
   const rawStdin =
-    io?.stdinText !== undefined ? io.stdinText : await readStdinWithCap(100);
+    io?.stdinText !== undefined ? io.stdinText : await readStdinWithCap();
 
   let payload: Record<string, unknown> = {};
   if (rawStdin.trim()) {
@@ -276,6 +377,7 @@ export async function runHookEmit(
     flags.event ??
     strField(payload, "hook_event_name", "hookEventName", "event") ??
     "PreToolUse";
+  const hookLow = hookEvent.toLowerCase();
 
   const cwd = path.resolve(
     flags.cwd ?? strField(payload, "cwd", "workspacePath") ?? process.cwd(),
@@ -285,22 +387,125 @@ export async function runHookEmit(
   const sessionId =
     strField(payload, "session_id", "sessionId") ?? `hook-${path.basename(cwd)}`;
   const toolName = strField(payload, "tool_name", "toolName");
-  const toolCallId = strField(payload, "tool_use_id", "toolCallId");
-  const toolInput = objField(payload, "tool_input", "toolInput");
-  const agentId =
-    strField(payload, "agent_id", "agentId", "agent_type", "agentName") ??
-    flags.role ??
-    "root";
+  const toolCallId = strField(payload, "tool_use_id", "toolCallId", "tool_call_id");
+  const toolArgsRaw = anyField(
+    payload,
+    "tool_args",
+    "toolArgs",
+    "tool_input",
+    "toolInput",
+  );
+  let toolInput = objField(payload, "tool_input", "toolInput", "tool_args", "toolArgs");
+  if (Object.keys(toolInput).length === 0 && typeof toolArgsRaw === "string") {
+    try {
+      const parsedArgs: unknown = JSON.parse(toolArgsRaw);
+      if (parsedArgs && typeof parsedArgs === "object" && !Array.isArray(parsedArgs)) {
+        toolInput = parsedArgs as Record<string, unknown>;
+      }
+    } catch {
+      // ignore non-JSON toolArgs string
+    }
+  }
+  const toolResultRaw = anyField(
+    payload,
+    "tool_response",
+    "tool_result",
+    "toolResponse",
+    "toolResult",
+  );
+
+  const subagentId = strField(
+    payload,
+    "agent_id",
+    "agentId",
+    "subagent_id",
+    "subagentId",
+  );
+  const subagentType = strField(
+    payload,
+    "agent_type",
+    "agentType",
+    "agent_name",
+    "agentName",
+  );
+  const parentAgentId = strField(payload, "parent_agent_id", "parentAgentId");
+  const parentSessionId = strField(
+    payload,
+    "parent_session_id",
+    "parentSessionId",
+  );
+  const transcriptPath = strField(payload, "transcript_path", "transcriptPath");
+  const agentTranscriptPath = strField(
+    payload,
+    "agent_transcript_path",
+    "agentTranscriptPath",
+  );
+  const modelRaw = strField(payload, "model", "model_id", "modelId");
+
+  const typeSlug = subagentType ? slug(subagentType) : undefined;
+  const normalizedSubagentId =
+    ide === "claude-code"
+      ? subagentId && subagentId !== "root"
+        ? subagentId.startsWith("agent-")
+          ? subagentId
+          : `agent-${subagentId}`
+        : typeSlug || "subagent"
+      : subagentId && subagentId !== "root"
+        ? subagentId
+        : typeSlug || "subagent";
+
+  const isSubagentLifecycle =
+    hookLow === "subagentstart" || hookLow === "subagentstop";
+  const isToolHook =
+    hookLow === "pretooluse" ||
+    hookLow === "posttooluse" ||
+    hookLow === "posttoolusefailure";
+
+  let agentId: string;
+  let targetAgentId: string | undefined;
+  let resolvedParentAgentId: string | undefined;
+  let agentLabel: string | undefined;
+
+  if (isSubagentLifecycle) {
+    agentId = parentAgentId || "root";
+    targetAgentId = normalizedSubagentId;
+    resolvedParentAgentId = parentAgentId ? "root" : undefined;
+  } else if (subagentId && subagentId !== "root") {
+    agentId = normalizedSubagentId;
+    resolvedParentAgentId = parentAgentId || "root";
+    agentLabel = subagentType;
+  } else {
+    agentId = flags.role ?? "root";
+  }
+
   const role =
     flags.role ??
     strField(payload, "agent_role", "agentRole", "role", "agent_type", "agentName");
 
   const epoch = Date.now() / 1000;
-  const kind = mapHookEventToKind(hookEvent);
+  let kind = mapHookEventToKind(hookEvent);
+  const lowTool = (toolName ?? "").toLowerCase();
+  if (hookLow === "pretooluse" && toolName) {
+    if ((lowTool === "agent" || lowTool === "task") && targetAgentId) {
+      kind = "subagent_spawn";
+    } else if (lowTool === "sendmessage") {
+      kind = "message";
+    } else if (lowTool === "askuserquestion") {
+      kind = "user_input";
+    } else if (isBoardMutationToolCall(toolName, toolInput)) {
+      kind = "board_mutation";
+    }
+  } else if (
+    (hookLow === "posttooluse" || hookLow === "posttoolusefailure") &&
+    (lowTool === "agent" || lowTool === "task") &&
+    targetAgentId
+  ) {
+    kind = "subagent_done";
+  }
 
   // Evaluate PreToolUse guardrails before delivering telemetry
   let denyReason: string | null = null;
-  if (hookEvent.toLowerCase() === "pretooluse" && toolName) {
+  if (hookLow === "pretooluse" && toolName) {
     denyReason = evaluatePreToolUseGuardrail({
       toolName,
       toolInput,
@@ -309,11 +514,77 @@ export async function runHookEmit(
     });
   }
 
+  const promptText =
+    strField(payload, "prompt", "user_prompt", "userPrompt") ??
+    (typeof payload.message === "string" && payload.message.trim()
+      ? payload.message.trim()
+      : payload.message &&
+          typeof payload.message === "object" &&
+          !Array.isArray(payload.message)
+        ? strField(payload.message as Record<string, unknown>, "text", "content")
+        : undefined);
+
+  let status: EnrichedEvent["status"] = "ok";
+  let isError = false;
+  if (hookLow === "pretooluse") {
+    if (denyReason) {
+      status = "denied";
+      isError = true;
+    } else {
+      status = "running";
+      isError = false;
+    }
+  } else if (hookLow === "posttoolusefailure") {
+    status = "error";
+    isError = true;
+  } else if (hookLow === "posttooluse") {
+    const respObj =
+      toolResultRaw &&
+      typeof toolResultRaw === "object" &&
+      !Array.isArray(toolResultRaw)
+        ? (toolResultRaw as Record<string, unknown>)
+        : undefined;
+    const toolIsError =
+      respObj?.is_error === true ||
+      respObj?.isError === true ||
+      payload.is_error === true ||
+      payload.isError === true;
+    status = toolIsError ? "error" : "ok";
+    isError = toolIsError;
+  }
+
   const summary = denyReason
     ? `DENIED ${toolName ?? "tool"}: ${denyReason}`
-    : toolName
-      ? `${hookEvent}: ${toolName}`
-      : `${hookEvent} (${agentId})`;
+    : isSubagentLifecycle
+      ? `${hookLow === "subagentstart" ? "Spawned" : "Completed"} ${subagentType || normalizedSubagentId}`
+      : hookLow === "userpromptsubmit" && promptText
+        ? `Human: ${cleanHumanSummary(promptText, 130)}`
+        : toolName
+          ? `${hookEvent}: ${toolName}`
+          : `${hookEvent} (${agentId})`;
+
+  const usageDelta = extractHookUsageDelta(payload, modelRaw);
+
+  const eventPayload: Record<string, unknown> = {
+    hookEvent,
+    toolInput,
+    ...(toolArgsRaw !== undefined ? { toolArgs: toolArgsRaw } : {}),
+    ...(toolResultRaw !== undefined ? { toolResult: toolResultRaw } : {}),
+    ...(subagentId !== undefined ? { agentId: subagentId } : {}),
+    ...(subagentType !== undefined
+      ? { agentType: subagentType, agentLabel: subagentType }
+      : {}),
+    ...(parentSessionId !== undefined ? { parentSessionId } : {}),
+    ...(transcriptPath !== undefined ? { transcriptPath } : {}),
+    ...(agentTranscriptPath !== undefined ? { agentTranscriptPath } : {}),
+    ...(modelRaw !== undefined ? { model: modelRaw } : {}),
+    ...(promptText !== undefined
+      ? { prompt: promptText, body: promptText }
+      : {}),
+    ...(isError ? { isError: true } : {}),
+    ...(denyReason ? { denyReason } : {}),
+    ...(usageDelta ? { _usageDelta: usageDelta } : {}),
+  };
 
   const event: EnrichedEvent = {
     id: computeDeterministicEventId({
@@ -342,18 +613,19 @@ export async function runHookEmit(
     workspacePath: normalizeWsPath(cwd),
     projectId: manifest?.project.id,
     agentId,
+    ...(agentLabel ? { agentLabel } : {}),
+    ...(resolvedParentAgentId ? { parentAgentId: resolvedParentAgentId } : {}),
     kind,
     toolName,
     toolCallId,
+    ...(targetAgentId ? { targetAgentId } : {}),
     summary,
-    status: denyReason ? "denied" : "ok",
-    isError: Boolean(denyReason),
-    payload: {
-      hookEvent,
-      toolInput,
-      ...(denyReason ? { denyReason } : {}),
-    },
+    status,
+    isError,
+    ...(usageDelta ? { usageDelta } : {}),
+    payload: eventPayload,
   };
+  void isToolHook;
 
   const port = flags.port ?? process.env.AGENT_STUDIO_PORT ?? "8767";
   const ingestUrl = `http://127.0.0.1:${port}/api/ingest`;
@@ -387,7 +659,8 @@ export async function runHookEmit(
     };
     writeStdout(JSON.stringify(denyPayload) + "\n");
     writeStderr(`[agent-studio guardrail] ${denyReason}\n`);
-    return { exitCode: 2, denied: true, deliveredVia, event };
+    const exitCode = ide === "claude-code" ? 0 : 2;
+    return { exitCode, denied: true, deliveredVia, event };
   }
 
   return { exitCode: 0, denied: false, deliveredVia, event };

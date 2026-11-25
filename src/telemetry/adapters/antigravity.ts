@@ -15,6 +15,7 @@ import {
   toIsoUtc,
   unquoteArg,
   type AdapterHealth,
+  type AgentStatus,
   type DiscoveredSession,
   type EnrichedEvent,
   type ModelSource,
@@ -29,15 +30,18 @@ import {
 
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 const CREATED_SUBAGENT_RE =
-  /Created the following subagent:\s*\{[^}]*"conversationId"\s*:\s*"([0-9a-f-]{36})"/is;
+  /Created the following subagent:\s*(\{[^}]*"conversationId"\s*:\s*"([0-9a-f-]{36})"[^}]*\})/is;
 const CANCELED_SUBAGENT_RE =
   /Subagent\s+"([0-9a-f-]{36})"\s+has been explicitly canceled by the user/i;
 const MODEL_SELECTION_RE =
-  /Model Selection.*?\bto\s+([A-Za-z0-9 ._()/-]+?)(?:\.|\n|<|$)/i;
+  /Model Selection.*?\bto\s+([A-Za-z0-9 ._()/-]+?)(?:\.(?:\s|$)|\n|<|$)/i;
 const ACTIVE_WS_RE =
   /Active Workspaces?:\s*\n(?:\s*-\s*)?([a-zA-Z]:\/[^\s\n"'<>|]+|\/[^\s\n"'<>|]+)/gi;
 const CMD_CWD_RE =
   /Command Working Directory:\s*([a-zA-Z]:\/[^\s\n"'<>|]+|\/[^\s\n"'<>|]+)/gi;
+const FILE_URI_RE = /file:\/\/\/[^\s"'<>|\\)]+/gi;
+const POSIX_FIELD_PATH_RE =
+  /"(?:cwd|workspacePath|workspace_path|root|DirectoryPath|SearchPath|TargetFile|AbsolutePath)"\s*:\s*"(\/[^"\n]+)"/gi;
 const WIN_ABS_PATH_RE = /\b([a-zA-Z]:\/[^"\s\n'<>|,;()`]+)/g;
 
 interface AntigravityToolCall {
@@ -124,7 +128,11 @@ function extractWorkspacesFromText(sampleText: string): string[] {
         low.includes("/appdata/roaming/") ||
         low.includes("/appdata/local/programs/") ||
         low.includes("/program files") ||
-        low.includes("/node_modules/")
+        low.includes("/node_modules/") ||
+        low.startsWith("/tmp/") ||
+        low.startsWith("/usr/") ||
+        low.startsWith("/bin/") ||
+        low.startsWith("/etc/")
       ) {
         return;
       }
@@ -137,6 +145,22 @@ function extractWorkspacesFromText(sampleText: string): string[] {
   }
   for (const m of unescaped.matchAll(CMD_CWD_RE)) {
     if (m[1]) addCandidate(m[1], true);
+  }
+  for (const m of sampleText.matchAll(FILE_URI_RE)) {
+    if (!m[0]) continue;
+    let decoded = normalizeWsPath(m[0]).replace(/\/+/g, "/").replace(/\/+$/, "");
+    if (/\/[^/]+\.[a-z0-9]{1,8}$/i.test(decoded)) {
+      decoded = decoded.slice(0, decoded.lastIndexOf("/"));
+    }
+    addCandidate(decoded, false);
+  }
+  for (const m of unescaped.matchAll(POSIX_FIELD_PATH_RE)) {
+    if (!m[1]) continue;
+    let candidate = m[1].replace(/\/+/g, "/").replace(/\/+$/, "");
+    if (/\/[^/]+\.[a-z0-9]{1,8}$/i.test(candidate)) {
+      candidate = candidate.slice(0, candidate.lastIndexOf("/"));
+    }
+    addCandidate(candidate, false);
   }
   for (const m of unescaped.matchAll(WIN_ABS_PATH_RE)) {
     if (!m[1]) continue;
@@ -174,15 +198,32 @@ function detectTitle(rows: AntigravityRow[], fallbackId: string): string {
   return `Antigravity ${fallbackId.slice(0, 8)}`;
 }
 
+interface CachedDiscoveryMeta {
+  mtimeMs: number;
+  sizeBytes: number;
+  isChild: boolean;
+  spawnedChildren: string[];
+  workspaces: string[];
+  isMultiAgent: boolean;
+  title: string;
+  tailStatus?: AgentStatus;
+  isCompleted?: boolean;
+}
+
 export class AntigravityAdapter implements PassiveIdeAdapter {
   readonly ide = "antigravity" as const;
   private readonly brainDir: string;
+  private readonly discoveryCache = new Map<string, CachedDiscoveryMeta>();
 
   constructor(options?: AntigravityAdapterOptions) {
     this.brainDir =
       options?.brainDir ??
       process.env.ANTIGRAVITY_BRAIN_DIR?.trim() ??
       path.join(os.homedir(), ".gemini", "antigravity", "brain");
+  }
+
+  getBrainDir(): string {
+    return this.brainDir;
   }
 
   async getHealth(): Promise<AdapterHealth> {
@@ -267,74 +308,124 @@ export class AntigravityAdapter implements PassiveIdeAdapter {
     }> = [];
 
     for (const cand of rawCandidates.slice(0, limit * 2)) {
-      let headText = "";
-      try {
-        const fh = await fs.open(cand.filePath, "r");
+      let meta = this.discoveryCache.get(cand.cid);
+      if (
+        !meta ||
+        meta.mtimeMs !== cand.mtimeMs ||
+        meta.sizeBytes !== cand.sizeBytes
+      ) {
+        let fullText = "";
         try {
-          const buf = Buffer.alloc(Math.min(cand.sizeBytes, 32768));
-          const { bytesRead } = await fh.read(buf, 0, buf.length, 0);
-          headText = buf.subarray(0, bytesRead).toString("utf8");
-        } finally {
-          await fh.close();
+          fullText = await fs.readFile(cand.filePath, "utf8");
+        } catch {
+          continue;
         }
-      } catch {
+
+        const lines = fullText.split(/\r?\n/).filter((l) => l.trim().length > 0);
+        const firstLine = lines[0] ?? "";
+        const isChild =
+          (firstLine.includes('"type":"SYSTEM_MESSAGE"') ||
+            firstLine.includes('"type": "SYSTEM_MESSAGE"')) &&
+          firstLine.includes("sender=") &&
+          !fullText.includes('"USER_INPUT"');
+
+        const spawnedChildren: string[] = [];
+        const unescapedText = fullText.replace(/\\"/g, '"');
+        for (const m of unescapedText.matchAll(
+          new RegExp(CREATED_SUBAGENT_RE.source, "gis"),
+        )) {
+          if (m[2]) {
+            spawnedChildren.push(m[2]);
+          }
+        }
+
+        const workspaces = extractWorkspacesFromText(fullText);
+        const isMultiAgent =
+          fullText.includes("invoke_subagent") ||
+          fullText.includes("send_message") ||
+          spawnedChildren.length > 0;
+
+        let title = `Antigravity ${cand.cid.slice(0, 8)}`;
+        for (const line of lines.slice(0, 20)) {
+          if (!line.includes("USER_INPUT")) continue;
+          try {
+            const row = JSON.parse(line) as AntigravityRow;
+            if (row.type === "USER_INPUT" && row.content) {
+              const clean = row.content
+                .replace(/<[^>]+>/g, " ")
+                .replace(/\s+/g, " ")
+                .trim();
+              if (clean) {
+                title = clean.slice(0, 80);
+                break;
+              }
+            }
+          } catch {
+            // ignore
+          }
+        }
+
+        // Inspect tail row for accurate discovery status
+        let tailStatus: AgentStatus | undefined;
+        let isCompleted: boolean | undefined;
+        for (let li = lines.length - 1; li >= 0; li--) {
+          try {
+            const tailRow = JSON.parse(lines[li]!) as AntigravityRow;
+            if (tailRow.type === "PLANNER_RESPONSE") {
+              const tcs = Array.isArray(tailRow.tool_calls)
+                ? tailRow.tool_calls
+                : [];
+              if (tcs.length === 0 && tailRow.content?.trim()) {
+                tailStatus = "DONE";
+                isCompleted = true;
+              } else if (tcs.length > 0) {
+                tailStatus = "WORKING";
+                isCompleted = false;
+              }
+            } else if (tailRow.type === "GENERIC") {
+              if (tailRow.status === "RUNNING") {
+                tailStatus = "WORKING";
+                isCompleted = false;
+              } else if (tailRow.status === "ERROR") {
+                tailStatus = "BLOCKED";
+                isCompleted = false;
+              }
+            } else if (tailRow.type === "USER_INPUT") {
+              tailStatus = "THINKING";
+              isCompleted = false;
+            }
+            break;
+          } catch {
+            // Skip partial trailing line
+          }
+        }
+
+        meta = {
+          mtimeMs: cand.mtimeMs,
+          sizeBytes: cand.sizeBytes,
+          isChild,
+          spawnedChildren,
+          workspaces,
+          isMultiAgent,
+          title,
+          tailStatus,
+          isCompleted,
+        };
+        this.discoveryCache.set(cand.cid, meta);
+      }
+
+      for (const spawnedId of meta.spawnedChildren) {
+        childIds.add(spawnedId);
+      }
+      if (meta.isChild) {
+        childIds.add(cand.cid);
         continue;
       }
 
-      // Skip transcripts that look like spawned child subagents (start with SYSTEM_MESSAGE [Message] sender=...)
-      const firstLine = headText.split(/\r?\n/, 1)[0] ?? "";
-      if (
-        firstLine.includes('"type":"SYSTEM_MESSAGE"') ||
-        firstLine.includes('"type": "SYSTEM_MESSAGE"')
-      ) {
-        if (firstLine.includes("sender=") && !firstLine.includes('"USER_INPUT"')) {
-          childIds.add(cand.cid);
-          continue;
-        }
-      }
-
-      const spawnedChildren: string[] = [];
-      const unescapedHead = headText.replace(/\\"/g, '"');
-      for (const m of unescapedHead.matchAll(
-        new RegExp(CREATED_SUBAGENT_RE.source, "gis"),
-      )) {
-        if (m[1]) {
-          spawnedChildren.push(m[1]);
-          childIds.add(m[1]);
-        }
-      }
-
-      const workspaces = extractWorkspacesFromText(headText);
-      const primaryWs = workspaces[0];
+      const primaryWs = meta.workspaces[0];
       const projectId =
-        matchProjectIdForWorkspaces(workspaces, knownProjects) ??
+        matchProjectIdForWorkspaces(meta.workspaces, knownProjects) ??
         (primaryWs ? path.basename(primaryWs) : undefined);
-
-      const isMultiAgent =
-        headText.includes("invoke_subagent") ||
-        headText.includes("send_message") ||
-        spawnedChildren.length > 0;
-
-      // Extract quick title from first USER_INPUT line if available
-      let title = `Antigravity ${cand.cid.slice(0, 8)}`;
-      for (const line of headText.split(/\r?\n/).slice(0, 12)) {
-        if (!line.includes("USER_INPUT")) continue;
-        try {
-          const row = JSON.parse(line) as AntigravityRow;
-          if (row.type === "USER_INPUT" && row.content) {
-            const clean = row.content
-              .replace(/<[^>]+>/g, " ")
-              .replace(/\s+/g, " ")
-              .trim();
-            if (clean) {
-              title = clean.slice(0, 80);
-              break;
-            }
-          }
-        } catch {
-          // ignore
-        }
-      }
 
       inspected.push({
         session: {
@@ -342,14 +433,18 @@ export class AntigravityAdapter implements PassiveIdeAdapter {
           sessionId: cand.cid,
           filePath: cand.filePath,
           workspacePath: primaryWs,
-          workspaces,
+          workspaces: meta.workspaces,
           projectId,
-          title,
+          title: meta.title,
           mtimeMs: cand.mtimeMs,
           sizeBytes: cand.sizeBytes,
-          isMultiAgent,
+          isMultiAgent: meta.isMultiAgent,
+          ...(meta.tailStatus ? { status: meta.tailStatus } : {}),
+          ...(meta.isCompleted !== undefined
+            ? { isCompleted: meta.isCompleted }
+            : {}),
         },
-        spawnedChildren,
+        spawnedChildren: meta.spawnedChildren,
       });
     }
 
@@ -383,9 +478,11 @@ export class AntigravityAdapter implements PassiveIdeAdapter {
       parentCid: string;
       targetId: string;
       role: string;
+      prompt: string;
       requestedModel?: string;
       spawnEvent: EnrichedEvent;
     }> = [];
+    const childRowsCache = new Map<string, AntigravityRow[]>();
 
     interface AgentUsageAcc {
       model?: string;
@@ -534,7 +631,10 @@ export class AntigravityAdapter implements PassiveIdeAdapter {
               "logs",
               "transcript.jsonl",
             );
-      const rows = cid === rootCid ? rootRows : await readJsonlRows(tpath);
+      const rows =
+        cid === rootCid
+          ? rootRows
+          : childRowsCache.get(cid) ?? (await readJsonlRows(tpath));
       let senderId = convToAgent.get(cid);
       if (!senderId) {
         senderId = `agent-${cid.slice(0, 6)}`;
@@ -626,7 +726,7 @@ export class AntigravityAdapter implements PassiveIdeAdapter {
           acc.exactInput += inTok;
           acc.exactOutput += outTok;
           acc.exactCached += cachedTok;
-          acc.lastTurnContext = Math.max(acc.lastTurnContext, inTok + cachedTok + outTok);
+          acc.lastTurnContext = inTok + cachedTok;
         }
 
         // Accumulate char-based fallback estimation for transcripts without exact token fields
@@ -640,17 +740,98 @@ export class AntigravityAdapter implements PassiveIdeAdapter {
         }
 
         // 1. Match subagent creation inside GENERIC rows (including source === "MODEL")
-        if (rtype === "GENERIC" || CREATED_SUBAGENT_RE.test(content)) {
+        const isCreatedSubagentRow = CREATED_SUBAGENT_RE.test(content);
+        if (rtype === "GENERIC" || isCreatedSubagentRow) {
           const mSub = CREATED_SUBAGENT_RE.exec(content);
-          if (mSub?.[1] && mSub[1] !== cid) {
-            const childCid = mSub[1];
+          if (mSub?.[2] && mSub[2] !== cid) {
+            const childCid = mSub[2];
             let spawnedId: string | undefined;
             let spawnedRole = "";
             let requestedModel: string | undefined;
             let spawnEvent: EnrichedEvent | undefined;
-            const spawnIdx = pendingSpawns.findIndex(
-              (p) => p.parentCid === cid,
-            );
+
+            const matchingIndices = pendingSpawns
+              .map((p, pIdx) => (p.parentCid === cid ? pIdx : -1))
+              .filter((pIdx) => pIdx >= 0);
+
+            let spawnIdx = matchingIndices[0] ?? -1;
+
+            if (matchingIndices.length > 1) {
+              // Correlate parallel pendingSpawns by child transcript initial message or JSON hint
+              let createdMeta: Record<string, unknown> | undefined;
+              try {
+                if (mSub[1]) {
+                  const parsed: unknown = JSON.parse(mSub[1]);
+                  if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+                    createdMeta = parsed as Record<string, unknown>;
+                  }
+                }
+              } catch {
+                // ignore
+              }
+              const metaHint = String(
+                createdMeta?.type ??
+                  createdMeta?.TypeName ??
+                  createdMeta?.role ??
+                  createdMeta?.Role ??
+                  createdMeta?.name ??
+                  "",
+              )
+                .trim()
+                .toLowerCase();
+
+              let childMsg = "";
+              if (!childRowsCache.has(childCid)) {
+                const childPath = path.join(
+                  this.brainDir,
+                  childCid,
+                  ".system_generated",
+                  "logs",
+                  "transcript.jsonl",
+                );
+                childRowsCache.set(childCid, await readJsonlRows(childPath));
+              }
+              const cRows = childRowsCache.get(childCid) ?? [];
+              const firstSys = cRows.find(
+                (cr) => cr.type === "SYSTEM_MESSAGE" && cr.content,
+              );
+              if (firstSys?.content) {
+                const mContent = /content=(.+)/s.exec(firstSys.content);
+                childMsg = (mContent?.[1] ?? firstSys.content)
+                  .replace(/\s+/g, " ")
+                  .trim();
+              }
+
+              if (childMsg) {
+                const promptMatch = matchingIndices.find((pIdx) => {
+                  const pPrompt = pendingSpawns[pIdx]!.prompt
+                    .replace(/\s+/g, " ")
+                    .trim();
+                  if (!pPrompt) return false;
+                  const prefix = pPrompt.slice(0, 60);
+                  return (
+                    childMsg === pPrompt ||
+                    childMsg.includes(prefix) ||
+                    pPrompt.includes(childMsg.slice(0, 60))
+                  );
+                });
+                if (promptMatch !== undefined) {
+                  spawnIdx = promptMatch;
+                }
+              } else if (metaHint) {
+                const roleMatch = matchingIndices.find((pIdx) => {
+                  const cand = pendingSpawns[pIdx]!;
+                  return (
+                    cand.targetId.toLowerCase() === metaHint ||
+                    cand.role.toLowerCase() === metaHint
+                  );
+                });
+                if (roleMatch !== undefined) {
+                  spawnIdx = roleMatch;
+                }
+              }
+            }
+
             if (spawnIdx >= 0) {
               const popped = pendingSpawns.splice(spawnIdx, 1)[0];
               spawnedId = popped?.targetId;
@@ -765,8 +946,8 @@ export class AntigravityAdapter implements PassiveIdeAdapter {
           }
         }
 
-        // 4. GENERIC tool result row closes oldest open tool call (when status !== RUNNING)
-        if (rtype === "GENERIC") {
+        // 4. GENERIC tool result row closes oldest open tool call (when status !== RUNNING and not subagent-create row)
+        if (rtype === "GENERIC" && !isCreatedSubagentRow) {
           const selfDaemon = isSelfDaemonCommand(content);
           if (rstatus !== "RUNNING" && openToolCalls.length > 0) {
             const finished = openToolCalls.shift()!;
@@ -856,15 +1037,62 @@ export class AntigravityAdapter implements PassiveIdeAdapter {
                 parentCid: cid,
                 targetId: targetSlug,
                 role,
+                prompt,
                 requestedModel: requestedModel || undefined,
                 spawnEvent,
               });
-              openToolCalls.push({
-                toolCallId,
-                toolName: tname,
-                summary: spawnSummary,
-                isSelfDaemon: false,
-              });
+            } else if (tname === "manage_subagents") {
+              const action = unquoteArg(
+                args.Action ?? args.action ?? args.Operation ?? args.operation,
+              ).toLowerCase();
+              const targetCid = unquoteArg(
+                args.ConversationId ??
+                  args.conversationId ??
+                  args.SubagentId ??
+                  args.subagentId ??
+                  args.Id ??
+                  args.id,
+              );
+              const isCancel =
+                action === "cancel" ||
+                action === "stop" ||
+                action === "terminate" ||
+                action === "kill" ||
+                args.Cancel === true ||
+                args.cancel === "true";
+              if (isCancel && targetCid) {
+                rawEvents.push(
+                  makeEvent({
+                    epoch: epoch + tcIdx * 0.0001,
+                    agentId: targetCid,
+                    targetAgentId: targetCid,
+                    kind: "subagent_done",
+                    toolName: tname,
+                    toolCallId,
+                    summary: "Canceled by user",
+                    status: "ok",
+                    payload: { canceled: true, action: action || "cancel", conv: cid },
+                  }),
+                );
+              } else {
+                rawEvents.push(
+                  makeEvent({
+                    epoch: epoch + tcIdx * 0.0001,
+                    agentId: senderId,
+                    kind: "tool_start",
+                    toolName: tname,
+                    toolCallId,
+                    summary: actionText,
+                    payload: { args, conv: cid },
+                  }),
+                );
+                openToolCalls.push({
+                  toolCallId,
+                  toolName: tname,
+                  summary: actionText,
+                  isSelfDaemon: false,
+                });
+              }
             } else if (tname === "send_message") {
               const recipientRaw = unquoteArg(args.Recipient);
               const body = unquoteArg(args.Message);
@@ -893,12 +1121,6 @@ export class AntigravityAdapter implements PassiveIdeAdapter {
                   inlineBody,
                 }),
               );
-              openToolCalls.push({
-                toolCallId,
-                toolName: tname,
-                summary: msgSummary,
-                isSelfDaemon: false,
-              });
             } else if (tname === "notify_user") {
               const body = unquoteArg(args.Message) || "Updated user";
               const firstLine = body.split(/\r?\n/, 1)[0] ?? body;
@@ -918,12 +1140,6 @@ export class AntigravityAdapter implements PassiveIdeAdapter {
                   inlineBody,
                 }),
               );
-              openToolCalls.push({
-                toolCallId,
-                toolName: tname,
-                summary: notifySummary,
-                isSelfDaemon: false,
-              });
             } else if (tname === "ask_question") {
               const qSummary = "Asked user a question";
               rawEvents.push(

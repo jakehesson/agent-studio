@@ -5,6 +5,36 @@ All notable changes to **Agent Studio** will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.9.0] - 2026-11-25
+
+### Added
+- **Permanent Platform Validation Specialist Agents (`S1-52`):**
+  - Added read-only `vscode-copilot-specialist`, `claude-code-specialist`, and `antigravity-specialist` agents plus the shared `platform-validation` skill synced across Antigravity, Claude Code, and GitHub Copilot / VS Code.
+- **VS Code Copilot Discovery, Transcripts & Hooks:**
+  - Added multi-variant VS Code storage discovery (`Code`, `Code - Insiders`, `VSCodium`), `GitHub.copilot-chat/transcripts/*.jsonl` parsing with `(mtimeMs, sizeBytes)` caching, and `PushBus` hook `transcript_path` / `agent_transcript_path` enrichment.
+  - Added `SessionStart`, `UserPromptSubmit`, and `PreCompact` hooks for VS Code Copilot (`.github/hooks/agent-studio.json`) and `PostToolUseFailure` hook for Claude Code (`.claude/settings.json`).
+  - Added VS Code extension sidebar session deep-linking (`?session=<id>`) and webview panel session preservation on reveal.
+
+### Changed
+- **Passive Transcript Live Streaming & Cross-Adapter Improvements:**
+  - Added passive transcript live streaming over SSE (`heartbeatTimer` polling with per-client `inFlight` guard and volatile-field hash stripping) so Antigravity, Claude Code, and VS Code passive updates stream live without manual refresh.
+  - Updated `AntigravityAdapter` for full-file cached discovery beyond 32 KB (`isMultiAgent`, `file:///` `workspaceUris`, tail `status`), `deferToHostOrchestrator` emitting `model: inherit` on `orchestrator.md`, and removed deprecated `MultiEdit` from Claude Code compiled agent tools.
+  - Switched to non-monotonic `lastTurnContext` tracking across all three adapters so context compaction (`/compact`) drops displayed occupancy accurately, and added `[1m]` and IDE-aware context window inference.
+
+### Fixed
+- **VS Code Copilot Session Correlation & Ghost Node Elimination (`BUG-16`):**
+  - Added `PushBus` `subagentToParent` re-homing (including out-of-order orphan migration), fixed `SubagentStart`/`SubagentStop` actor (`root`) vs `targetAgentId` & `agent_type` preservation, and prevented `PreToolUse`/`PostToolUse` `Agent`/`Task` without `targetAgentId` from spawning ghost nodes or marking Coordinator `DONE`.
+  - Pinned Live Studio SSE `stream.updateParams({ session })` with mismatched-session frame drop guards and eliminated phantom `subagent-<hash>` ghost cards using server-authoritative live tail.
+- **VS Code Copilot Context, Token & Model Tracking (`BUG-17`):**
+  - Hydrated real usage, model, and subagent metadata from VS Code transcripts and `toolCallRounds`, fixed `root -> orchestrator` definition model fallback, improved fallback token estimation and `peakContextPercent` reporting, and fixed `CopilotVSCodeAdapter` `subagent.*` self-loop edges.
+- **Claude Code & Antigravity Telemetry Accuracy:**
+  - Fixed Claude Code streaming assistant `message.id` usage deduplication (eliminating 3x–5x token inflation), `PreToolUse` deny exit code (`0` with JSON on stdout), `subagents/agent-*.jsonl` correlation and `mtimeMs` inclusion, hyphenated workspace matching, and MCP App multi-IDE filtering.
+  - Fixed Antigravity `openToolCalls` desync on `invoke_subagent`/`send_message`/`notify_user`, parallel `pendingSpawns` correlation, `manage_subagents` cancel handling, and decimal `MODEL_SELECTION_RE` truncation.
+
+### Security
+- **Hardened `transcriptPath` / `agentTranscriptPath` Ingestion (`BUG-18`):**
+  - Enforced strict syntactic checks (rejecting null bytes, control chars, UNC/device prefixes, `..` traversal, relative paths, non-`.jsonl`, and `telemetry.jsonl`), `lstat`/`realpath` containment via `path.relative` against server-trusted roots only, a 20 MB file size cap, and a 64 paths/session `PushBus` cap.
+
 ## [0.8.2] - 2026-11-25
 
 ### Added

@@ -58,6 +58,7 @@ interface ClaudeRow {
   isSidechain?: boolean;
   agentId?: string;
   totalCostUSD?: number;
+  toolUseResult?: { agentId?: string } | string;
   message?: {
     id?: string;
     role?: string;
@@ -75,6 +76,31 @@ interface ClaudeRow {
 
 export interface ClaudeCodeAdapterOptions {
   projectsDir?: string;
+}
+
+function encodeCwdVariants(root: string): string[] {
+  const resolved = path.resolve(root).replace(/\\/g, "/").replace(/\/+$/, "");
+  const basic = resolved
+    .replace(/^([A-Za-z]):\//, "$1--")
+    .replace(/\//g, "-");
+  const dotNorm = resolved
+    .replace(/^([A-Za-z]):\//, "$1--")
+    .replace(/[/. _]/g, "-");
+  return [...new Set([basic.toLowerCase(), dotNorm.toLowerCase()])];
+}
+
+function resolveEncodedFolderWorkspace(
+  folder: string,
+  candidateRoots: ReadonlyArray<string>,
+): string | undefined {
+  const lowFolder = folder.toLowerCase();
+  for (const root of candidateRoots) {
+    if (!root) continue;
+    if (encodeCwdVariants(root).includes(lowFolder)) {
+      return normalizeWsPath(root);
+    }
+  }
+  return decodeEncodedCwd(folder);
 }
 
 function decodeEncodedCwd(encodedDirName: string): string | undefined {
@@ -135,6 +161,10 @@ export class ClaudeCodeAdapter implements PassiveIdeAdapter {
       path.join(os.homedir(), ".claude", "projects");
   }
 
+  getProjectsDir(): string {
+    return this.projectsDir;
+  }
+
   async getHealth(): Promise<AdapterHealth> {
     try {
       const st = await fs.stat(this.projectsDir);
@@ -177,7 +207,22 @@ export class ClaudeCodeAdapter implements PassiveIdeAdapter {
     }
 
     const knownProjects = getKnownProjects();
-    const sessions: DiscoveredSession[] = [];
+    const candidateRoots = [
+      ...(opts?.workspaceRoots ?? []),
+      ...knownProjects.map((p) => p.root),
+    ];
+    const limit = opts?.limit ?? 100;
+
+    interface ClaudeCandidate {
+      folder: string;
+      folderPath: string;
+      sessionId: string;
+      filePath: string;
+      mtimeMs: number;
+      sizeBytes: number;
+      hasSubagentFiles: boolean;
+    }
+    const candidates: ClaudeCandidate[] = [];
 
     for (const folder of projectFolders) {
       const folderPath = path.join(this.projectsDir, folder);
@@ -208,96 +253,123 @@ export class ClaudeCodeAdapter implements PassiveIdeAdapter {
         }
 
         const sessionId = fname.slice(0, -".jsonl".length);
-        let headText = "";
-        try {
-          const fh = await fs.open(filePath, "r");
-          try {
-            const buf = Buffer.alloc(Math.min(fst.size, 32768));
-            const { bytesRead } = await fh.read(buf, 0, buf.length, 0);
-            headText = buf.subarray(0, bytesRead).toString("utf8");
-          } finally {
-            await fh.close();
-          }
-        } catch {
-          continue;
-        }
-
-        let cwd: string | undefined;
-        let title = `Claude ${sessionId.slice(0, 8)}`;
-        let isMultiAgent = false;
-
-        for (const line of headText.split(/\r?\n/)) {
-          const t = line.trim();
-          if (!t) continue;
-          try {
-            const row = JSON.parse(t) as ClaudeRow;
-            if (!cwd && row.cwd) {
-              cwd = normalizeWsPath(row.cwd);
-            }
-            if (row.isSidechain) {
-              isMultiAgent = true;
-            }
-            if (row.type === "user" && title.startsWith("Claude ")) {
-              const txt = extractTextFromContent(row.message?.content)
-                .replace(/\s+/g, " ")
-                .trim();
-              if (txt) title = txt.slice(0, 80);
-            }
-            if (row.type === "assistant" && Array.isArray(row.message?.content)) {
-              for (const b of row.message.content) {
-                if (
-                  b.type === "tool_use" &&
-                  (b.name === "Agent" || b.name === "Task" || b.name === "SendMessage")
-                ) {
-                  isMultiAgent = true;
-                }
-              }
-            }
-          } catch {
-            // ignore
-          }
-        }
-
-        // Check for <session>/subagents/ directory
+        let maxMtimeMs = fst.mtimeMs;
+        let hasSubagentFiles = false;
         const subDir = path.join(folderPath, sessionId, "subagents");
         try {
           const subFiles = await fs.readdir(subDir);
-          if (subFiles.some((f) => f.endsWith(".jsonl"))) {
-            isMultiAgent = true;
+          for (const sf of subFiles) {
+            if (!sf.endsWith(".jsonl")) continue;
+            hasSubagentFiles = true;
+            try {
+              const sst = await fs.stat(path.join(subDir, sf));
+              if (sst.isFile() && sst.mtimeMs > maxMtimeMs) {
+                maxMtimeMs = sst.mtimeMs;
+              }
+            } catch {
+              // ignore unreadable subagent stat
+            }
           }
         } catch {
           // No subagents dir.
         }
 
-        const decodedFolderWs = decodeEncodedCwd(folder);
-        const workspaces = [
-          ...(cwd ? [cwd] : []),
-          ...(decodedFolderWs && decodedFolderWs !== cwd
-            ? [decodedFolderWs]
-            : []),
-        ];
-        const workspacePath = workspaces[0];
-        const projectId =
-          matchProjectIdForWorkspaces(workspaces, knownProjects) ??
-          (workspacePath ? path.basename(workspacePath) : undefined);
-
-        sessions.push({
-          ide: this.ide,
+        candidates.push({
+          folder,
+          folderPath,
           sessionId,
           filePath,
-          workspacePath,
-          workspaces,
-          projectId,
-          title,
-          mtimeMs: fst.mtimeMs,
+          mtimeMs: maxMtimeMs,
           sizeBytes: fst.size,
-          isMultiAgent,
+          hasSubagentFiles,
         });
       }
     }
 
-    sessions.sort((a, b) => b.mtimeMs - a.mtimeMs);
-    return sessions.slice(0, opts?.limit ?? 100);
+    candidates.sort((a, b) => b.mtimeMs - a.mtimeMs);
+    const sessions: DiscoveredSession[] = [];
+
+    for (const cand of candidates.slice(0, limit * 2)) {
+      let headText = "";
+      try {
+        const fh = await fs.open(cand.filePath, "r");
+        try {
+          const buf = Buffer.alloc(Math.min(cand.sizeBytes, 32768));
+          const { bytesRead } = await fh.read(buf, 0, buf.length, 0);
+          headText = buf.subarray(0, bytesRead).toString("utf8");
+        } finally {
+          await fh.close();
+        }
+      } catch {
+        continue;
+      }
+
+      let cwd: string | undefined;
+      let title = `Claude ${cand.sessionId.slice(0, 8)}`;
+      let isMultiAgent = cand.hasSubagentFiles;
+
+      for (const line of headText.split(/\r?\n/)) {
+        const t = line.trim();
+        if (!t) continue;
+        try {
+          const row = JSON.parse(t) as ClaudeRow;
+          if (!cwd && row.cwd) {
+            cwd = normalizeWsPath(row.cwd);
+          }
+          if (row.isSidechain) {
+            isMultiAgent = true;
+          }
+          if (row.type === "user" && title.startsWith("Claude ")) {
+            const txt = extractTextFromContent(row.message?.content)
+              .replace(/\s+/g, " ")
+              .trim();
+            if (txt) title = txt.slice(0, 80);
+          }
+          if (row.type === "assistant" && Array.isArray(row.message?.content)) {
+            for (const b of row.message.content) {
+              if (
+                b.type === "tool_use" &&
+                (b.name === "Agent" || b.name === "Task" || b.name === "SendMessage")
+              ) {
+                isMultiAgent = true;
+              }
+            }
+          }
+        } catch {
+          // ignore
+        }
+      }
+
+      const decodedFolderWs = resolveEncodedFolderWorkspace(
+        cand.folder,
+        candidateRoots,
+      );
+      const workspaces = [
+        ...(cwd ? [cwd] : []),
+        ...(decodedFolderWs && decodedFolderWs !== cwd
+          ? [decodedFolderWs]
+          : []),
+      ];
+      const workspacePath = workspaces[0];
+      const projectId =
+        matchProjectIdForWorkspaces(workspaces, knownProjects) ??
+        (workspacePath ? path.basename(workspacePath) : undefined);
+
+      sessions.push({
+        ide: this.ide,
+        sessionId: cand.sessionId,
+        filePath: cand.filePath,
+        workspacePath,
+        workspaces,
+        projectId,
+        title,
+        mtimeMs: cand.mtimeMs,
+        sizeBytes: cand.sizeBytes,
+        isMultiAgent,
+      });
+    }
+
+    return sessions.slice(0, limit);
   }
 
   async parseSession(
@@ -326,8 +398,27 @@ export class ClaudeCodeAdapter implements PassiveIdeAdapter {
     const events: EnrichedEvent[] = [];
     const spawnToolUseMap = new Map<
       string,
-      { targetAgentId: string; agentLabel: string }
+      {
+        callId: string;
+        targetAgentId: string;
+        agentLabel: string;
+        prompt: string;
+        matchedSubId?: string;
+        matchedFromResult?: string;
+        spawnEvent?: EnrichedEvent;
+        doneEvent?: EnrichedEvent;
+      }
     >();
+    const spawnRecords: Array<{
+      callId: string;
+      targetAgentId: string;
+      agentLabel: string;
+      prompt: string;
+      matchedSubId?: string;
+      matchedFromResult?: string;
+      spawnEvent?: EnrichedEvent;
+      doneEvent?: EnrichedEvent;
+    }> = [];
     const toolSummaryMap = new Map<string, { toolName: string; summary: string }>();
 
     interface ClaudeUsageAcc {
@@ -359,12 +450,64 @@ export class ClaudeCodeAdapter implements PassiveIdeAdapter {
       return acc;
     };
 
+    const resolveRowAgentId = (
+      row: ClaudeRow,
+      defaultAgentId: string,
+    ): { agentId: string; parentAgentId?: string } => {
+      const isInlineSidechain =
+        defaultAgentId === "root" && row.isSidechain === true;
+      const agentId = isInlineSidechain
+        ? row.agentId
+          ? `agent-${row.agentId}`
+          : `sidechain-${(row.parentUuid ?? row.uuid ?? "sub").slice(0, 6)}`
+        : defaultAgentId;
+      return {
+        agentId,
+        parentAgentId: isInlineSidechain ? "root" : undefined,
+      };
+    };
+
     const parseRowsForAgent = (
       rows: ClaudeRow[],
       defaultAgentId: string,
       defaultParentAgentId?: string,
       defaultLabel?: string,
     ): void => {
+      // Pre-pass: deduplicate streaming type:"assistant" usage per (agentId, row.message.id),
+      // keeping the final row (stop_reason != null / highest output_tokens).
+      const finalUsageRowByMsg = new Map<
+        string,
+        { rowIdx: number; hasStop: boolean; outTok: number }
+      >();
+      for (let i = 0; i < rows.length; i++) {
+        const row = rows[i]!;
+        if (row.type !== "assistant") continue;
+        const usage = row.message?.usage;
+        if (
+          !usage ||
+          (typeof usage.input_tokens !== "number" &&
+            typeof usage.output_tokens !== "number")
+        ) {
+          continue;
+        }
+        const { agentId } = resolveRowAgentId(row, defaultAgentId);
+        const msgId = row.message?.id;
+        const key = msgId ? `${agentId}\0${msgId}` : `__row_${i}`;
+        const hasStop = row.message?.stop_reason != null;
+        const outTok = Math.max(0, Math.round(usage.output_tokens ?? 0));
+        const prev = finalUsageRowByMsg.get(key);
+        if (
+          !prev ||
+          (hasStop && !prev.hasStop) ||
+          (hasStop === prev.hasStop && outTok >= prev.outTok)
+        ) {
+          finalUsageRowByMsg.set(key, { rowIdx: i, hasStop, outTok });
+        }
+      }
+      const selectedUsageIndices = new Set<number>(
+        [...finalUsageRowByMsg.values()].map((v) => v.rowIdx),
+      );
+
       let fallbackEpoch = session.mtimeMs / 1000 - Math.max(rows.length, 1);
 
       for (let i = 0; i < rows.length; i++) {
@@ -381,16 +524,9 @@ export class ClaudeCodeAdapter implements PassiveIdeAdapter {
         fallbackEpoch = epoch;
 
         // Flat sidechain fallback when subagent messages are logged inline with isSidechain: true
-        const isInlineSidechain =
-          defaultAgentId === "root" && row.isSidechain === true;
-        const agentId = isInlineSidechain
-          ? row.agentId
-            ? `agent-${row.agentId}`
-            : `sidechain-${(row.parentUuid ?? row.uuid ?? "sub").slice(0, 6)}`
-          : defaultAgentId;
-        const parentAgentId = isInlineSidechain
-          ? "root"
-          : defaultParentAgentId;
+        const resolvedIds = resolveRowAgentId(row, defaultAgentId);
+        const agentId = resolvedIds.agentId;
+        const parentAgentId = resolvedIds.parentAgentId ?? defaultParentAgentId;
         const agentLabel =
           defaultLabel ??
           (agentId === "root" ? "Coordinator" : prettifyAgentLabel(agentId));
@@ -404,6 +540,7 @@ export class ClaudeCodeAdapter implements PassiveIdeAdapter {
         const usage = row.message?.usage;
         if (
           usage &&
+          (rtype !== "assistant" || selectedUsageIndices.has(i)) &&
           (typeof usage.input_tokens === "number" ||
             typeof usage.output_tokens === "number")
         ) {
@@ -422,10 +559,8 @@ export class ClaudeCodeAdapter implements PassiveIdeAdapter {
           acc.inputTokens += inTok;
           acc.outputTokens += outTok;
           acc.cachedTokens += cachedTok;
-          acc.lastTurnContext = Math.max(
-            acc.lastTurnContext,
-            inTok + cachedTok + outTok,
-          );
+          // Set to latest deduplicated turn (not Math.max) so /compact drops context properly
+          acc.lastTurnContext = inTok + cachedTok + outTok;
         }
         const rawContent = row.message?.content;
         const contentChars =
@@ -454,7 +589,7 @@ export class ClaudeCodeAdapter implements PassiveIdeAdapter {
           offset?: number;
           fullBody?: string;
           inlineBody?: string;
-        }): void => {
+        }): EnrichedEvent => {
           const evEpoch = epoch + (input.offset ?? 0);
           const id = computeDeterministicEventId({
             ide: this.ide,
@@ -480,7 +615,7 @@ export class ClaudeCodeAdapter implements PassiveIdeAdapter {
           const bodyTruncated = hasBody
             ? input.fullBody!.length > (input.inlineBody?.length ?? 0)
             : undefined;
-          events.push({
+          const ev: EnrichedEvent = {
             id,
             mergeKey,
             ts: toIsoUtc(evEpoch),
@@ -505,10 +640,12 @@ export class ClaudeCodeAdapter implements PassiveIdeAdapter {
             isSelfDaemon: input.isSelfDaemon,
             isError: input.isError,
             waitingReason: input.waitingReason,
-          });
+          };
+          events.push(ev);
           if (hasBody) {
             opts?.onFullBody?.(id, input.fullBody!);
           }
+          return ev;
         };
 
         if (rtype === "user") {
@@ -530,8 +667,22 @@ export class ClaudeCodeAdapter implements PassiveIdeAdapter {
                             block.content as ClaudeContentBlock[],
                           ).trim()
                         : "";
+                  const turAgent =
+                    row.toolUseResult &&
+                    typeof row.toolUseResult === "object" &&
+                    typeof row.toolUseResult.agentId === "string"
+                      ? row.toolUseResult.agentId.trim()
+                      : undefined;
+                  const matchText =
+                    turAgent ??
+                    /agentId:\s*([a-zA-Z0-9_-]+)/i.exec(resultText)?.[1];
+                  if (matchText) {
+                    spawnInfo.matchedFromResult = matchText.startsWith("agent-")
+                      ? matchText
+                      : `agent-${matchText}`;
+                  }
                   const inlineBody = resultText ? resultText.slice(0, 1000) : "";
-                  emit({
+                  spawnInfo.doneEvent = emit({
                     kind: "subagent_done",
                     toolName: "Agent",
                     toolCallId: callId,
@@ -632,14 +783,10 @@ export class ClaudeCodeAdapter implements PassiveIdeAdapter {
                 const subId = subType || `subagent-${callId.slice(0, 6)}`;
                 const subLabel = cleanHumanSummary(
                   String(
-                    input.description ?? input.subagent_type ?? prettifyAgentLabel(subId),
+                    input.name ?? input.description ?? input.subagent_type ?? prettifyAgentLabel(subId),
                   ),
                   60,
                 );
-                spawnToolUseMap.set(callId, {
-                  targetAgentId: subId,
-                  agentLabel: subLabel,
-                });
                 const rawPrompt =
                   typeof input.prompt === "string"
                     ? input.prompt
@@ -657,7 +804,7 @@ export class ClaudeCodeAdapter implements PassiveIdeAdapter {
                     : {}),
                   ...(inlinePrompt ? { prompt: inlinePrompt } : {}),
                 };
-                emit({
+                const spawnEv = emit({
                   kind: "subagent_spawn",
                   toolName: tname,
                   toolCallId: callId,
@@ -665,6 +812,10 @@ export class ClaudeCodeAdapter implements PassiveIdeAdapter {
                   summary: cleanHumanSummary(`Spawned ${subLabel}`, 140),
                   payload: {
                     input: compactInput,
+                    agentLabel: subLabel,
+                    ...(typeof input.subagent_type === "string"
+                      ? { agentType: input.subagent_type }
+                      : {}),
                     ...(inlinePrompt ? { prompt: inlinePrompt } : {}),
                     subagentId: subId,
                   },
@@ -673,6 +824,15 @@ export class ClaudeCodeAdapter implements PassiveIdeAdapter {
                     : {}),
                   offset: bIdx * 0.0001,
                 });
+                const rec = {
+                  callId,
+                  targetAgentId: subId,
+                  agentLabel: subLabel,
+                  prompt: rawPrompt.trim(),
+                  spawnEvent: spawnEv,
+                };
+                spawnToolUseMap.set(callId, rec);
+                spawnRecords.push(rec);
               } else if (tname === "SendMessage") {
                 const target = String(input.recipient ?? input.to ?? "peer");
                 const body = String(input.message ?? input.content ?? "");
@@ -752,23 +912,83 @@ export class ClaudeCodeAdapter implements PassiveIdeAdapter {
     parseRowsForAgent(mainRows, "root", undefined, "Coordinator");
 
     // Parse nested subagent files under <folder>/<sessionId>/subagents/agent-*.jsonl
+    // Correlate each file with main-transcript Agent/Task tool_use calls by tool_result agentId / prompt / order.
     const subagentsDir = path.join(
       path.dirname(session.filePath),
       session.sessionId,
       "subagents",
     );
     try {
-      const subFiles = await fs.readdir(subagentsDir);
-      for (const sf of subFiles.sort()) {
-        if (!sf.endsWith(".jsonl")) continue;
+      const subFiles = (await fs.readdir(subagentsDir))
+        .filter((f) => f.endsWith(".jsonl"))
+        .sort();
+      const loadedSubs: Array<{
+        subId: string;
+        rows: ClaudeRow[];
+        firstPrompt: string;
+        firstEpoch: number;
+      }> = [];
+      for (const sf of subFiles) {
         const subId = sf.slice(0, -".jsonl".length);
         const subRows = await readClaudeJsonl(path.join(subagentsDir, sf));
-        parseRowsForAgent(
-          subRows,
-          subId,
-          "root",
-          prettifyAgentLabel(subId),
+        const firstUserRow = subRows.find((r) => r.type === "user");
+        const firstPrompt = firstUserRow
+          ? extractTextFromContent(firstUserRow.message?.content).trim()
+          : "";
+        const firstEpoch = parseEpochSeconds(subRows[0]?.timestamp, 0);
+        loadedSubs.push({ subId, rows: subRows, firstPrompt, firstEpoch });
+      }
+      loadedSubs.sort(
+        (a, b) => a.firstEpoch - b.firstEpoch || a.subId.localeCompare(b.subId),
+      );
+
+      for (const sub of loadedSubs) {
+        // 1. Exact match by tool_result agentId
+        let matched = spawnRecords.find(
+          (r) => !r.matchedSubId && r.matchedFromResult === sub.subId,
         );
+        // 2. Match by initial user prompt
+        if (!matched && sub.firstPrompt) {
+          const normSubPrompt = sub.firstPrompt.replace(/\s+/g, " ").trim();
+          const prefix = normSubPrompt.slice(0, 80);
+          matched = spawnRecords.find((r) => {
+            if (r.matchedSubId || !r.prompt) return false;
+            const normSpawnPrompt = r.prompt.replace(/\s+/g, " ").trim();
+            return (
+              normSpawnPrompt === normSubPrompt ||
+              (prefix.length >= 16 &&
+                (normSpawnPrompt.includes(prefix) ||
+                  normSubPrompt.includes(normSpawnPrompt.slice(0, 80))))
+            );
+          });
+        }
+        // 3. Fallback by chronological order
+        if (!matched) {
+          matched = spawnRecords.find((r) => !r.matchedSubId);
+        }
+
+        let resolvedLabel = prettifyAgentLabel(sub.subId);
+        if (matched) {
+          matched.matchedSubId = sub.subId;
+          resolvedLabel = matched.agentLabel || resolvedLabel;
+          if (matched.spawnEvent) {
+            matched.spawnEvent.targetAgentId = sub.subId;
+            matched.spawnEvent.payload = {
+              ...(matched.spawnEvent.payload ?? {}),
+              subagentId: sub.subId,
+              agentLabel: resolvedLabel,
+            };
+          }
+          if (matched.doneEvent) {
+            matched.doneEvent.targetAgentId = sub.subId;
+            matched.doneEvent.payload = {
+              ...(matched.doneEvent.payload ?? {}),
+              targetAgentId: sub.subId,
+            };
+          }
+        }
+
+        parseRowsForAgent(sub.rows, sub.subId, "root", resolvedLabel);
       }
     } catch {
       // No nested subagents directory.

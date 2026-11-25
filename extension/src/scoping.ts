@@ -24,6 +24,7 @@ export interface BuildScopedViewUrlInput {
   baseUrl: string;
   view?: StudioView;
   projectId?: string;
+  sessionId?: string;
   embed?: boolean;
   hostIde?: HostIde;
   workspaceRoot?: string;
@@ -46,6 +47,9 @@ export function buildScopedViewUrl(input: BuildScopedViewUrlInput): string {
   }
   if (input.projectId) {
     params.set("project", input.projectId);
+  }
+  if (input.sessionId) {
+    params.set("session", input.sessionId);
   }
   const qs = params.toString();
   return `${input.baseUrl.replace(/\/+$/, "")}/${qs ? `?${qs}` : ""}`;

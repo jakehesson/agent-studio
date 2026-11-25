@@ -54,15 +54,23 @@ export function activate(context: vscode.ExtensionContext): void {
   const modelSync = new ModelSyncManager(manager, output, lmApi);
   context.subscriptions.push(modelSync);
 
-  const openView = async (view: StudioViewName): Promise<void> => {
-    await StudioPanel.createOrShow(manager, view);
+  const openView = async (
+    view: StudioViewName,
+    sessionId?: string,
+  ): Promise<void> => {
+    await StudioPanel.createOrShow(manager, view, sessionId);
     void sidebarProvider.refresh();
     void statusBar.poll();
   };
 
   context.subscriptions.push(
-    vscode.commands.registerCommand("agentStudio.openStudio", () =>
-      openView("studio"),
+    vscode.commands.registerCommand("agentStudio.openStudio", (sessionId?: unknown) =>
+      openView(
+        "studio",
+        typeof sessionId === "string" && sessionId.trim()
+          ? sessionId.trim()
+          : undefined,
+      ),
     ),
     vscode.commands.registerCommand("agentStudio.openBoard", () =>
       openView("board"),
