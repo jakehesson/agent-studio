@@ -1,0 +1,528 @@
+/* ==========================================================================
+   Galaxy Z Fold 7 & Desktop Three-Tier Responsive Architecture
+   Tier 1: Cover Screen (< 640px, ~360-412px) — Single-screen 100dvh + Bottom Nav
+   Tier 2: Fold Open (640px - 1020px, ~700-840px) — 1fr 1fr Dual-Pane + Hinge API
+   Tier 3: Desktop (>= 1021px) — Full Multi-Column Studio Workspace
+   ========================================================================== */
+
+/* Container Queries for Card / Pane Internals */
+@container pane (inline-size < 430px) {
+  .summary-strip {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    gap: 6px;
+    padding: 7px 10px;
+  }
+  .kpi-strip {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+  .card-head {
+    padding: 8px 10px;
+  }
+  .legend {
+    gap: 7px;
+    font-size: 10.5px;
+  }
+}
+
+/* Touch Ergonomics (44px tap targets on phones & foldables; hide desktop kbd hints) */
+@media (pointer: coarse) {
+  :root {
+    --target-size: 44px;
+  }
+  .tl-btn {
+    min-height: 40px;
+    min-width: 40px;
+  }
+  .tl-btn.play {
+    min-width: 46px;
+  }
+  .live-pill {
+    min-height: 40px;
+    padding: 6px 12px;
+  }
+  .tl-track-wrap {
+    height: 36px;
+  }
+  .tl-thumb {
+    width: 20px;
+    height: 20px;
+  }
+  .tl-hint {
+    display: none;
+  }
+  .copy-btn,
+  .guide-copy-btn {
+    min-height: 44px;
+    padding: 6px 14px;
+  }
+  .insp-icon-btn {
+    min-width: 44px;
+    min-height: 44px;
+  }
+  .guide-tab,
+  .ide-guide-jump,
+  .feed-mode-btn {
+    min-height: 44px;
+  }
+  .mr-select,
+  .rm-select,
+  .mi-select,
+  .mi-radio-label,
+  .mi-check-label,
+  .mi-mini-btn,
+  .model-routing-bar button,
+  .model-index-dialog button,
+  .model-index-dialog input:not([type="checkbox"], [type="radio"]),
+  .model-index-dialog select,
+  .team-detail-dialog button,
+  .team-detail-dialog input:not([type="checkbox"], [type="radio"]),
+  .team-detail-dialog select,
+  .roster-card-foot button {
+    min-block-size: 44px;
+    min-inline-size: 44px;
+  }
+  .model-index-dialog input:not([type="checkbox"], [type="radio"]),
+  .model-index-dialog select,
+  .team-detail-dialog input:not([type="checkbox"], [type="radio"]),
+  .team-detail-dialog select,
+  .mr-select,
+  .rm-select {
+    font-size: max(1rem, 1em);
+  }
+}
+
+/* ==========================================================================
+   TIER 2: Open / Unfolded (640px - 1020px, Galaxy Z Fold 7 unfolded ~700-840px)
+   Preserves 2-column 1fr 1fr split inside 100dvh instead of stacking vertically!
+   ========================================================================== */
+@media (max-width: 1020px) and (min-width: 640px) {
+  .context-bar {
+    padding: max(8px, env(safe-area-inset-top, 0px)) max(12px, env(safe-area-inset-right, 0px)) 8px
+      max(12px, env(safe-area-inset-left, 0px));
+  }
+
+  .brand-sub {
+    display: none;
+  }
+
+  .session-picker {
+    flex: 1 1 200px;
+  }
+
+  .session-trigger {
+    width: 100%;
+    min-width: 160px;
+    max-width: none;
+  }
+
+  /* 1fr 1fr Topology left / Feed+Inspector right */
+  .studio-workspace {
+    grid-template-columns: 1fr 1fr;
+    gap: 12px;
+    padding: 10px max(12px, env(safe-area-inset-right, 0px))
+      calc(82px + env(safe-area-inset-bottom, 0px)) max(12px, env(safe-area-inset-left, 0px));
+  }
+
+  .stream-inspector-slot[data-inspector-state="open"] {
+    flex: 0 0 44%;
+    min-height: min(200px, 46%);
+    max-height: 52%;
+  }
+
+  .timeline-bar {
+    gap: 10px;
+    min-height: 68px;
+    padding: 6px max(12px, env(safe-area-inset-right, 0px))
+      max(8px, env(safe-area-inset-bottom, 0px)) max(12px, env(safe-area-inset-left, 0px));
+  }
+
+  .tl-hint {
+    display: none;
+  }
+
+  /* Agile Board 1fr 1fr: Kanban left / Detail + Bugs + Testruns right */
+  .board-split {
+    grid-template-columns: 1fr 1fr;
+    gap: 12px;
+  }
+
+  /* Mockups 1fr 1fr split */
+  .mockups-view {
+    grid-template-columns: 240px 1fr;
+    gap: 12px;
+  }
+
+  /* Doctor IDE cards & Team grids: 2-col on nearly-square unfolded screen */
+  .ide-cards-grid:not(.is-single-ide),
+  .team-roster-grid,
+  .team-defs-grid,
+  .team-cp-grid,
+  .model-tiers-grid,
+  .model-catalog-grid,
+  .model-add-grid,
+  .mi-health-layers {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+}
+
+/* Hinge / Crease-Aware Dual-Screen Support (Viewport Segments API) */
+@media (horizontal-viewport-segments: 2) {
+  /* Full-viewport split shells map directly to physical display segments */
+  .studio-workspace,
+  .board-split,
+  .mockups-view,
+  .doctor-bottom-grid,
+  .guide-two-col {
+    grid-template-columns: env(viewport-segment-width 0 0) env(viewport-segment-width 1 0);
+    gap: max(12px, calc(env(viewport-segment-left 1 0) - env(viewport-segment-right 0 0)));
+  }
+
+  /* Padded containers and modal dialogs use fractional 2-col with hinge-aware gap */
+  .team-roster-grid,
+  .team-defs-grid,
+  .model-tiers-grid,
+  .model-catalog-grid,
+  .mi-health-layers {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    gap: max(12px, calc(env(viewport-segment-left 1 0) - env(viewport-segment-right 0 0)));
+  }
+}
+
+/* ==========================================================================
+   TIER 1: Closed / Cover Screen (< 640px, Galaxy Z Fold 7 cover ~360-412px)
+   Single-screen 100dvh app shell with fixed bottom segmented view switcher
+   ========================================================================== */
+@media (max-width: 639px) {
+  :root {
+    --cover-nav-h: 60px;
+    --timeline-cover-h: 112px;
+  }
+
+  html {
+    scroll-padding-bottom: calc(
+      var(--cover-nav-h) + var(--timeline-cover-h) + 12px + env(safe-area-inset-bottom, 0px)
+    );
+  }
+
+  .context-bar {
+    padding: max(8px, env(safe-area-inset-top, 0px)) max(10px, env(safe-area-inset-right, 0px)) 8px
+      max(10px, env(safe-area-inset-left, 0px));
+    gap: 6px;
+  }
+
+  .brand-sub,
+  .primary-tabs,
+  .legend,
+  .tl-hint {
+    display: none;
+  }
+
+  .ctx-controls-row {
+    flex-direction: column;
+    align-items: stretch;
+    gap: 6px;
+    overflow: visible;
+  }
+
+  /* On Live Studio cover screen, Project picker lives in the bottom-sheet dialog;
+     on Team / Board / Mockups / Doctor, expose Project Switcher directly in 1 tap */
+  .app-shell[data-active-view="studio"] .ctx-group {
+    display: none;
+  }
+
+  .app-shell:not([data-active-view="studio"]) .ctx-group {
+    display: block;
+    width: 100%;
+  }
+
+  .app-shell:not([data-active-view="studio"]) .ctx-select {
+    width: 100%;
+    max-width: none;
+  }
+
+  .session-picker {
+    order: 1;
+    margin-left: 0;
+    width: 100%;
+  }
+
+  .session-trigger {
+    width: 100%;
+    min-width: 0;
+    max-width: none;
+  }
+
+  /* Dedicated full-width row for IDE Filter Pills so All | Antigravity | Claude Code | VS Code never fight the session picker */
+  .ide-pills {
+    order: 2;
+    width: 100%;
+    display: flex;
+    justify-content: space-between;
+    overflow-x: auto;
+    scrollbar-width: none;
+  }
+
+  .ide-pill {
+    flex: 1 0 auto;
+    text-align: center;
+    padding: 5px 8px;
+    font-size: 11.5px;
+  }
+
+  /* Remove cramped inline bottom inspector on cover screen; full Feed height + bottom-sheet modal on tap */
+  .stream-inspector-slot {
+    display: none;
+  }
+
+  .feed-tap-hint {
+    display: inline;
+  }
+
+  .inspector-dialog,
+  .team-detail-dialog,
+  .model-index-dialog {
+    margin: auto 0 0 0;
+    width: 100%;
+    max-width: 100%;
+    max-height: 88dvh;
+    border: none;
+    border-top: 1px solid var(--border-strong);
+    border-radius: 16px 16px 0 0;
+  }
+
+  .insp-sheet-shell {
+    max-height: 88dvh;
+  }
+
+  .insp-sheet-shell .sheet-handle {
+    display: block;
+  }
+
+  .insp-sheet-body {
+    padding: 12px 14px max(20px, env(safe-area-inset-bottom, 0px));
+  }
+
+  .insp-sheet-body .insp-pre-wrap {
+    max-height: 54dvh;
+  }
+
+  /* Fixed bottom segmented view switcher: Studio | Feed | Team | Board | Mockups | Doctor */
+  .cover-bottom-nav {
+    position: fixed;
+    left: 0;
+    right: 0;
+    bottom: 0;
+    z-index: 55;
+    display: grid;
+    grid-template-columns: repeat(6, minmax(0, 1fr));
+    gap: 2px;
+    padding: 5px max(4px, env(safe-area-inset-right, 0px))
+      max(8px, env(safe-area-inset-bottom, 0px)) max(4px, env(safe-area-inset-left, 0px));
+    background: rgba(9, 13, 22, 0.97);
+    border-top: 1px solid var(--border-strong);
+    backdrop-filter: blur(8px);
+  }
+
+  .app-shell[data-hide-mockups="1"] .cover-bottom-nav {
+    grid-template-columns: repeat(5, minmax(0, 1fr));
+  }
+
+  .cover-nav-btn {
+    position: relative;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    gap: 2px;
+    min-block-size: 44px;
+    min-width: 0;
+    padding: 4px 2px;
+    border-radius: 7px;
+    border: 1px solid transparent;
+    background: transparent;
+    color: var(--muted);
+    font-size: 9.5px;
+    font-weight: 650;
+    cursor: pointer;
+    white-space: nowrap;
+    overflow: hidden;
+  }
+
+  .cover-nav-btn span:last-child {
+    max-width: 100%;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+
+  .cover-nav-btn.active {
+    background: #1a2744;
+    border-color: rgba(6, 182, 212, 0.55);
+    color: var(--text-strong);
+  }
+
+  .cover-nav-btn.active::before {
+    content: "";
+    position: absolute;
+    inset: 0 6px auto;
+    border-block-start: 2px solid var(--cyan);
+  }
+
+  .cover-nav-ico {
+    font-size: 14px;
+    line-height: 1;
+  }
+
+  /* Live Studio switches cleanly between Topology and Feed panes on cover screen */
+  .studio-workspace {
+    display: flex;
+    flex-direction: column;
+    gap: 0;
+    padding: 8px max(8px, env(safe-area-inset-right, 0px))
+      calc(var(--cover-nav-h) + var(--timeline-cover-h) + 8px + env(safe-area-inset-bottom, 0px))
+      max(8px, env(safe-area-inset-left, 0px));
+  }
+
+  .studio-workspace[data-cover-pane="topology"] .pane-stream {
+    display: none;
+  }
+
+  .studio-workspace[data-cover-pane="feed"] .pane-topology {
+    display: none;
+  }
+
+  .pane-topology,
+  .pane-stream {
+    flex: 1;
+    min-height: 0;
+  }
+
+  /* Compact timeline docked right above the fixed bottom nav */
+  .timeline-bar {
+    bottom: calc(var(--cover-nav-h) + env(safe-area-inset-bottom, 0px));
+    min-height: var(--timeline-cover-h);
+    padding: 6px max(10px, env(safe-area-inset-right, 0px)) 6px
+      max(10px, env(safe-area-inset-left, 0px));
+    grid-template-columns: 1fr auto;
+    grid-template-rows: auto auto;
+    gap: 6px 6px;
+  }
+
+  .tl-center {
+    grid-column: 1 / -1;
+    grid-row: 1;
+  }
+
+  .tl-transport {
+    grid-column: 1;
+    grid-row: 2;
+    gap: 4px;
+    min-width: 0;
+  }
+
+  .tl-btn {
+    min-width: 36px;
+    padding: 0 7px;
+  }
+
+  .tl-btn.play {
+    min-width: 40px;
+  }
+
+  .tl-speed {
+    min-width: 34px;
+  }
+
+  .tl-right {
+    grid-column: 2;
+    grid-row: 2;
+  }
+
+  .tl-timecode {
+    display: none;
+  }
+
+  /* Team, Board, Mockups, and Doctor clear the fixed bottom nav cleanly */
+  .team-view,
+  .board-view,
+  .doctor-view {
+    padding: 10px max(10px, env(safe-area-inset-right, 0px))
+      calc(var(--cover-nav-h) + 16px + env(safe-area-inset-bottom, 0px))
+      max(10px, env(safe-area-inset-left, 0px));
+  }
+
+  .board-split,
+  .doctor-bottom-grid,
+  .ide-cards-grid,
+  .guide-two-col,
+  .team-roster-grid,
+  .team-defs-grid,
+  .team-cp-grid,
+  .model-tiers-grid,
+  .model-catalog-grid,
+  .model-add-grid,
+  .mi-health-layers,
+  .roster-model-controls {
+    grid-template-columns: 1fr;
+  }
+
+  .mr-controls-row,
+  .mi-scope-bar,
+  .mi-role-row,
+  .roster-card-foot {
+    flex-direction: column;
+    align-items: stretch;
+  }
+
+  .mr-field,
+  .mi-role-ctrl {
+    flex: none;
+    min-width: 0;
+    width: 100%;
+  }
+
+  .roster-foot-actions {
+    width: 100%;
+    justify-content: space-between;
+  }
+
+  .guides-shell {
+    padding: 12px 10px;
+  }
+
+  .guide-tabs {
+    width: 100%;
+  }
+
+  .kpi-strip {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  .mockups-view {
+    display: flex;
+    flex-direction: column;
+    overflow-y: auto;
+    gap: 10px;
+    padding: 10px max(10px, env(safe-area-inset-right, 0px))
+      calc(var(--cover-nav-h) + 16px + env(safe-area-inset-bottom, 0px))
+      max(10px, env(safe-area-inset-left, 0px));
+  }
+
+  .mockups-view > * {
+    flex-shrink: 0;
+  }
+
+  .mockups-sidebar {
+    max-height: 180px;
+  }
+
+  .iframe-stage {
+    flex: none;
+    height: 360px;
+  }
+}
+
+@media (max-width: 400px) {
+  .timeline-bar [data-tl="home"] {
+    display: none;
+  }
+}

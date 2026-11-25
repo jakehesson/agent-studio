@@ -1,0 +1,12 @@
+{
+  "mcpServers": {
+    "agent-studio": {
+      "command": "npx",
+      "args": [
+        "-y",
+        "agent-studio",
+        "mcp"
+      ]
+    }
+  }
+}

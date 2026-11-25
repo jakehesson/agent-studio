@@ -1,0 +1,178 @@
+schemaVersion: 1
+project:
+  id: agent-studio
+  title: Agent Studio
+  description: IDE-agnostic multi-agent orchestration, QA-gated Agile Board MCP,
+    and live monitoring studio
+  mockupsDirs:
+    - docs/mockups
+targets:
+  - antigravity
+  - claude-code
+  - copilot-vscode
+workflow:
+  boardPath: pipeline/board.json
+  stages:
+    - ready
+    - design
+    - dev
+    - test
+    - done
+  enforcement:
+    orchestratorReadOnly: true
+    qaGateRequired: true
+    blockDirectBoardEdits: true
+  suites:
+    smoke:
+      - CP0
+      - CP1
+    full:
+      - CP0
+      - CP1
+      - CP2
+  checkpoints:
+    CP0:
+      title: TypeScript Typecheck & Unit Suite
+      command: npm run check && npm test
+      steps:
+        - Run `npm run check && npm test` to verify TypeScript compilation, schemas, board lock/QA gate, compiler, telemetry adapters, and HTTP/SSE tests.
+      pass:
+        - Exit code 0 with zero TypeScript errors and 100% passing unit tests.
+      fail:
+        - Any compiler error or failing unit/integration test assertion.
+    CP1:
+      title: Web Studio Typecheck & Vite Build
+      command: npm --prefix web run check && npm --prefix web run build
+      steps:
+        - Run `npm --prefix web run check && npm --prefix web run build` to verify frontend types and production bundle output in `dist/web/`.
+      pass:
+        - Web typecheck and Vite production build exit 0 cleanly.
+      fail:
+        - Any frontend TypeScript or Vite bundling failure.
+    CP2:
+      title: Legacy Python Visualizer Smoke Suite
+      command: python tests/smoke_test.py
+      steps:
+        - Run `python tests/smoke_test.py` to confirm backward compatibility of `agent_visualizer.py`.
+      pass:
+        - All smoke checks pass with exit code 0.
+      fail:
+        - Any syntax, transcript parsing, or ephemeral HTTP regression.
+  modelRouting:
+    policy: prefer-fallback
+    respectBuiltInOrchestrators: true
+    allowSubagentModelHints: true
+    copilotHandoffModels: false
+roster:
+  - id: orchestrator
+    name: Team Orchestrator
+    roleType: orchestrator
+    boardRole: orchestrator
+    promptFile: agents/orchestrator.md
+    modelTier: fast
+    capabilities:
+      - read
+      - search
+      - delegate
+      - ask_user
+      - mcp_board
+    handoffs:
+      - architect
+      - ux-designer
+      - backend-engineer
+      - frontend-engineer
+      - qa-validator
+    description: Strict manager and dispatcher overseeing ready -> design -> dev ->
+      test -> done and enforcing the QA gate via agent-studio MCP.
+  - id: architect
+    name: System Architect
+    roleType: specialist
+    boardRole: design
+    promptFile: agents/architect.md
+    modelTier: reasoning
+    capabilities:
+      - read
+      - search
+      - write_docs
+      - mcp_board
+    description: System architecture, technical specifications, data schemas, and
+      API contracts.
+  - id: ux-designer
+    name: UX Engineer & Designer
+    roleType: specialist
+    boardRole: ux
+    promptFile: agents/ux-designer.md
+    modelTier: reasoning
+    capabilities:
+      - read
+      - search
+      - write_docs
+      - mcp_board
+    description: Usability engineering, interaction design, layout/overflow audits,
+      WCAG AA accessibility, and Galaxy Z Fold 7 three-tier responsive ergonomics
+      partnering with frontend-engineer.
+  - id: backend-engineer
+    name: Backend Engineer
+    roleType: specialist
+    boardRole: backend
+    promptFile: agents/backend-engineer.md
+    modelTier: balanced
+    capabilities:
+      - read
+      - search
+      - edit
+      - shell
+      - mcp_board
+    description: Server, CLI, data layer, and core backend implementation with unit
+      test coverage.
+  - id: frontend-engineer
+    name: Frontend Engineer
+    roleType: specialist
+    boardRole: frontend
+    promptFile: agents/frontend-engineer.md
+    modelTier: balanced
+    capabilities:
+      - read
+      - search
+      - edit
+      - shell
+      - mcp_board
+    description: UI, interactive views, visualizations, and responsive styling
+      across mobile, foldable, and desktop.
+  - id: qa-validator
+    name: QA Validator
+    roleType: qa
+    boardRole: qa
+    promptFile: agents/qa-validator.md
+    modelTier: fast
+    capabilities:
+      - read
+      - search
+      - edit_tests
+      - shell
+      - mcp_board
+      - mcp_testrun
+    description: Automated test suites, formal MCP testruns, bug filing, and test ->
+      done QA gate verification.
+  - id: team-setup
+    name: Team Setup Agent
+    roleType: setup
+    boardRole: ops
+    promptFile: agents/team-setup.md
+    modelTier: balanced
+    capabilities:
+      - read
+      - search
+      - edit
+      - shell
+      - ask_user
+    description: Cross-IDE AI Setup Agent that inspects the repo, tailors
+      .agent-team/, compiles IDE adapters, and verifies health.
+skills:
+  - skills/agile-board-workflow
+  - skills/architecture-spec
+  - skills/ux-review
+  - skills/qa-validation
+  - skills/token-efficiency
+  - skills/model-routing
+  - skills/team-setup

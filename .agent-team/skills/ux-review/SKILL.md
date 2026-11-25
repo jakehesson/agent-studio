@@ -1,0 +1,27 @@
+---
+name: ux-review
+description: Audit UI usability, layout/overflow integrity, accessibility (WCAG AA / Forced Colors), empty/error states, and Galaxy Z Fold 7 three-tier responsive ergonomics alongside frontend implementation.
+---
+
+# UX Review & Usability Engineering Skill
+
+## When to Use
+Use before and after UI changes to partner with `frontend-engineer` on usability, layout resilience, accessibility, and responsive ergonomics.
+
+## Usability & Layout Integrity Checklist
+1. **No Clipping or Scroll Traps:** Verify flex/grid children set `min-width: 0` / `min-height: 0` where needed, `100dvh` shells never clip sticky/bottom bars, and wide diagrams/tables scroll inside their own `role="region" tabindex="0"` container.
+2. **Visual Hierarchy & Clarity:** Primary actions are immediately distinguishable; typography, spacing, and badges remain scannable without clutter.
+3. **Complete UI States:** Every view provides clear loading, empty (with next-step CTA), error (with recovery action), and live/offline feedback states.
+4. **Accessibility (WCAG AA):** Sufficient color contrast, semantic landmarks/ARIA labels, logical Tab order with visible `:focus-visible` outlines, `@media (prefers-reduced-motion: reduce)`, and `@media (forced-colors: active)` legibility.
+5. **Three-Tier Responsive Ergonomics (Galaxy Z Fold 7 + Desktop):**
+   - **Cover (`< 640px`):** single-screen `100dvh` layout, segmented view switcher, bottom-sheet popovers, horizontally scrollable filter bars, `env(safe-area-inset-*)`, `44px` tap targets under `@media (pointer: coarse)`.
+   - **Unfolded (`640px–1020px`):** `1fr 1fr` split inside `100dvh` honoring `@media (horizontal-viewport-segments: 2)` and `env(viewport-segment-*)` hinge gutters.
+   - **Desktop (`>= 1021px`):** full multi-column workspace with `@container` widget adaptation and keyboard shortcut hints.
+6. **Standalone Web vs. Embedded IDE Extension Scoping:**
+   - In **embedded IDE extension mode (`embed=1`)**, scope all views, sessions, sidebar items, and status bar counters strictly to the detected **host IDE** (`antigravity` or `copilot-vscode`) and **current workspace**, hiding cross-IDE and cross-project UI chrome (multi-project switcher, other-IDE filter pills, other-IDE Doctor cards/usage guides, and other-IDE Team definitions/skills).
+   - In **standalone Web Studio mode** (browser without `embed=1`), preserve full multi-IDE and multi-project switching across all registered workspaces.
+
+## UX Sign-Off Procedure
+1. Record prioritized findings (P0 blocker / P1 polish / P2 nice-to-have) with exact viewport widths and actionable fixes.
+2. Partner with `frontend-engineer` to verify fixes cleanly without regressions.
+3. Post a concise UX sign-off note on the board item via MCP `board { op: "note" }`.

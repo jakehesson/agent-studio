@@ -1,0 +1,100 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*.*.*"
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    name: Build & Publish Release
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js 22
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: |
+            package-lock.json
+            web/package-lock.json
+            extension/package-lock.json
+
+      - name: Setup Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Verify SemVer lockstep with git tag
+        id: version
+        shell: bash
+        run: |
+          TAG_VERSION="${GITHUB_REF_NAME#v}"
+          ROOT_VER=$(node -p "require('./package.json').version")
+          WEB_VER=$(node -p "require('./web/package.json').version")
+          EXT_VER=$(node -p "require('./extension/package.json').version")
+          echo "Tag: ${TAG_VERSION} | root=${ROOT_VER} | web=${WEB_VER} | extension=${EXT_VER}"
+          if [[ "${ROOT_VER}" != "${TAG_VERSION}" || "${WEB_VER}" != "${TAG_VERSION}" || "${EXT_VER}" != "${TAG_VERSION}" ]]; then
+            echo "::error::SemVer mismatch! Tag=${TAG_VERSION}, package.json=${ROOT_VER}, web=${WEB_VER}, extension=${EXT_VER}"
+            exit 1
+          fi
+          echo "tag_version=${TAG_VERSION}" >> "$GITHUB_OUTPUT"
+
+      - name: Install dependencies
+        run: |
+          npm ci
+          npm --prefix web ci
+          npm --prefix extension ci
+
+      - name: Typecheck core, web, and extension
+        run: |
+          npm run check
+          npm --prefix web run check
+          npm --prefix extension run check
+
+      - name: Build core and Web Studio
+        run: npm run build:all
+
+      - name: Package VS Code / Antigravity extension (.vsix)
+        run: npm --prefix extension run package
+
+      - name: Build native Antigravity MCP App plugin
+        run: node antigravity-plugin/scripts/build-plugin.mjs
+
+      - name: Run unit test suite
+        run: npm test
+
+      - name: Verify compiled IDE adapters have zero drift
+        run: node dist/cli/index.js sync --check
+
+      - name: Run legacy Python visualizer smoke suite
+        run: python tests/smoke_test.py
+
+      - name: Verify npm package contents
+        run: npm pack --dry-run
+
+      - name: Package release artifacts
+        shell: bash
+        run: |
+          TAG_VERSION="${{ steps.version.outputs.tag_version }}"
+          VSIX_PATH="extension/agent-studio-${TAG_VERSION}.vsix"
+          if [[ ! -f "${VSIX_PATH}" ]]; then
+            echo "::error::Expected VSIX artifact not found at ${VSIX_PATH}"
+            exit 1
+          fi
+          (cd antigravity-plugin/dist && zip -r "../../agent-studio-antigravity-plugin-${TAG_VERSION}.zip" .)
+
+      - name: Publish GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          generate_release_notes: true
+          files: |
+            extension/agent-studio-${{ steps.version.outputs.tag_version }}.vsix
+            agent-studio-antigravity-plugin-${{ steps.version.outputs.tag_version }}.zip

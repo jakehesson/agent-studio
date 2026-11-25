@@ -1,0 +1,323 @@
+/* Antigravity MCP App Host Theme Bridge
+   Maps SEP-1865 host style variables onto Agent Studio tokens with dark & light fallbacks. */
+:root {
+  color-scheme: dark light;
+
+  --bg: var(--color-background-primary, #07090f);
+  --panel: var(--color-background-secondary, #0e131f);
+  --panel-2: var(--color-background-tertiary, #141c2e);
+  --panel-3: var(--color-background-tertiary, #1b253d);
+
+  --border: var(--color-border-secondary, #1e2942);
+  --border-strong: var(--color-border-primary, #31446b);
+
+  --text: var(--color-text-primary, #e8effa);
+  --text-strong: var(--color-text-primary, #f8fafc);
+  --muted: var(--color-text-secondary, var(--color-text-tertiary, #8b9bb8));
+}
+
+body {
+  font-family: var(--font-sans, Inter, "Segoe UI", system-ui, -apple-system, sans-serif);
+}
+
+/* Light theme surface contrast adaptation when Antigravity host switches to light mode */
+:root[data-theme="light"] {
+  color-scheme: light;
+
+  --bg: var(--color-background-primary, #f8fafc);
+  --panel: var(--color-background-secondary, #ffffff);
+  --panel-2: var(--color-background-tertiary, #f1f5f9);
+  --panel-3: var(--color-background-tertiary, #e2e8f0);
+
+  --border: var(--color-border-secondary, #dbe3ef);
+  --border-strong: var(--color-border-primary, #94a3b8);
+
+  --text: var(--color-text-primary, #0f172a);
+  --text-strong: var(--color-text-primary, #020617);
+  --muted: var(--color-text-secondary, #475569);
+
+  --scrollbar-thumb: #94a3b8;
+  --scrollbar-track: #e2e8f0;
+}
+
+:root[data-theme="light"] .primary-tabs,
+:root[data-theme="light"] .guide-tabs,
+:root[data-theme="light"] .feed-mode-toggle,
+:root[data-theme="light"] .zoom-bar,
+:root[data-theme="light"] .summary-strip,
+:root[data-theme="light"] .stream-inspector-slot,
+:root[data-theme="light"] .insp-head,
+:root[data-theme="light"] .kpi-card,
+:root[data-theme="light"] .guide-card,
+:root[data-theme="light"] .team-workflow-bar,
+:root[data-theme="light"] .cp-card,
+:root[data-theme="light"] .embed-scope-chip,
+:root[data-theme="light"] .insp-act-row,
+:root[data-theme="light"] .insp-narrative,
+:root[data-theme="light"] .insp-def-box,
+:root[data-theme="light"] .usage-kpi,
+:root[data-theme="light"] .usage-section-card {
+  background: var(--panel-2);
+  color: var(--text);
+}
+
+:root[data-theme="light"] .smart-zone-track,
+:root[data-theme="light"] .tok-stack-track,
+:root[data-theme="light"] .ctx-meter-track,
+:root[data-theme="light"] .model-dist-bar {
+  background: #e2e8f0;
+  border-color: #cbd5e1;
+}
+
+:root[data-theme="light"] .usage-agent-card {
+  background: var(--panel);
+  color: var(--text);
+}
+
+:root[data-theme="light"] .usage-agent-card:hover {
+  background: var(--panel-2);
+}
+
+:root[data-theme="light"] .usage-agent-card.selected {
+  background: #dbeafe;
+}
+
+:root[data-theme="light"] .usage-model-pill {
+  background: rgba(124, 58, 237, 0.12);
+  border-color: rgba(124, 58, 237, 0.35);
+  color: #5b21b6;
+}
+
+:root[data-theme="light"] .zone-ok {
+  background: rgba(16, 185, 129, 0.14);
+  color: #047857;
+}
+
+:root[data-theme="light"] .zone-warn {
+  background: rgba(245, 158, 11, 0.16);
+  color: #b45309;
+}
+
+:root[data-theme="light"] .zone-err {
+  background: rgba(239, 68, 68, 0.14);
+  color: #b91c1c;
+}
+
+:root[data-theme="light"] .primary-tab[aria-selected="true"],
+:root[data-theme="light"] .guide-tab[aria-selected="true"],
+:root[data-theme="light"] .feed-mode-btn[aria-pressed="true"],
+:root[data-theme="light"] .filter-chip[aria-selected="true"],
+:root[data-theme="light"] .filter-chip[aria-pressed="true"],
+:root[data-theme="light"] .ev-row.selected {
+  background: #dbeafe;
+  color: #0f172a;
+}
+
+:root[data-theme="light"] .ev-title,
+:root[data-theme="light"] .insp-act-text,
+:root[data-theme="light"] .insp-summary,
+:root[data-theme="light"] .roster-desc,
+:root[data-theme="light"] .def-tile-desc,
+:root[data-theme="light"] .guide-tagline {
+  color: var(--text);
+}
+
+:root[data-theme="light"] .timeline-bar {
+  background: linear-gradient(180deg, rgba(248, 250, 252, 0.96) 0%, #f1f5f9 100%);
+  box-shadow: 0 -6px 20px rgba(15, 23, 42, 0.08);
+}
+
+:root[data-theme="light"] .tl-now-label,
+:root[data-theme="light"] .tl-timecode {
+  color: var(--text);
+}
+
+:root[data-theme="light"] .tl-track {
+  background: #cbd5e1;
+  border-color: #94a3b8;
+}
+
+:root[data-theme="light"] .cover-bottom-nav {
+  background: rgba(248, 250, 252, 0.96);
+}
+
+:root[data-theme="light"] .session-popover,
+:root[data-theme="light"] .bottom-sheet-dialog,
+:root[data-theme="light"] .inspector-dialog,
+:root[data-theme="light"] .team-detail-dialog,
+:root[data-theme="light"] .model-index-dialog,
+:root[data-theme="light"] .insp-sheet-head,
+:root[data-theme="light"] .session-pop-head {
+  background: var(--panel);
+  color: var(--text);
+}
+
+:root[data-theme="light"] .mr-controls-row,
+:root[data-theme="light"] .roster-model-box,
+:root[data-theme="light"] .ro-ide-fieldset,
+:root[data-theme="light"] .mi-mcp-banner,
+:root[data-theme="light"] .mi-scope-bar,
+:root[data-theme="light"] .mi-ide-meta-banner,
+:root[data-theme="light"] .model-tier-card,
+:root[data-theme="light"] .model-catalog-card,
+:root[data-theme="light"] .mi-form-card,
+:root[data-theme="light"] .mi-role-row,
+:root[data-theme="light"] .mi-health-layer {
+  background: var(--panel-2);
+  color: var(--text);
+}
+
+:root[data-theme="light"] .tier-pill.tier-fast {
+  color: #047857;
+  background: rgba(16, 185, 129, 0.14);
+}
+
+:root[data-theme="light"] .tier-pill.tier-balanced {
+  color: #0369a1;
+  background: rgba(56, 189, 248, 0.16);
+}
+
+:root[data-theme="light"] .tier-pill.tier-reasoning {
+  color: #6d28d9;
+  background: rgba(168, 85, 247, 0.16);
+  border-color: rgba(109, 40, 217, 0.35);
+}
+
+:root[data-theme="light"] .ro-mcp-cli,
+:root[data-theme="light"] .cp-cmd-scroll,
+:root[data-theme="light"] .insp-pre-wrap,
+:root[data-theme="light"] .insp-pre,
+:root[data-theme="light"] .team-root-path,
+:root[data-theme="light"] .ide-path {
+  background: var(--panel);
+  color: var(--text);
+  border-color: var(--border-strong);
+}
+
+:root[data-theme="light"] .issue-row {
+  background: rgba(245, 158, 11, 0.14);
+  border-color: rgba(180, 83, 9, 0.45);
+  color: #78350f;
+}
+
+:root[data-theme="light"] .issue-row.ok {
+  background: rgba(16, 185, 129, 0.12);
+  border-color: rgba(4, 120, 87, 0.42);
+  color: #064e3b;
+}
+
+:root[data-theme="light"] .issue-row.error {
+  background: rgba(244, 63, 94, 0.12);
+  border-color: rgba(190, 18, 60, 0.45);
+  color: #881337;
+}
+
+:root[data-theme="light"] .guide-copy-btn,
+:root[data-theme="light"] .copy-btn,
+:root[data-theme="light"] .insp-icon-btn,
+:root[data-theme="light"] .ide-guide-jump {
+  background: var(--panel);
+  color: var(--text);
+  border-color: var(--border-strong);
+}
+
+:root[data-theme="light"] .guide-copy-btn:hover,
+:root[data-theme="light"] .copy-btn:hover,
+:root[data-theme="light"] .insp-icon-btn:hover,
+:root[data-theme="light"] .ide-guide-jump:hover {
+  background: var(--panel-3);
+  color: var(--text-strong);
+  border-color: #0284c7;
+}
+
+:root[data-theme="light"] .guide-copy-btn.copied,
+:root[data-theme="light"] .copy-btn.copied {
+  background: rgba(16, 185, 129, 0.14);
+  border-color: #059669;
+  color: #065f46;
+}
+
+:root[data-theme="light"] .pill {
+  color: #334155;
+  border-color: var(--border-strong);
+  background: var(--panel);
+}
+
+:root[data-theme="light"] .pill.ok,
+:root[data-theme="light"] .pill.complete,
+:root[data-theme="light"] .cp-badge.cp-passed,
+:root[data-theme="light"] .team-role-badge.role-qa {
+  color: #065f46;
+  border-color: rgba(4, 120, 87, 0.45);
+  background: rgba(16, 185, 129, 0.14);
+}
+
+:root[data-theme="light"] .pill.blocker,
+:root[data-theme="light"] .cp-badge.cp-failed {
+  color: #9f1239;
+  border-color: rgba(190, 18, 60, 0.45);
+  background: rgba(244, 63, 94, 0.14);
+}
+
+:root[data-theme="light"] .pill.dispatch,
+:root[data-theme="light"] .handoff-pill {
+  color: #3730a3;
+  border-color: rgba(67, 56, 202, 0.4);
+  background: rgba(99, 102, 241, 0.12);
+}
+
+:root[data-theme="light"] .pill.peer,
+:root[data-theme="light"] .team-role-badge.role-spec {
+  color: #0e7490;
+  border-color: rgba(14, 116, 144, 0.42);
+  background: rgba(6, 182, 212, 0.12);
+}
+
+:root[data-theme="light"] .pill.board,
+:root[data-theme="light"] .pill.thinking,
+:root[data-theme="light"] .team-role-badge.role-orch {
+  color: #6b21a8;
+  border-color: rgba(107, 33, 168, 0.42);
+  background: rgba(168, 85, 247, 0.14);
+}
+
+:root[data-theme="light"] .pill.human,
+:root[data-theme="light"] .cp-badge.cp-running,
+:root[data-theme="light"] .team-role-badge.role-setup {
+  color: #92400e;
+  border-color: rgba(180, 83, 9, 0.42);
+  background: rgba(245, 158, 11, 0.16);
+}
+
+:root[data-theme="light"] .pill.tool {
+  color: #334155;
+  border-color: var(--border-strong);
+  background: var(--panel);
+}
+
+:root[data-theme="light"] .cap-chip {
+  background: var(--panel);
+  color: var(--text);
+  border-color: var(--border-strong);
+}
+
+:root[data-theme="light"] .mi-cat-id,
+:root[data-theme="light"] .roster-id,
+:root[data-theme="light"] .def-tile-name code {
+  color: #0369a1;
+}
+
+:root[data-theme="light"] .resolved-model-pill {
+  background: var(--panel) !important;
+  color: var(--text) !important;
+  border-color: var(--border-strong) !important;
+}
+
+:root[data-theme="light"] .resolved-model-pill strong {
+  color: var(--text-strong) !important;
+}
+
+/* Keep SVG topology canvas dark for crisp glowing agent cards & animated packet contrast */
+:root[data-theme="light"] .graph-wrap {
+  background: radial-gradient(circle at 50% 45%, #111827 0%, #090d16 78%);
+}

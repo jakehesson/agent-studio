@@ -1,0 +1,523 @@
+{
+  "project": "agent-visualizer",
+  "milestone": {
+    "id": "M1",
+    "name": "Agent Studio Core & Multi-IDE Orchestration",
+    "sprints": [
+      "S1"
+    ],
+    "final_suite": "full"
+  },
+  "active_sprint": "S1",
+  "sprints": {
+    "S1": {
+      "goal": "Establish core multi-agent orchestration, QA-gated Agile Board, and live monitoring studio",
+      "status": "active",
+      "started_at": "2026-11-23T23:45:00Z"
+    }
+  },
+  "suites": {
+    "smoke": [
+      "CP0",
+      "CP1"
+    ],
+    "full": [
+      "CP0",
+      "CP1",
+      "CP2"
+    ]
+  },
+  "items": [
+    {
+      "id": "S1-01",
+      "type": "story",
+      "role": "backend",
+      "sprint": "S1",
+      "state": "done",
+      "title": "Bootstrap project board schema and checkpoint definitions",
+      "ac": [
+        "Board JSON schema supports items, sprints, suites, builds, and testruns"
+      ],
+      "deps": [],
+      "notes": [
+        "2026-11-23T23:50:00Z orchestrator: created",
+        "2026-11-24T00:05:00Z qa-validator: test->done | Verified via TR-001"
+      ],
+      "owner": "backend-engineer",
+      "evidence": [
+        "TR-001 PASS"
+      ]
+    },
+    {
+      "id": "S1-02",
+      "type": "task",
+      "role": "backend",
+      "sprint": "S1",
+      "state": "done",
+      "title": "Implement transcript discovery and JSONL parser",
+      "ac": [
+        "Discover sessions from transcript logs dynamically"
+      ],
+      "deps": [
+        "S1-01"
+      ],
+      "notes": [
+        "2026-11-24T00:10:00Z orchestrator: created"
+      ],
+      "owner": "backend-engineer"
+    },
+    {
+      "id": "S1-03",
+      "type": "task",
+      "role": "frontend",
+      "sprint": "S1",
+      "state": "done",
+      "title": "Build non-overlapping SVG topology graph layout",
+      "ac": [
+        "Auto-layout supports 1 to 12+ dynamic agents without node overlap"
+      ],
+      "deps": [
+        "S1-02"
+      ],
+      "notes": [
+        "2026-11-24T00:20:00Z orchestrator: created"
+      ],
+      "owner": "frontend-engineer"
+    },
+    {
+      "id": "S1-04",
+      "type": "story",
+      "role": "frontend",
+      "sprint": "S1",
+      "state": "done",
+      "title": "Add video-style timeline scrubber with live tail pinning",
+      "ac": [
+        "Scrub history backward and re-pin to LIVE edge"
+      ],
+      "deps": [
+        "S1-03"
+      ],
+      "notes": [
+        "2026-11-24T00:35:00Z orchestrator: created"
+      ],
+      "owner": "frontend-engineer"
+    },
+    {
+      "id": "S1-05",
+      "type": "task",
+      "role": "backend",
+      "sprint": "S1",
+      "state": "done",
+      "title": "Add SSE /api/stream endpoint with incremental replay",
+      "ac": [
+        "Clients receive live snapshot updates over SSE"
+      ],
+      "deps": [
+        "S1-02"
+      ],
+      "notes": [
+        "2026-11-24T01:00:00Z orchestrator: created"
+      ],
+      "owner": "backend-engineer"
+    },
+    {
+      "id": "S1-06",
+      "type": "bug",
+      "role": "backend",
+      "sprint": "S1",
+      "state": "done",
+      "title": "Exclude self-daemon rows from active WORKING state detection",
+      "severity": "S2",
+      "resolution": "fixed",
+      "verified_build": "build-002",
+      "ac": [
+        "Self-polling daemon commands never pin root status to WORKING"
+      ],
+      "deps": [],
+      "notes": [
+        "2026-11-24T01:20:00Z qa-validator: verified fixed in build-002"
+      ]
+    },
+    {
+      "id": "S1-07",
+      "type": "task",
+      "role": "qa",
+      "sprint": "S1",
+      "state": "done",
+      "title": "Add smoke_test.py syntax and ephemeral HTTP checks",
+      "ac": [
+        "py_compile, embedded JS syntax check, and HTTP GET checks pass"
+      ],
+      "deps": [
+        "S1-05"
+      ],
+      "notes": [
+        "2026-11-24T01:40:00Z qa-validator: TR-002 PASS"
+      ],
+      "owner": "qa-validator"
+    },
+    {
+      "id": "S1-08",
+      "type": "story",
+      "role": "frontend",
+      "sprint": "S1",
+      "state": "done",
+      "title": "Add message and tool-call payload inspector drawer",
+      "ac": [
+        "Clicking an activity row opens structured payload details"
+      ],
+      "deps": [
+        "S1-04"
+      ],
+      "notes": [
+        "2026-11-24T02:00:00Z frontend-engineer: implemented"
+      ]
+    },
+    {
+      "id": "S1-09",
+      "type": "task",
+      "role": "backend",
+      "sprint": "S1",
+      "state": "done",
+      "title": "Unquote JSON-encoded tool call arguments in activity summaries",
+      "ac": [
+        "Tool argument strings render without double-quoted artifacts"
+      ],
+      "deps": [
+        "S1-02"
+      ],
+      "notes": [
+        "2026-11-24T02:15:00Z backend-engineer: done"
+      ]
+    },
+    {
+      "id": "S1-10",
+      "type": "task",
+      "role": "frontend",
+      "sprint": "S1",
+      "state": "done",
+      "title": "Add keyboard shortcuts for timeline playback and stepping",
+      "ac": [
+        "Space, ArrowLeft, ArrowRight, Home, and L shortcuts work"
+      ],
+      "deps": [
+        "S1-04"
+      ],
+      "notes": [
+        "2026-11-24T02:30:00Z frontend-engineer: done"
+      ]
+    },
+    {
+      "id": "S1-11",
+      "type": "task",
+      "role": "backend",
+      "sprint": "S1",
+      "state": "done",
+      "title": "Support session selector and query-param pinning",
+      "ac": [
+        "Users can switch between recent transcript sessions"
+      ],
+      "deps": [
+        "S1-05"
+      ],
+      "notes": [
+        "2026-11-24T02:45:00Z backend-engineer: done"
+      ]
+    },
+    {
+      "id": "S1-12",
+      "type": "bug",
+      "role": "frontend",
+      "sprint": "S1",
+      "state": "done",
+      "title": "Prevent SVG edge label overlap on dense multi-agent graphs",
+      "severity": "S3",
+      "resolution": "fixed",
+      "ac": [
+        "Bidirectional edges separate cleanly with distinct offsets"
+      ],
+      "deps": [
+        "S1-03"
+      ],
+      "notes": [
+        "2026-11-24T03:00:00Z qa-validator: TR-004 PASS"
+      ]
+    },
+    {
+      "id": "S1-13",
+      "type": "task",
+      "role": "qa",
+      "sprint": "S1",
+      "state": "done",
+      "title": "Verify buildSnapshot historical reconstruction invariants",
+      "ac": [
+        "Rewinding timeline reconstructs agent states and counters accurately"
+      ],
+      "deps": [
+        "S1-04",
+        "S1-07"
+      ],
+      "notes": [
+        "2026-11-24T03:30:00Z qa-validator: TR-005 PASS"
+      ]
+    },
+    {
+      "id": "S1-14",
+      "type": "story",
+      "role": "frontend",
+      "sprint": "S1",
+      "state": "done",
+      "title": "Implement Galaxy Z Fold 7 three-tier responsive studio layout",
+      "ac": [
+        "Cover (<640px), unfolded (640-1020px), and desktop (>=1021px) layouts render cleanly"
+      ],
+      "deps": [
+        "S1-04"
+      ],
+      "notes": [
+        "2026-11-24T04:00:00Z frontend-engineer: done"
+      ]
+    },
+    {
+      "id": "S1-15",
+      "type": "task",
+      "role": "backend",
+      "sprint": "S1",
+      "state": "done",
+      "title": "Detect WAITING and BLOCKED states from user prompts and errors",
+      "ac": [
+        "Unanswered user questions transition agent status to WAITING"
+      ],
+      "deps": [
+        "S1-02"
+      ],
+      "notes": [
+        "2026-11-24T04:30:00Z backend-engineer: done"
+      ]
+    },
+    {
+      "id": "S1-16",
+      "type": "spike",
+      "role": "architect",
+      "sprint": "S1",
+      "state": "done",
+      "title": "Design IDE-agnostic agent-studio package and MCP server contract",
+      "ac": [
+        "Specification covers Zod schemas, locking, QA gate, and multi-IDE compiler"
+      ],
+      "deps": [],
+      "notes": [
+        "2026-11-24T17:00:00Z architect: design spec published"
+      ]
+    },
+    {
+      "id": "S1-17",
+      "type": "story",
+      "role": "tools",
+      "sprint": "S1",
+      "state": "done",
+      "title": "Phase 1: Core agent-studio Node/TS package, schemas, Agile Board engine, and QA-gated stdio MCP server",
+      "ac": [
+        "Node/TS package.json (bin: agent-studio), tsconfig, and Zod/TS schemas for team.yaml, board.json, and NormalizedEvent",
+        "Multi-project locked Agile Board engine compatible with pipeline/board.json plus ~/.agent-studio/projects.json registry",
+        "Stdio MCP server (agent-studio mcp) exposing projects, board, testrun, telemetry tools with server-side QA Gate",
+        "Unit tests pass with zero TS errors and existing python tests/smoke_test.py remains green"
+      ],
+      "deps": [
+        "S1-16"
+      ],
+      "notes": [
+        "2026-11-24T17:27:00Z orchestrator: created",
+        "2026-11-24T17:44:09Z qa-validator: test->done | QA Gate PASS (TR-008)"
+      ],
+      "evidence": [
+        "TR-008 passed: npm run check PASS, npm run build PASS, npm test PASS"
+      ]
+    },
+    {
+      "id": "S1-18",
+      "type": "story",
+      "role": "backend",
+      "sprint": "S1",
+      "state": "done",
+      "title": "Phase 2: Multi-IDE compiler for Antigravity, Claude Code, and Copilot/VS Code",
+      "ac": [
+        "init, sync, sync --check, and doctor CLI commands operate idempotently"
+      ],
+      "deps": [
+        "S1-17"
+      ],
+      "notes": [
+        "2026-11-24T18:30:00Z backend-engineer: implemented"
+      ]
+    },
+    {
+      "id": "S1-19",
+      "type": "story",
+      "role": "backend",
+      "sprint": "S1",
+      "state": "done",
+      "title": "Phase 3: Hybrid telemetry aggregator across Antigravity, Claude Code, and VS Code",
+      "ac": [
+        "Tier-1 and Tier-2 deduplication merges hooks and transcript events cleanly"
+      ],
+      "deps": [
+        "S1-17"
+      ],
+      "notes": [
+        "2026-11-24T19:30:00Z backend-engineer: implemented"
+      ]
+    },
+    {
+      "id": "S1-20",
+      "type": "story",
+      "role": "frontend",
+      "sprint": "S1",
+      "state": "done",
+      "title": "Phase 4: Unified Vite Web Studio with Live Monitor, Board, Team, and Doctor views",
+      "ac": [
+        "Single-port server serves REST API, SSE stream, and compiled static SPA"
+      ],
+      "deps": [
+        "S1-18",
+        "S1-19"
+      ],
+      "notes": [
+        "2026-11-24T20:30:00Z frontend-engineer: implemented"
+      ]
+    }
+  ],
+  "builds": [
+    {
+      "id": "build-001",
+      "profile": "local",
+      "at": "2026-11-23T23:55:00Z"
+    },
+    {
+      "id": "build-002",
+      "profile": "local",
+      "at": "2026-11-24T01:15:00Z"
+    }
+  ],
+  "testruns": [
+    {
+      "id": "TR-001",
+      "suite": "smoke",
+      "build": "build-001",
+      "started": "2026-11-23T23:59:17Z",
+      "closed": "2026-11-23T23:59:45Z",
+      "status": "passed",
+      "results": {
+        "CP0": "pass: static checks green",
+        "CP1": "pass: ephemeral HTTP checks green"
+      },
+      "bugs": [],
+      "actor": "qa-validator"
+    },
+    {
+      "id": "TR-002",
+      "suite": "smoke",
+      "build": "build-002",
+      "started": "2026-11-24T01:45:00Z",
+      "closed": "2026-11-24T01:46:00Z",
+      "status": "passed",
+      "results": {
+        "CP0": "pass: py_compile and JS syntax checks green",
+        "CP1": "pass: transcript parsing verified"
+      },
+      "bugs": [],
+      "actor": "qa-validator"
+    },
+    {
+      "id": "TR-003",
+      "suite": "smoke",
+      "build": "build-002",
+      "started": "2026-11-24T02:10:00Z",
+      "closed": "2026-11-24T02:11:00Z",
+      "status": "passed",
+      "results": {
+        "CP0": "pass",
+        "CP1": "pass"
+      },
+      "bugs": [],
+      "actor": "qa-validator"
+    },
+    {
+      "id": "TR-004",
+      "suite": "full",
+      "build": "build-002",
+      "started": "2026-11-24T03:05:00Z",
+      "closed": "2026-11-24T03:08:00Z",
+      "status": "passed",
+      "results": {
+        "CP0": "pass",
+        "CP1": "pass",
+        "CP2": "pass"
+      },
+      "bugs": [],
+      "actor": "qa-validator"
+    },
+    {
+      "id": "TR-005",
+      "suite": "full",
+      "build": "build-002",
+      "started": "2026-11-24T03:35:00Z",
+      "closed": "2026-11-24T03:38:00Z",
+      "status": "passed",
+      "results": {
+        "CP0": "pass",
+        "CP1": "pass",
+        "CP2": "pass"
+      },
+      "bugs": [],
+      "actor": "qa-validator"
+    },
+    {
+      "id": "TR-006",
+      "suite": "smoke",
+      "build": "build-002",
+      "started": "2026-11-24T04:10:00Z",
+      "closed": "2026-11-24T04:11:00Z",
+      "status": "passed",
+      "results": {
+        "CP0": "pass",
+        "CP1": "pass"
+      },
+      "bugs": [],
+      "actor": "qa-validator"
+    },
+    {
+      "id": "TR-007",
+      "suite": "full",
+      "build": "build-002",
+      "started": "2026-11-24T17:35:00Z",
+      "closed": "2026-11-24T17:37:00Z",
+      "status": "failed",
+      "results": {
+        "CP0": "pass",
+        "CP1": "fail: state transition test failed",
+        "CP2": "pass"
+      },
+      "bugs": [
+        "BUG-01"
+      ],
+      "actor": "qa-validator"
+    },
+    {
+      "id": "TR-008",
+      "suite": "full",
+      "build": "build-002",
+      "started": "2026-11-24T17:42:00Z",
+      "closed": "2026-11-24T17:44:00Z",
+      "status": "passed",
+      "results": {
+        "CP0": "pass: typecheck and unit tests green",
+        "CP1": "pass: web build green",
+        "CP2": "pass: smoke_test.py green"
+      },
+      "bugs": [],
+      "actor": "qa-validator"
+    }
+  ],
+  "kv": {}
+}

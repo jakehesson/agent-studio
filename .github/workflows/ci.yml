@@ -1,0 +1,75 @@
+name: CI
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+    branches:
+      - main
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  verify:
+    name: ${{ matrix.os }} / Node ${{ matrix.node }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+        node: [20, 22]
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js ${{ matrix.node }}
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+          cache: npm
+          cache-dependency-path: |
+            package-lock.json
+            web/package-lock.json
+            extension/package-lock.json
+
+      - name: Setup Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: |
+          npm ci
+          npm --prefix web ci
+          npm --prefix extension ci
+
+      - name: Typecheck core, web, and extension
+        run: |
+          npm run check
+          npm --prefix web run check
+          npm --prefix extension run check
+
+      - name: Build core and Web Studio
+        run: npm run build:all
+
+      - name: Package VS Code / Antigravity extension (.vsix)
+        run: npm --prefix extension run package
+
+      - name: Build native Antigravity MCP App plugin
+        run: node antigravity-plugin/scripts/build-plugin.mjs
+
+      - name: Run unit test suite
+        run: npm test
+
+      - name: Verify compiled IDE adapters have zero drift
+        run: node dist/cli/index.js sync --check
+
+      - name: Run legacy Python visualizer smoke suite
+        run: python tests/smoke_test.py
+
+      - name: Verify npm package contents
+        run: npm pack --dry-run

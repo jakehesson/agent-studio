@@ -1,0 +1,59 @@
+{
+  "name": "agent-visualizer",
+  "title": "Antigravity Agent Visualizer",
+  "game": "standalone-app",
+  "game_dir": null,
+  "user_dir": null,
+  "launch_exe": "python",
+  "console": true,
+  "launch_args": [
+    "agent_visualizer.py"
+  ],
+  "process_names": [
+    "python.exe"
+  ],
+  "logs": [],
+  "deploy_profiles": {},
+  "checkpoints": {
+    "CP0": {
+      "title": "Static Syntax & Smoke Suite",
+      "steps": [
+        "Run python tests/smoke_test.py.",
+        "Confirm py_compile and node --check on embedded JS both pass with 0 errors."
+      ],
+      "pass": [
+        "All smoke_test.py checks report [PASS]."
+      ],
+      "fail": [
+        "Any syntax error, JS parse failure, or smoke test assertion failure."
+      ]
+    },
+    "CP1": {
+      "title": "Transcript Discovery & Live State Accuracy",
+      "steps": [
+        "Verify /api/sessions lists recent Antigravity brain sessions.",
+        "Verify /api/state parses root coordinator, spawned subagents, unquoted args, and live THINKING/WORKING/DONE states."
+      ],
+      "pass": [
+        "Dynamic agent discovery works with zero hardcoded project names.",
+        "Self-daemon rows are excluded from WORKING detection."
+      ],
+      "fail": [
+        "Missing subagents, quoted arg artifacts, or stuck WORKING/THINKING status."
+      ]
+    },
+    "CP2": {
+      "title": "SSE Streaming & Video Timeline Scrubbing",
+      "steps": [
+        "Open the live UI on an ephemeral or default port and verify /api/stream connects.",
+        "Scrub timeline backward, verify buildSnapshot historical reconstruction, hover preview, and LIVE tail re-pinning."
+      ],
+      "pass": [
+        "Zero console errors, non-overlapping SVG topology for 1-12+ agents, smooth timeline scrubbing and keyboard shortcuts (Space, Left/Right, Home, L)."
+      ],
+      "fail": [
+        "Broken SSE reconnects, overlapping SVG nodes, or broken timeline snapshot state."
+      ]
+    }
+  }
+}

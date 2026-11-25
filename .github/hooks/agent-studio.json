@@ -1,0 +1,41 @@
+{
+  "version": 1,
+  "managedBy": "agent-studio",
+  "hooks": {
+    "PreToolUse": [
+      {
+        "type": "command",
+        "command": "npx agent-studio hook-emit --ide copilot-vscode --event PreToolUse",
+        "timeoutSec": 5
+      }
+    ],
+    "PostToolUse": [
+      {
+        "type": "command",
+        "command": "npx agent-studio hook-emit --ide copilot-vscode --event PostToolUse",
+        "timeoutSec": 5
+      }
+    ],
+    "SubagentStart": [
+      {
+        "type": "command",
+        "command": "npx agent-studio hook-emit --ide copilot-vscode --event SubagentStart",
+        "timeoutSec": 5
+      }
+    ],
+    "SubagentStop": [
+      {
+        "type": "command",
+        "command": "npx agent-studio hook-emit --ide copilot-vscode --event SubagentStop",
+        "timeoutSec": 5
+      }
+    ],
+    "Stop": [
+      {
+        "type": "command",
+        "command": "npx agent-studio hook-emit --ide copilot-vscode --event Stop",
+        "timeoutSec": 5
+      }
+    ]
+  }
+}

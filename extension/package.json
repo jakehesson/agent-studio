@@ -1,0 +1,161 @@
+{
+  "name": "agent-studio-vscode",
+  "displayName": "Agent Studio — Multi-Agent Monitor & Agile Board",
+  "description": "IDE-agnostic live multi-agent topology monitor, QA-gated Agile Board, Agent Team inspector, and Setup/Doctor studio for VS Code and Antigravity.",
+  "publisher": "agent-studio",
+  "version": "0.5.0",
+  "license": "MIT",
+  "author": "Jake Hesson",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/jakehesson/agent-studio.git"
+  },
+  "homepage": "https://github.com/jakehesson/agent-studio#readme",
+  "bugs": {
+    "url": "https://github.com/jakehesson/agent-studio/issues"
+  },
+  "engines": {
+    "vscode": "^1.93.0"
+  },
+  "categories": [
+    "Visualization",
+    "Other"
+  ],
+  "keywords": [
+    "agent-studio",
+    "multi-agent",
+    "antigravity",
+    "claude-code",
+    "copilot",
+    "mcp",
+    "agile-board"
+  ],
+  "activationEvents": [
+    "onStartupFinished"
+  ],
+  "main": "./dist/extension.js",
+  "contributes": {
+    "viewsContainers": {
+      "activitybar": [
+        {
+          "id": "agent-studio",
+          "title": "Agent Studio",
+          "icon": "media/agent-studio-icon.svg"
+        }
+      ]
+    },
+    "views": {
+      "agent-studio": [
+        {
+          "type": "webview",
+          "id": "agentStudio.sidebar",
+          "name": "Studio Overview"
+        }
+      ]
+    },
+    "commands": [
+      {
+        "command": "agentStudio.openStudio",
+        "title": "Open Studio",
+        "category": "Agent Studio"
+      },
+      {
+        "command": "agentStudio.openBoard",
+        "title": "Open Agile Board",
+        "category": "Agent Studio"
+      },
+      {
+        "command": "agentStudio.openTeam",
+        "title": "Open Agent Team",
+        "category": "Agent Studio"
+      },
+      {
+        "command": "agentStudio.openDoctor",
+        "title": "Open Setup & Doctor",
+        "category": "Agent Studio"
+      },
+      {
+        "command": "agentStudio.openInBrowser",
+        "title": "Open in Browser",
+        "category": "Agent Studio"
+      },
+      {
+        "command": "agentStudio.initWorkspace",
+        "title": "Onboard Workspace (Init & Sync)",
+        "category": "Agent Studio"
+      },
+      {
+        "command": "agentStudio.syncWorkspace",
+        "title": "Sync IDE Adapters",
+        "category": "Agent Studio"
+      },
+      {
+        "command": "agentStudio.runDoctor",
+        "title": "Run Doctor Check",
+        "category": "Agent Studio"
+      },
+      {
+        "command": "agentStudio.restartServer",
+        "title": "Restart Server",
+        "category": "Agent Studio"
+      },
+      {
+        "command": "agentStudio.refreshModelIndex",
+        "title": "Refresh Live Model Index",
+        "category": "Agent Studio"
+      }
+    ],
+    "configuration": {
+      "title": "Agent Studio",
+      "properties": {
+        "agentStudio.port": {
+          "type": "number",
+          "default": 8767,
+          "description": "Local TCP port for the Agent Studio HTTP/SSE server."
+        },
+        "agentStudio.host": {
+          "type": "string",
+          "default": "127.0.0.1",
+          "description": "Bind host when Agent Studio spawns a managed local server (use 0.0.0.0 for LAN/Tailscale)."
+        },
+        "agentStudio.autoStart": {
+          "type": "boolean",
+          "default": true,
+          "description": "Automatically start the bundled Agent Studio server if no server is already running on the configured port."
+        },
+        "agentStudio.externalUrl": {
+          "type": "string",
+          "default": "",
+          "description": "Optional external Studio URL (for example a Tailscale HTTPS URL like https://your-host.tailnet.ts.net:8767) used for Open in Browser and fallback viewing."
+        },
+        "agentStudio.mcpAutoRegister": {
+          "type": "boolean",
+          "default": true,
+          "description": "Automatically register the bundled Agent Studio stdio MCP server via VS Code's MCP provider API when supported by the host IDE."
+        }
+      }
+    },
+    "mcpServerDefinitionProviders": [
+      {
+        "id": "agent-studio.mcp",
+        "label": "Agent Studio Agile Board & Telemetry MCP"
+      }
+    ]
+  },
+  "scripts": {
+    "check": "tsc --noEmit",
+    "compile": "tsc --noEmit && node scripts/build.mjs",
+    "build": "node scripts/build.mjs",
+    "package": "npm run build && node scripts/package.mjs"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.0",
+    "@types/vscode": "^1.93.0",
+    "@vscode/vsce": "^3.2.2",
+    "esbuild": "^0.25.0",
+    "typescript": "^5.7.3"
+  },
+  "dependencies": {
+    "agent-studio": "file:.."
+  }
+}

@@ -1,0 +1,59 @@
+name: Bug Report
+description: Report a reproducible bug in Agent Studio (CLI, MCP, Web Studio, Extension, or Antigravity Plugin)
+title: "[Bug]: "
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for reporting an issue! Please check existing issues first and include reproduction details below.
+  - type: dropdown
+    id: surface
+    attributes:
+      label: Affected Surface
+      options:
+        - CLI / Compiler (agent-studio init / sync / doctor)
+        - Stdio MCP Server (board / testrun / telemetry)
+        - Web Studio (Vite UI)
+        - VS Code / Antigravity Extension (.vsix)
+        - Native Antigravity MCP App Plugin
+        - Legacy Python Visualizer (agent_visualizer.py)
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: Agent Studio Version
+      placeholder: "e.g., 0.5.0"
+    validations:
+      required: true
+  - type: input
+    id: environment
+    attributes:
+      label: OS, Node.js, and Host IDE
+      placeholder: "e.g., Windows 11, Node 22.x, Antigravity / VS Code / Claude Code"
+    validations:
+      required: true
+  - type: textarea
+    id: description
+    attributes:
+      label: What happened?
+      description: Clear description of the bug and expected behavior.
+    validations:
+      required: true
+  - type: textarea
+    id: repro
+    attributes:
+      label: Steps to Reproduce
+      placeholder: |
+        1. Run `...`
+        2. Open `...`
+        3. Observe error `...`
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: Relevant Logs or `doctor --json` Output
+      description: Please strip any personal paths or secrets before pasting.
+      render: text

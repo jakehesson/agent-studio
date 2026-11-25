@@ -1,0 +1,13 @@
+{
+  "servers": {
+    "agent-studio": {
+      "type": "stdio",
+      "command": "npx",
+      "args": [
+        "-y",
+        "agent-studio",
+        "mcp"
+      ]
+    }
+  }
+}

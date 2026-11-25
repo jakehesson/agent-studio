@@ -1,0 +1,64 @@
+{
+  "name": "agent-studio",
+  "version": "0.5.0",
+  "description": "IDE-agnostic multi-agent orchestration, QA-gated Agile Board MCP, and live monitoring studio",
+  "license": "MIT",
+  "author": "Jake Hesson",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/jakehesson/agent-studio.git"
+  },
+  "homepage": "https://github.com/jakehesson/agent-studio#readme",
+  "bugs": {
+    "url": "https://github.com/jakehesson/agent-studio/issues"
+  },
+  "keywords": [
+    "agent-studio",
+    "multi-agent",
+    "mcp",
+    "mcp-apps",
+    "antigravity",
+    "claude-code",
+    "github-copilot",
+    "vscode",
+    "agile-board",
+    "ai-agents"
+  ],
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    }
+  },
+  "bin": {
+    "agent-studio": "./dist/cli/index.js"
+  },
+  "files": [
+    "dist",
+    "docs",
+    "README.md",
+    "LICENSE",
+    "CHANGELOG.md"
+  ],
+  "engines": {
+    "node": ">=20.0.0"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "build:all": "npm run build && npm --prefix web run build",
+    "build:plugin": "node antigravity-plugin/scripts/build-plugin.mjs",
+    "check": "tsc -p tsconfig.json --noEmit && tsc -p tsconfig.test.json --noEmit",
+    "test": "npm run build && tsc -p tsconfig.test.json && node --test \"dist-test/tests/unit/*.test.js\""
+  },
+  "dependencies": {
+    "yaml": "^2.7.0",
+    "zod": "^3.24.2"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.0",
+    "typescript": "^5.7.3"
+  }
+}

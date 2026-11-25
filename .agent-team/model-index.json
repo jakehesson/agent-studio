@@ -1,0 +1,508 @@
+{
+  "schemaVersion": 1,
+  "updatedAt": "2026-11-25T05:03:33.461Z",
+  "updatedBy": "cli",
+  "notes": "Workspace Agent Studio model index (.agent-team/model-index.json). Agents and Web Studio may update tier bindings, role recommendations, and catalog metadata deterministically.",
+  "roleRecommendations": {
+    "orchestrator": {
+      "tier": "fast",
+      "rationale": "Read-only board triage, dispatch, and QA gate verification (#1 token-savings lever).",
+      "deferToHostOrchestrator": true
+    },
+    "architect": {
+      "tier": "reasoning",
+      "rationale": "Technical specs, schemas, concurrency, and boundaries have highest downstream leverage."
+    },
+    "ux-designer": {
+      "tier": "reasoning",
+      "rationale": "Layout audits, visual hierarchy, multimodal UI inspection, and Z Fold 7 ergonomics.",
+      "multimodalPreferred": true
+    },
+    "backend-engineer": {
+      "tier": "balanced",
+      "rationale": "Server, CLI, compiler, and unit-test throughput with strong coding precision."
+    },
+    "frontend-engineer": {
+      "tier": "balanced",
+      "rationale": "Interactive UI, SVG/CSS, and iterative typecheck/build fixes."
+    },
+    "qa-validator": {
+      "tier": "fast",
+      "rationale": "Deterministic checkpoint runs, MCP testrun recording, and pass/fail triage (#2 token-savings lever)."
+    },
+    "team-setup": {
+      "tier": "balanced",
+      "rationale": "Repo inspection, user interview, deterministic init/sync/doctor onboarding."
+    }
+  },
+  "ides": {
+    "antigravity": {
+      "mode": "tier-enum",
+      "tiers": {
+        "fast": {
+          "primary": "flash_lite",
+          "fallback": [
+            "flash_lite",
+            "flash",
+            "inherit"
+          ],
+          "notes": "Portable fast tier enum for read-only routing and QA verification."
+        },
+        "balanced": {
+          "primary": "flash",
+          "fallback": [
+            "flash",
+            "pro",
+            "inherit"
+          ],
+          "notes": "Portable balanced tier enum for daily implementation throughput."
+        },
+        "reasoning": {
+          "primary": "pro",
+          "fallback": [
+            "pro",
+            "flash",
+            "inherit"
+          ],
+          "notes": "Portable high-reasoning tier enum for architecture & UX audits."
+        }
+      },
+      "catalog": [
+        {
+          "id": "inherit",
+          "label": "Inherit Host Selection (inherit)",
+          "vendor": "antigravity",
+          "family": "tier-enum",
+          "tier": "balanced",
+          "capabilities": [
+            "orchestration",
+            "coding",
+            "reasoning"
+          ],
+          "available": true,
+          "source": "built-in",
+          "notes": "Defers to /swarm or active user UI Model Selection."
+        },
+        {
+          "id": "flash_lite",
+          "label": "Flash Lite (flash_lite)",
+          "vendor": "google",
+          "family": "tier-enum",
+          "tier": "fast",
+          "capabilities": [
+            "fast",
+            "search",
+            "orchestration"
+          ],
+          "available": true,
+          "source": "built-in",
+          "notes": "Antigravity portable fast tier enum."
+        },
+        {
+          "id": "flash",
+          "label": "Flash (flash)",
+          "vendor": "google",
+          "family": "tier-enum",
+          "tier": "balanced",
+          "capabilities": [
+            "coding",
+            "fast",
+            "multimodal",
+            "long-context"
+          ],
+          "available": true,
+          "source": "built-in",
+          "notes": "Antigravity portable balanced tier enum."
+        },
+        {
+          "id": "pro",
+          "label": "Pro (pro)",
+          "vendor": "google",
+          "family": "tier-enum",
+          "tier": "reasoning",
+          "capabilities": [
+            "reasoning",
+            "coding",
+            "multimodal",
+            "long-context"
+          ],
+          "available": true,
+          "source": "built-in",
+          "notes": "Antigravity portable reasoning tier enum."
+        },
+        {
+          "id": "gemini-3.5-flash-lite",
+          "label": "Gemini 3.5 Flash Lite",
+          "vendor": "google",
+          "family": "gemini-3.5",
+          "tier": "fast",
+          "capabilities": [
+            "fast",
+            "search",
+            "coding"
+          ],
+          "contextWindow": 1000000,
+          "available": true,
+          "source": "built-in"
+        },
+        {
+          "id": "gemini-3.8-flash",
+          "label": "Gemini 3.8 Flash",
+          "vendor": "google",
+          "family": "gemini-3.8",
+          "tier": "balanced",
+          "capabilities": [
+            "coding",
+            "fast",
+            "multimodal",
+            "long-context"
+          ],
+          "contextWindow": 1000000,
+          "available": true,
+          "source": "built-in"
+        },
+        {
+          "id": "gemini-4-carbon",
+          "label": "Gemini 4 Carbon",
+          "vendor": "google",
+          "family": "gemini-4",
+          "tier": "balanced",
+          "capabilities": [
+            "coding",
+            "reasoning",
+            "multimodal"
+          ],
+          "contextWindow": 1000000,
+          "available": true,
+          "source": "built-in"
+        },
+        {
+          "id": "gemini-4-argon",
+          "label": "Gemini 4 Argon",
+          "vendor": "google",
+          "family": "gemini-4",
+          "tier": "reasoning",
+          "capabilities": [
+            "reasoning",
+            "coding",
+            "orchestration"
+          ],
+          "contextWindow": 1000000,
+          "available": true,
+          "source": "built-in"
+        },
+        {
+          "id": "gemini-4-neon",
+          "label": "Gemini 4 Neon",
+          "vendor": "google",
+          "family": "gemini-4",
+          "tier": "reasoning",
+          "capabilities": [
+            "reasoning",
+            "coding",
+            "multimodal",
+            "long-context"
+          ],
+          "contextWindow": 1000000,
+          "available": true,
+          "source": "built-in"
+        },
+        {
+          "id": "gemini-4-hydrogen",
+          "label": "Gemini 4 Hydrogen",
+          "vendor": "google",
+          "family": "gemini-4",
+          "tier": "fast",
+          "capabilities": [
+            "fast",
+            "search"
+          ],
+          "contextWindow": 1000000,
+          "available": true,
+          "source": "built-in"
+        }
+      ],
+      "syncSource": "built-in"
+    },
+    "claude-code": {
+      "mode": "family-alias",
+      "tiers": {
+        "fast": {
+          "primary": "haiku",
+          "fallback": [
+            "haiku",
+            "sonnet",
+            "inherit"
+          ],
+          "notes": "Yields to CLAUDE_CODE_SUBAGENT_MODEL and Agent invocation overrides."
+        },
+        "balanced": {
+          "primary": "sonnet",
+          "fallback": [
+            "sonnet",
+            "opus",
+            "inherit"
+          ],
+          "notes": "Balanced coding alias; yields to CLAUDE_CODE_SUBAGENT_MODEL."
+        },
+        "reasoning": {
+          "primary": "opus",
+          "fallback": [
+            "opus",
+            "sonnet",
+            "inherit"
+          ],
+          "notes": "Deep architecture & design alias; yields to CLAUDE_CODE_SUBAGENT_MODEL."
+        }
+      },
+      "catalog": [
+        {
+          "id": "inherit",
+          "label": "Inherit Session / Env (inherit)",
+          "vendor": "anthropic",
+          "family": "alias",
+          "tier": "balanced",
+          "capabilities": [
+            "orchestration",
+            "coding",
+            "reasoning"
+          ],
+          "available": true,
+          "source": "built-in",
+          "notes": "Inherits session /model or CLAUDE_CODE_SUBAGENT_MODEL."
+        },
+        {
+          "id": "haiku",
+          "label": "Claude Haiku (haiku)",
+          "vendor": "anthropic",
+          "family": "haiku",
+          "tier": "fast",
+          "capabilities": [
+            "fast",
+            "search",
+            "orchestration"
+          ],
+          "contextWindow": 200000,
+          "available": true,
+          "source": "built-in"
+        },
+        {
+          "id": "sonnet",
+          "label": "Claude Sonnet (sonnet)",
+          "vendor": "anthropic",
+          "family": "sonnet",
+          "tier": "balanced",
+          "capabilities": [
+            "coding",
+            "reasoning",
+            "multimodal"
+          ],
+          "contextWindow": 200000,
+          "available": true,
+          "source": "built-in"
+        },
+        {
+          "id": "opus",
+          "label": "Claude Opus (opus)",
+          "vendor": "anthropic",
+          "family": "opus",
+          "tier": "reasoning",
+          "capabilities": [
+            "reasoning",
+            "coding",
+            "orchestration",
+            "multimodal"
+          ],
+          "contextWindow": 200000,
+          "available": true,
+          "source": "built-in"
+        }
+      ],
+      "syncSource": "built-in"
+    },
+    "copilot-vscode": {
+      "mode": "picker-array",
+      "tiers": {
+        "fast": {
+          "primary": "Claude Haiku 4.5 (copilot)",
+          "fallback": [
+            "Claude Haiku 4.5 (copilot)",
+            "Gemini 3 Flash (copilot)",
+            "GPT-4.1 (copilot)",
+            "GPT-4o mini (copilot)"
+          ],
+          "omitOnDefer": true,
+          "notes": "Emits model-policy: preferred unless policy is pinned; omitted on defer-to-host for Fusion/Auto."
+        },
+        "balanced": {
+          "primary": "Claude Sonnet 4.5 (copilot)",
+          "fallback": [
+            "Claude Sonnet 4.5 (copilot)",
+            "Claude Sonnet 4 (copilot)",
+            "GPT-4.1 (copilot)",
+            "Gemini 2.5 Pro (copilot)"
+          ],
+          "omitOnDefer": true,
+          "notes": "Emits model-policy: preferred unless policy is pinned; omitted on defer-to-host for Fusion/Auto."
+        },
+        "reasoning": {
+          "primary": "Claude Opus 4.5 (copilot)",
+          "fallback": [
+            "Claude Opus 4.5 (copilot)",
+            "Claude Opus 4.1 (copilot)",
+            "Claude Sonnet 4.5 (copilot)",
+            "Gemini 2.5 Pro (copilot)"
+          ],
+          "omitOnDefer": true,
+          "notes": "Emits model-policy: preferred unless policy is pinned; omitted on defer-to-host for Fusion/Auto."
+        }
+      },
+      "catalog": [
+        {
+          "id": "Claude Haiku 4.5 (copilot)",
+          "label": "Claude Haiku 4.5",
+          "vendor": "copilot",
+          "family": "claude-haiku-4.5",
+          "tier": "fast",
+          "capabilities": [
+            "fast",
+            "search",
+            "orchestration"
+          ],
+          "contextWindow": 200000,
+          "premiumMultiplier": 0.33,
+          "available": true,
+          "source": "built-in"
+        },
+        {
+          "id": "Gemini 3 Flash (copilot)",
+          "label": "Gemini 3 Flash",
+          "vendor": "copilot",
+          "family": "gemini-3-flash",
+          "tier": "fast",
+          "capabilities": [
+            "fast",
+            "multimodal",
+            "long-context"
+          ],
+          "contextWindow": 1000000,
+          "premiumMultiplier": 0.33,
+          "available": true,
+          "source": "built-in"
+        },
+        {
+          "id": "GPT-4.1 (copilot)",
+          "label": "GPT-4.1",
+          "vendor": "copilot",
+          "family": "gpt-4.1",
+          "tier": "balanced",
+          "capabilities": [
+            "coding",
+            "fast",
+            "long-context"
+          ],
+          "contextWindow": 128000,
+          "premiumMultiplier": 0,
+          "available": true,
+          "source": "built-in"
+        },
+        {
+          "id": "GPT-4o mini (copilot)",
+          "label": "GPT-4o mini",
+          "vendor": "copilot",
+          "family": "gpt-4o-mini",
+          "tier": "fast",
+          "capabilities": [
+            "fast"
+          ],
+          "contextWindow": 128000,
+          "premiumMultiplier": 0,
+          "available": true,
+          "source": "built-in"
+        },
+        {
+          "id": "Claude Sonnet 4.5 (copilot)",
+          "label": "Claude Sonnet 4.5",
+          "vendor": "copilot",
+          "family": "claude-sonnet-4.5",
+          "tier": "balanced",
+          "capabilities": [
+            "coding",
+            "reasoning",
+            "multimodal"
+          ],
+          "contextWindow": 200000,
+          "premiumMultiplier": 1,
+          "available": true,
+          "source": "built-in"
+        },
+        {
+          "id": "Claude Sonnet 4 (copilot)",
+          "label": "Claude Sonnet 4",
+          "vendor": "copilot",
+          "family": "claude-sonnet-4",
+          "tier": "balanced",
+          "capabilities": [
+            "coding",
+            "reasoning"
+          ],
+          "contextWindow": 200000,
+          "premiumMultiplier": 1,
+          "available": true,
+          "source": "built-in"
+        },
+        {
+          "id": "Gemini 2.5 Pro (copilot)",
+          "label": "Gemini 2.5 Pro",
+          "vendor": "copilot",
+          "family": "gemini-2.5-pro",
+          "tier": "reasoning",
+          "capabilities": [
+            "reasoning",
+            "coding",
+            "multimodal",
+            "long-context"
+          ],
+          "contextWindow": 1000000,
+          "premiumMultiplier": 1,
+          "available": true,
+          "source": "built-in"
+        },
+        {
+          "id": "Claude Opus 4.5 (copilot)",
+          "label": "Claude Opus 4.5",
+          "vendor": "copilot",
+          "family": "claude-opus-4.5",
+          "tier": "reasoning",
+          "capabilities": [
+            "reasoning",
+            "coding",
+            "orchestration",
+            "multimodal"
+          ],
+          "contextWindow": 200000,
+          "premiumMultiplier": 3,
+          "available": true,
+          "source": "built-in"
+        },
+        {
+          "id": "Claude Opus 4.1 (copilot)",
+          "label": "Claude Opus 4.1",
+          "vendor": "copilot",
+          "family": "claude-opus-4.1",
+          "tier": "reasoning",
+          "capabilities": [
+            "reasoning",
+            "coding",
+            "orchestration"
+          ],
+          "contextWindow": 200000,
+          "premiumMultiplier": 10,
+          "available": true,
+          "source": "built-in"
+        }
+      ],
+      "syncSource": "built-in"
+    }
+  }
+}

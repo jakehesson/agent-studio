@@ -1,0 +1,617 @@
+export type IdeSource =
+  | "antigravity"
+  | "claude-code"
+  | "copilot-vscode"
+  | "mcp"
+  | "unknown";
+
+export type IdeFilter = "all" | "antigravity" | "claude-code" | "copilot-vscode";
+export type HostIde = "antigravity" | "claude-code" | "copilot-vscode";
+
+export interface EmbedScope {
+  embedMode: boolean;
+  lockedIde: HostIde | null;
+  lockedWorkspace: string;
+  mcpAppMode?: boolean;
+}
+
+export type TelemetryChannel = "passive" | "hook" | "mcp";
+
+export type AgentStatus =
+  | "THINKING"
+  | "WORKING"
+  | "WAITING"
+  | "BLOCKED"
+  | "DONE"
+  | "IDLE";
+
+export type NodeType = "agent" | "human" | "external";
+
+export type NormalizedEventKind =
+  | "session_start"
+  | "user_input"
+  | "thinking_start"
+  | "tool_start"
+  | "tool_end"
+  | "subagent_spawn"
+  | "subagent_done"
+  | "message"
+  | "board_mutation"
+  | "assistant_turn_end";
+
+export interface NormalizedEvent {
+  id: string;
+  mergeKey?: string;
+  ts: string;
+  epoch: number;
+  ide: IdeSource;
+  channel?: TelemetryChannel;
+  sessionId: string;
+  workspacePath?: string;
+  projectId?: string;
+  agentId: string;
+  agentLabel?: string;
+  parentAgentId?: string;
+  kind: NormalizedEventKind;
+  toolName?: string;
+  toolCallId?: string;
+  targetAgentId?: string;
+  summary: string;
+  payload?: Record<string, unknown>;
+}
+
+export interface AgentUsageMetrics {
+  model: string;
+  modelSource: "exact" | "inherited" | "definition" | "unknown";
+  usageSource: "exact" | "estimated";
+  inputTokens: number;
+  outputTokens: number;
+  cachedTokens: number;
+  totalTokens: number;
+  contextTokens: number;
+  contextWindow: number;
+  contextPercent: number;
+  costUsd?: number;
+}
+
+export interface ModelUsageBucket {
+  model: string;
+  agentCount: number;
+  totalTokens: number;
+  sharePercent: number;
+}
+
+export interface SessionUsageSummary {
+  totalTokens: number;
+  inputTokens: number;
+  outputTokens: number;
+  cachedTokens: number;
+  peakContextPercent: number;
+  peakContextAgentId: string | null;
+  usageSource: "exact" | "estimated" | "mixed";
+  costUsd?: number;
+  models: ModelUsageBucket[];
+}
+
+export interface AgentRecentAction {
+  ts: string;
+  text: string;
+  kind: NormalizedEventKind;
+  toolName?: string;
+  routineEnd?: boolean;
+  isError?: boolean;
+}
+
+export interface AgentNodeSnapshot {
+  id: string;
+  label: string;
+  parentAgentId?: string;
+  nodeType?: NodeType;
+  ide: IdeSource;
+  status: AgentStatus;
+  model?: string;
+  usage?: AgentUsageMetrics;
+  activeTool?: string;
+  thinkingSince?: string;
+  thinkingEpoch?: number;
+  lastEventAt?: string;
+  lastEpoch?: number;
+  steps?: number;
+  toolCalls: number;
+  messagesSent: number;
+  messagesReceived: number;
+  summary?: string;
+  role?: string;
+  recentActions?: AgentRecentAction[];
+}
+
+export interface AgentEdgeSnapshot {
+  from: string;
+  to: string;
+  count: number;
+  lastKind?: NormalizedEventKind;
+  lastTs?: string;
+}
+
+export interface SessionCounters {
+  totalEvents: number;
+  toolCalls: number;
+  messages: number;
+  boardMutations: number;
+  activeAgents: number;
+  completedAgents: number;
+}
+
+export interface DiscoveredSessionSummary {
+  sessionId: string;
+  ide: IdeSource;
+  projectId?: string;
+  workspacePath?: string;
+  title?: string;
+  status: AgentStatus;
+  waitingOn?: string | null;
+  isWaiting?: boolean;
+  isCompleted?: boolean;
+  isMultiAgent?: boolean;
+  agentCount?: number;
+  updatedAt?: string;
+  mtimeMs?: number;
+}
+
+export interface RegisteredProject {
+  id: string;
+  title?: string;
+  name?: string;
+  rootPath?: string;
+  path?: string;
+  boardPath?: string;
+}
+
+export interface PendingHumanPrompt {
+  id: string;
+  agentId: string;
+  agentLabel: string;
+  kind: "question" | "approval";
+  title: string;
+  summary?: string;
+  options?: Array<{ label: string; recommended?: boolean }>;
+  ts?: string;
+}
+
+export interface SessionSnapshot {
+  sessionId: string;
+  ide: IdeSource;
+  projectId?: string;
+  workspacePath?: string;
+  updatedAt: string;
+  serverTime?: string;
+  status: AgentStatus;
+  waitingOn?: string | null;
+  isWaiting?: boolean;
+  isCompleted?: boolean;
+  isMultiAgent?: boolean;
+  agents: AgentNodeSnapshot[];
+  edges: AgentEdgeSnapshot[];
+  events: NormalizedEvent[];
+  counters: SessionCounters;
+  usage?: SessionUsageSummary;
+  sessions?: DiscoveredSessionSummary[];
+  boardProjects?: RegisteredProject[];
+  pendingPrompts?: PendingHumanPrompt[];
+  definitions?: TeamDefinitionEntry[];
+}
+
+export interface SessionsResponse {
+  sessions: DiscoveredSessionSummary[];
+  projects: RegisteredProject[];
+}
+
+/* ---------- Agile Board Types ---------- */
+
+export type BoardState =
+  | "backlog"
+  | "ready"
+  | "design"
+  | "dev"
+  | "test"
+  | "done"
+  | "blocked";
+
+export type BugSeverity = "S1" | "S2" | "S3" | "S4";
+
+export interface BoardItem {
+  id: string;
+  type: "spike" | "story" | "task" | "bug";
+  role: string;
+  sprint?: string | null;
+  state: BoardState;
+  title: string;
+  ac?: string[];
+  deps?: string[];
+  notes?: string[];
+  owner?: string | null;
+  severity?: BugSeverity | null;
+  points?: number | null;
+  resolution?: string | null;
+  suite?: string;
+  required_checkpoints?: string[];
+  created_at?: string;
+}
+
+export interface TestrunRecord {
+  id: string;
+  suite: string;
+  build: string;
+  started: string;
+  closed?: string;
+  status: "running" | "passed" | "failed";
+  results: Record<string, string>;
+  step_results?: Record<string, Record<string, string>>;
+  bugs: string[];
+  actor?: string;
+  items?: string[];
+}
+
+export interface SprintInfo {
+  goal?: string;
+  status?: string;
+  started_at?: string | null;
+  closed_at?: string | null;
+}
+
+export interface BoardData {
+  project?: string;
+  milestone?: {
+    id: string;
+    name: string;
+    sprints?: string[];
+    final_suite?: string;
+  };
+  active_sprint?: string | null;
+  sprints?: Record<string, SprintInfo>;
+  suites?: Record<string, string[]>;
+  items: BoardItem[];
+  testruns: TestrunRecord[];
+}
+
+export interface BoardApiResponse {
+  ok?: boolean;
+  project?: string;
+  projects?: RegisteredProject[];
+  board?: BoardData | null;
+  counts?: Record<string, number>;
+  openBugs?: BoardItem[];
+  qaGate?: {
+    required?: boolean;
+    passedCount?: number;
+    blockedItems?: string[];
+  };
+  error?: string;
+}
+
+/* ---------- Mockups Types ---------- */
+
+export interface MockupEntry {
+  id: string;
+  title: string;
+  projectId?: string;
+  fileName: string;
+  relPath?: string;
+  mtimeMs?: number;
+  url?: string;
+  feedback?: string;
+}
+
+export interface MockupsApiResponse {
+  mockups: MockupEntry[];
+  projects?: RegisteredProject[];
+}
+
+/* ---------- Doctor Types ---------- */
+
+export type CheckStatus = "pass" | "warn" | "fail" | "unknown";
+
+export interface IdeHealthCard {
+  ide: IdeSource;
+  name: string;
+  detected: boolean;
+  enabled?: boolean;
+  adapterStatus: CheckStatus;
+  configDrift: string[];
+  mcpConfigured: boolean;
+  hooksConfigured: boolean;
+  telemetryPath?: string;
+  telemetryReachable?: boolean;
+  sessionCount?: number;
+  fileCount?: number;
+  details?: string;
+}
+
+export interface DoctorCheckItem {
+  id: string;
+  label: string;
+  status: CheckStatus;
+  detail: string;
+  fixHint?: string;
+}
+
+export type ModelTier = "fast" | "balanced" | "reasoning";
+
+export type ModelRoutingPolicy =
+  | "defer-to-host"
+  | "prefer-fallback"
+  | "pinned";
+
+export type ModelPolicy = ModelRoutingPolicy;
+
+export type ModelCapabilityTag =
+  | "coding"
+  | "reasoning"
+  | "multimodal"
+  | "fast"
+  | "orchestration"
+  | "search"
+  | "long-context";
+
+export type ModelSourceTag = "built-in" | "vscode-lm" | "agent" | "user";
+
+export type IdeModelMode = "tier-enum" | "family-alias" | "picker-array";
+
+export interface ModelCatalogEntry {
+  id: string;
+  label: string;
+  vendor?: string;
+  family?: string;
+  tier: ModelTier;
+  capabilities: ModelCapabilityTag[];
+  contextWindow?: number;
+  premiumMultiplier?: number;
+  available: boolean;
+  source: ModelSourceTag;
+  discoveredAt?: string;
+  notes?: string;
+}
+
+export interface IdeTierBinding {
+  primary: string;
+  fallback: string[];
+  omitOnDefer?: boolean;
+  notes?: string;
+}
+
+export interface IdeModelConfig {
+  mode: IdeModelMode;
+  tiers: Record<ModelTier, IdeTierBinding>;
+  catalog: ModelCatalogEntry[];
+  lastSyncedAt?: string;
+  syncSource?: "built-in" | "vscode-lm" | "manual";
+}
+
+export interface RoleRecommendation {
+  tier: ModelTier;
+  rationale: string;
+  multimodalPreferred?: boolean;
+  deferToHostOrchestrator?: boolean;
+}
+
+export interface ModelIndex {
+  $schema?: string;
+  schemaVersion: 1;
+  updatedAt: string;
+  updatedBy: "built-in" | "cli" | "api" | "vscode-lm" | "agent" | "user";
+  notes?: string;
+  roleRecommendations: Record<string, RoleRecommendation>;
+  ides: Record<HostIde, IdeModelConfig>;
+}
+
+export interface ModelIndexOverlay {
+  schemaVersion?: 1;
+  updatedAt?: string;
+  updatedBy?: "built-in" | "cli" | "api" | "vscode-lm" | "agent" | "user";
+  notes?: string;
+  roleRecommendations?: Record<string, Partial<RoleRecommendation>>;
+  ides?: Partial<
+    Record<
+      HostIde,
+      {
+        mode?: IdeModelMode;
+        tiers?: Partial<Record<ModelTier, Partial<IdeTierBinding>>>;
+        catalog?: ModelCatalogEntry[];
+        lastSyncedAt?: string;
+        syncSource?: "built-in" | "vscode-lm" | "manual";
+      }
+    >
+  >;
+}
+
+export type IdeModelOverride =
+  | string
+  | string[]
+  | {
+      primary?: string;
+      fallback?: string[];
+      omit?: boolean;
+      copilotPolicy?: "preferred" | "required";
+    };
+
+export interface WorkflowModelRouting {
+  policy: ModelRoutingPolicy;
+  respectBuiltInOrchestrators: boolean;
+  allowSubagentModelHints: boolean;
+  copilotHandoffModels: boolean;
+  idePolicies?: Partial<Record<HostIde, ModelRoutingPolicy>>;
+}
+
+export interface ResolvedIdeModel {
+  model: string | string[];
+  fallback: string[];
+  copilotPolicy?: "preferred" | "required";
+  omitted?: boolean;
+  tier: ModelTier;
+  policy: ModelRoutingPolicy;
+  source?: string;
+}
+
+export interface RoleModelRouting {
+  id: string;
+  modelTier?: ModelTier;
+  modelPolicy?: ModelRoutingPolicy;
+  models?: Partial<Record<HostIde, IdeModelOverride>>;
+  resolved?: Partial<Record<HostIde, ResolvedIdeModel>>;
+}
+
+export interface ModelIndexLayersInfo {
+  globalPath: string;
+  globalExists: boolean;
+  globalUpdatedAt?: string;
+  workspacePath: string;
+  workspaceExists: boolean;
+  workspaceUpdatedAt?: string;
+  globalDiffersFromWorkspace: boolean;
+}
+
+export interface ModelIndexView {
+  ok: boolean;
+  projectId?: string;
+  projectRoot?: string;
+  effective: ModelIndex;
+  layers: ModelIndexLayersInfo;
+  routing: WorkflowModelRouting & {
+    resolvedRoles: Record<string, RoleModelRouting>;
+  };
+  compileResult?: unknown;
+}
+
+export interface ModelIndexHealth {
+  valid: boolean;
+  policy: ModelRoutingPolicy;
+  layers: {
+    globalPath: string;
+    globalExists: boolean;
+    workspacePath: string;
+    workspaceExists: boolean;
+    globalLastSyncedAt?: string;
+    workspaceUpdatedAt?: string;
+  };
+  warnings: string[];
+  errors: string[];
+}
+
+export interface DoctorApiResponse {
+  ok?: boolean;
+  project?: string;
+  nodeVersion?: string;
+  teamYamlValid?: boolean;
+  ides: IdeHealthCard[];
+  checks: DoctorCheckItem[];
+  guardrails?: {
+    orchestratorReadOnly?: boolean;
+    qaGateRequired?: boolean;
+    blockDirectBoardEdits?: boolean;
+  };
+  driftFiles?: Array<{ file: string; status: string; ide?: string; reason?: string }>;
+  modelIndex?: ModelIndexHealth;
+  timestamp?: string;
+}
+
+/* ---------- Agent Team Details Types ---------- */
+
+export type TeamSourceIde =
+  | "canonical"
+  | "antigravity"
+  | "claude-code"
+  | "copilot-vscode";
+
+export interface TeamCheckpoint {
+  title: string;
+  command?: string;
+  steps: string[];
+  pass: string[];
+  fail: string[];
+}
+
+export interface TeamRosterEntry {
+  id: string;
+  name: string;
+  roleType: string;
+  boardRole: string;
+  description: string;
+  capabilities: string[];
+  handoffs: string[];
+  promptFile: string;
+  source_path: string;
+  chars: number;
+  est_tokens: number;
+  preview: string;
+  modelTier?: ModelTier;
+  modelPolicy?: ModelRoutingPolicy;
+  models?: Partial<Record<HostIde, IdeModelOverride>>;
+  resolvedModels?: Partial<Record<HostIde, ResolvedIdeModel>>;
+}
+
+export interface TeamSkillEntry {
+  id: string;
+  name: string;
+  description: string;
+  source_ide: TeamSourceIde;
+  source_path: string;
+  chars: number;
+  est_tokens: number;
+  preview: string;
+}
+
+export interface TeamDefinitionEntry {
+  id: string;
+  name: string;
+  roleType?: string;
+  boardRole?: string;
+  description: string;
+  model: string;
+  tools?: string[];
+  capabilities?: string[];
+  handoffs?: string[];
+  source_ide: TeamSourceIde;
+  source_path: string;
+  chars: number;
+  est_tokens: number;
+  preview: string;
+}
+
+export interface TeamDetailsResponse {
+  project: {
+    id: string;
+    title: string;
+    description: string;
+    root: string;
+  };
+  hasManifest: boolean;
+  targets: string[];
+  workflow: {
+    boardPath: string;
+    stages: string[];
+    enforcement: {
+      orchestratorReadOnly: boolean;
+      qaGateRequired: boolean;
+      blockDirectBoardEdits: boolean;
+    };
+    suites: Record<string, string[]>;
+    checkpoints: Record<string, TeamCheckpoint>;
+  };
+  roster: TeamRosterEntry[];
+  skills: TeamSkillEntry[];
+  definitions: TeamDefinitionEntry[];
+  modelRouting?: WorkflowModelRouting;
+  modelIndexSummary?: {
+    updatedAt?: string;
+    updatedBy?: string;
+    hasGlobalOverlay?: boolean;
+    hasWorkspaceOverlay?: boolean;
+    globalLastSyncedAt?: string;
+    globalDiffersFromWorkspace?: boolean;
+  };
+  server_time: string;
+}
+
+export type PrimaryView = "studio" | "team" | "board" | "mockups" | "doctor";
+export type CoverPane = "studio" | "feed" | "team" | "board" | "mockups" | "doctor";
+export type ConnectionState = "connecting" | "live" | "reconnecting" | "offline";

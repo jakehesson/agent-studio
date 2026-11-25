@@ -1,0 +1,54 @@
+{
+  "project": "example-project",
+  "milestone": {
+    "id": "M1",
+    "name": "Initial Release",
+    "sprints": [
+      "S1"
+    ],
+    "final_suite": "full"
+  },
+  "active_sprint": "S1",
+  "sprints": {
+    "S1": {
+      "goal": "Onboard project with Agent Studio and ship initial milestone",
+      "status": "active",
+      "started_at": "2026-01-01T00:00:00Z"
+    }
+  },
+  "suites": {
+    "smoke": [
+      "CP0",
+      "CP1"
+    ],
+    "full": [
+      "CP0",
+      "CP1",
+      "CP2"
+    ]
+  },
+  "items": [
+    {
+      "id": "S1-01",
+      "type": "story",
+      "role": "backend",
+      "sprint": "S1",
+      "state": "ready",
+      "title": "Example story: implement core API endpoint",
+      "ac": [
+        "Endpoint returns HTTP 200 with validated JSON payload",
+        "Unit tests cover success and error cases"
+      ],
+      "deps": [],
+      "notes": [
+        "2026-01-01T00:00:00Z orchestrator: created"
+      ],
+      "owner": null,
+      "points": 3,
+      "created_at": "2026-01-01T00:00:00Z"
+    }
+  ],
+  "builds": [],
+  "testruns": [],
+  "kv": {}
+}

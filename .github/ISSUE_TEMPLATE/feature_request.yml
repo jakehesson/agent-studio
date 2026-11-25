@@ -1,0 +1,36 @@
+name: Feature Request
+description: Propose a new capability, IDE adapter, or workflow improvement for Agent Studio
+title: "[Feature]: "
+labels: ["enhancement"]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem / Use Case
+      description: What workflow gap or limitation does this solve?
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed Solution
+      description: Describe the CLI, MCP, UI, or compiler behavior you would like to see.
+    validations:
+      required: true
+  - type: dropdown
+    id: surface
+    attributes:
+      label: Target Surface(s)
+      multiple: true
+      options:
+        - CLI / Compiler
+        - Stdio MCP Server
+        - Web Studio
+        - VS Code / Antigravity Extension
+        - Antigravity MCP App Plugin
+        - Model Index / Routing
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives Considered
+      description: Any workarounds or alternative designs you considered.
