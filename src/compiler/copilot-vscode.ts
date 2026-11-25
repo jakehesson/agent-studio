@@ -13,6 +13,10 @@ import {
   mapCapabilitiesToCopilotVsCode,
   resolveEffectiveCapabilities,
 } from "./capabilities.js";
+import {
+  buildPortableHookCommand,
+  buildPortableMcpSpec,
+} from "./launcher.js";
 import { type ExpectedFile, wrapGeneratedMarkdown } from "./merge.js";
 import {
   loadManifestSkills,
@@ -35,7 +39,7 @@ export function buildCopilotHooksConfig(): Record<string, unknown> {
     hooks[eventName] = [
       {
         type: "command",
-        command: `npx agent-studio hook-emit --ide copilot-vscode --event ${eventName}`,
+        command: buildPortableHookCommand("copilot-vscode", eventName),
         timeoutSec: 5,
       },
     ];
@@ -132,8 +136,7 @@ export function compileCopilotVsCode(
       servers: {
         "agent-studio": {
           type: "stdio",
-          command: "npx",
-          args: ["-y", "agent-studio", "mcp"],
+          ...buildPortableMcpSpec(),
         },
       },
     },

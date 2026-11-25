@@ -10,6 +10,10 @@ import {
   resolveEffectiveCapabilities,
 } from "./capabilities.js";
 import {
+  buildPortableHookCommand,
+  buildPortableMcpSpec,
+} from "./launcher.js";
+import {
   type ClaudeHookRule,
   type ExpectedFile,
   wrapGeneratedMarkdown,
@@ -36,7 +40,7 @@ export function buildClaudeCodeHooks(): Record<string, ClaudeHookRule[]> {
       hooks: [
         {
           type: "command",
-          command: `npx agent-studio hook-emit --ide claude-code --event ${eventName}`,
+          command: buildPortableHookCommand("claude-code", eventName),
           timeout: 5,
         },
       ],
@@ -114,10 +118,7 @@ export function compileClaudeCode(
     kind: "json-merge",
     patch: {
       mcpServers: {
-        "agent-studio": {
-          command: "npx",
-          args: ["-y", "agent-studio", "mcp"],
-        },
+        "agent-studio": buildPortableMcpSpec(),
       },
     },
   });

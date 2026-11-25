@@ -1,4 +1,5 @@
 import * as vscode from "vscode";
+import { registerTerminalPath, syncCliShims } from "./cliShim";
 import { registerMcpProvider } from "./mcpProvider";
 import { ModelSyncManager, type LanguageModelApiLike } from "./modelSync";
 import { ServerManager } from "./serverManager";
@@ -18,6 +19,20 @@ export function activate(context: vscode.ExtensionContext): void {
   const manager = new ServerManager(context.extensionPath, output);
   serverManager = manager;
   context.subscriptions.push(manager);
+
+  const shimResult = syncCliShims({ sourceCliPath: manager.getStudioCliPath() });
+  if (!shimResult.ok) {
+    output.appendLine(
+      `[cli-shim] Warning: failed to sync CLI shims in ${shimResult.binDir}: ${shimResult.error ?? "unknown error"}`,
+    );
+  } else {
+    registerTerminalPath(context.environmentVariableCollection, shimResult.binDir);
+    if (shimResult.written.length > 0) {
+      output.appendLine(
+        `[cli-shim] Synced ${shimResult.written.length} CLI shim file(s) to ${shimResult.binDir}`,
+      );
+    }
+  }
 
   const sidebarProvider = new StudioSidebarProvider(manager);
   context.subscriptions.push(

@@ -22,11 +22,11 @@ description: Agent Studio architecture profile, module boundaries, state/concurr
 ## 3. State Management, Concurrency & Locking Contracts
 - **Atomic File Locking:** Mutations to `pipeline/board.json`, `.agent-team/model-index.json`, `~/.agent-studio/model-index.json`, and `.agent-team/team.yaml` must acquire file locks, release in `finally`, and recover stale locks safely.
 - **CI Determinism (Layer 0 + Layer 2 only):** `compileTeam`, `checkTeamDrift`, `sync`, and `doctor` drift checks must merge **Layer 0 + Layer 2** only unless `--use-global-index` is explicitly specified; Layer 1 (`~/.agent-studio/model-index.json`) must never introduce CI drift.
-- **Idempotency:** Double-running `npx agent-studio sync` must produce zero written/merged files and pass `sync --check` with zero drift.
+- **Idempotency:** Double-running `agent-studio sync` must produce zero written/merged files and pass `sync --check` with zero drift.
 
 ## 4. Hard Repository Invariants & Lockstep Rules
 1. **3-Layer Orchestrator Read-Only Enforcement:** `orchestrator` capabilities strip `edit`, `write_docs`, `edit_tests`, and `shell` across Antigravity, Claude Code, and Copilot; `PreToolUse` hooks block direct writes to `pipeline/board.json`.
-2. **Never Hand-Edit Compiled Outputs or `pipeline/board.json`:** All team changes belong in `.agent-team/` followed by `npx agent-studio sync`; all board changes go through MCP `board` / `testrun` or `npx agent-studio board`.
+2. **Never Hand-Edit Compiled Outputs or `pipeline/board.json`:** All team changes belong in `.agent-team/` followed by `agent-studio sync`; all board changes go through MCP `board` / `testrun` or `agent-studio board`.
 3. **IDE Extension Scoping Invariant (`embed=1`):** Embedded IDE extension mode must detect the host IDE and current workspace root and scope all views, API calls, sidebar items, and status bar counts strictly to that host IDE + workspace, hiding cross-IDE/cross-project chrome while keeping standalone Web Studio multi-IDE/multi-project switching intact.
 4. **Core Token-Efficiency Invariant:** All blueprints (`src/templates/`), compiled team rules (`renderSharedTeamRules`), and `.agent-team/` must retain always-on Token & Context Discipline rules and `skills/token-efficiency/SKILL.md`.
 5. **SemVer Lockstep Invariant:** `"version"` must match across `package.json`, `extension/package.json`, and `web/package.json`, and packaged `.vsix` filenames must derive dynamically from `extension/package.json`.

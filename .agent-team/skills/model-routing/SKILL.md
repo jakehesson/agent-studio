@@ -11,8 +11,8 @@ description: Inspect and update Agent Studio's 3-layer Model Index (model-index.
 3. **Layer 2 (Workspace Override):** `.agent-team/model-index.json`. Git-tracked project catalog, tier overrides, and role recommendations.
 
 ## CI Determinism & Overlay Precedence
-- `npx agent-studio sync` and `sync --check` read **Layer 0 + Layer 2 only** unless `--use-global-index` is explicitly passed so CI builds stay deterministic.
-- Runtime views (`GET /api/model-index`, `GET /api/team`, `npx agent-studio models show`) merge **Layer 2 > Layer 1 > Layer 0**, upserting catalog entries by `(ide, id)`.
+- `agent-studio sync` and `sync --check` read **Layer 0 + Layer 2 only** unless `--use-global-index` is explicitly passed so CI builds stay deterministic.
+- Runtime views (`GET /api/model-index`, `GET /api/team`, `agent-studio models show`) merge **Layer 2 > Layer 1 > Layer 0**, upserting catalog entries by `(ide, id)`.
 
 ## Host-Compatibility Policies (`workflow.modelRouting.policy`)
 - **`prefer-fallback` (default):**
@@ -27,12 +27,12 @@ description: Inspect and update Agent Studio's 3-layer Model Index (model-index.
 - `.agent-team/team.yaml`: `workflow.modelRouting.{policy,respectBuiltInOrchestrators,allowSubagentModelHints,copilotHandoffModels,idePolicies}` and `roster[].{modelTier,modelPolicy,models}`.
 
 ## Safe Agent & CLI Update Commands
-- Inspect effective index & resolved per-IDE models: `npx agent-studio models show`
-- Update a tier binding in workspace index: `npx agent-studio models set-tier copilot-vscode balanced "Claude Sonnet 4.5 (copilot)" --fallback "Claude Sonnet 4.5 (copilot),GPT-4.1 (copilot)" --sync`
-- Update a role's tier or policy: `npx agent-studio models set-role architect --tier reasoning --sync`
-- Switch workflow routing policy: `npx agent-studio models set-policy defer-to-host --sync`
-- Upsert a model into catalog: `npx agent-studio models upsert --ide antigravity --id gemini-4-neon --tier reasoning`
-- Adopt live Layer 1 models into Git-tracked `.agent-team/model-index.json`: `npx agent-studio models adopt --sync`
-- Reset workspace or global overlay: `npx agent-studio models reset --scope workspace --sync`
+- Inspect effective index & resolved per-IDE models: `agent-studio models show`
+- Update a tier binding in workspace index: `agent-studio models set-tier copilot-vscode balanced "Claude Sonnet 4.5 (copilot)" --fallback "Claude Sonnet 4.5 (copilot),GPT-4.1 (copilot)" --sync`
+- Update a role's tier or policy: `agent-studio models set-role architect --tier reasoning --sync`
+- Switch workflow routing policy: `agent-studio models set-policy defer-to-host --sync`
+- Upsert a model into catalog: `agent-studio models upsert --ide antigravity --id gemini-4-neon --tier reasoning`
+- Adopt live Layer 1 models into Git-tracked `.agent-team/model-index.json`: `agent-studio models adopt --sync`
+- Reset workspace or global overlay: `agent-studio models reset --scope workspace --sync`
 
-> **Never hand-edit compiled IDE outputs** (`.agents/plugins/`, `.claude/agents/`, `.github/agents/`). Update `.agent-team/` via CLI or JSON/YAML, then run `npx agent-studio sync`.
+> **Never hand-edit compiled IDE outputs** (`.agents/plugins/`, `.claude/agents/`, `.github/agents/`). Update `.agent-team/` via CLI or JSON/YAML, then run `agent-studio sync`.

@@ -71,5 +71,5 @@ For rapid UI iteration without rebuilding the binary, set `AGENT_STUDIO_APP_HTML
 | Surface | Best For | Transport | Scope |
 | :--- | :--- | :--- | :--- |
 | **Native Antigravity MCP App Plugin** (`antigravity-plugin/`) | Native Antigravity side pane, sidebar, and inline conversation UI with zero background HTTP server | Stdio MCP + SEP-1865 `postMessage` (`app_get_*`) | Antigravity IDE + active workspace |
-| **VS Code / Antigravity Extension** (`extension/agent-studio-0.8.0.vsix`) | VS Code Activity Bar sidebar, Status Bar pill, Command Palette onboarding, and Remote SSH/WSL port-forwarding | Local/External HTTP + SSE (`?embed=1`) | Host IDE (`copilot-vscode` / `antigravity`) + active workspace |
+| **VS Code / Antigravity Extension** (`extension/agent-studio-0.8.1.vsix`) | VS Code Activity Bar sidebar, Status Bar pill, Command Palette onboarding, and Remote SSH/WSL port-forwarding | Local/External HTTP + SSE (`?embed=1`) | Host IDE (`copilot-vscode` / `antigravity`) + active workspace |
 | **Standalone Web Studio** (`npx agent-studio serve --host 0.0.0.0 --port 8767`) | Multi-IDE + multi-project browser dashboard, mobile / Galaxy Z Fold 7 via Tailscale, Mockups gallery | HTTP + SSE (single port `8767`) | All registered projects & all 3 IDEs |

@@ -35,7 +35,9 @@ workflow:
       title: TypeScript Typecheck & Unit Suite
       command: npm run check && npm test
       steps:
-        - Run `npm run check && npm test` to verify TypeScript compilation, schemas, board lock/QA gate, compiler, telemetry adapters, and HTTP/SSE tests.
+        - Run `npm run check && npm test` to verify TypeScript compilation,
+          schemas, board lock/QA gate, compiler, telemetry adapters, and
+          HTTP/SSE tests.
       pass:
         - Exit code 0 with zero TypeScript errors and 100% passing unit tests.
       fail:
@@ -44,7 +46,8 @@ workflow:
       title: Web Studio Typecheck & Vite Build
       command: npm --prefix web run check && npm --prefix web run build
       steps:
-        - Run `npm --prefix web run check && npm --prefix web run build` to verify frontend types and production bundle output in `dist/web/`.
+        - Run `npm --prefix web run check && npm --prefix web run build` to
+          verify frontend types and production bundle output in `dist/web/`.
       pass:
         - Web typecheck and Vite production build exit 0 cleanly.
       fail:
@@ -53,7 +56,8 @@ workflow:
       title: Legacy Python Visualizer Smoke Suite
       command: python tests/smoke_test.py
       steps:
-        - Run `python tests/smoke_test.py` to confirm backward compatibility of `agent_visualizer.py`.
+        - Run `python tests/smoke_test.py` to confirm backward compatibility of
+          `agent_visualizer.py`.
       pass:
         - All smoke checks pass with exit code 0.
       fail:
@@ -69,7 +73,6 @@ roster:
     roleType: orchestrator
     boardRole: orchestrator
     promptFile: agents/orchestrator.md
-    modelTier: fast
     capabilities:
       - read
       - search
@@ -86,12 +89,12 @@ roster:
       - release-engineer
     description: Strict manager and dispatcher overseeing ready -> design -> dev ->
       test -> done and enforcing the QA gate via agent-studio MCP.
+    modelTier: fast
   - id: architect
     name: System Architect
     roleType: specialist
     boardRole: design
     promptFile: agents/architect.md
-    modelTier: reasoning
     capabilities:
       - read
       - search
@@ -99,26 +102,26 @@ roster:
       - mcp_board
     description: System architecture, technical specifications, data schemas, and
       API contracts.
+    modelTier: reasoning
   - id: ux-designer
     name: UX Engineer & Designer
     roleType: specialist
     boardRole: ux
     promptFile: agents/ux-designer.md
-    modelTier: reasoning
     capabilities:
       - read
       - search
       - write_docs
       - mcp_board
     description: Usability engineering, interaction design, layout/overflow audits,
-      WCAG AA accessibility, and Galaxy Z Fold 7 three-tier responsive ergonomics
-      partnering with frontend-engineer.
+      WCAG AA accessibility, and Galaxy Z Fold 7 three-tier responsive
+      ergonomics partnering with frontend-engineer.
+    modelTier: reasoning
   - id: backend-engineer
     name: Backend Engineer
     roleType: specialist
     boardRole: backend
     promptFile: agents/backend-engineer.md
-    modelTier: balanced
     capabilities:
       - read
       - search
@@ -127,12 +130,12 @@ roster:
       - mcp_board
     description: Server, CLI, data layer, and core backend implementation with unit
       test coverage.
+    modelTier: balanced
   - id: frontend-engineer
     name: Frontend Engineer
     roleType: specialist
     boardRole: frontend
     promptFile: agents/frontend-engineer.md
-    modelTier: balanced
     capabilities:
       - read
       - search
@@ -141,12 +144,12 @@ roster:
       - mcp_board
     description: UI, interactive views, visualizations, and responsive styling
       across mobile, foldable, and desktop.
+    modelTier: balanced
   - id: code-reviewer
     name: Code Reviewer
     roleType: specialist
     boardRole: review
     promptFile: agents/code-reviewer.md
-    modelTier: reasoning
     capabilities:
       - read
       - search
@@ -155,12 +158,12 @@ roster:
     description: Rigorous code reviewer auditing syntax, security, architecture
       conformance, performance, concurrency, and test coverage before QA gate
       sign-off.
+    modelTier: reasoning
   - id: qa-validator
     name: QA Validator
     roleType: qa
     boardRole: qa
     promptFile: agents/qa-validator.md
-    modelTier: fast
     capabilities:
       - read
       - search
@@ -170,12 +173,12 @@ roster:
       - mcp_testrun
     description: Automated test suites, formal MCP testruns, bug filing, and test ->
       done QA gate verification.
+    modelTier: fast
   - id: release-engineer
     name: CI/CD & Release Engineer
     roleType: specialist
     boardRole: ops
     promptFile: agents/release-engineer.md
-    modelTier: balanced
     capabilities:
       - read
       - search
@@ -184,12 +187,12 @@ roster:
       - mcp_board
     description: GitHub Actions CI/CD workflows, SemVer lockstep releases, CHANGELOG
       curation, and pre-release packaging verification.
+    modelTier: balanced
   - id: team-setup
     name: Team Setup Agent
     roleType: setup
     boardRole: ops
     promptFile: agents/team-setup.md
-    modelTier: balanced
     capabilities:
       - read
       - search
@@ -198,6 +201,7 @@ roster:
       - ask_user
     description: Cross-IDE AI Setup Agent that inspects the repo, tailors
       .agent-team/, compiles IDE adapters, and verifies health.
+    modelTier: balanced
 skills:
   - skills/agile-board-workflow
   - skills/architecture-spec

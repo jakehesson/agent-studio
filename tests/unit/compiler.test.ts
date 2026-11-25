@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { spawnSync } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -12,11 +13,14 @@ import {
 import { runInit } from "../../src/cli/commands/init.js";
 import { runSync } from "../../src/cli/commands/sync.js";
 import {
+  buildPortableHookCommand,
+  buildPortableMcpSpec,
   checkTeamDrift,
   compileTeam,
   computeDrift,
   extractGeneratedHash,
   formatGeneratedMarker,
+  HOOK_TAG_NEEDLE,
   installGlobalSetupAgent,
   MANAGED_BEGIN,
   MANAGED_END,
@@ -255,11 +259,11 @@ describe("Multi-IDE Compiler (Golden Fixtures & Orchestrator Read-Only)", () => 
     assert.ok(fs.existsSync(path.join(agyPluginDir, "skills", "agile-board-workflow", "SKILL.md")));
     assert.ok(fs.existsSync(path.join(agyPluginDir, "skills", "team-setup", "SKILL.md")));
 
+    const expectedMcp = buildPortableMcpSpec();
     const agyMcp = JSON.parse(
       fs.readFileSync(path.join(agyPluginDir, "mcp_config.json"), "utf8"),
     ) as { mcpServers: Record<string, { command: string; args: string[] }> };
-    assert.equal(agyMcp.mcpServers["agent-studio"]?.command, "npx");
-    assert.deepEqual(agyMcp.mcpServers["agent-studio"]?.args, ["-y", "agent-studio", "mcp"]);
+    assert.deepEqual(agyMcp.mcpServers["agent-studio"], expectedMcp);
 
     const agyOrchRaw = fs.readFileSync(
       path.join(agyPluginDir, "agents", "orchestrator.md"),
@@ -327,8 +331,7 @@ describe("Multi-IDE Compiler (Golden Fixtures & Orchestrator Read-Only)", () => 
     const ccMcp = JSON.parse(fs.readFileSync(path.join(repo, ".mcp.json"), "utf8")) as {
       mcpServers: Record<string, { command: string; args: string[] }>;
     };
-    assert.equal(ccMcp.mcpServers["agent-studio"]?.command, "npx");
-    assert.deepEqual(ccMcp.mcpServers["agent-studio"]?.args, ["-y", "agent-studio", "mcp"]);
+    assert.deepEqual(ccMcp.mcpServers["agent-studio"], expectedMcp);
 
     const ccSettings = JSON.parse(
       fs.readFileSync(path.join(repo, ".claude", "settings.json"), "utf8"),
@@ -464,8 +467,8 @@ describe("Multi-IDE Compiler (Golden Fixtures & Orchestrator Read-Only)", () => 
       fs.readFileSync(path.join(repo, ".vscode", "mcp.json"), "utf8"),
     ) as { servers: Record<string, { type: string; command: string; args: string[] }> };
     assert.equal(vscMcp.servers["agent-studio"]?.type, "stdio");
-    assert.equal(vscMcp.servers["agent-studio"]?.command, "npx");
-    assert.deepEqual(vscMcp.servers["agent-studio"]?.args, ["-y", "agent-studio", "mcp"]);
+    assert.equal(vscMcp.servers["agent-studio"]?.command, expectedMcp.command);
+    assert.deepEqual(vscMcp.servers["agent-studio"]?.args, expectedMcp.args);
 
     const copilotHooks = JSON.parse(
       fs.readFileSync(path.join(repo, ".github", "hooks", "agent-studio.json"), "utf8"),
@@ -1060,5 +1063,147 @@ describe("CLI Init, Global Install & Doctor", () => {
     assert.ok(
       directRes.installedFiles.some((f) => f.endsWith("team-setup.instructions.md")),
     );
+  });
+});
+
+describe("Portable Hook & MCP Launcher", () => {
+  it("preserves HOOK_TAG_NEEDLE and embeds zero shell-unsafe characters inside node -e bodies", () => {
+    const hookCmd = buildPortableHookCommand("copilot-vscode", "PreToolUse");
+    assert.ok(hookCmd.startsWith('node -e "') && hookCmd.endsWith('"'));
+    assert.ok(hookCmd.includes(HOOK_TAG_NEEDLE));
+    assert.ok(hookCmd.includes("--ide copilot-vscode --event PreToolUse"));
+
+    const hookBody = hookCmd.slice('node -e "'.length, -1);
+    assert.equal(
+      /["$`%\\\r\n]/.test(hookBody),
+      false,
+      'hook body must contain zero ", $, `, %, \\, or newlines',
+    );
+
+    const mcpSpec = buildPortableMcpSpec();
+    assert.equal(mcpSpec.command, "node");
+    assert.equal(mcpSpec.args[0], "-e");
+    assert.equal(
+      /["$`%\\\r\n]/.test(mcpSpec.args[1]),
+      false,
+      'MCP body must contain zero ", $, `, %, \\, or newlines',
+    );
+  });
+
+  it("executes compiled hook command via shell with piped stdin, preserves exit 0/2, resolves PATH fallback, and fails open when missing", () => {
+    const tmpBase = makeTempDir("av-launcher-");
+    const emptyCwd = path.join(tmpBase, "empty cwd");
+    const studioHome = path.join(tmpBase, "studio home");
+    const binDir = path.join(studioHome, "bin");
+    fs.mkdirSync(emptyCwd, { recursive: true });
+    fs.mkdirSync(binDir, { recursive: true });
+
+    const hookCmd = buildPortableHookCommand("copilot-vscode", "PreToolUse");
+    const nodeDir = path.dirname(process.execPath);
+    const isolatedEnv = {
+      ...process.env,
+      HOME: tmpBase,
+      USERPROFILE: tmpBase,
+      AGENT_STUDIO_HOME: studioHome,
+      PATH: nodeDir,
+    };
+
+    // 1. Mock studio-cli.mjs returning exit 0 and echoing args + stdin
+    const mockCli = path.join(binDir, "studio-cli.mjs");
+    fs.writeFileSync(
+      mockCli,
+      [
+        'import fs from "node:fs";',
+        'const stdin = fs.readFileSync(0, "utf8");',
+        'process.stdout.write(JSON.stringify({ argv: process.argv.slice(2), stdin }));',
+        "process.exit(0);",
+      ].join("\n"),
+      "utf8",
+    );
+
+    const res0 = spawnSync(hookCmd, {
+      cwd: emptyCwd,
+      env: isolatedEnv,
+      shell: true,
+      input: "{}",
+      encoding: "utf8",
+      timeout: 10_000,
+    });
+    assert.equal(res0.status, 0, `expected exit 0, got ${res0.status}: ${res0.stderr}`);
+    const parsed0 = JSON.parse(res0.stdout) as { argv: string[]; stdin: string };
+    assert.deepEqual(parsed0.argv, [
+      "hook-emit",
+      "--ide",
+      "copilot-vscode",
+      "--event",
+      "PreToolUse",
+    ]);
+    assert.equal(parsed0.stdin, "{}");
+
+    // 2. Mock studio-cli.mjs returning exit 2 (PreToolUse guardrail deny)
+    fs.writeFileSync(mockCli, "process.exit(2);\n", "utf8");
+    const res2 = spawnSync(hookCmd, {
+      cwd: emptyCwd,
+      env: isolatedEnv,
+      shell: true,
+      input: "{}",
+      encoding: "utf8",
+      timeout: 10_000,
+    });
+    assert.equal(res2.status, 2, `expected exit 2 guardrail propagation, got ${res2.status}`);
+
+    // 3. Remove AGENT_STUDIO_HOME shim -> verify PATH fallback (with spaces in dir)
+    fs.rmSync(mockCli, { force: true });
+    const pathFallbackDir = path.join(tmpBase, "path with space");
+    fs.mkdirSync(pathFallbackDir, { recursive: true });
+    if (process.platform === "win32") {
+      fs.writeFileSync(
+        path.join(pathFallbackDir, "agent-studio.cmd"),
+        "@echo off\r\nexit /b 2\r\n",
+        "utf8",
+      );
+    } else {
+      const shBin = path.join(pathFallbackDir, "agent-studio");
+      fs.writeFileSync(shBin, "#!/usr/bin/env sh\nexit 2\n", "utf8");
+      fs.chmodSync(shBin, 0o755);
+    }
+    const resPathFallback = spawnSync(hookCmd, {
+      cwd: emptyCwd,
+      env: {
+        ...isolatedEnv,
+        PATH: `${pathFallbackDir}${path.delimiter}${nodeDir}`,
+      },
+      shell: true,
+      input: "{}",
+      encoding: "utf8",
+      timeout: 10_000,
+    });
+    assert.equal(
+      resPathFallback.status,
+      2,
+      `expected PATH fallback exit 2, got ${resPathFallback.status}: ${resPathFallback.stderr}`,
+    );
+
+    // 4. Missing CLI everywhere -> hook fails open with exit 0
+    const resMissingHook = spawnSync(hookCmd, {
+      cwd: emptyCwd,
+      env: isolatedEnv,
+      shell: true,
+      input: "{}",
+      encoding: "utf8",
+      timeout: 10_000,
+    });
+    assert.equal(resMissingHook.status, 0, "missing CLI hook must fail open with exit 0");
+
+    // 5. Missing CLI everywhere -> MCP launcher exits 1 with install hint
+    const mcpSpec = buildPortableMcpSpec();
+    const resMissingMcp = spawnSync(mcpSpec.command, mcpSpec.args, {
+      cwd: emptyCwd,
+      env: isolatedEnv,
+      encoding: "utf8",
+      timeout: 10_000,
+    });
+    assert.equal(resMissingMcp.status, 1);
+    assert.match(resMissingMcp.stderr, /agent-studio CLI not found/);
   });
 });

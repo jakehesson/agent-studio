@@ -175,3 +175,4 @@ export * from "./antigravity.js";
 export * from "./claude-code.js";
 export * from "./copilot-vscode.js";
 export * from "./global-install.js";
+export * from "./launcher.js";

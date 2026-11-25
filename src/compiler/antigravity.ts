@@ -9,6 +9,7 @@ import {
   mapCapabilitiesToAntigravity,
   resolveEffectiveCapabilities,
 } from "./capabilities.js";
+import { buildPortableMcpSpec } from "./launcher.js";
 import { type ExpectedFile, wrapGeneratedMarkdown } from "./merge.js";
 import {
   loadManifestSkills,
@@ -63,10 +64,7 @@ export function compileAntigravity(
 
   const mcpConfig = {
     mcpServers: {
-      "agent-studio": {
-        command: "npx",
-        args: ["-y", "agent-studio", "mcp"],
-      },
+      "agent-studio": buildPortableMcpSpec(),
     },
   };
 

@@ -6,7 +6,7 @@ description: Manage sprints, backlog items, bugs, and QA-gated lifecycle transit
 # Agile Board Workflow
 
 ## Core Invariants
-1. **Single Source of Truth:** Track all sprint work in `pipeline/board.json` exclusively through the `agent-studio` MCP (`board`, `testrun`, `projects`) or `npx agent-studio board ...` CLI.
+1. **Single Source of Truth:** Track all sprint work in `pipeline/board.json` exclusively through the `agent-studio` MCP (`board`, `testrun`, `projects`) or `agent-studio board ...` CLI.
 2. **Never Hand-Edit `board.json`:** Direct edits bypass atomic locking, audit notes, and QA gate enforcement (and are blocked by `PreToolUse` hooks).
 3. **Lifecycle Stages:** `ready -> design -> dev -> test -> done`.
 4. **QA Gate:** Moving an item `test -> done` is rejected by the MCP server unless a closed, passing `testrun` covers its required suite.

@@ -139,7 +139,7 @@ export function renderSharedTeamRules(
     `# ${manifest.project.title} — Agent Studio Team Rules`,
     "",
     `- **Project ID:** \`${manifest.project.id}\``,
-    `- **Canonical Source:** \`.agent-team/team.yaml\` + \`.agent-team/model-index.json\` (edit only \`.agent-team/\`, then run \`npx agent-studio sync\`).`,
+    `- **Canonical Source:** \`.agent-team/team.yaml\` + \`.agent-team/model-index.json\` (edit only \`.agent-team/\`, then run \`agent-studio sync\`).`,
     `- **Lifecycle:** \`${stages}\``,
     `- **Board File:** \`${manifest.workflow.boardPath}\``,
     "",

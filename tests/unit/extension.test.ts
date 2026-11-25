@@ -1,10 +1,12 @@
 import assert from "node:assert/strict";
-import { execFileSync } from "node:child_process";
+import { execFileSync, spawnSync } from "node:child_process";
 import fs from "node:fs";
+import { createRequire } from "node:module";
 import os from "node:os";
 import path from "node:path";
 import { describe, it } from "node:test";
 import ts from "typescript";
+import type * as CliShimModule from "../../extension/src/cliShim.js";
 import type * as ModelSyncModule from "../../extension/src/modelSync.js";
 import type * as ScopingModule from "../../extension/src/scoping.js";
 
@@ -15,6 +17,7 @@ function loadExtensionScopingModule(): typeof ScopingModule {
     compilerOptions: {
       module: ts.ModuleKind.CommonJS,
       target: ts.ScriptTarget.ES2022,
+      esModuleInterop: true,
     },
   });
   const mod = { exports: {} as Partial<typeof ScopingModule> };
@@ -30,12 +33,30 @@ function loadExtensionModelSyncModule(): typeof ModelSyncModule {
     compilerOptions: {
       module: ts.ModuleKind.CommonJS,
       target: ts.ScriptTarget.ES2022,
+      esModuleInterop: true,
     },
   });
   const mod = { exports: {} as Partial<typeof ModelSyncModule> };
   const fn = new Function("exports", "module", outputText);
   fn(mod.exports, mod);
   return mod.exports as typeof ModelSyncModule;
+}
+
+function loadExtensionCliShimModule(): typeof CliShimModule {
+  const srcPath = path.join(REPO_ROOT, "extension", "src", "cliShim.ts");
+  const source = fs.readFileSync(srcPath, "utf8");
+  const { outputText } = ts.transpileModule(source, {
+    compilerOptions: {
+      module: ts.ModuleKind.CommonJS,
+      target: ts.ScriptTarget.ES2022,
+      esModuleInterop: true,
+    },
+  });
+  const mod = { exports: {} as Partial<typeof CliShimModule> };
+  const localRequire = createRequire(srcPath);
+  const fn = new Function("exports", "module", "require", outputText);
+  fn(mod.exports, mod, localRequire);
+  return mod.exports as typeof CliShimModule;
 }
 
 const REPO_ROOT = path.resolve(process.cwd());
@@ -429,5 +450,136 @@ describe("VS Code / Antigravity IDE Extension (.vsix)", () => {
     assert.ok(
       extPkg.contributes.commands.some((c) => c.command === "agentStudio.refreshModelIndex"),
     );
+  });
+
+  it("cliShim syncs atomic shims idempotently, handles missing source, registers terminal PATH, and executes --version", () => {
+    const {
+      registerTerminalPath,
+      resolveAgentStudioBinDir,
+      syncCliShims,
+    } = loadExtensionCliShimModule();
+
+    const tmpBase = fs.mkdtempSync(path.join(os.tmpdir(), "av-shim-test-"));
+    const fakeHome = path.join(tmpBase, "studio home");
+    const prevEnvHome = process.env.AGENT_STUDIO_HOME;
+
+    try {
+      process.env.AGENT_STUDIO_HOME = fakeHome;
+      assert.equal(resolveAgentStudioBinDir(), path.join(fakeHome, "bin"));
+      assert.equal(
+        resolveAgentStudioBinDir(path.join(tmpBase, "override")),
+        path.join(tmpBase, "override", "bin"),
+      );
+
+      // Missing source returns ok: false without throwing
+      const missingRes = syncCliShims({
+        sourceCliPath: path.join(tmpBase, "does-not-exist.mjs"),
+        agentStudioHome: fakeHome,
+      });
+      assert.equal(missingRes.ok, false);
+      assert.ok(missingRes.error);
+      assert.deepEqual(missingRes.written, []);
+
+      // Initial sync writes all 3 files
+      const firstRes = syncCliShims({
+        sourceCliPath: STUDIO_CLI,
+        agentStudioHome: fakeHome,
+      });
+      assert.equal(firstRes.ok, true);
+      assert.equal(firstRes.binDir, path.join(fakeHome, "bin"));
+      assert.equal(firstRes.cliPath, path.join(fakeHome, "bin", "studio-cli.mjs"));
+      assert.equal(firstRes.written.length, 3);
+
+      const cmdPath = path.join(firstRes.binDir, "agent-studio.cmd");
+      const shPath = path.join(firstRes.binDir, "agent-studio");
+      assert.equal(
+        fs.readFileSync(cmdPath, "utf8"),
+        '@echo off\r\nnode "%~dp0studio-cli.mjs" %*\r\n',
+      );
+      assert.equal(
+        fs.readFileSync(shPath, "utf8"),
+        '#!/usr/bin/env sh\nexec node "$(dirname "$0")/studio-cli.mjs" "$@"\n',
+      );
+      if (process.platform !== "win32") {
+        const mode = fs.statSync(shPath).mode & 0o777;
+        assert.ok((mode & 0o111) !== 0, "POSIX shim must be executable");
+      }
+
+      // Second sync is 100% idempotent (written === [])
+      const secondRes = syncCliShims({
+        sourceCliPath: STUDIO_CLI,
+        agentStudioHome: fakeHome,
+      });
+      assert.equal(secondRes.ok, true);
+      assert.deepEqual(secondRes.written, []);
+
+      // Content change triggers atomic rewrite without leaving .tmp-* files
+      fs.writeFileSync(cmdPath, "stale-content", "utf8");
+      const thirdRes = syncCliShims({
+        sourceCliPath: STUDIO_CLI,
+        agentStudioHome: fakeHome,
+      });
+      assert.equal(thirdRes.ok, true);
+      assert.deepEqual(thirdRes.written, [cmdPath]);
+      assert.equal(
+        fs.readFileSync(cmdPath, "utf8"),
+        '@echo off\r\nnode "%~dp0studio-cli.mjs" %*\r\n',
+      );
+      const leftoverTemps = fs
+        .readdirSync(firstRes.binDir)
+        .filter((f) => f.startsWith(".tmp-"));
+      assert.deepEqual(leftoverTemps, []);
+
+      // registerTerminalPath prepends binDir + path.delimiter
+      const prepended: Array<{ key: string; value: string }> = [];
+      assert.equal(registerTerminalPath(undefined, firstRes.binDir), false);
+      assert.equal(
+        registerTerminalPath(
+          {
+            prepend(key, value) {
+              prepended.push({ key, value });
+            },
+          },
+          firstRes.binDir,
+        ),
+        true,
+      );
+      assert.deepEqual(prepended, [
+        { key: "PATH", value: `${firstRes.binDir}${path.delimiter}` },
+      ]);
+
+      // Invoke generated shim directly with --version
+      const nodeBinDir = path.dirname(process.execPath);
+      const shimEnv = {
+        ...process.env,
+        PATH: `${nodeBinDir}${path.delimiter}${process.env.PATH ?? ""}`,
+      };
+      const runRes =
+        process.platform === "win32"
+          ? spawnSync(
+              process.env.ComSpec || "cmd.exe",
+              ["/d", "/s", "/c", `""${cmdPath}" --version"`],
+              {
+                env: shimEnv,
+                encoding: "utf8",
+                timeout: 10_000,
+                windowsVerbatimArguments: true,
+              },
+            )
+          : spawnSync(shPath, ["--version"], {
+              env: shimEnv,
+              encoding: "utf8",
+              timeout: 10_000,
+            });
+      assert.equal(runRes.status, 0, `Shim exited with ${runRes.status}: ${runRes.stderr}`);
+      assert.equal(runRes.stdout.trim(), EXPECTED_VERSION);
+    } finally {
+      if (prevEnvHome === undefined) {
+        delete process.env.AGENT_STUDIO_HOME;
+      } else {
+        process.env.AGENT_STUDIO_HOME = prevEnvHome;
+      }
+      fs.rmSync(tmpBase, { recursive: true, force: true });
+    }
   });
 });

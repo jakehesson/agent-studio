@@ -5,6 +5,18 @@ All notable changes to **Agent Studio** will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.8.1] - 2026-11-25
+
+### Fixed
+- **VSIX-Only Machine CLI/Hook/MCP Execution (`BUG-14`):**
+  - Eliminated `npm E404` errors (`npx agent-studio`) on VSIX-only / non-npm-published machines where the extension is installed without a global npm install.
+  - **Extension Auto-Shim (`extension/src/cliShim.ts`, `extension/src/extension.ts`):** VS Code / Antigravity extension activation now atomically syncs the bundled `studio-cli.mjs` and cross-platform `agent-studio` / `agent-studio.cmd` shims to `~/.agent-studio/bin/` and prepends that directory to integrated terminal `PATH`.
+  - **Portable Hook & MCP Launcher (`src/compiler/launcher.ts`):** Compiled Copilot, Claude Code, and Antigravity hooks and MCP configs (`.github/hooks/agent-studio.json`, `.claude/settings.json`, `.mcp.json`, `.vscode/mcp.json`, `.agents/plugins/*/mcp_config.json`) now use a portable `node -e` launcher resolving `~/.agent-studio/bin/studio-cli.mjs`, local `node_modules/.bin`, or `PATH` (preserving `HOOK_TAG_NEEDLE` and failing open on hooks).
+
+### Changed
+- **Templates & Skills (`src/templates/prompts.ts`, `src/templates/skills.ts`):**
+  - Updated `team-setup` prompts, skills, and generated IDE adapters to prefer `agent-studio` / `~/.agent-studio/bin` instead of raw `npx agent-studio`.
+
 ## [0.8.0] - 2026-11-25
 
 ### Added
