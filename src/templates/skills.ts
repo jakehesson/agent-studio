@@ -1,10 +1,60 @@
+import type { DetectedRepoInfo } from "./detect.js";
+
 export interface SkillTemplate {
   id: string;
   relDir: string;
   content: string;
 }
 
-export function getDefaultSkills(): SkillTemplate[] {
+export function renderArchitectureReviewSkillTemplate(
+  detected?: DetectedRepoInfo,
+): string {
+  const arch = detected?.architecture;
+  const formatList = (items: string[] | undefined, fallback: string) =>
+    items && items.length > 0 ? items.map((i) => `\`${i}\``).join(", ") : fallback;
+
+  return [
+    "---",
+    "name: architecture-review",
+    "description: Repository-specific architecture profile, module boundaries, state/concurrency contracts, invariants, and P0/P1/P2 conformance rubric.",
+    "---",
+    "",
+    "# Architecture Review Profile & Conformance Rubric",
+    "",
+    "<!-- architecture-research: pending -->",
+    "> **Status:** PENDING DEEP RESEARCH — run `team-setup` to inspect the codebase, populate repo-specific invariants & failure modes, and remove this marker.",
+    "",
+    "## 1. Detected Architecture Pre-Scan",
+    `- **Stack:** \`${detected?.stack ?? "generic"}\``,
+    `- **Topology Hints:** ${formatList(arch?.topologyHints, "_run team-setup to classify_")}`,
+    `- **Frameworks:** ${formatList(arch?.frameworks, "_none detected_")}`,
+    `- **State Management:** ${formatList(arch?.stateManagement, "_none detected_")}`,
+    `- **Concurrency Signals:** ${formatList(arch?.concurrencySignals, "_none detected_")}`,
+    `- **API Boundaries:** ${formatList(arch?.apiBoundaries, "_none detected_")}`,
+    `- **Storage Signals:** ${formatList(arch?.storageSignals, "_none detected_")}`,
+    `- **Top-Level Directories:** ${formatList(arch?.topLevelDirs, "_none_")}`,
+    `- **Monorepo Workspaces:** ${formatList(arch?.monorepoWorkspaces, "_none_")}`,
+    `- **CI Workflows:** ${formatList(arch?.ciWorkflows, "_none_")}`,
+    "",
+    "## 2. Architectural Style & Module Boundaries",
+    "- _TODO (`team-setup`):_ Document the primary architectural style (modular monolith, monorepo, microservices, layered/hexagonal, event-driven, full-stack).",
+    "- _TODO (`team-setup`):_ Define allowed dependency directions and forbidden cross-layer imports.",
+    "",
+    "## 3. State Management, Concurrency & Locking Contracts",
+    "- _TODO (`team-setup`):_ Document canonical state owners, persistence/lock guarantees, transaction boundaries, and async backpressure/timeout contracts.",
+    "",
+    "## 4. Hard Repository Invariants & Lockstep Rules",
+    "- _TODO (`team-setup`):_ List non-negotiable invariants (e.g. schema compatibility, version lockstep, generated-file rules, auth/containment boundaries).",
+    "",
+    "## 5. Known Failure Modes & P0/P1/P2 Architectural Rubric",
+    "- **[P0 Blocker]:** Violated hard invariants, broken trust boundaries, race conditions/stale locks, or forbidden cross-layer coupling.",
+    "- **[P1 Required]:** Missing error/timeout handling at boundaries, schema/contract drift, or unguarded state mutations.",
+    "- **[P2 Advisory]:** Non-blocking module cohesion, naming, or maintainability improvements.",
+    "",
+  ].join("\n");
+}
+
+export function getDefaultSkills(detected?: DetectedRepoInfo): SkillTemplate[] {
   return [
     {
       id: "agile-board-workflow",
@@ -90,6 +140,44 @@ export function getDefaultSkills(): SkillTemplate[] {
         "3. Post a concise UX sign-off note on the board item via MCP `board { op: \"note\" }`.",
         "",
       ].join("\n"),
+    },
+    {
+      id: "code-review",
+      relDir: "skills/code-review",
+      content: [
+        "---",
+        "name: code-review",
+        "description: Universal 5-pillar code review rubric covering syntax/types, security, architecture conformance, performance/concurrency, and test coverage before QA gate sign-off.",
+        "---",
+        "",
+        "# Code Review Skill (5-Pillar Rubric)",
+        "",
+        "## Read-Only Containment",
+        "- Perform reviews strictly read-only (`git diff`, `git status`, search, typecheck, linter, and targeted test runs).",
+        "- Never modify repository source files, tests, docs, or `pipeline/board.json` directly.",
+        "",
+        "## Five Review Pillars",
+        "1. **Syntax, Types & Correctness:** Type soundness, null/undefined handling, exhaustiveness, schema/contract alignment, dead code, and error propagation.",
+        "2. **Security & Trust Boundaries:** Injection (SQL/shell/HTML/XSS), path traversal and symlink escape, authn/authz enforcement, secret exposure, input bounds/payload caps, and unsafe deserialization.",
+        "3. **Architecture Conformance:** Compliance with repo-specific layering, dependency direction, invariants, and rules in `skills/architecture-review/SKILL.md` and the active Architect spec.",
+        "4. **Performance, Resource & Concurrency Safety:** Algorithmic complexity, N+1 queries, unbounded loops/buffers, race conditions, lock acquisition/release (`finally` cleanup), async timeouts/backpressure, and resource/memory leaks.",
+        "5. **Test Coverage & Edge Cases:** Happy path plus failure/boundary tests, regression coverage for bug fixes, deterministic mocks/temp isolation, and no skipped or relaxed assertions.",
+        "",
+        "## Finding Classification",
+        "- **`[P0 Blocker]`** — Security flaw, data corruption, crash, race condition, or violated hard invariant (must return `test -> dev`; file bug via `board { op: \"add\", type: \"bug\" }`).",
+        "- **`[P1 Required]`** — Missing test coverage for core logic, broken boundary/error handling, architectural violation, or significant perf regression (must resolve before QA gate).",
+        "- **`[P2 Advisory]`** — Non-blocking clarity, naming, or minor refactor suggestions.",
+        "",
+        "## Board Handoff",
+        "- Post a structured review summary (`CODE REVIEW PASS` or `CODE REVIEW CHANGES REQUESTED` with `file:line` citations) via `board { op: \"note\" }`.",
+        "- On `CODE REVIEW CHANGES REQUESTED` with blockers, file bugs and transition the item back to `dev`; on `CODE REVIEW PASS`, clear for `qa-validator`.",
+        "",
+      ].join("\n"),
+    },
+    {
+      id: "architecture-review",
+      relDir: "skills/architecture-review",
+      content: renderArchitectureReviewSkillTemplate(detected),
     },
     {
       id: "qa-validation",
@@ -221,6 +309,12 @@ export function getDefaultSkills(): SkillTemplate[] {
         "2. **Never Hand-Edit Compiled Outputs:** Always run `npx agent-studio sync` to regenerate IDE adapters cleanly.",
         "3. **Preserve Existing Work:** `init` never clobbers an existing `pipeline/board.json`, and `sync` uses managed Markdown blocks and key-scoped JSON merges.",
         "4. **Verify Health:** Finish every setup or config change with `npx agent-studio doctor` and `npx agent-studio sync --check`.",
+        "",
+        "## Deep Architectural Research & `code-reviewer` Tailoring",
+        "1. **Survey Architecture:** Inspect entry points, module boundaries, state stores, concurrency/locking primitives, and trust boundaries (delegate 5+ file surveys to a read-only `research` subagent).",
+        "2. **Classify & Extract Invariants:** Identify topology (modular monolith, monorepo, microservices, layered, event-driven, full-stack), lockstep/coupling rules, forbidden cross-layer imports, and known failure modes.",
+        "3. **Equip `code-reviewer`:** Populate `.agent-team/skills/architecture-review/SKILL.md` (clearing the `PENDING DEEP RESEARCH` / `<!-- architecture-research: pending -->` marker) and customize `.agent-team/agents/code-reviewer.md` with repo-specific review checks before running `npx agent-studio sync`.",
+        "4. **Brownfield Upgrades:** When upgrading an existing repo without `--force`, add `code-reviewer` to `team.yaml` (`roster` + `orchestrator.handoffs`) and `model-index.json`, ensure `skills/code-review` and `skills/architecture-review` exist, and run `npx agent-studio sync`.",
         "",
         "## Quick Commands",
         "- Global bootstrap (`team-setup` in all IDEs): `npx agent-studio init --global`",

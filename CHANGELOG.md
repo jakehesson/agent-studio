@@ -5,6 +5,22 @@ All notable changes to **Agent Studio** will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.8.0] - 2026-11-25
+
+### Added
+- **First-Class `code-reviewer` Agent (`S1-49`):**
+  - Registered `code-reviewer` (`roleType: specialist`, `boardRole: review`, `modelTier: reasoning`) in `.agent-team/team.yaml`, compiled IDE adapters (Antigravity, Claude Code, GitHub Copilot / VS Code), and orchestrator handoff workflows (`src/templates/manifest.ts`, `src/templates/prompts.ts`, `src/schema/model-index.ts`, `src/models/defaults.ts`).
+- **Universal `code-review` & Repo-Specific `architecture-review` Skills:**
+  - Added the 5-pillar `code-review` skill (syntax/types, security, architecture conformance, performance/concurrency, test coverage) and repo-tailored `architecture-review` skill (`src/templates/skills.ts`, `.agent-team/skills/`), bundled into the Antigravity MCP App plugin (`antigravity-plugin/scripts/build-plugin.mjs`).
+- **Architectural Research Detection & `team-setup` Enhancement:**
+  - Added `detectProjectArchitecture` (`src/templates/detect.ts`) to inspect repository topology hints, frameworks, state management, concurrency signals, API boundaries, storage signals, monorepo workspaces, and CI workflows.
+  - Enhanced `team-setup` prompts and skills to run deep architectural research tasks tailoring `architecture-review` and `code-reviewer` to repository invariants, module boundaries, and concurrency contracts.
+
+### Changed
+- **`init` & `doctor` Architecture Diagnostics:**
+  - Updated `agent-studio init` (`src/cli/commands/init.ts`) to surface detected architectural topology and frameworks during scaffolding.
+  - Updated `agent-studio doctor` (`src/cli/commands/doctor.ts`) with `architectureReview` health checks reporting `code-reviewer` roster registration, review skill presence, and deep architectural research customization status.
+
 ## [0.7.0] - 2026-11-24
 
 ### Added

@@ -1,6 +1,7 @@
 import { defaultTierForRoleType } from "../models/defaults.js";
 import { DEFAULT_MODEL_INDEX } from "../schema/model-index.js";
 import type { TeamManifest } from "../schema/team.js";
+import type { DetectedRepoInfo } from "./detect.js";
 
 function renderRosterTable(manifest: TeamManifest): string {
   const rows = manifest.roster.map(
@@ -84,7 +85,7 @@ export function renderOrchestratorPrompt(manifest: TeamManifest): string {
     "3. Move the selected item to `design` or `dev`, assign its owner, and dispatch the right specialist with a concise brief:",
     `   \`PROJECT ${manifest.project.id} | ITEM <ID> | SCOPE <files> | ACCEPTANCE <criteria>\``,
     "4. When parallel specialists work concurrently, enforce **strict non-overlapping write scopes**.",
-    "5. After implementation finishes, verify the item is in `test` and dispatch `qa-validator` to run verification checkpoints and record a `testrun`.",
+    "5. After implementation finishes, verify the item is in `test` and dispatch `code-reviewer` for non-trivial code changes (security, architecture, concurrency, coverage) before or alongside `qa-validator` running verification checkpoints and recording a `testrun`.",
     "6. Only transition `test -> done` after a closed, passing `testrun` covers the item's required suite.",
     "",
   ].join("\n");
@@ -178,6 +179,59 @@ export function renderUxDesignerPrompt(manifest: TeamManifest): string {
   ].join("\n");
 }
 
+export function renderCodeReviewerPrompt(
+  manifest: TeamManifest,
+  detected?: DetectedRepoInfo,
+): string {
+  const arch = detected?.architecture;
+  const baselineLines: string[] = [];
+  if (arch) {
+    baselineLines.push(
+      "## Detected Architecture Baseline",
+      `- **Stack:** \`${detected.stack}\``,
+      `- **Topology Hints:** ${arch.topologyHints.length > 0 ? arch.topologyHints.map((t) => `\`${t}\``).join(", ") : "_none_"}`,
+      `- **Frameworks:** ${arch.frameworks.length > 0 ? arch.frameworks.map((f) => `\`${f}\``).join(", ") : "_none_"}`,
+      `- **API Boundaries:** ${arch.apiBoundaries.length > 0 ? arch.apiBoundaries.map((a) => `\`${a}\``).join(", ") : "_none_"}`,
+      `- **State / Concurrency / Storage:** ${
+        [...arch.stateManagement, ...arch.concurrencySignals, ...arch.storageSignals].length > 0
+          ? [...arch.stateManagement, ...arch.concurrencySignals, ...arch.storageSignals]
+              .map((s) => `\`${s}\``)
+              .join(", ")
+          : "_none detected_"
+      }`,
+      "- Consult `skills/architecture-review/SKILL.md` for repo-specific invariants, module boundaries, and failure modes.",
+      "",
+    );
+  }
+
+  return [
+    `# ${manifest.project.title} — Code Reviewer`,
+    "",
+    `You are the **Code Reviewer** (\`code-reviewer\`) for **${manifest.project.title}** (\`${manifest.project.id}\`).`,
+    "",
+    "## Scope & Strict Read-Only Containment",
+    "- Audit changes before QA gate sign-off across five pillars (see `skills/code-review/SKILL.md` and `skills/architecture-review/SKILL.md`):",
+    "  1. **Syntax, Types & Correctness**",
+    "  2. **Security & Trust Boundaries**",
+    "  3. **Architecture Conformance**",
+    "  4. **Performance, Resource & Concurrency Safety**",
+    "  5. **Test Coverage & Edge Cases**",
+    "- **Read-Only Sandbox:** Use shell tools (`run_command` / `Bash` / `execute/runInTerminal`) strictly for read-only inspection (`git diff`, `git status`, `rg`/`Select-String`, typecheck, linter, and targeted test execution). **NEVER modify repository source files, tests, docs, or `pipeline/board.json` directly.**",
+    "- Do not close QA gate `testrun`s (that belongs exclusively to `qa-validator`).",
+    "",
+    ...baselineLines,
+    "## Verification Checkpoints",
+    renderCheckpointSummary(manifest),
+    "",
+    "## Review Output & Board Handoff",
+    "1. Classify every finding by severity with exact `file:line` citations: `[P0 Blocker]`, `[P1 Required]`, or `[P2 Advisory]`.",
+    "2. Post a structured review summary (`CODE REVIEW PASS` or `CODE REVIEW CHANGES REQUESTED`) via `board { op: \"note\" }`.",
+    "3. For any `[P0 Blocker]` (or unresolved `[P1 Required]`) finding, file a reproducible bug via `board { op: \"add\", type: \"bug\" }`, transition the item back to `dev`, and report back to `orchestrator`.",
+    "4. On `CODE REVIEW PASS`, report clearance to `orchestrator` / `qa-validator` so the QA gate can proceed.",
+    "",
+  ].join("\n");
+}
+
 export function renderQaValidatorPrompt(manifest: TeamManifest): string {
   return [
     `# ${manifest.project.title} — QA Validator`,
@@ -217,14 +271,14 @@ export function renderTeamSetupPrompt(manifest?: TeamManifest): string {
     "",
     "## Step-by-Step Onboarding Workflow",
     "",
-    "### 1. Inspect the Repository",
-    "- Inspect root build/config files (`package.json`, `pyproject.toml`, `requirements.txt`, `Cargo.toml`, `go.mod`, `Makefile`, CI workflows under `.github/workflows/`).",
-    "- Check for existing multi-agent or board configs (`.agent-team/`, `pipeline/board.json`, `.agents/plugins/`, `.claude/`, `.github/agents/`, `.mcp.json`, `.vscode/mcp.json`, `CLAUDE.md`, `.github/copilot-instructions.md`).",
-    "- Identify the project's primary language/stack, build commands, lint/typecheck commands, and unit/integration test commands.",
+    "### 1. Inspect the Repository & Deep Architectural Research",
+    "- **1a. Baseline Manifest & Config Scan:** Inspect root build/config files (`package.json`, `pyproject.toml`, `requirements.txt`, `Cargo.toml`, `go.mod`, `Makefile`, CI workflows under `.github/workflows/`), existing multi-agent/board configs (`.agent-team/`, `pipeline/board.json`, `.agents/plugins/`, `.claude/`, `.github/agents/`, `.mcp.json`, `.vscode/mcp.json`, `CLAUDE.md`, `.github/copilot-instructions.md`), and the architectural pre-scan emitted by `agent-studio init`.",
+    "- **1b. Deep Architectural Research:** Inspect entry points, module graph, state stores, concurrency primitives, and trust boundaries (delegating 5+ file surveys to a read-only `research` subagent) to classify architectural style (monolith, modular monolith, microservices, layered/clean/hexagonal, event-driven, full-stack framework conventions), state management, and concurrency model.",
+    "- **1c. Invariants & Failure Modes:** Extract repository-specific invariants, coupling/lockstep rules, forbidden cross-layer imports, and known/likely failure modes (races, stale locks, schema drift, auth bypasses, resource leaks).",
     "",
     "### 2. Interview the User",
     "- Confirm the **target IDEs** to compile (`antigravity`, `claude-code`, `copilot-vscode`).",
-    "- Confirm the **specialist roster** (default blueprint: `orchestrator`, `architect`, `ux-designer`, `backend-engineer`, `frontend-engineer`, `qa-validator`, plus any domain-specific specialists the repo needs).",
+    "- Confirm the **specialist roster** (default blueprint: `orchestrator`, `architect`, `ux-designer`, `backend-engineer`, `frontend-engineer`, `code-reviewer`, `qa-validator`, plus any domain-specific specialists the repo needs).",
     "- Confirm the **model routing policy** (`prefer-fallback` default for portable tiers & `model-policy: preferred`, `defer-to-host` for pure `/swarm` / Copilot Auto, or `pinned`) and per-role `modelTier` (`fast` / `balanced` / `reasoning`).",
     "- Confirm the **QA Gate checkpoints** (`CP0`, `CP1`, `CP2`) and commands that must pass before items move `test -> done`.",
     "- Confirm whether to install `team-setup` globally as well (`npx agent-studio init --global`).",
@@ -236,11 +290,12 @@ export function renderTeamSetupPrompt(manifest?: TeamManifest): string {
     "  ```",
     "- Note: `agent-studio init` preserves any existing `pipeline/board.json` and merges shared IDE files non-destructively.",
     "",
-    "### 4. Customize Canonical Source (`.agent-team/`) Only",
+    "### 4. Customize Canonical Source (`.agent-team/`) & Equip `code-reviewer`",
     "- NEVER hand-edit generated files inside `.agents/plugins/`, `.claude/agents/`, or `.github/agents/`.",
     "- Edit `.agent-team/team.yaml` to tailor project metadata, `workflow.checkpoints`, `workflow.suites`, `workflow.modelRouting`, `roster` roles/capabilities/`modelTier`, and `targets`.",
     "- Inspect or update `.agent-team/model-index.json` using `npx agent-studio models show|set-tier|set-role|set-policy|adopt` (see `skills/model-routing/SKILL.md`).",
-    "- Tailor role prompts in `.agent-team/agents/*.md` and domain skills in `.agent-team/skills/*/SKILL.md` to reflect repository conventions and architecture.",
+    "- **4b. Equip `code-reviewer`:** Populate `.agent-team/skills/architecture-review/SKILL.md` with the researched architectural style, module boundaries, state/concurrency contracts, invariants, and `P0`/`P1`/`P2` rubric (clearing the `PENDING DEEP RESEARCH` status marker), and customize `.agent-team/agents/code-reviewer.md` with repo-specific review focus and static check commands.",
+    "- Tailor remaining role prompts in `.agent-team/agents/*.md` and domain skills in `.agent-team/skills/*/SKILL.md` to reflect repository conventions and architecture.",
     "- Keep `workflow.enforcement.orchestratorReadOnly: true`, `qaGateRequired: true`, and `blockDirectBoardEdits: true` enabled unless the user explicitly opts out.",
     "",
     "### 5. Compile & Verify Zero Drift",

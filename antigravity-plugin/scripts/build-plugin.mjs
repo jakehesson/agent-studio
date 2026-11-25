@@ -106,10 +106,10 @@ tools:
 You are **\`team-setup\`**, the Cross-IDE Onboarding & Configuration Agent for **Agent Studio**.
 
 ## Workflow
-1. Inspect root build/config files (\`package.json\`, \`pyproject.toml\`, \`Cargo.toml\`, \`go.mod\`, existing \`.agent-team/\`, \`pipeline/board.json\`).
-2. Confirm target IDEs (\`antigravity\`, \`claude-code\`, \`copilot-vscode\`), specialist roles, and QA gate checkpoints (\`CP0\`, \`CP1\`, \`CP2\`) with the user.
+1. Inspect root build/config files (\`package.json\`, \`pyproject.toml\`, \`Cargo.toml\`, \`go.mod\`, existing \`.agent-team/\`, \`pipeline/board.json\`) and perform deep architectural research (topology, module boundaries, state/concurrency contracts, invariants, and failure modes — delegating 5+ file surveys to a read-only \`research\` subagent).
+2. Confirm target IDEs (\`antigravity\`, \`claude-code\`, \`copilot-vscode\`), specialist roles (including \`code-reviewer\`), model routing policy, and QA gate checkpoints (\`CP0\`, \`CP1\`, \`CP2\`) with the user.
 3. Run \`npx agent-studio init --ides antigravity,claude-code,copilot-vscode --non-interactive\` (preserving any existing \`pipeline/board.json\`).
-4. Edit ONLY \`.agent-team/team.yaml\`, \`.agent-team/agents/*.md\`, and \`.agent-team/skills/*/SKILL.md\`.
+4. Edit ONLY \`.agent-team/team.yaml\`, \`.agent-team/model-index.json\`, \`.agent-team/agents/*.md\`, and \`.agent-team/skills/*/SKILL.md\`. Populate \`.agent-team/skills/architecture-review/SKILL.md\` (removing the \`PENDING DEEP RESEARCH\` marker) and tailor \`.agent-team/agents/code-reviewer.md\` with the repository's concrete invariants and review rubric.
 5. Run \`npx agent-studio sync\`, \`npx agent-studio sync --check\`, and \`npx agent-studio doctor\`, then open **Agent Studio** via the \`open_studio\` MCP App tool.
 `;
 
@@ -214,7 +214,12 @@ async function main() {
     TOKEN_EFFICIENCY_RULES,
   );
 
-  for (const skillId of ["team-setup", "token-efficiency"]) {
+  for (const skillId of [
+    "team-setup",
+    "token-efficiency",
+    "code-review",
+    "architecture-review",
+  ]) {
     const canonicalSkill = path.join(
       repoRoot,
       ".agent-team",

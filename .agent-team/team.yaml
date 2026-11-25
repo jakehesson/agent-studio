@@ -81,6 +81,7 @@ roster:
       - ux-designer
       - backend-engineer
       - frontend-engineer
+      - code-reviewer
       - qa-validator
       - release-engineer
     description: Strict manager and dispatcher overseeing ready -> design -> dev ->
@@ -140,6 +141,20 @@ roster:
       - mcp_board
     description: UI, interactive views, visualizations, and responsive styling
       across mobile, foldable, and desktop.
+  - id: code-reviewer
+    name: Code Reviewer
+    roleType: specialist
+    boardRole: review
+    promptFile: agents/code-reviewer.md
+    modelTier: reasoning
+    capabilities:
+      - read
+      - search
+      - shell
+      - mcp_board
+    description: Rigorous code reviewer auditing syntax, security, architecture
+      conformance, performance, concurrency, and test coverage before QA gate
+      sign-off.
   - id: qa-validator
     name: QA Validator
     roleType: qa
@@ -187,6 +202,8 @@ skills:
   - skills/agile-board-workflow
   - skills/architecture-spec
   - skills/ux-review
+  - skills/code-review
+  - skills/architecture-review
   - skills/qa-validation
   - skills/token-efficiency
   - skills/model-routing

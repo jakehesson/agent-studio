@@ -105,6 +105,8 @@ describe("Native Antigravity MCP App Plugin Packager", () => {
         "agents/team-setup.md",
         "skills/team-setup/SKILL.md",
         "skills/token-efficiency/SKILL.md",
+        "skills/code-review/SKILL.md",
+        "skills/architecture-review/SKILL.md",
         "rules/AGENTS.md",
       ];
       for (const rel of expectedFiles) {

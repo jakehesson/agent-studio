@@ -15,6 +15,7 @@ import {
 import { splitFrontmatter } from "../../src/compiler/shared.js";
 import {
   DEFAULT_MODEL_INDEX,
+  defaultTierForRoleType,
   getFileLockPath,
   getGlobalModelIndexPath,
   getTeamYamlPath,
@@ -65,6 +66,14 @@ describe("Per-Role Model Routing, 3-Layer Model Index & Compilers", () => {
     const validated = ModelIndexSchema.parse(DEFAULT_MODEL_INDEX);
     assert.equal(validated.roleRecommendations.orchestrator?.tier, "fast");
     assert.equal(validated.roleRecommendations.architect?.tier, "reasoning");
+    assert.equal(
+      validated.roleRecommendations["code-reviewer"]?.tier,
+      "reasoning",
+    );
+    assert.equal(
+      defaultTierForRoleType("specialist", "code-reviewer"),
+      "reasoning",
+    );
     assert.equal(
       validated.roleRecommendations["ux-designer"]?.multimodalPreferred,
       true,
@@ -294,6 +303,36 @@ describe("Per-Role Model Routing, 3-Layer Model Index & Compilers", () => {
       ).frontmatter ?? "",
     ) as { model?: unknown };
     assert.equal(ccArchFm.model, "opus");
+
+    // Check code-reviewer across all 3 IDEs -> pro / opus / Claude Opus 4.5 (copilot) fallback array
+    const agyRevFm = parseYaml(
+      splitFrontmatter(
+        fs.readFileSync(
+          path.join(repo, ".agents", "plugins", "policy-app-team", "agents", "code-reviewer.md"),
+          "utf8",
+        ),
+      ).frontmatter ?? "",
+    ) as { model?: unknown };
+    assert.equal(agyRevFm.model, "pro");
+
+    const ccRevFm = parseYaml(
+      splitFrontmatter(
+        fs.readFileSync(path.join(repo, ".claude", "agents", "code-reviewer.md"), "utf8"),
+      ).frontmatter ?? "",
+    ) as { model?: unknown };
+    assert.equal(ccRevFm.model, "opus");
+
+    const vscRevFm = parseYaml(
+      splitFrontmatter(
+        fs.readFileSync(
+          path.join(repo, ".github", "agents", "code-reviewer.agent.md"),
+          "utf8",
+        ),
+      ).frontmatter ?? "",
+    ) as { model?: unknown; "model-policy"?: string };
+    assert.ok(Array.isArray(vscRevFm.model));
+    assert.equal((vscRevFm.model as string[])[0], "Claude Opus 4.5 (copilot)");
+    assert.equal(vscRevFm["model-policy"], "preferred");
 
     // Check Copilot backend-engineer -> picker array + model-policy: preferred; orchestrator handoffs omit model by default
     const vscBackendFm = parseYaml(

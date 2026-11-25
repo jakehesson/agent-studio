@@ -53,7 +53,12 @@ export function defaultTierForRoleType(
     return "fast";
   }
   const lowId = (roleId ?? "").trim().toLowerCase();
-  if (lowId === "architect" || lowId === "ux-designer") {
+  if (
+    lowId === "architect" ||
+    lowId === "ux-designer" ||
+    lowId === "code-reviewer" ||
+    (roleType as string).trim().toLowerCase() === "review"
+  ) {
     return "reasoning";
   }
   return "balanced";

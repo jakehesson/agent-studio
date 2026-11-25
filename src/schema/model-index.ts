@@ -205,6 +205,11 @@ export const DEFAULT_MODEL_INDEX: ModelIndex = ModelIndexSchema.parse({
       rationale:
         "Interactive UI, SVG/CSS, and iterative typecheck/build fixes.",
     },
+    "code-reviewer": {
+      tier: "reasoning",
+      rationale:
+        "Deep code review for security vulnerabilities, architecture conformance, concurrency bugs, performance regressions, and test coverage.",
+    },
     "qa-validator": {
       tier: "fast",
       rationale:

@@ -14,6 +14,12 @@ Guides the `team-setup` AI agent (or human developer) through safe, deterministi
 3. **Preserve Existing Work:** `init` never clobbers an existing `pipeline/board.json`, and `sync` uses managed Markdown blocks and key-scoped JSON merges.
 4. **Verify Health:** Finish every setup or config change with `npx agent-studio doctor` and `npx agent-studio sync --check`.
 
+## Deep Architectural Research & `code-reviewer` Tailoring
+1. **Survey Architecture:** Inspect entry points, module boundaries, state stores, concurrency/locking primitives, and trust boundaries (delegate 5+ file surveys to a read-only `research` subagent).
+2. **Classify & Extract Invariants:** Identify topology (modular monolith, monorepo, microservices, layered, event-driven, full-stack), lockstep/coupling rules, forbidden cross-layer imports, and known failure modes.
+3. **Equip `code-reviewer`:** Populate `.agent-team/skills/architecture-review/SKILL.md` (clearing the `PENDING DEEP RESEARCH` / `<!-- architecture-research: pending -->` marker) and customize `.agent-team/agents/code-reviewer.md` with repo-specific review checks before running `npx agent-studio sync`.
+4. **Brownfield Upgrades:** When upgrading an existing repo without `--force`, add `code-reviewer` to `team.yaml` (`roster` + `orchestrator.handoffs`) and `model-index.json`, ensure `skills/code-review` and `skills/architecture-review` exist, and run `npx agent-studio sync`.
+
 ## Quick Commands
 - Global bootstrap (`team-setup` in all IDEs): `npx agent-studio init --global`
 - Project bootstrap: `npx agent-studio init --ides antigravity,claude-code,copilot-vscode --non-interactive`

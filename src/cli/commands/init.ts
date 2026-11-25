@@ -209,10 +209,22 @@ export async function runInit(args: string[]): Promise<InitCommandResult> {
       const boardSummary = boardPreserved
         ? `preserved existing ${scaffold.manifest.workflow.boardPath}`
         : `initialized ${scaffold.manifest.workflow.boardPath}`;
+      const arch = scaffold.detected.architecture;
+      const archParts: string[] = [];
+      if (arch.topologyHints.length > 0) {
+        archParts.push(arch.topologyHints.join(", "));
+      }
+      if (arch.frameworks.length > 0) {
+        archParts.push(`frameworks=${arch.frameworks.join(", ")}`);
+      }
+      const archSummary =
+        (archParts.length > 0 ? archParts.join(" · ") : "unknown") +
+        " (run team-setup for deep architectural research)";
       process.stdout.write(
         [
           `[agent-studio] Initialized ${scaffold.manifest.project.title} (${scaffold.manifest.project.id})`,
           `  Stack:    ${scaffold.detected.stack}`,
+          `  Arch:     ${archSummary}`,
           `  Targets:  ${compileResult.targets.join(", ")}`,
           `  Board:    ${boardSummary}`,
           `  Scaffold: ${scaffold.created.length} created, ${scaffold.skipped.length} preserved`,

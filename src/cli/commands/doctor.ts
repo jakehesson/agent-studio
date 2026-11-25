@@ -91,6 +91,13 @@ export interface ModelIndexHealthInfo {
   errors: string[];
 }
 
+export interface ArchitectureReviewHealthInfo {
+  codeReviewerDefined: boolean;
+  codeReviewSkillPresent: boolean;
+  architectureSkillPresent: boolean;
+  customized: boolean;
+}
+
 export interface DoctorReport {
   ok: boolean;
   projectId: string | null;
@@ -104,6 +111,7 @@ export interface DoctorReport {
   mcpStatus: McpStatusReport;
   hooksStatus: HooksStatusReport;
   modelIndex: ModelIndexHealthInfo;
+  architectureReview: ArchitectureReviewHealthInfo;
   telemetryFallbackPath: string;
   telemetryFallbackExists: boolean;
 }
@@ -563,6 +571,43 @@ export function buildDoctorReport(projectRoot: string): DoctorReport {
   const telemetryFallbackPath = path.join(root, ".agent-studio", "telemetry.jsonl");
   const telemetryFallbackExists = fs.existsSync(telemetryFallbackPath);
 
+  const codeReviewerDefined = Boolean(
+    manifest?.roster.some((r) => r.id === "code-reviewer"),
+  );
+  const codeReviewSkillPath = path.join(
+    root,
+    ".agent-team",
+    "skills",
+    "code-review",
+    "SKILL.md",
+  );
+  const archSkillPath = path.join(
+    root,
+    ".agent-team",
+    "skills",
+    "architecture-review",
+    "SKILL.md",
+  );
+  const codeReviewSkillPresent = fs.existsSync(codeReviewSkillPath);
+  const architectureSkillPresent = fs.existsSync(archSkillPath);
+  let architectureCustomized = false;
+  if (architectureSkillPresent) {
+    try {
+      const archSkillContent = fs.readFileSync(archSkillPath, "utf8");
+      architectureCustomized =
+        !archSkillContent.includes("PENDING DEEP RESEARCH") &&
+        !archSkillContent.includes("architecture-research: pending");
+    } catch {
+      architectureCustomized = false;
+    }
+  }
+  const architectureReview: ArchitectureReviewHealthInfo = {
+    codeReviewerDefined,
+    codeReviewSkillPresent,
+    architectureSkillPresent,
+    customized: architectureCustomized,
+  };
+
   const ok =
     nodeVersion.ok &&
     manifestValid &&
@@ -584,6 +629,7 @@ export function buildDoctorReport(projectRoot: string): DoctorReport {
     mcpStatus,
     hooksStatus,
     modelIndex,
+    architectureReview,
     telemetryFallbackPath,
     telemetryFallbackExists,
   };
@@ -628,6 +674,15 @@ function resolveProjectRootArg(projectRef?: string): string {
 }
 
 function formatDoctorText(report: DoctorReport): string {
+  const archRev = report.architectureReview;
+  const archRevStatus = !archRev.codeReviewerDefined
+    ? "NOT CONFIGURED (no code-reviewer in roster)"
+    : !archRev.codeReviewSkillPresent || !archRev.architectureSkillPresent
+      ? "INCOMPLETE (missing review skill)"
+      : archRev.customized
+        ? "OK (customized)"
+        : "PENDING DEEP RESEARCH (run team-setup)";
+
   const lines: string[] = [
     `Agent Studio Doctor — ${report.projectId ?? path.basename(report.projectRoot)} (${report.ok ? "PASS" : "ISSUES FOUND"})`,
     `  Root:         ${report.projectRoot}`,
@@ -637,6 +692,7 @@ function formatDoctorText(report: DoctorReport): string {
     `  MCP Configs:  ${report.mcpStatus.ok ? "OK" : "MISSING/INCOMPLETE"}`,
     `  IDE Hooks:    ${report.hooksStatus.ok ? "OK" : "MISSING/INCOMPLETE"}`,
     `  Model Index:  ${report.modelIndex.valid ? `OK (policy=${report.modelIndex.policy})` : `INVALID (${report.modelIndex.errors.length} error(s))`}`,
+    `  Code Review:  ${archRevStatus}`,
   ];
 
   for (const ide of ALL_IDES) {

@@ -11,6 +11,7 @@ import { detectRepoStack, type DetectedRepoInfo } from "./detect.js";
 import {
   renderArchitectPrompt,
   renderBackendEngineerPrompt,
+  renderCodeReviewerPrompt,
   renderFrontendEngineerPrompt,
   renderOrchestratorPrompt,
   renderQaValidatorPrompt,
@@ -90,6 +91,7 @@ export function buildDefaultTeamManifest(
           "ux-designer",
           "backend-engineer",
           "frontend-engineer",
+          "code-reviewer",
           "qa-validator",
         ],
       },
@@ -138,6 +140,17 @@ export function buildDefaultTeamManifest(
         capabilities: ["read", "search", "edit", "shell", "mcp_board"],
       },
       {
+        id: "code-reviewer",
+        name: "Code Reviewer",
+        roleType: "specialist",
+        boardRole: "review",
+        promptFile: "agents/code-reviewer.md",
+        modelTier: "reasoning",
+        description:
+          "Rigorous code reviewer auditing syntax, security, architecture conformance, performance, concurrency, and test coverage before QA gate sign-off.",
+        capabilities: ["read", "search", "shell", "mcp_board"],
+      },
+      {
         id: "qa-validator",
         name: "QA Validator",
         roleType: "qa",
@@ -171,6 +184,8 @@ export function buildDefaultTeamManifest(
       "skills/agile-board-workflow",
       "skills/architecture-spec",
       "skills/ux-review",
+      "skills/code-review",
+      "skills/architecture-review",
       "skills/qa-validation",
       "skills/token-efficiency",
       "skills/model-routing",
@@ -240,6 +255,10 @@ export function scaffoldAgentTeam(
       ".agent-team/agents/frontend-engineer.md",
       renderFrontendEngineerPrompt(manifest),
     ],
+    [
+      ".agent-team/agents/code-reviewer.md",
+      renderCodeReviewerPrompt(manifest, detected),
+    ],
     [".agent-team/agents/qa-validator.md", renderQaValidatorPrompt(manifest)],
     [".agent-team/agents/team-setup.md", renderTeamSetupPrompt(manifest)],
   ];
@@ -248,7 +267,7 @@ export function scaffoldAgentTeam(
     writeIfAllowed(root, relPath, content, force, created, skipped);
   }
 
-  for (const skill of getDefaultSkills()) {
+  for (const skill of getDefaultSkills(detected)) {
     writeIfAllowed(
       root,
       `.agent-team/${skill.relDir}/SKILL.md`,

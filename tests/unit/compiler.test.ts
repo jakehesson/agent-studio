@@ -35,6 +35,7 @@ import {
   type TeamManifest,
 } from "../../src/schema/team.js";
 import {
+  detectProjectArchitecture,
   detectRepoStack,
   scaffoldAgentTeam,
 } from "../../src/templates/index.js";
@@ -129,6 +130,97 @@ describe("Templates & Stack Detection", () => {
     const genericDir = makeTempDir("av-stack-generic-");
     const genericInfo = detectRepoStack(genericDir);
     assert.equal(genericInfo.stack, "generic");
+    assert.deepEqual(genericInfo.architecture.topologyHints, ["unknown"]);
+    assert.deepEqual(genericInfo.architecture.frameworks, []);
+    assert.deepEqual(genericInfo.architecture.topLevelDirs, []);
+  });
+
+  it("detects architecture signals deterministically across monorepo, microservices, full-stack, Python, Rust, and Go fixtures", () => {
+    // 1. Node monorepo + full-stack + event-driven + CI workflow
+    const monoDir = makeTempDir("av-arch-mono-");
+    fs.mkdirSync(path.join(monoDir, "packages"), { recursive: true });
+    fs.mkdirSync(path.join(monoDir, "web"), { recursive: true });
+    fs.mkdirSync(path.join(monoDir, "src", "cli"), { recursive: true });
+    fs.mkdirSync(path.join(monoDir, ".github", "workflows"), { recursive: true });
+    fs.writeFileSync(path.join(monoDir, ".github", "workflows", "ci.yml"), "name: CI\n", "utf8");
+    fs.writeFileSync(path.join(monoDir, "pnpm-workspace.yaml"), "packages:\n  - packages/*\n  - web\n", "utf8");
+    fs.writeFileSync(
+      path.join(monoDir, "package.json"),
+      JSON.stringify({
+        name: "mono-studio",
+        bin: { mono: "dist/cli.js" },
+        dependencies: {
+          react: "^19.0.0",
+          express: "^5.0.0",
+          zustand: "^5.0.0",
+          bullmq: "^5.0.0",
+          zod: "^3.24.0",
+          "@prisma/client": "^6.0.0",
+        },
+      }),
+      "utf8",
+    );
+
+    const monoArch1 = detectProjectArchitecture(monoDir);
+    const monoArch2 = detectRepoStack(monoDir).architecture;
+    assert.deepEqual(monoArch1, monoArch2);
+    assert.ok(monoArch1.topologyHints.includes("monorepo"));
+    assert.ok(monoArch1.topologyHints.includes("full-stack-web"));
+    assert.ok(monoArch1.topologyHints.includes("cli-library"));
+    assert.ok(monoArch1.topologyHints.includes("event-driven"));
+    assert.ok(monoArch1.frameworks.includes("react"));
+    assert.ok(monoArch1.frameworks.includes("express"));
+    assert.ok(monoArch1.stateManagement.includes("zustand"));
+    assert.ok(monoArch1.concurrencySignals.includes("bullmq"));
+    assert.ok(monoArch1.apiBoundaries.includes("http-rest"));
+    assert.ok(monoArch1.apiBoundaries.includes("schema-validation"));
+    assert.ok(monoArch1.storageSignals.includes("prisma"));
+    assert.deepEqual(monoArch1.monorepoWorkspaces, ["packages/*", "web"]);
+    assert.deepEqual(monoArch1.ciWorkflows, ["ci.yml"]);
+
+    // 2. Microservices + Python
+    const microDir = makeTempDir("av-arch-micro-");
+    fs.mkdirSync(path.join(microDir, "services"), { recursive: true });
+    fs.writeFileSync(path.join(microDir, "docker-compose.yml"), "services:\n  api: {}\n", "utf8");
+    fs.writeFileSync(
+      path.join(microDir, "pyproject.toml"),
+      '[project]\nname = "py-micro"\ndependencies = ["fastapi>=0.115", "celery>=5.4", "pydantic>=2.0"]\n',
+      "utf8",
+    );
+    const microArch = detectRepoStack(microDir).architecture;
+    assert.ok(microArch.topologyHints.includes("microservices"));
+    assert.ok(microArch.topologyHints.includes("event-driven"));
+    assert.ok(microArch.frameworks.includes("fastapi"));
+    assert.ok(microArch.concurrencySignals.includes("task-queue"));
+    assert.ok(microArch.apiBoundaries.includes("schema-validation"));
+
+    // 3. Rust + layered
+    const rustLayered = makeTempDir("av-arch-rust-");
+    fs.mkdirSync(path.join(rustLayered, "src", "domain"), { recursive: true });
+    fs.mkdirSync(path.join(rustLayered, "src", "adapters"), { recursive: true });
+    fs.writeFileSync(
+      path.join(rustLayered, "Cargo.toml"),
+      '[package]\nname = "layered-rs"\n[dependencies]\naxum = "0.7"\ntokio = "1"\nsqlx = "0.8"\n',
+      "utf8",
+    );
+    const rustArch = detectRepoStack(rustLayered).architecture;
+    assert.ok(rustArch.topologyHints.includes("layered"));
+    assert.ok(rustArch.frameworks.includes("axum"));
+    assert.ok(rustArch.concurrencySignals.includes("tokio-async"));
+    assert.ok(rustArch.storageSignals.includes("postgres-sql"));
+
+    // 4. Go
+    const goDir = makeTempDir("av-arch-go-");
+    fs.mkdirSync(path.join(goDir, "cmd"), { recursive: true });
+    fs.writeFileSync(
+      path.join(goDir, "go.mod"),
+      "module github.com/acme/svc\nrequire (\n  github.com/gin-gonic/gin v1.10.0\n  golang.org/x/sync v0.8.0\n)\n",
+      "utf8",
+    );
+    const goArch = detectRepoStack(goDir).architecture;
+    assert.ok(goArch.topologyHints.includes("cli-library"));
+    assert.ok(goArch.frameworks.includes("gin"));
+    assert.ok(goArch.concurrencySignals.includes("errgroup"));
   });
 });
 
@@ -265,21 +357,92 @@ describe("Multi-IDE Compiler (Golden Fixtures & Orchestrator Read-Only)", () => 
     assert.ok(!vscOrchFm.tools.includes("edit/createFile"));
     assert.ok(!vscOrchFm.tools.includes("execute/runInTerminal"));
 
-    assert.ok(Array.isArray(vscOrchFm.handoffs) && vscOrchFm.handoffs.length === 5);
+    assert.ok(Array.isArray(vscOrchFm.handoffs) && vscOrchFm.handoffs.length === 6);
     assert.deepEqual(
       vscOrchFm.handoffs.map((h) => h.agent),
-      ["architect", "ux-designer", "backend-engineer", "frontend-engineer", "qa-validator"],
+      [
+        "architect",
+        "ux-designer",
+        "backend-engineer",
+        "frontend-engineer",
+        "code-reviewer",
+        "qa-validator",
+      ],
     );
 
-    // Verify ux-designer agent, ux-review skill, and core token-efficiency skill & rules compiled across all 3 IDEs
+    // Verify scaffolded canonical code-reviewer and review skills
+    assert.ok(fs.existsSync(path.join(repo, ".agent-team", "agents", "code-reviewer.md")));
+    assert.ok(fs.existsSync(path.join(repo, ".agent-team", "skills", "code-review", "SKILL.md")));
+    const archSkillRaw = fs.readFileSync(
+      path.join(repo, ".agent-team", "skills", "architecture-review", "SKILL.md"),
+      "utf8",
+    );
+    assert.ok(archSkillRaw.includes("PENDING DEEP RESEARCH"));
+
+    // Verify compiled code-reviewer across all 3 IDEs: SHA-256 valid, read+search+shell+mcp_board only, ZERO file-edit tools
+    const agyReviewerRaw = fs.readFileSync(
+      path.join(agyPluginDir, "agents", "code-reviewer.md"),
+      "utf8",
+    );
+    assert.ok(verifyGeneratedMarkdownHash(agyReviewerRaw));
+    const agyReviewerFm = parseYaml(splitFrontmatter(agyReviewerRaw).frontmatter ?? "") as {
+      tools: string[];
+      inheritMcp: boolean;
+    };
+    assert.equal(agyReviewerFm.inheritMcp, true);
+    assert.ok(agyReviewerFm.tools.includes("read_file"));
+    assert.ok(agyReviewerFm.tools.includes("run_command"));
+    assert.ok(!agyReviewerFm.tools.includes("write_file"));
+    assert.ok(!agyReviewerFm.tools.includes("edit_file"));
+
+    const ccReviewerRaw = fs.readFileSync(
+      path.join(repo, ".claude", "agents", "code-reviewer.md"),
+      "utf8",
+    );
+    assert.ok(verifyGeneratedMarkdownHash(ccReviewerRaw));
+    const ccReviewerFm = parseYaml(splitFrontmatter(ccReviewerRaw).frontmatter ?? "") as {
+      tools: string[];
+    };
+    assert.ok(ccReviewerFm.tools.includes("Read"));
+    assert.ok(ccReviewerFm.tools.includes("Glob"));
+    assert.ok(ccReviewerFm.tools.includes("Grep"));
+    assert.ok(ccReviewerFm.tools.includes("Bash"));
+    assert.ok(ccReviewerFm.tools.includes("mcp__agent-studio__board"));
+    assert.ok(!ccReviewerFm.tools.includes("Edit"));
+    assert.ok(!ccReviewerFm.tools.includes("Write"));
+    assert.ok(!ccReviewerFm.tools.includes("MultiEdit"));
+    assert.ok(!ccReviewerFm.tools.includes("mcp__agent-studio__testrun"));
+
+    const vscReviewerRaw = fs.readFileSync(
+      path.join(repo, ".github", "agents", "code-reviewer.agent.md"),
+      "utf8",
+    );
+    assert.ok(verifyGeneratedMarkdownHash(vscReviewerRaw));
+    const vscReviewerFm = parseYaml(splitFrontmatter(vscReviewerRaw).frontmatter ?? "") as {
+      tools: string[];
+    };
+    assert.ok(vscReviewerFm.tools.includes("read/readFile"));
+    assert.ok(vscReviewerFm.tools.includes("search/codebase"));
+    assert.ok(vscReviewerFm.tools.includes("execute/runInTerminal"));
+    assert.ok(vscReviewerFm.tools.includes("agent-studio/*"));
+    assert.ok(!vscReviewerFm.tools.includes("edit/editFiles"));
+    assert.ok(!vscReviewerFm.tools.includes("edit/createFile"));
+
+    // Verify ux-designer agent, ux-review, code-review, architecture-review, and token-efficiency skills compiled across all 3 IDEs
     assert.ok(fs.existsSync(path.join(agyPluginDir, "agents", "ux-designer.md")));
     assert.ok(fs.existsSync(path.join(agyPluginDir, "skills", "ux-review", "SKILL.md")));
+    assert.ok(fs.existsSync(path.join(agyPluginDir, "skills", "code-review", "SKILL.md")));
+    assert.ok(fs.existsSync(path.join(agyPluginDir, "skills", "architecture-review", "SKILL.md")));
     assert.ok(fs.existsSync(path.join(agyPluginDir, "skills", "token-efficiency", "SKILL.md")));
     assert.ok(fs.existsSync(path.join(repo, ".claude", "agents", "ux-designer.md")));
     assert.ok(fs.existsSync(path.join(repo, ".claude", "skills", "ux-review", "SKILL.md")));
+    assert.ok(fs.existsSync(path.join(repo, ".claude", "skills", "code-review", "SKILL.md")));
+    assert.ok(fs.existsSync(path.join(repo, ".claude", "skills", "architecture-review", "SKILL.md")));
     assert.ok(fs.existsSync(path.join(repo, ".claude", "skills", "token-efficiency", "SKILL.md")));
     assert.ok(fs.existsSync(path.join(repo, ".github", "agents", "ux-designer.agent.md")));
     assert.ok(fs.existsSync(path.join(repo, ".github", "skills", "ux-review", "SKILL.md")));
+    assert.ok(fs.existsSync(path.join(repo, ".github", "skills", "code-review", "SKILL.md")));
+    assert.ok(fs.existsSync(path.join(repo, ".github", "skills", "architecture-review", "SKILL.md")));
     assert.ok(fs.existsSync(path.join(repo, ".github", "skills", "token-efficiency", "SKILL.md")));
 
     // Verify always-on Token & Context Discipline rules appear in all 3 IDE rules files
@@ -817,6 +980,23 @@ describe("CLI Init, Global Install & Doctor", () => {
     assert.equal(doctor.adapters.antigravity.ok, true);
     assert.equal(doctor.adapters["claude-code"].ok, true);
     assert.equal(doctor.adapters["copilot-vscode"].ok, true);
+    assert.deepEqual(doctor.architectureReview, {
+      codeReviewerDefined: true,
+      codeReviewSkillPresent: true,
+      architectureSkillPresent: true,
+      customized: false,
+    });
+
+    // Customizing architecture-review/SKILL.md flips customized -> true cleanly
+    fs.writeFileSync(
+      path.join(repo, ".agent-team", "skills", "architecture-review", "SKILL.md"),
+      "---\nname: architecture-review\ndescription: Tailored rubric\n---\n\n# Architecture Review\n",
+      "utf8",
+    );
+    compileTeam(repo);
+    const doctorCustomized = buildDoctorReport(repo);
+    assert.equal(doctorCustomized.ok, true);
+    assert.equal(doctorCustomized.architectureReview.customized, true);
 
     const cliDoctor = await runDoctor(["--project", repo, "--json", "--quiet"]);
     assert.equal(cliDoctor.ok, true);
