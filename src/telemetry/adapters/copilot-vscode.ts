@@ -9,6 +9,7 @@ import {
   computeMergeKey,
   isBoardMutationToolCall,
   isSelfDaemonCommand,
+  normalizeCopilotUsage,
   normalizeWsPath,
   parseEpochSeconds,
   prettifyAgentLabel,
@@ -45,6 +46,14 @@ interface VSCodeUsageObject {
   cache_creation_input_tokens?: number;
   contextTokens?: number;
   context_tokens?: number;
+  currentTokens?: number;
+  current_tokens?: number;
+  tokenLimit?: number;
+  token_limit?: number;
+  maxInputTokens?: number;
+  max_input_tokens?: number;
+  contextWindow?: number;
+  context_window?: number;
   totalTokens?: number;
   costUsd?: number;
   cost_usd?: number;
@@ -62,6 +71,7 @@ interface VSCodeResponseItem {
   invocationMessage?: string | { value?: string };
   pastTenseMessage?: string | { value?: string };
   generatedTitle?: string;
+  uri?: string | { path?: string; fsPath?: string; external?: string };
   resultDetails?: unknown;
   toolSpecificData?: Record<string, unknown>;
 }
@@ -108,7 +118,7 @@ interface VSCodeChatSessionState {
           identifier?: string;
           id?: string;
           name?: string;
-          metadata?: { id?: string; name?: string };
+          metadata?: { id?: string; name?: string; maxInputTokens?: number };
         };
   };
   requests?: VSCodeRequest[];
@@ -197,6 +207,70 @@ function extractSelectedModel(
   );
 }
 
+function extractSelectedModelContextWindow(
+  selectedModel: NonNullable<VSCodeChatSessionState["inputState"]>["selectedModel"],
+): number | undefined {
+  if (!selectedModel || typeof selectedModel === "string") return undefined;
+  const maxIn = selectedModel.metadata?.maxInputTokens;
+  if (typeof maxIn === "number" && Number.isFinite(maxIn) && maxIn > 0) {
+    return Math.round(maxIn);
+  }
+  return undefined;
+}
+
+function extractUriBasename(uri: VSCodeResponseItem["uri"]): string | undefined {
+  if (!uri) return undefined;
+  const raw =
+    typeof uri === "string"
+      ? uri
+      : uri.fsPath || uri.path || uri.external || "";
+  const rawClean = raw.trim().split(/[?#]/)[0] ?? "";
+  if (!rawClean) return undefined;
+  let decoded = rawClean;
+  try {
+    decoded = decodeURIComponent(rawClean);
+  } catch {
+    // keep raw if malformed URI encoding
+  }
+  const norm = decoded
+    .replace(/^[a-zA-Z][a-zA-Z0-9+.-]*:\/\//, "")
+    .replace(/\\/g, "/")
+    .replace(/\/+$/, "");
+  const base = path.posix.basename(norm);
+  return base || undefined;
+}
+
+function isMessageToolName(lowTool: string): boolean {
+  return (
+    lowTool === "write_agent" ||
+    lowTool === "read_agent" ||
+    lowTool === "send_message" ||
+    lowTool === "sendmessage"
+  );
+}
+
+function extractMessageTarget(args: Record<string, unknown>): string | undefined {
+  for (const key of [
+    "targetAgentId",
+    "target_agent_id",
+    "agent_id",
+    "agentId",
+    "recipient",
+    "Recipient",
+    "target",
+    "to",
+    "agent_name",
+    "agentName",
+    "name",
+  ]) {
+    const val = args[key];
+    if (typeof val === "string" && val.trim()) {
+      return val.trim();
+    }
+  }
+  return undefined;
+}
+
 function extractUsageNumbers(
   u: Record<string, unknown> | VSCodeUsageObject | undefined,
 ): {
@@ -204,6 +278,7 @@ function extractUsageNumbers(
   outTok?: number;
   cachedTok: number;
   contextTok?: number;
+  contextWindow?: number;
   costUsd?: number;
 } {
   if (!u || typeof u !== "object") {
@@ -234,15 +309,102 @@ function extractUsageNumbers(
       "cache_read_tokens",
     ) ?? 0;
   const cacheCreate =
-    num("cacheCreationInputTokens", "cache_creation_input_tokens") ?? 0;
-  const contextTok = num("contextTokens", "context_tokens");
+    num(
+      "cacheCreationInputTokens",
+      "cache_creation_input_tokens",
+      "cacheWriteTokens",
+      "cache_write_tokens",
+    ) ?? 0;
+  const contextTok = num(
+    "contextTokens",
+    "context_tokens",
+    "currentTokens",
+    "current_tokens",
+  );
+  const rawWin = num(
+    "tokenLimit",
+    "token_limit",
+    "maxInputTokens",
+    "max_input_tokens",
+    "contextWindow",
+    "context_window",
+  );
+  const contextWindow =
+    rawWin !== undefined && rawWin > 0 ? Math.round(rawWin) : undefined;
   const costUsd = num("costUsd", "cost_usd", "totalCostUSD");
   return {
     inTok,
     outTok,
     cachedTok: Math.max(0, Math.round(cacheRead + cacheCreate)),
     contextTok,
+    contextWindow,
     costUsd,
+  };
+}
+
+function extractModelMetricsUsage(modelMetrics: unknown): {
+  inTok?: number;
+  outTok?: number;
+  cachedTok: number;
+  contextWindow?: number;
+  costUsd?: number;
+  model?: string;
+} {
+  if (!modelMetrics || typeof modelMetrics !== "object") {
+    return { cachedTok: 0 };
+  }
+  const entries: Array<[string | undefined, unknown]> = Array.isArray(modelMetrics)
+    ? modelMetrics.map((v) => [undefined, v])
+    : Object.entries(modelMetrics as Record<string, unknown>);
+
+  let hasIn = false;
+  let hasOut = false;
+  let inSum = 0;
+  let outSum = 0;
+  let cachedSum = 0;
+  let contextWindow: number | undefined;
+  let costSum = 0;
+  let hasCost = false;
+  let model: string | undefined;
+
+  for (const [mKey, val] of entries) {
+    if (!val || typeof val !== "object" || Array.isArray(val)) continue;
+    const rec = val as Record<string, unknown>;
+    if (!model && mKey) {
+      const pretty = prettifyModelName(mKey) || mKey;
+      if (pretty) model = pretty;
+    }
+    const usageObj =
+      rec.usage && typeof rec.usage === "object" && !Array.isArray(rec.usage)
+        ? (rec.usage as Record<string, unknown>)
+        : rec;
+    const u = extractUsageNumbers(usageObj);
+    const outer = extractUsageNumbers(rec);
+    const cw = u.contextWindow ?? outer.contextWindow;
+    if (cw !== undefined && cw > 0) contextWindow = cw;
+    if (u.inTok !== undefined) {
+      hasIn = true;
+      inSum += Math.max(0, Math.round(u.inTok));
+    }
+    if (u.outTok !== undefined) {
+      hasOut = true;
+      outSum += Math.max(0, Math.round(u.outTok));
+    }
+    cachedSum += u.cachedTok;
+    const cost = u.costUsd ?? outer.costUsd;
+    if (cost !== undefined && cost >= 0) {
+      costSum += cost;
+      hasCost = true;
+    }
+  }
+
+  return {
+    ...(hasIn ? { inTok: inSum } : {}),
+    ...(hasOut ? { outTok: outSum } : {}),
+    cachedTok: cachedSum,
+    ...(contextWindow !== undefined ? { contextWindow } : {}),
+    ...(hasCost ? { costUsd: costSum } : {}),
+    ...(model ? { model } : {}),
   };
 }
 
@@ -830,12 +992,23 @@ export class CopilotVSCodeAdapter implements PassiveIdeAdapter {
     interface TranscriptUsageAcc {
       model?: string;
       hasExact: boolean;
+      hasIncrementalExact: boolean;
       inputTokens: number;
       outputTokens: number;
       cachedTokens: number;
       lastTurnContext: number;
+      contextWindow?: number;
+      cumulativeFallback?: {
+        inputTokens: number;
+        outputTokens: number;
+        cachedTokens: number;
+        costUsd?: number;
+      };
       estInputChars: number;
       estOutputChars: number;
+      priorBoundedProseChars: number;
+      currTurnProseChars: number;
+      currTurnChars: number;
       costUsd?: number;
       agentLabel?: string;
     }
@@ -845,18 +1018,23 @@ export class CopilotVSCodeAdapter implements PassiveIdeAdapter {
       if (!acc) {
         acc = {
           hasExact: false,
+          hasIncrementalExact: false,
           inputTokens: 0,
           outputTokens: 0,
           cachedTokens: 0,
           lastTurnContext: 0,
           estInputChars: 0,
           estOutputChars: 0,
+          priorBoundedProseChars: 0,
+          currTurnProseChars: 0,
+          currTurnChars: 0,
         };
         usageAccByAgent.set(aid, acc);
       }
       return acc;
     };
 
+    const emittedProseCompletionByAgent = new Map<string, boolean>();
     const toolSummaryMap = new Map<
       string,
       { toolName: string; summary: string; agentId: string }
@@ -933,25 +1111,103 @@ export class CopilotVSCodeAdapter implements PassiveIdeAdapter {
           : undefined) ??
         d;
       const u = extractUsageNumbers(usageCandidate);
-      if (
+      const dataMeta = extractUsageNumbers(d);
+      const rowMeta = extractUsageNumbers(row as Record<string, unknown>);
+      const rowContextWindow =
+        u.contextWindow ?? dataMeta.contextWindow ?? rowMeta.contextWindow;
+      if (rowContextWindow !== undefined && rowContextWindow > 0) {
+        acc.contextWindow = rowContextWindow;
+      }
+
+      const isIncrementalUsageRow =
+        rtype === "assistant.message" ||
+        rtype === "assistant.usage" ||
+        rtype === "session.usage_record";
+      const isCumulativeUsageRow =
+        rtype === "session.usage_checkpoint" || rtype === "session.shutdown";
+
+      if (isIncrementalUsageRow) {
+        if (
+          u.inTok !== undefined ||
+          u.outTok !== undefined ||
+          u.contextTok !== undefined
+        ) {
+          const norm = normalizeCopilotUsage({
+            inTok: u.inTok,
+            outTok: u.outTok,
+            cachedTok: u.cachedTok,
+            contextTok: u.contextTok,
+          });
+          acc.hasExact = true;
+          acc.hasIncrementalExact = true;
+          acc.inputTokens += norm.freshIn;
+          acc.outputTokens += norm.outTok;
+          acc.cachedTokens += norm.cachedTok;
+          if (norm.turnContext !== undefined) {
+            acc.lastTurnContext = norm.turnContext;
+          }
+        }
+        if (u.costUsd !== undefined && u.costUsd >= 0) {
+          acc.costUsd = (acc.costUsd ?? 0) + u.costUsd;
+        }
+      } else if (isCumulativeUsageRow) {
+        const mm =
+          rtype === "session.shutdown" && d.modelMetrics
+            ? extractModelMetricsUsage(d.modelMetrics)
+            : undefined;
+        if (mm?.contextWindow !== undefined && mm.contextWindow > 0) {
+          acc.contextWindow = mm.contextWindow;
+        }
+        if (mm?.model && !acc.model) {
+          acc.model = mm.model;
+        }
+        if (rtype === "session.usage_checkpoint") {
+          const ckCtx = u.contextTok ?? dataMeta.contextTok;
+          if (ckCtx !== undefined) {
+            acc.lastTurnContext = Math.max(0, Math.round(ckCtx));
+          }
+        }
+        const cumIn = mm?.inTok ?? u.inTok;
+        const cumOut = mm?.outTok ?? u.outTok;
+        const cumCached = mm && (mm.inTok !== undefined || mm.outTok !== undefined)
+          ? mm.cachedTok
+          : u.cachedTok;
+        const cumCost = mm?.costUsd ?? u.costUsd;
+        if (cumIn !== undefined || cumOut !== undefined) {
+          const norm = normalizeCopilotUsage({
+            inTok: cumIn,
+            outTok: cumOut,
+            cachedTok: cumCached,
+          });
+          acc.cumulativeFallback = {
+            inputTokens: norm.freshIn,
+            outputTokens: norm.outTok,
+            cachedTokens: norm.cachedTok,
+            ...(cumCost !== undefined && cumCost >= 0 ? { costUsd: cumCost } : {}),
+          };
+        }
+      } else if (
         u.inTok !== undefined ||
         u.outTok !== undefined ||
         u.contextTok !== undefined
       ) {
+        const norm = normalizeCopilotUsage({
+          inTok: u.inTok,
+          outTok: u.outTok,
+          cachedTok: u.cachedTok,
+          contextTok: u.contextTok,
+        });
         acc.hasExact = true;
-        const inTok = Math.max(0, Math.round(u.inTok ?? 0));
-        const outTok = Math.max(0, Math.round(u.outTok ?? 0));
-        const cachedTok = u.cachedTok;
-        acc.inputTokens += inTok;
-        acc.outputTokens += outTok;
-        acc.cachedTokens += cachedTok;
-        acc.lastTurnContext =
-          u.contextTok !== undefined
-            ? Math.max(0, Math.round(u.contextTok))
-            : inTok + cachedTok + outTok;
-      }
-      if (u.costUsd !== undefined && u.costUsd >= 0) {
-        acc.costUsd = (acc.costUsd ?? 0) + u.costUsd;
+        acc.hasIncrementalExact = true;
+        acc.inputTokens += norm.freshIn;
+        acc.outputTokens += norm.outTok;
+        acc.cachedTokens += norm.cachedTok;
+        if (norm.turnContext !== undefined) {
+          acc.lastTurnContext = norm.turnContext;
+        }
+        if (u.costUsd !== undefined && u.costUsd >= 0) {
+          acc.costUsd = (acc.costUsd ?? 0) + u.costUsd;
+        }
       }
 
       const agentLabel =
@@ -1046,6 +1302,7 @@ export class CopilotVSCodeAdapter implements PassiveIdeAdapter {
           },
         });
       } else if (rtype === "user.message") {
+        emittedProseCompletionByAgent.set(agentId, false);
         const txt = (
           (typeof d.content === "string" && d.content) ||
           (typeof d.transformedContent === "string" && d.transformedContent) ||
@@ -1054,7 +1311,14 @@ export class CopilotVSCodeAdapter implements PassiveIdeAdapter {
           ""
         ).trim();
         if (txt) {
+          if (acc.currTurnChars > 0) {
+            acc.priorBoundedProseChars += Math.min(4000, acc.currTurnProseChars);
+            acc.currTurnProseChars = 0;
+            acc.currTurnChars = 0;
+          }
           acc.estInputChars += txt.length;
+          acc.currTurnProseChars += txt.length;
+          acc.currTurnChars += txt.length;
           const inlineBody = txt.slice(0, 1400);
           if (agentId !== "root") {
             emit({
@@ -1079,12 +1343,16 @@ export class CopilotVSCodeAdapter implements PassiveIdeAdapter {
             });
           }
         }
+      } else if (rtype === "assistant.turn_start") {
+        emittedProseCompletionByAgent.set(agentId, false);
       } else if (rtype === "assistant.message") {
         const msgText =
           (typeof d.content === "string" && d.content.trim()) || "";
         const reasoning =
           (typeof d.reasoningText === "string" && d.reasoningText.trim()) || "";
         acc.estOutputChars += msgText.length + reasoning.length;
+        acc.currTurnProseChars += msgText.length + reasoning.length;
+        acc.currTurnChars += msgText.length + reasoning.length;
         if (reasoning) {
           emit({
             kind: "thinking_start",
@@ -1093,6 +1361,16 @@ export class CopilotVSCodeAdapter implements PassiveIdeAdapter {
         }
         const toolReqs = Array.isArray(d.toolRequests) ? d.toolRequests : [];
         if (toolReqs.length > 0) {
+          if (msgText) {
+            const inlineBody = msgText.slice(0, 1000);
+            emit({
+              kind: "thinking_start",
+              summary: cleanHumanSummary(msgText, 140) || "Thinking…",
+              payload: { body: inlineBody },
+              fullBody: msgText,
+              inlineBody,
+            });
+          }
           for (let ti = 0; ti < toolReqs.length; ti++) {
             const tr = toolReqs[ti] as Record<string, unknown>;
             const tname =
@@ -1108,20 +1386,38 @@ export class CopilotVSCodeAdapter implements PassiveIdeAdapter {
               !Array.isArray(tr.arguments)
                 ? (tr.arguments as Record<string, unknown>)
                 : {};
+            const lowTool = tname.toLowerCase();
             const isBoardMut = isBoardMutationToolCall(tname, args);
+            const isMsgTool = isMessageToolName(lowTool);
             const sum = summarizeToolCall(tname, args);
+            acc.currTurnChars += sum.length;
             toolSummaryMap.set(callId, { toolName: tname, summary: sum, agentId });
+            const msgTarget = isMsgTool ? extractMessageTarget(args) : undefined;
+            const msgBody =
+              isMsgTool &&
+              typeof (args.message ?? args.content ?? args.body) === "string"
+                ? String(args.message ?? args.content ?? args.body).trim()
+                : undefined;
             emit({
-              epoch: epoch + ti * 0.0001,
-              kind: isBoardMut ? "board_mutation" : "tool_start",
+              epoch: epoch + (ti + (msgText ? 1 : 0)) * 0.0001,
+              kind: isMsgTool
+                ? "message"
+                : isBoardMut
+                  ? "board_mutation"
+                  : "tool_start",
               toolName: tname,
               toolCallId: callId,
+              ...(msgTarget ? { targetAgentId: msgTarget } : {}),
               summary: sum,
-              status: "running",
-              payload: { args },
+              status: isMsgTool ? "ok" : "running",
+              payload: {
+                args,
+                ...(msgBody ? { body: msgBody } : {}),
+              },
             });
           }
         } else if (msgText) {
+          emittedProseCompletionByAgent.set(agentId, true);
           const inlineBody = msgText.slice(0, 1000);
           emit({
             kind:
@@ -1134,11 +1430,15 @@ export class CopilotVSCodeAdapter implements PassiveIdeAdapter {
           });
         }
       } else if (rtype === "assistant.turn_end") {
-        emit({
-          kind: agentId === "root" ? "assistant_turn_end" : "subagent_done",
-          summary: "Turn completed",
-          status: "ok",
-        });
+        if (emittedProseCompletionByAgent.get(agentId)) {
+          emittedProseCompletionByAgent.set(agentId, false);
+        } else {
+          emit({
+            kind: agentId === "root" ? "assistant_turn_end" : "subagent_done",
+            summary: "Turn completed",
+            status: "ok",
+          });
+        }
       } else if (rtype === "tool.execution_start") {
         const tname =
           (typeof d.mcpToolName === "string" && d.mcpToolName) ||
@@ -1153,20 +1453,37 @@ export class CopilotVSCodeAdapter implements PassiveIdeAdapter {
           !Array.isArray(d.arguments)
             ? (d.arguments as Record<string, unknown>)
             : {};
+        const lowTool = tname.toLowerCase();
         const isBoardMut = isBoardMutationToolCall(tname, args);
+        const isMsgTool = isMessageToolName(lowTool);
         const sum = summarizeToolCall(tname, args);
+        acc.currTurnChars += sum.length;
         const selfDaemon = isSelfDaemonCommand(
           sum + " " + JSON.stringify(args),
         );
         toolSummaryMap.set(callId, { toolName: tname, summary: sum, agentId });
+        const msgTarget = isMsgTool ? extractMessageTarget(args) : undefined;
+        const msgBody =
+          isMsgTool &&
+          typeof (args.message ?? args.content ?? args.body) === "string"
+            ? String(args.message ?? args.content ?? args.body).trim()
+            : undefined;
         emit({
-          kind: isBoardMut ? "board_mutation" : "tool_start",
+          kind: isMsgTool
+            ? "message"
+            : isBoardMut
+              ? "board_mutation"
+              : "tool_start",
           toolName: tname,
           toolCallId: callId,
+          ...(msgTarget ? { targetAgentId: msgTarget } : {}),
           summary: sum,
-          status: "running",
+          status: isMsgTool ? "ok" : "running",
           isSelfDaemon: selfDaemon,
-          payload: { args },
+          payload: {
+            args,
+            ...(msgBody ? { body: msgBody } : {}),
+          },
         });
       } else if (rtype === "tool.execution_complete") {
         const callId =
@@ -1176,6 +1493,7 @@ export class CopilotVSCodeAdapter implements PassiveIdeAdapter {
           (typeof d.toolName === "string" && d.toolName) || prev?.toolName;
         const isErr = d.success === false || d.isError === true || Boolean(d.error);
         const baseLabel = prev?.summary ?? tname ?? "tool call";
+        acc.currTurnChars += baseLabel.length;
         emit({
           kind: "tool_end",
           toolName: tname,
@@ -1344,6 +1662,20 @@ export class CopilotVSCodeAdapter implements PassiveIdeAdapter {
     for (const [aid, acc] of usageAccByAgent.entries()) {
       const targetEv = lastEvByAgent.get(aid);
       if (!targetEv) continue;
+      if (!acc.hasIncrementalExact && acc.cumulativeFallback) {
+        acc.hasExact = true;
+        acc.inputTokens = acc.cumulativeFallback.inputTokens;
+        acc.outputTokens = acc.cumulativeFallback.outputTokens;
+        acc.cachedTokens = acc.cumulativeFallback.cachedTokens;
+        if (
+          acc.costUsd === undefined &&
+          acc.cumulativeFallback.costUsd !== undefined
+        ) {
+          acc.costUsd = acc.cumulativeFallback.costUsd;
+        }
+      } else if (acc.lastTurnContext > 0) {
+        acc.hasExact = true;
+      }
       const inputTokens = acc.hasExact
         ? acc.inputTokens
         : Math.round(acc.estInputChars / 4);
@@ -1353,7 +1685,7 @@ export class CopilotVSCodeAdapter implements PassiveIdeAdapter {
       const cachedTokens = acc.hasExact ? acc.cachedTokens : 0;
       const contextTokens = acc.hasExact
         ? acc.lastTurnContext
-        : inputTokens + outputTokens;
+        : Math.round((acc.priorBoundedProseChars + acc.currTurnChars) / 4);
       const usageDelta: UsageDelta = {
         model: acc.model,
         modelSource: acc.model ? "exact" : "unknown",
@@ -1362,6 +1694,9 @@ export class CopilotVSCodeAdapter implements PassiveIdeAdapter {
         outputTokens,
         cachedTokens,
         contextTokens,
+        ...(acc.contextWindow !== undefined
+          ? { contextWindow: acc.contextWindow }
+          : {}),
         ...(acc.costUsd !== undefined ? { costUsd: acc.costUsd } : {}),
         isTotal: true,
       };
@@ -1415,6 +1750,9 @@ export class CopilotVSCodeAdapter implements PassiveIdeAdapter {
     const selectedModelFallback = extractSelectedModel(
       state.inputState?.selectedModel,
     );
+    const selectedModelContextWindow = extractSelectedModelContextWindow(
+      state.inputState?.selectedModel,
+    );
 
     const requests = Array.isArray(state.requests) ? state.requests : [];
     const events: EnrichedEvent[] = [];
@@ -1426,8 +1764,12 @@ export class CopilotVSCodeAdapter implements PassiveIdeAdapter {
       outputTokens: number;
       cachedTokens: number;
       lastTurnContext: number;
+      contextWindow?: number;
       estInputChars: number;
       estOutputChars: number;
+      priorBoundedProseChars: number;
+      prevTurnProseChars: number;
+      latestTurnChars: number;
       costUsd?: number;
     }
     const usageAccByAgent = new Map<string, CopilotUsageAcc>();
@@ -1440,8 +1782,12 @@ export class CopilotVSCodeAdapter implements PassiveIdeAdapter {
           outputTokens: 0,
           cachedTokens: 0,
           lastTurnContext: 0,
+          contextWindow: selectedModelContextWindow,
           estInputChars: 0,
           estOutputChars: 0,
+          priorBoundedProseChars: 0,
+          prevTurnProseChars: 0,
+          latestTurnChars: 0,
         };
         usageAccByAgent.set(aid, acc);
       }
@@ -1484,39 +1830,51 @@ export class CopilotVSCodeAdapter implements PassiveIdeAdapter {
       const metaFields = extractUsageNumbers(
         req.result?.metadata as Record<string, unknown> | undefined,
       );
+      const reqContextWindow =
+        directUsage.contextWindow ?? metaFields.contextWindow;
+      if (reqContextWindow !== undefined && reqContextWindow > 0) {
+        acc.contextWindow = reqContextWindow;
+      }
+
+      const hasDirectPromptOrContext =
+        directUsage.inTok !== undefined ||
+        directUsage.contextTok !== undefined ||
+        metaFields.inTok !== undefined ||
+        metaFields.contextTok !== undefined;
+      const hasDirectOut =
+        directUsage.outTok !== undefined ||
+        metaFields.outTok !== undefined ||
+        typeof req.completionTokens === "number";
 
       if (
-        directUsage.inTok !== undefined ||
-        directUsage.outTok !== undefined ||
-        metaFields.inTok !== undefined ||
-        metaFields.outTok !== undefined ||
-        typeof req.completionTokens === "number"
+        hasDirectPromptOrContext ||
+        (hasDirectOut && roundUsages.length === 0)
       ) {
-        acc.hasExact = true;
-        const inTok = Math.max(
-          0,
-          Math.round(directUsage.inTok ?? metaFields.inTok ?? 0),
-        );
-        const outTok = Math.max(
-          0,
-          Math.round(
-            directUsage.outTok ??
-              metaFields.outTok ??
-              req.completionTokens ??
-              0,
-          ),
-        );
-        const cachedTok =
+        const rawIn = directUsage.inTok ?? metaFields.inTok;
+        const rawOut =
+          directUsage.outTok ??
+          metaFields.outTok ??
+          (typeof req.completionTokens === "number"
+            ? req.completionTokens
+            : undefined);
+        const rawCached =
           directUsage.cachedTok > 0
             ? directUsage.cachedTok
             : metaFields.cachedTok;
-        acc.inputTokens += inTok;
-        acc.outputTokens += outTok;
-        acc.cachedTokens += cachedTok;
-        acc.lastTurnContext =
-          directUsage.contextTok !== undefined
-            ? Math.max(0, Math.round(directUsage.contextTok))
-            : inTok + cachedTok + outTok;
+        const rawCtx = directUsage.contextTok ?? metaFields.contextTok;
+        const norm = normalizeCopilotUsage({
+          inTok: rawIn,
+          outTok: rawOut,
+          cachedTok: rawCached,
+          contextTok: rawCtx,
+        });
+        acc.hasExact = true;
+        acc.inputTokens += norm.freshIn;
+        acc.outputTokens += norm.outTok;
+        acc.cachedTokens += norm.cachedTok;
+        if (norm.turnContext !== undefined) {
+          acc.lastTurnContext = norm.turnContext;
+        }
         const cost = directUsage.costUsd ?? metaFields.costUsd;
         if (cost !== undefined && cost >= 0) {
           acc.costUsd = (acc.costUsd ?? 0) + cost;
@@ -1524,24 +1882,75 @@ export class CopilotVSCodeAdapter implements PassiveIdeAdapter {
       } else if (roundUsages.length > 0) {
         acc.hasExact = true;
         for (const ru of roundUsages) {
-          const inTok = Math.max(0, Math.round(ru.inTok ?? 0));
-          const outTok = Math.max(0, Math.round(ru.outTok ?? 0));
-          acc.inputTokens += inTok;
-          acc.outputTokens += outTok;
-          acc.cachedTokens += ru.cachedTok;
-          acc.lastTurnContext =
-            ru.contextTok !== undefined
-              ? Math.max(0, Math.round(ru.contextTok))
-              : inTok + ru.cachedTok + outTok;
+          if (ru.contextWindow !== undefined && ru.contextWindow > 0) {
+            acc.contextWindow = ru.contextWindow;
+          }
+          const norm = normalizeCopilotUsage({
+            inTok: ru.inTok,
+            outTok: ru.outTok,
+            cachedTok: ru.cachedTok,
+            contextTok: ru.contextTok,
+          });
+          acc.inputTokens += norm.freshIn;
+          acc.outputTokens += norm.outTok;
+          acc.cachedTokens += norm.cachedTok;
+          if (norm.turnContext !== undefined) {
+            acc.lastTurnContext = norm.turnContext;
+          }
           if (ru.costUsd !== undefined && ru.costUsd >= 0) {
             acc.costUsd = (acc.costUsd ?? 0) + ru.costUsd;
           }
         }
       }
-      acc.estInputChars += (req.message?.text ?? "").length;
-      if (Array.isArray(req.response) && req.response.length > 0) {
-        acc.estOutputChars += JSON.stringify(req.response).length;
+
+      const reqPromptChars = (req.message?.text ?? "").length;
+      acc.estInputChars += reqPromptChars;
+      let respVisibleChars = 0;
+      let respProseChars = 0;
+      if (Array.isArray(req.response)) {
+        for (const item of req.response) {
+          const rk = item.kind ?? "";
+          if (rk === "thinking") {
+            const len =
+              extractMessageText(item.value).length +
+              (item.generatedTitle?.length ?? 0);
+            respVisibleChars += len;
+            respProseChars += len;
+          } else if (!rk || rk === "markdownContent" || rk === "text") {
+            const len = (
+              extractMessageText(item.value) || extractMessageText(item.content)
+            ).length;
+            respVisibleChars += len;
+            respProseChars += len;
+          } else if (rk === "toolInvocationSerialized") {
+            const title =
+              extractMessageText(item.pastTenseMessage) ||
+              extractMessageText(item.invocationMessage) ||
+              item.generatedTitle ||
+              item.toolId ||
+              item.toolName ||
+              "";
+            respVisibleChars += title.length;
+          } else if (rk === "textEditGroup") {
+            const base = extractUriBasename(item.uri);
+            respVisibleChars += base ? `Edit ${base}`.length : 20;
+          } else {
+            const len = (
+              extractMessageText(item.value) ||
+              extractMessageText(item.content) ||
+              item.generatedTitle ||
+              ""
+            ).length;
+            respVisibleChars += len;
+          }
+        }
       }
+      acc.estOutputChars += respVisibleChars;
+      if (acc.latestTurnChars > 0) {
+        acc.priorBoundedProseChars += Math.min(4000, acc.prevTurnProseChars);
+      }
+      acc.prevTurnProseChars = reqPromptChars + respProseChars;
+      acc.latestTurnChars = reqPromptChars + respVisibleChars;
 
       const emit = (input: {
         epoch: number;
@@ -1620,7 +2029,7 @@ export class CopilotVSCodeAdapter implements PassiveIdeAdapter {
           epoch: reqEpoch,
           kind: "user_input",
           targetAgentId: agentId,
-          summary: `Human: ${promptText.replace(/\s+/g, " ").slice(0, 90)}`,
+          summary: `Human: ${cleanHumanSummary(promptText, 130)}`,
           payload: {
             body: inlineBody,
             requestId: req.requestId,
@@ -1639,11 +2048,19 @@ export class CopilotVSCodeAdapter implements PassiveIdeAdapter {
         const rkind = item.kind ?? "";
 
         if (rkind === "thinking") {
-          const thinkText = extractMessageText(item.value);
+          const thinkText = extractMessageText(item.value).trim();
+          const genTitle =
+            typeof item.generatedTitle === "string"
+              ? item.generatedTitle.trim()
+              : "";
+          const inlineBody = thinkText ? thinkText.slice(0, 1000) : "";
           emit({
             epoch: stepEpoch,
             kind: "thinking_start",
-            summary: thinkText.replace(/\s+/g, " ").trim().slice(0, 80) || "Thinking…",
+            summary:
+              cleanHumanSummary(genTitle || thinkText, 120) || "Thinking…",
+            ...(inlineBody ? { payload: { body: inlineBody } } : {}),
+            ...(thinkText ? { fullBody: thinkText, inlineBody } : {}),
           });
         } else if (rkind === "prepareToolInvocation") {
           const tname = item.toolName || item.toolId || "tool";
@@ -1800,35 +2217,59 @@ export class CopilotVSCodeAdapter implements PassiveIdeAdapter {
               item.isComplete === false && item.isConfirmed === false;
             const specificArgs = item.toolSpecificData ?? {};
             const isBoardMut = isBoardMutationToolCall(tname, specificArgs);
-            const cleanMsg = isBoardMut
-              ? summarizeToolCall(tname, specificArgs)
-              : cleanHumanSummary(msg, 140) || summarizeToolCall(tname, specificArgs);
-            emit({
-              epoch: stepEpoch,
-              kind: isBoardMut ? "board_mutation" : "tool_start",
-              toolName: tname,
-              toolCallId: callId,
-              summary: cleanMsg,
-              isSelfDaemon: selfDaemon,
-              waitingReason: needsApproval ? "tool_approval" : undefined,
-              payload: {
-                isConfirmed: item.isConfirmed,
-                toolSpecificData: item.toolSpecificData,
-              },
-            });
-            if (item.isComplete) {
+            const isMsgTool = isMessageToolName(lowTool);
+            const cleanMsg =
+              isBoardMut || isMsgTool
+                ? summarizeToolCall(tname, specificArgs)
+                : cleanHumanSummary(msg, 140) || summarizeToolCall(tname, specificArgs);
+            if (isMsgTool) {
+              const msgTarget = extractMessageTarget(specificArgs);
+              const msgBody =
+                typeof (specificArgs.message ?? specificArgs.content ?? specificArgs.body) === "string"
+                  ? String(specificArgs.message ?? specificArgs.content ?? specificArgs.body).trim()
+                  : undefined;
               emit({
-                epoch: stepEpoch + 0.005,
-                kind: "tool_end",
+                epoch: stepEpoch,
+                kind: "message",
                 toolName: tname,
                 toolCallId: callId,
-                summary: cleanHumanSummary(`Completed: ${cleanMsg}`, 140),
+                ...(msgTarget ? { targetAgentId: msgTarget } : {}),
+                summary: cleanMsg,
                 isSelfDaemon: selfDaemon,
                 payload: {
-                  resultDetails: item.resultDetails,
-                  routineEnd: true,
+                  isConfirmed: item.isConfirmed,
+                  toolSpecificData: item.toolSpecificData,
+                  ...(msgBody ? { body: msgBody } : {}),
                 },
               });
+            } else {
+              emit({
+                epoch: stepEpoch,
+                kind: isBoardMut ? "board_mutation" : "tool_start",
+                toolName: tname,
+                toolCallId: callId,
+                summary: cleanMsg,
+                isSelfDaemon: selfDaemon,
+                waitingReason: needsApproval ? "tool_approval" : undefined,
+                payload: {
+                  isConfirmed: item.isConfirmed,
+                  toolSpecificData: item.toolSpecificData,
+                },
+              });
+              if (item.isComplete) {
+                emit({
+                  epoch: stepEpoch + 0.005,
+                  kind: "tool_end",
+                  toolName: tname,
+                  toolCallId: callId,
+                  summary: cleanHumanSummary(`Completed: ${cleanMsg}`, 140),
+                  isSelfDaemon: selfDaemon,
+                  payload: {
+                    resultDetails: item.resultDetails,
+                    routineEnd: true,
+                  },
+                });
+              }
             }
           }
         } else if (
@@ -1846,19 +2287,22 @@ export class CopilotVSCodeAdapter implements PassiveIdeAdapter {
           });
         } else if (rkind === "textEditGroup") {
           const callId = `${req.requestId ?? rIdx}:${i}:edit`;
+          const fileBase = extractUriBasename(item.uri);
           emit({
             epoch: stepEpoch,
             kind: "tool_start",
             toolName: "copilot_edit",
             toolCallId: callId,
-            summary: "Edit workspace files",
+            summary: fileBase ? `Edit ${fileBase}` : "Edit workspace files",
           });
           emit({
             epoch: stepEpoch + 0.002,
             kind: "tool_end",
             toolName: "copilot_edit",
             toolCallId: callId,
-            summary: "Applied file edits",
+            summary: fileBase
+              ? `Completed: Edit ${fileBase}`
+              : "Applied file edits",
           });
         }
       }
@@ -1898,7 +2342,7 @@ export class CopilotVSCodeAdapter implements PassiveIdeAdapter {
           kind: "assistant_turn_end",
           summary: hasErr
             ? `Error: ${req.result?.errorDetails?.message ?? "Copilot error"}`
-            : "Turn completed",
+            : cleanHumanSummary(turnText, 140) || "Turn completed",
           status: hasErr ? "error" : "ok",
           isError: hasErr,
           payload: turnPayload,
@@ -1926,7 +2370,7 @@ export class CopilotVSCodeAdapter implements PassiveIdeAdapter {
       const cachedTokens = acc.hasExact ? acc.cachedTokens : 0;
       const contextTokens = acc.hasExact
         ? acc.lastTurnContext
-        : inputTokens + outputTokens;
+        : Math.round((acc.priorBoundedProseChars + acc.latestTurnChars) / 4);
       const usageDelta: UsageDelta = {
         model: acc.model,
         modelSource: acc.model ? "exact" : "unknown",
@@ -1935,6 +2379,9 @@ export class CopilotVSCodeAdapter implements PassiveIdeAdapter {
         outputTokens,
         cachedTokens,
         contextTokens,
+        ...(acc.contextWindow !== undefined
+          ? { contextWindow: acc.contextWindow }
+          : {}),
         ...(acc.costUsd !== undefined ? { costUsd: acc.costUsd } : {}),
         isTotal: true,
       };

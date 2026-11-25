@@ -124,6 +124,73 @@ function parseTier2Key(
   return { prefix: key.slice(0, lastColon), bucket };
 }
 
+export function canonicalDedupToolName(toolName?: string): string {
+  const low = (toolName ?? "").trim().toLowerCase();
+  if (!low) return "";
+  if (
+    low === "read" ||
+    low === "read_file" ||
+    low === "view" ||
+    low === "view_file" ||
+    low === "copilot_readfile"
+  ) {
+    return "fs_read";
+  }
+  if (
+    low === "bash" ||
+    low === "powershell" ||
+    low === "run_command" ||
+    low === "run_in_terminal" ||
+    low === "execute/runinterminal"
+  ) {
+    return "shell";
+  }
+  if (
+    low === "edit" ||
+    low === "edit_file" ||
+    low === "multiedit" ||
+    low === "write" ||
+    low === "write_file" ||
+    low === "apply_patch" ||
+    low === "copilot_applypatch" ||
+    low === "copilot_edit" ||
+    low === "copilot_replacestring" ||
+    low === "copilot_multireplacestring" ||
+    low === "copilot_createfile" ||
+    low === "replace_file_content" ||
+    low === "multi_replace_file_content" ||
+    low === "edit/editfiles" ||
+    low === "edit/createfile"
+  ) {
+    return "fs_edit";
+  }
+  if (
+    low === "grep" ||
+    low === "grep_search" ||
+    low === "rg" ||
+    low === "copilot_findtextinfiles"
+  ) {
+    return "fs_search";
+  }
+  if (
+    low === "glob" ||
+    low === "find_by_name" ||
+    low === "copilot_findfiles"
+  ) {
+    return "fs_glob";
+  }
+  if (
+    low === "agent" ||
+    low === "task" ||
+    low === "invoke_subagent" ||
+    low === "runsubagent" ||
+    low === "agent/runsubagent"
+  ) {
+    return "subagent";
+  }
+  return low;
+}
+
 function extractNormalizedPrompt(ev: EnrichedEvent): string {
   const raw =
     (typeof ev.payload?.prompt === "string" && ev.payload.prompt) ||
@@ -163,11 +230,34 @@ export function deduplicateEvents(events: EnrichedEvent[]): EnrichedEvent[] {
       matchIdx = tier1Index.get(mergeKey);
     }
 
-    if (matchIdx === undefined) {
-      const t2 = parseTier2Key(mergeKey);
-      if (t2) {
+    const t2 = parseTier2Key(mergeKey);
+    const canonTool = canonicalDedupToolName(
+      ev.toolName ?? (t2 ? t2.prefix.split(":").slice(4).join(":") : undefined),
+    );
+    const canonT2Prefix =
+      t2 && canonTool
+        ? `t2:${ev.sessionId}:${ev.agentId}:${ev.kind}:${canonTool}`
+        : undefined;
+
+    if (matchIdx === undefined && t2) {
+      for (const delta of [0, -1, 1]) {
+        const probe = `${t2.prefix}:${t2.bucket + delta}`;
+        const candidate = tier2Index.get(probe);
+        if (candidate !== undefined) {
+          const existing = result[candidate];
+          if (existing && existing.channel !== ev.channel) {
+            matchIdx = candidate;
+            break;
+          }
+        }
+      }
+      if (
+        matchIdx === undefined &&
+        canonT2Prefix &&
+        canonT2Prefix !== t2.prefix
+      ) {
         for (const delta of [0, -1, 1]) {
-          const probe = `${t2.prefix}:${t2.bucket + delta}`;
+          const probe = `${canonT2Prefix}:${t2.bucket + delta}`;
           const candidate = tier2Index.get(probe);
           if (candidate !== undefined) {
             const existing = result[candidate];
@@ -206,13 +296,23 @@ export function deduplicateEvents(events: EnrichedEvent[]): EnrichedEvent[] {
       result[matchIdx] = merged;
       idIndex.set(merged.id, matchIdx);
       if (mergeKey.startsWith("t1:")) tier1Index.set(mergeKey, matchIdx);
-      if (mergeKey.startsWith("t2:")) tier2Index.set(mergeKey, matchIdx);
+      if (t2) {
+        tier2Index.set(mergeKey, matchIdx);
+        if (canonT2Prefix && canonT2Prefix !== t2.prefix) {
+          tier2Index.set(`${canonT2Prefix}:${t2.bucket}`, matchIdx);
+        }
+      }
     } else {
       const idx = result.length;
       result.push({ ...ev, mergeKey });
       idIndex.set(ev.id, idx);
       if (mergeKey.startsWith("t1:")) tier1Index.set(mergeKey, idx);
-      if (mergeKey.startsWith("t2:")) tier2Index.set(mergeKey, idx);
+      if (t2) {
+        tier2Index.set(mergeKey, idx);
+        if (canonT2Prefix && canonT2Prefix !== t2.prefix) {
+          tier2Index.set(`${canonT2Prefix}:${t2.bucket}`, idx);
+        }
+      }
       if (ev.kind === "user_input") {
         const uiKey = `${ev.sessionId}:${ev.agentId}`;
         let list = userInputBySessionAgent.get(uiKey);
@@ -293,10 +393,14 @@ interface MutableAgentState {
   outputTokens: number;
   cachedTokens: number;
   contextTokens: number;
+  contextWindow?: number;
   costUsd?: number;
   fallbackChars: number;
   fallbackInputChars: number;
   fallbackOutputChars: number;
+  fallbackPriorProseChars: number;
+  fallbackTurnProseChars: number;
+  fallbackTurnTotalChars: number;
 }
 
 function payloadTextLen(val: unknown): number {
@@ -319,10 +423,22 @@ function formatHms(epochSec: number): string {
   return `${hh}:${mm}:${ss}`;
 }
 
+function stripSubagentNamespacePrefix(raw: string): string {
+  const s = raw.trim();
+  const colonIdx = s.indexOf(":");
+  if (colonIdx > 0 && colonIdx < s.length - 1) {
+    const rest = s.slice(colonIdx + 1).trim();
+    if (rest) return rest;
+  }
+  return s;
+}
+
 function normalizeSubagentLabel(raw?: string): string {
   if (!raw) return "";
-  return raw
-    .trim()
+  const unprefixed = stripSubagentNamespacePrefix(raw);
+  return unprefixed
+    .replace(/([a-z0-9])([A-Z])/g, "$1 $2")
+    .replace(/([A-Z]+)([A-Z][a-z])/g, "$1 $2")
     .toLowerCase()
     .replace(/[^a-z0-9]+/g, " ")
     .trim();
@@ -577,13 +693,18 @@ function reconcileCopilotSubagents(rawEvents: EnrichedEvent[]): EnrichedEvent[] 
   const matchedHSet = new Set<string>();
   const mergedSourcesByHId = new Map<string, Set<string>>();
   for (const { p, h } of matches) {
+    const cleanP =
+      p.readableLabel && p.readableLabel !== "Subagent" && !isUuidOrOpaqueId(p.readableLabel)
+        ? stripSubagentNamespacePrefix(p.readableLabel)
+        : undefined;
+    const cleanH =
+      h.readableLabel && !isUuidOrOpaqueId(h.readableLabel)
+        ? stripSubagentNamespacePrefix(h.readableLabel)
+        : undefined;
     const readableLabel =
-      (p.readableLabel && p.readableLabel !== "Subagent" && !isUuidOrOpaqueId(p.readableLabel)
-        ? p.readableLabel
-        : undefined) ||
-      (h.readableLabel && !isUuidOrOpaqueId(h.readableLabel)
-        ? h.readableLabel
-        : undefined) ||
+      (h.readableLabel && p.readableLabel !== cleanP ? cleanH : undefined) ||
+      cleanP ||
+      cleanH ||
       p.readableLabel;
     pToH.set(p.pId, { hId: h.hId, readableLabel });
     matchedHSet.add(h.hId);
@@ -669,7 +790,13 @@ function reconcileCopilotSubagents(rawEvents: EnrichedEvent[]): EnrichedEvent[] 
       (ev.kind === "subagent_spawn" || ev.kind === "subagent_done")
     ) {
       const lbl = hReadableById.get(ev.targetAgentId);
-      if (lbl && (!strVal(ev.payload?.agentLabel) || isUuidOrOpaqueId(strVal(ev.payload?.agentLabel)))) {
+      const curPayloadLbl = strVal(ev.payload?.agentLabel);
+      if (
+        lbl &&
+        (!curPayloadLbl ||
+          isUuidOrOpaqueId(curPayloadLbl) ||
+          stripSubagentNamespacePrefix(curPayloadLbl) !== curPayloadLbl)
+      ) {
         ev.payload = { ...(ev.payload ?? {}), agentLabel: lbl };
       }
     }
@@ -911,6 +1038,9 @@ export function buildSessionSnapshot(
         fallbackChars: 0,
         fallbackInputChars: 0,
         fallbackOutputChars: 0,
+        fallbackPriorProseChars: 0,
+        fallbackTurnProseChars: 0,
+        fallbackTurnTotalChars: 0,
       };
       agentMap.set(id, st);
       agentOrder.push(id);
@@ -994,35 +1124,56 @@ export function buildSessionSnapshot(
     ag.steps += 1;
     if (ag.firstEventEpoch === 0) ag.firstEventEpoch = ev.epoch;
     ag.lastEventEpoch = Math.max(ag.lastEventEpoch, ev.epoch);
-    const bodyChars = Math.max(
-      ev.bodyLength ?? 0,
-      payloadTextLen(ev.payload?.body),
-      payloadTextLen(ev.payload?.prompt),
+    const FALLBACK_EVENT_CAP = 2000;
+    const summaryChars = Math.min(FALLBACK_EVENT_CAP, ev.summary.length);
+    const bodyChars = Math.min(
+      FALLBACK_EVENT_CAP,
+      Math.max(
+        ev.bodyLength ?? 0,
+        payloadTextLen(ev.payload?.body),
+        payloadTextLen(ev.payload?.prompt),
+      ),
     );
-    const toolInChars = Math.max(
-      payloadTextLen(ev.payload?.toolArgs),
-      payloadTextLen(ev.payload?.toolInput),
-      payloadTextLen(ev.payload?.args),
-      payloadTextLen(ev.payload?.input),
+    const toolInChars = Math.min(
+      FALLBACK_EVENT_CAP,
+      Math.max(
+        payloadTextLen(ev.payload?.toolArgs),
+        payloadTextLen(ev.payload?.toolInput),
+        payloadTextLen(ev.payload?.args),
+        payloadTextLen(ev.payload?.input),
+      ),
     );
-    const toolOutChars = Math.max(
-      payloadTextLen(ev.payload?.toolResult),
-      payloadTextLen(ev.payload?.resultDetails),
-      payloadTextLen(ev.payload?.preview),
+    const toolOutChars = Math.min(
+      FALLBACK_EVENT_CAP,
+      Math.max(
+        payloadTextLen(ev.payload?.toolResult),
+        payloadTextLen(ev.payload?.resultDetails),
+        payloadTextLen(ev.payload?.preview),
+      ),
     );
-    const evCharSpan = Math.max(
-      ev.summary.length,
-      bodyChars,
-      toolInChars,
-      toolOutChars,
+    const evCharSpan = Math.min(
+      FALLBACK_EVENT_CAP,
+      Math.max(summaryChars, bodyChars, toolInChars, toolOutChars),
     );
     ag.fallbackChars += evCharSpan;
     if (ev.kind === "user_input") {
-      ag.fallbackInputChars += Math.max(ev.summary.length, bodyChars);
+      if (ag.fallbackTurnTotalChars > 0) {
+        ag.fallbackPriorProseChars += Math.min(4000, ag.fallbackTurnProseChars);
+        ag.fallbackTurnProseChars = 0;
+        ag.fallbackTurnTotalChars = 0;
+      }
+      const c = Math.max(summaryChars, bodyChars);
+      ag.fallbackInputChars += c;
+      ag.fallbackTurnProseChars += c;
+      ag.fallbackTurnTotalChars += c;
     } else if (ev.kind === "tool_end") {
-      ag.fallbackInputChars += Math.max(ev.summary.length, toolOutChars, bodyChars);
+      const c = Math.max(summaryChars, toolOutChars, bodyChars);
+      ag.fallbackInputChars += c;
+      ag.fallbackTurnTotalChars += c;
     } else if (ev.kind === "tool_start" || ev.kind === "board_mutation") {
-      ag.fallbackOutputChars += Math.max(ev.summary.length, toolInChars);
+      const c = Math.max(summaryChars, toolInChars);
+      ag.fallbackOutputChars += c;
+      ag.fallbackTurnTotalChars += c;
     } else if (
       ev.kind === "subagent_spawn" ||
       ev.kind === "message" ||
@@ -1030,9 +1181,14 @@ export function buildSessionSnapshot(
       ev.kind === "subagent_done" ||
       ev.kind === "thinking_start"
     ) {
-      ag.fallbackOutputChars += Math.max(ev.summary.length, bodyChars);
+      const c = Math.max(summaryChars, bodyChars);
+      ag.fallbackOutputChars += c;
+      ag.fallbackTurnProseChars += c;
+      ag.fallbackTurnTotalChars += c;
     } else {
-      ag.fallbackInputChars += ev.summary.length;
+      ag.fallbackInputChars += summaryChars;
+      ag.fallbackTurnProseChars += summaryChars;
+      ag.fallbackTurnTotalChars += summaryChars;
     }
 
     // Fold per-event UsageDelta metadata if present
@@ -1080,18 +1236,26 @@ export function buildSessionSnapshot(
           ag.inputTokens += inTok;
           ag.outputTokens += outTok;
           ag.cachedTokens += cachedTok;
-          if (typeof uDelta.contextTokens === "number") {
-            ag.contextTokens = Math.max(
-              ag.contextTokens,
-              Math.round(uDelta.contextTokens),
-            );
-          } else {
-            ag.contextTokens = Math.max(
-              ag.contextTokens,
-              ag.inputTokens + ag.outputTokens,
-            );
+          if (
+            typeof uDelta.contextTokens === "number" &&
+            Number.isFinite(uDelta.contextTokens) &&
+            uDelta.contextTokens > 0
+          ) {
+            ag.contextTokens = Math.round(uDelta.contextTokens);
+          } else if (
+            typeof uDelta.inputTokens === "number" &&
+            (inTok > 0 || cachedTok > 0)
+          ) {
+            ag.contextTokens = inTok + cachedTok + outTok;
           }
         }
+      }
+      if (
+        typeof uDelta.contextWindow === "number" &&
+        Number.isFinite(uDelta.contextWindow) &&
+        uDelta.contextWindow > 0
+      ) {
+        ag.contextWindow = Math.round(uDelta.contextWindow);
       }
       if (typeof uDelta.costUsd === "number" && Number.isFinite(uDelta.costUsd)) {
         ag.costUsd = uDelta.isTotal
@@ -1760,10 +1924,16 @@ export function buildSessionSnapshot(
       }
       const cachedTokens = ag.hasExplicitUsage ? ag.cachedTokens : 0;
       const totalTokens = inputTokens + outputTokens + cachedTokens;
-      const contextWindow = inferContextWindow(finalModel, ag.ide);
+      const contextWindow =
+        ag.contextWindow ?? inferContextWindow(finalModel, ag.ide);
+      const estTurnContext = Math.round(
+        (ag.fallbackPriorProseChars + ag.fallbackTurnTotalChars) / 4,
+      );
       const contextTokens = ag.hasExplicitUsage
         ? ag.contextTokens
-        : inputTokens + outputTokens;
+        : ag.fallbackPriorProseChars === 0 && inputTokens + outputTokens > 0 && estTurnContext === 0
+          ? 1
+          : estTurnContext;
       const rawPct = contextWindow > 0 ? (contextTokens / contextWindow) * 100 : 0;
       const rounded1 = Math.round(rawPct * 10) / 10;
       const contextPercent =

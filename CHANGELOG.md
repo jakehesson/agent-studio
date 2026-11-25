@@ -5,6 +5,21 @@ All notable changes to **Agent Studio** will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.11.0] - 2026-11-25
+
+### Added
+- **VS Code / Copilot & GitHub Enterprise Session Parity (`S1-56`):**
+  - Added human-readable hook feed summaries (`summarizeToolCall`) in `src/cli/commands/hook-emit.ts` across `PreToolUse`, `PostToolUse`, and `PostToolUseFailure`, promoted `write_agent` / `read_agent` to `message` edges, and guarded against `agent_id === sessionId` / `parent_agent_id === sessionId` creating phantom UUID nodes.
+  - Expanded VS Code / Copilot tool classification and summary coverage (`src/telemetry/types.ts`, `web/src/utils.ts`) for `powershell`, `view`, `rg`, `glob`, `apply_patch`, `sql`, `skill`, `tool_search_tool`, `rename_chat`, `copilot_*` tools, `manage_todo_list`, and slash-prefixed tool IDs, plus empty-label Markdown link basename extraction (`[](file:///...)` -> basename).
+  - Enriched `CopilotVSCodeAdapter` (`src/telemetry/adapters/copilot-vscode.ts`) passive session and transcript feed text using `thinking.generatedTitle`, `textEditGroup.uri`, `turnText` completion summaries, and `assistant.message` prose + `toolRequests` extraction (suppressing duplicate `"Turn completed"` rows).
+  - Added canonical Tier-2 cross-channel tool-alias deduplication (`canonicalDedupToolName`) and namespace-stripped subagent label reconciliation (`normalizeSubagentLabel`, e.g. `VS Code Synced Data:break-glass` -> `BreakGlass`) in `src/telemetry/normalizer.ts`.
+
+### Fixed
+- **VS Code / Copilot Token Usage & Context Window Accuracy (`BUG-20`):**
+  - Added `normalizeCopilotUsage()` across `CopilotVSCodeAdapter` and `hook-emit.ts` to subtract inclusive `cachedTokens` from OpenAI/Copilot `promptTokens`/`inputTokens` while preserving Anthropic raw usage and preventing `completionTokens`-only turns from overwriting `lastTurnContext`.
+  - Separated incremental usage rows from cumulative `session.usage_checkpoint` / `session.shutdown` checkpoints in `events.jsonl` parsing to eliminate checkpoint double-counting.
+  - Propagated explicit IDE `selectedModel.metadata.maxInputTokens` / `tokenLimit` via `UsageDelta.contextWindow`, aligned `inferContextWindow(model, ide)` across backend and frontend (`400_000` for GPT-5 / GPT-6), replaced cumulative fallback context estimation with active-turn non-cumulative estimation, and aligned Peak Context KPI display in `web/src/components/UsageDashboard.ts`.
+
 ## [0.10.0] - 2026-11-25
 
 ### Added

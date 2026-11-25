@@ -7,8 +7,10 @@ import {
   computeDeterministicEventId,
   computeMergeKey,
   isBoardMutationToolCall,
+  normalizeCopilotUsage,
   normalizeWsPath,
   prettifyModelName,
+  summarizeToolCall,
   toIsoUtc,
   type EnrichedEvent,
   type UsageDelta,
@@ -35,16 +37,20 @@ const EDIT_OR_WRITE_TOOLS = new Set([
   "notebookedit",
   "edit_file",
   "write_file",
+  "apply_patch",
   "edit/editfiles",
   "edit/createfile",
   "copilot_applypatch",
   "copilot_createfile",
+  "copilot_replacestring",
+  "copilot_multireplacestring",
   "replace_file_content",
   "multi_replace_file_content",
 ]);
 
 const SHELL_TOOLS = new Set([
   "bash",
+  "powershell",
   "run_command",
   "run_in_terminal",
   "execute/runinterminal",
@@ -170,6 +176,7 @@ function anyField(obj: Record<string, unknown>, ...keys: string[]): unknown {
 function extractHookUsageDelta(
   payload: Record<string, unknown>,
   model?: string,
+  ide?: IdeSource,
 ): UsageDelta | undefined {
   const usageObj = objField(payload, "usage", "token_usage", "tokenUsage");
   const src = Object.keys(usageObj).length > 0 ? usageObj : payload;
@@ -196,19 +203,51 @@ function extractHookUsageDelta(
     "cachedTokens",
     "cached_prompt_tokens",
     "cachedPromptTokens",
+    "cacheReadTokens",
     "cache_read_tokens",
   );
   const cacheCreate = numField(
     src,
     "cache_creation_input_tokens",
     "cacheCreationInputTokens",
+    "cacheWriteTokens",
+    "cache_write_tokens",
     "cache_creation_tokens",
   );
   const cachedTokens =
     cacheRead !== undefined || cacheCreate !== undefined
       ? Math.max(0, Math.round((cacheRead ?? 0) + (cacheCreate ?? 0)))
       : undefined;
-  const contextTokens = numField(src, "context_tokens", "contextTokens");
+  const contextTokens = numField(
+    src,
+    "context_tokens",
+    "contextTokens",
+    "currentTokens",
+    "current_tokens",
+  );
+  const rawContextWindow =
+    numField(
+      src,
+      "contextWindow",
+      "context_window",
+      "maxInputTokens",
+      "max_input_tokens",
+      "tokenLimit",
+      "token_limit",
+    ) ??
+    numField(
+      payload,
+      "contextWindow",
+      "context_window",
+      "maxInputTokens",
+      "max_input_tokens",
+      "tokenLimit",
+      "token_limit",
+    );
+  const contextWindow =
+    rawContextWindow !== undefined && rawContextWindow > 0
+      ? Math.round(rawContextWindow)
+      : undefined;
   const costUsd = numField(src, "cost_usd", "costUsd", "total_cost_usd", "totalCostUSD");
 
   const prettyModel = model ? prettifyModelName(model) || model : undefined;
@@ -218,8 +257,27 @@ function extractHookUsageDelta(
     cachedTokens !== undefined ||
     contextTokens !== undefined;
 
-  if (!prettyModel && !hasTokens && costUsd === undefined) {
+  if (!prettyModel && !hasTokens && costUsd === undefined && contextWindow === undefined) {
     return undefined;
+  }
+
+  if (ide === "copilot-vscode" && hasTokens) {
+    const norm = normalizeCopilotUsage({
+      inTok: inputTokens,
+      outTok: outputTokens,
+      cachedTok: cachedTokens,
+      contextTok: contextTokens,
+    });
+    return {
+      ...(prettyModel ? { model: prettyModel, modelSource: "exact" as const } : {}),
+      usageSource: "exact" as const,
+      ...(inputTokens !== undefined ? { inputTokens: norm.freshIn } : {}),
+      ...(outputTokens !== undefined ? { outputTokens: norm.outTok } : {}),
+      ...(cachedTokens !== undefined ? { cachedTokens: norm.cachedTok } : {}),
+      ...(norm.turnContext !== undefined ? { contextTokens: norm.turnContext } : {}),
+      ...(contextWindow !== undefined ? { contextWindow } : {}),
+      ...(costUsd !== undefined && costUsd >= 0 ? { costUsd } : {}),
+    };
   }
 
   return {
@@ -229,6 +287,7 @@ function extractHookUsageDelta(
     ...(outputTokens !== undefined ? { outputTokens: Math.max(0, Math.round(outputTokens)) } : {}),
     ...(cachedTokens !== undefined ? { cachedTokens } : {}),
     ...(contextTokens !== undefined ? { contextTokens: Math.max(0, Math.round(contextTokens)) } : {}),
+    ...(contextWindow !== undefined ? { contextWindow } : {}),
     ...(costUsd !== undefined && costUsd >= 0 ? { costUsd } : {}),
   };
 }
@@ -414,13 +473,6 @@ export async function runHookEmit(
     "toolResult",
   );
 
-  const subagentId = strField(
-    payload,
-    "agent_id",
-    "agentId",
-    "subagent_id",
-    "subagentId",
-  );
   const subagentType = strField(
     payload,
     "agent_type",
@@ -428,7 +480,25 @@ export async function runHookEmit(
     "agent_name",
     "agentName",
   );
-  const parentAgentId = strField(payload, "parent_agent_id", "parentAgentId");
+  const rawSubagentId = strField(
+    payload,
+    "agent_id",
+    "agentId",
+    "subagent_id",
+    "subagentId",
+  );
+  const rawParentAgentId = strField(payload, "parent_agent_id", "parentAgentId");
+  // Guard against IDE hooks (e.g. VS Code Copilot) echoing the root sessionId as agent_id
+  // or parent_agent_id. Preserve Claude Code orphan subagent hooks that carry agent_type.
+  const isRootUuidEcho =
+    rawSubagentId !== undefined &&
+    rawSubagentId === sessionId &&
+    (ide !== "claude-code" || !subagentType);
+  const subagentId = isRootUuidEcho ? undefined : rawSubagentId;
+  const parentAgentId =
+    rawParentAgentId && rawParentAgentId !== sessionId
+      ? rawParentAgentId
+      : undefined;
   const parentSessionId = strField(
     payload,
     "parent_session_id",
@@ -486,11 +556,35 @@ export async function runHookEmit(
   const epoch = Date.now() / 1000;
   let kind = mapHookEventToKind(hookEvent, isSubagentContext);
   const lowTool = (toolName ?? "").toLowerCase();
+  const isMessageTool =
+    lowTool === "sendmessage" ||
+    lowTool === "send_message" ||
+    lowTool === "write_agent" ||
+    lowTool === "read_agent";
   if (hookLow === "pretooluse" && toolName) {
     if ((lowTool === "agent" || lowTool === "task") && targetAgentId) {
       kind = "subagent_spawn";
-    } else if (lowTool === "sendmessage") {
+    } else if (isMessageTool) {
       kind = "message";
+      if (!targetAgentId) {
+        const msgTarget = strField(
+          toolInput,
+          "targetAgentId",
+          "target_agent_id",
+          "agent_id",
+          "agentId",
+          "recipient",
+          "Recipient",
+          "target",
+          "to",
+          "agent_name",
+          "agentName",
+          "name",
+        );
+        if (msgTarget && msgTarget !== sessionId && msgTarget !== agentId) {
+          targetAgentId = msgTarget;
+        }
+      }
     } else if (lowTool === "askuserquestion") {
       kind = "user_input";
     } else if (isBoardMutationToolCall(toolName, toolInput)) {
@@ -555,6 +649,7 @@ export async function runHookEmit(
   }
 
   const readableActor = agentLabel || (agentId === "root" ? "Coordinator" : agentId);
+  const toolSummary = toolName ? summarizeToolCall(toolName, toolInput) : undefined;
   const summary = denyReason
     ? `DENIED ${toolName ?? "tool"}: ${denyReason}`
     : isSubagentLifecycle
@@ -565,11 +660,19 @@ export async function runHookEmit(
           : promptText
             ? `Human: ${cleanHumanSummary(promptText, 130)}`
             : `${hookEvent} (${readableActor})`
-        : toolName
-          ? `${hookEvent}: ${toolName}`
+        : toolSummary
+          ? hookLow === "posttooluse" || hookLow === "posttoolusefailure"
+            ? cleanHumanSummary(
+                isError ? `Failed: ${toolSummary}` : `Completed: ${toolSummary}`,
+                140,
+              )
+            : toolSummary
           : `${hookEvent} (${readableActor})`;
 
-  const usageDelta = extractHookUsageDelta(payload, modelRaw);
+  const usageDelta = extractHookUsageDelta(payload, modelRaw, ide);
+  const toolMsgBody = isMessageTool
+    ? strField(toolInput, "message", "content", "body", "text")
+    : undefined;
 
   const eventPayload: Record<string, unknown> = {
     hookEvent,
@@ -586,7 +689,9 @@ export async function runHookEmit(
     ...(modelRaw !== undefined ? { model: modelRaw } : {}),
     ...(promptText !== undefined
       ? { prompt: promptText, body: promptText }
-      : {}),
+      : toolMsgBody !== undefined
+        ? { body: toolMsgBody }
+        : {}),
     ...(isError ? { isError: true } : {}),
     ...(denyReason ? { denyReason } : {}),
     ...(usageDelta ? { _usageDelta: usageDelta } : {}),

@@ -42,8 +42,61 @@ export interface UsageDelta {
   outputTokens?: number;
   cachedTokens?: number;
   contextTokens?: number;
+  contextWindow?: number;
   costUsd?: number;
   isTotal?: boolean;
+}
+
+export interface RawCopilotUsage {
+  inTok?: number;
+  outTok?: number;
+  cachedTok?: number;
+  contextTok?: number;
+}
+
+export interface NormalizedCopilotUsage {
+  freshIn: number;
+  outTok: number;
+  cachedTok: number;
+  turnContext?: number;
+}
+
+/**
+ * Normalizes Copilot / OpenAI usage where promptTokens/inputTokens may be inclusive
+ * of cachedTokens/cacheReadTokens, vs Anthropic-style raw inputTokens (< cachedTokens).
+ * Leaves completionTokens-only turns (inTok === undefined && contextTok === undefined)
+ * without overwriting turnContext.
+ */
+export function normalizeCopilotUsage(u: RawCopilotUsage): NormalizedCopilotUsage {
+  const rawIn = u.inTok !== undefined ? Math.max(0, Math.round(u.inTok)) : undefined;
+  const outTok = Math.max(0, Math.round(u.outTok ?? 0));
+  const cachedTok = Math.max(0, Math.round(u.cachedTok ?? 0));
+  const explicitCtx =
+    u.contextTok !== undefined ? Math.max(0, Math.round(u.contextTok)) : undefined;
+
+  if (rawIn !== undefined) {
+    if (cachedTok > 0 && rawIn >= cachedTok) {
+      return {
+        freshIn: rawIn - cachedTok,
+        outTok,
+        cachedTok,
+        turnContext: explicitCtx ?? rawIn + outTok,
+      };
+    }
+    return {
+      freshIn: rawIn,
+      outTok,
+      cachedTok,
+      turnContext: explicitCtx ?? rawIn + cachedTok + outTok,
+    };
+  }
+
+  return {
+    freshIn: 0,
+    outTok,
+    cachedTok,
+    ...(explicitCtx !== undefined ? { turnContext: explicitCtx } : {}),
+  };
 }
 
 export type TelemetryChannel = "passive" | "hook" | "mcp";
@@ -397,6 +450,7 @@ const FS_TOOL_SET = new Set([
   "view_file",
   "view_file_outline",
   "view_code_item",
+  "view",
   "find_by_name",
   "grep_search",
   "list_dir",
@@ -404,8 +458,10 @@ const FS_TOOL_SET = new Set([
   "write",
   "edit",
   "multiedit",
+  "apply_patch",
   "glob",
   "grep",
+  "rg",
   "copilot_readfile",
   "copilot_applypatch",
   "copilot_createfile",
@@ -415,6 +471,12 @@ const FS_TOOL_SET = new Set([
   "copilot_listdirectory",
   "copilot_getchangedfiles",
   "copilot_edit",
+  "copilot_replacestring",
+  "copilot_multireplacestring",
+  "copilot_searchcodebase",
+  "copilot_geterrors",
+  "edit/editfiles",
+  "edit/createfile",
 ]);
 
 const SHELL_TOOL_SET = new Set([
@@ -423,7 +485,9 @@ const SHELL_TOOL_SET = new Set([
   "command_status",
   "manage_task",
   "bash",
+  "powershell",
   "run_in_terminal",
+  "execute/runinterminal",
   "send_to_terminal",
   "get_terminal_output",
 ]);
@@ -468,6 +532,8 @@ export function classifyExternalTool(
       "invoke_subagent",
       "send_message",
       "sendmessage",
+      "write_agent",
+      "read_agent",
       "notify_user",
       "agent",
       "task",
@@ -581,8 +647,24 @@ export function cleanHumanSummary(text: string, maxLen = 140): string {
   if (s.endsWith('"') && !s.slice(0, -1).includes('"')) {
     s = s.slice(0, -1);
   }
-  // Convert Markdown links [label](url) -> label
-  s = s.replace(/\[([^\]]+)\]\([^)]+\)/g, "$1");
+  // Convert Markdown links [label](url) -> label, or decoded basename for empty-label links [](file:///.../foo.ts)
+  s = s.replace(/\[([^\]]*)\]\(([^)]+)\)/g, (_m, label: string, url: string) => {
+    const trimmedLabel = (label ?? "").trim();
+    if (trimmedLabel) return trimmedLabel;
+    const rawTarget = (url ?? "").trim().split(/[?#]/)[0] ?? "";
+    let decoded = rawTarget;
+    try {
+      decoded = decodeURIComponent(rawTarget);
+    } catch {
+      decoded = rawTarget;
+    }
+    const cleanPath = decoded
+      .replace(/^[a-zA-Z][a-zA-Z0-9+.-]*:\/\//, "")
+      .replace(/\\/g, "/")
+      .replace(/\/+$/, "");
+    const base = path.posix.basename(cleanPath);
+    return base || "link";
+  });
   // Strip HTML tags
   s = s.replace(/<[^>]+>/g, " ");
   // Strip Markdown formatting markers (**, __, `, headings, list bullets)
@@ -784,38 +866,99 @@ export function summarizeToolCall(
     return cleanHumanSummary(`MCP: ${prettifyAgentLabel(mcp.mcpTool)}`, 140);
   }
 
-  // 2. File tools
+  // 2. File & workspace tools
   if (
     low === "read_file" ||
     low === "read" ||
     low === "copilot_readfile" ||
-    low === "view_file"
+    low === "view_file" ||
+    low === "view"
   ) {
-    const p = unquoteArg(args.Path ?? args.file_path ?? args.path ?? args.filePath);
+    const p = unquoteArg(args.Path ?? args.file_path ?? args.path ?? args.filePath ?? args.uri);
     return `Read ${formatShortFile(p)}`;
   }
   if (
     low === "write_file" ||
     low === "write" ||
-    low === "copilot_createfile"
+    low === "copilot_createfile" ||
+    low === "edit/createfile"
   ) {
-    const p = unquoteArg(args.Path ?? args.file_path ?? args.path ?? args.filePath);
+    const p = unquoteArg(args.Path ?? args.file_path ?? args.path ?? args.filePath ?? args.uri);
     return `Wrote ${formatShortFile(p)}`;
   }
   if (
     low === "edit_file" ||
     low === "edit" ||
     low === "multiedit" ||
+    low === "apply_patch" ||
     low === "copilot_applypatch" ||
+    low === "copilot_edit" ||
+    low === "copilot_replacestring" ||
+    low === "copilot_multireplacestring" ||
+    low === "edit/editfiles" ||
     low === "replace_file_content" ||
     low === "multi_replace_file_content"
   ) {
-    const p = unquoteArg(args.Path ?? args.file_path ?? args.path ?? args.filePath);
+    let p = unquoteArg(args.Path ?? args.file_path ?? args.path ?? args.filePath ?? args.uri);
+    if (!p && low === "apply_patch") {
+      const patchText = unquoteArg(args.patch ?? args.input);
+      const m = /\*\*\*\s+(?:Update|Add|Delete)\s+File:\s+([^\r\n]+)/i.exec(patchText);
+      if (m?.[1]) p = m[1].trim();
+    }
     return `Edited ${formatShortFile(p)}`;
+  }
+  if (
+    low === "grep_search" ||
+    low === "grep" ||
+    low === "rg" ||
+    low === "copilot_findtextinfiles"
+  ) {
+    const q = cleanHumanSummary(
+      unquoteArg(args.query ?? args.Query ?? args.pattern ?? args.Pattern ?? args.regex),
+      60,
+    );
+    return q ? `Search: ${q}` : "Searched workspace text";
+  }
+  if (
+    low === "find_by_name" ||
+    low === "glob" ||
+    low === "copilot_findfiles"
+  ) {
+    const q = unquoteArg(
+      args.query ?? args.Query ?? args.pattern ?? args.Pattern ?? args.includePattern,
+    )
+      .replace(/\s+/g, " ")
+      .trim()
+      .slice(0, 60);
+    return q ? `Find files: ${q}` : "Found workspace files";
+  }
+  if (low === "list_dir" || low === "copilot_listdirectory") {
+    const p = unquoteArg(
+      args.path ?? args.dirPath ?? args.DirectoryPath ?? args.Path ?? args.filePath,
+    );
+    return p ? `Listed ${formatShortFile(p)}` : "Listed directory";
+  }
+  if (low === "copilot_searchcodebase") {
+    const q = cleanHumanSummary(unquoteArg(args.query ?? args.Query), 60);
+    return q ? `Codebase search: ${q}` : "Searched codebase";
+  }
+  if (low === "copilot_geterrors") {
+    const fp =
+      args.filePath ??
+      args.path ??
+      (Array.isArray(args.filePaths) ? args.filePaths[0] : undefined);
+    const p = unquoteArg(fp);
+    return p ? `Checked errors: ${formatShortFile(p)}` : "Checked workspace errors";
   }
 
   // 3. Shell tools
-  if (low === "run_command" || low === "bash" || low === "run_in_terminal") {
+  if (
+    low === "run_command" ||
+    low === "bash" ||
+    low === "powershell" ||
+    low === "run_in_terminal" ||
+    low === "execute/runinterminal"
+  ) {
     const explicit = unquoteArg(args.toolSummary ?? args.description);
     if (explicit) {
       return cleanHumanSummary(`Run: ${explicit}`, 120);
@@ -826,14 +969,64 @@ export function summarizeToolCall(
   }
 
   // 4. Subagent & messaging tools
-  if (low === "invoke_subagent" || low === "agent" || low === "task") {
+  if (
+    low === "invoke_subagent" ||
+    low === "agent" ||
+    low === "task" ||
+    low === "runsubagent" ||
+    low === "agent/runsubagent"
+  ) {
     const role = unquoteArg(
-      args.Role ?? args.TypeName ?? args.subagent_type ?? args.description,
+      args.Role ?? args.TypeName ?? args.subagent_type ?? args.agentName ?? args.description,
     );
     return cleanHumanSummary(`Spawned ${role || "subagent"}`, 140);
   }
   if (low === "send_message" || low === "sendmessage") {
     return "Sent message";
+  }
+  if (low === "write_agent") {
+    const target = unquoteArg(
+      args.agent_id ?? args.agentId ?? args.recipient ?? args.target ?? args.name,
+    );
+    const msg = cleanHumanSummary(unquoteArg(args.message ?? args.content ?? args.body), 80);
+    return cleanHumanSummary(
+      target
+        ? msg
+          ? `Message ${target}: ${msg}`
+          : `Messaged ${target}`
+        : msg
+          ? `Message agent: ${msg}`
+          : "Messaged subagent",
+      140,
+    );
+  }
+  if (low === "read_agent") {
+    const target = unquoteArg(args.agent_id ?? args.agentId ?? args.target ?? args.name);
+    return cleanHumanSummary(
+      target ? `Read response from ${target}` : "Read subagent response",
+      140,
+    );
+  }
+
+  // 5. Copilot/Agent utility tools
+  if (low === "sql") {
+    const desc = cleanHumanSummary(unquoteArg(args.description ?? args.query), 80);
+    return desc ? `SQL: ${desc}` : "Queried session SQL";
+  }
+  if (low === "skill") {
+    const name = unquoteArg(args.skill ?? args.name);
+    return name ? `Loaded skill: ${name}` : "Loaded skill";
+  }
+  if (low === "tool_search_tool") {
+    const q = cleanHumanSummary(unquoteArg(args.query), 60);
+    return q ? `Search tools: ${q}` : "Searched tools";
+  }
+  if (low === "rename_chat") {
+    const title = cleanHumanSummary(unquoteArg(args.title ?? args.name), 80);
+    return title ? `Renamed chat: ${title}` : "Renamed chat";
+  }
+  if (low === "manage_todo_list") {
+    return "Updated todo list";
   }
 
   return cleanHumanSummary(`Tool: ${tname}`, 120);
@@ -867,9 +1060,21 @@ export function inferContextWindow(model: string, ide?: IdeSource): number {
   if (!low || low === "unknown") {
     return ide === "antigravity" ? 1_000_000 : 200_000;
   }
-  if (low.includes("gemini")) return 1_000_000;
-  if (low.includes("claude")) return 200_000;
-  if (low.includes("gpt-4.1") || low.includes("gpt 4.1")) return 1_000_000;
+  if (
+    low.includes("gemini") ||
+    low.includes("gpt-4.1") ||
+    low.includes("gpt 4.1")
+  ) {
+    return 1_000_000;
+  }
+  if (
+    low.includes("gpt-5") ||
+    low.includes("gpt 5") ||
+    low.includes("gpt-6") ||
+    low.includes("gpt 6")
+  ) {
+    return 400_000;
+  }
   if (
     low.includes("gpt-4o") ||
     low.includes("gpt 4o") ||

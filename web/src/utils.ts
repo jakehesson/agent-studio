@@ -63,8 +63,23 @@ export function cleanSummaryText(raw: string | undefined | null): string {
     s = s.slice(1, -1).trim();
   }
 
-  // Strip Markdown links [label](url) -> label
-  s = s.replace(/\[([^\]]+)\]\(([^)]+)\)/g, "$1");
+  // Strip Markdown links [label](url) -> label (or decoded basename when label is empty)
+  s = s.replace(/\[([^\]]*)\]\(([^)]+)\)/g, (_m, label: string, url: string) => {
+    if (label.trim().length > 0) return label;
+    const cleanUrl = (url.split(/[?#]/)[0] ?? "").trim();
+    let decoded = cleanUrl;
+    try {
+      decoded = decodeURIComponent(cleanUrl);
+    } catch {
+      // Keep raw path if percent-encoding is malformed
+    }
+    const pathOnly = decoded
+      .replace(/^[a-zA-Z][a-zA-Z0-9+.-]*:\/\//, "")
+      .replace(/\\/g, "/")
+      .replace(/\/+$/, "");
+    const base = pathOnly.split("/").filter(Boolean).pop();
+    return base || "file";
+  });
   // Strip bold/italic/code inline Markdown markers
   s = s.replace(/\*\*([^*]+)\*\*/g, "$1");
   s = s.replace(/__([^_]+)__/g, "$1");
@@ -275,6 +290,7 @@ export function classifyEventReadable(
         tool === "ask_question" ||
         tool === "askuserquestion" ||
         tool === "vscode_askquestions" ||
+        tool === "questioncarousel" ||
         tool === "elicitationserialized"
       ) {
         return {
@@ -282,6 +298,15 @@ export function classifyEventReadable(
           cssClass: "human",
           category: "waiting",
           humanTitle: "Waiting for User Input",
+          isLowSignal: false,
+        };
+      }
+      if (tool === "write_agent" || tool === "read_agent") {
+        return {
+          badge: "Message",
+          cssClass: "peer",
+          category: "message",
+          humanTitle: "Agent Message",
           isLowSignal: false,
         };
       }
@@ -318,9 +343,18 @@ export function classifyEventReadable(
         tool === "edit" ||
         tool === "write" ||
         tool === "multiedit" ||
+        tool === "apply_patch" ||
+        tool === "replace_file_content" ||
+        tool === "multi_replace_file_content" ||
         tool === "copilot_applypatch" ||
         tool === "copilot_createfile" ||
-        tool === "copilot_edit"
+        tool === "copilot_createdirectory" ||
+        tool === "copilot_replacestring" ||
+        tool === "copilot_multireplacestring" ||
+        tool === "copilot_edit" ||
+        tool === "edit/editfiles" ||
+        tool === "edit/createfile" ||
+        tool.startsWith("edit/")
       ) {
         return {
           badge: "Edited",
@@ -333,8 +367,14 @@ export function classifyEventReadable(
       if (
         tool === "run_command" ||
         tool === "bash" ||
+        tool === "powershell" ||
         tool === "run_in_terminal" ||
         tool === "send_to_terminal" ||
+        tool === "get_terminal_output" ||
+        tool === "send_command_input" ||
+        tool === "command_status" ||
+        tool === "execute/runinterminal" ||
+        tool.startsWith("execute/") ||
         tool.includes("terminal")
       ) {
         return {
@@ -348,19 +388,45 @@ export function classifyEventReadable(
       if (
         tool === "read_file" ||
         tool === "read" ||
+        tool === "view" ||
+        tool === "view_file" ||
+        tool === "view_file_outline" ||
+        tool === "view_code_item" ||
         tool === "glob" ||
         tool === "grep" ||
+        tool === "rg" ||
         tool.startsWith("copilot_read") ||
         tool.startsWith("copilot_find") ||
+        tool.startsWith("copilot_list") ||
+        tool.startsWith("copilot_search") ||
+        tool === "copilot_geterrors" ||
+        tool === "copilot_getchangedfiles" ||
         tool === "list_dir" ||
         tool === "find_by_name" ||
-        tool === "grep_search"
+        tool === "grep_search" ||
+        tool === "tool_search_tool" ||
+        tool === "skill" ||
+        tool.startsWith("search/")
       ) {
         return {
           badge: "Read",
           cssClass: "tool",
           category: "read",
           humanTitle: "Inspected File",
+          isLowSignal: true,
+        };
+      }
+      if (tool === "sql" || tool === "manage_todo_list" || tool === "rename_chat") {
+        return {
+          badge: tool === "sql" ? "SQL" : tool === "manage_todo_list" ? "Todo" : "Chat",
+          cssClass: "tool",
+          category: "tool",
+          humanTitle:
+            tool === "sql"
+              ? "SQL Query"
+              : tool === "manage_todo_list"
+                ? "Updated Todo List"
+                : "Renamed Chat",
           isLowSignal: true,
         };
       }
@@ -662,9 +728,30 @@ export function classifyExternalTarget(toolName?: string): { id: string; label: 
   const low = t.toLowerCase();
 
   if (
+    low === "invoke_subagent" ||
+    low === "send_message" ||
+    low === "sendmessage" ||
+    low === "notify_user" ||
+    low === "agent" ||
+    low === "task" ||
+    low === "runsubagent" ||
+    low === "agent/runsubagent" ||
+    low === "write_agent" ||
+    low === "read_agent" ||
+    low === "sql" ||
+    low === "skill" ||
+    low === "tool_search_tool" ||
+    low === "rename_chat" ||
+    low === "manage_todo_list"
+  ) {
+    return null;
+  }
+
+  if (
     low === "ask_question" ||
     low === "askuserquestion" ||
     low === "vscode_askquestions" ||
+    low === "questioncarousel" ||
     low === "elicitationserealized" ||
     low === "elicitationserialized"
   ) {
@@ -684,9 +771,14 @@ export function classifyExternalTarget(toolName?: string): { id: string; label: 
   if (
     low === "run_command" ||
     low === "bash" ||
+    low === "powershell" ||
     low === "run_in_terminal" ||
     low === "send_to_terminal" ||
     low === "get_terminal_output" ||
+    low === "send_command_input" ||
+    low === "command_status" ||
+    low === "execute/runinterminal" ||
+    low.startsWith("execute/") ||
     low.includes("terminal")
   ) {
     return { id: "ext:shell", label: "Local Shell" };
@@ -696,16 +788,37 @@ export function classifyExternalTarget(toolName?: string): { id: string; label: 
     low === "read_file" ||
     low === "write_file" ||
     low === "edit_file" ||
+    low === "view_file" ||
+    low === "view_file_outline" ||
+    low === "view_code_item" ||
+    low === "replace_file_content" ||
+    low === "multi_replace_file_content" ||
+    low === "list_dir" ||
+    low === "find_by_name" ||
+    low === "grep_search" ||
     low === "read" ||
     low === "edit" ||
     low === "write" ||
     low === "multiedit" ||
     low === "glob" ||
     low === "grep" ||
+    low === "view" ||
+    low === "rg" ||
+    low === "apply_patch" ||
+    low === "edit/editfiles" ||
+    low === "edit/createfile" ||
+    low.startsWith("edit/") ||
+    low.startsWith("search/") ||
     low.startsWith("copilot_read") ||
     low.startsWith("copilot_apply") ||
     low.startsWith("copilot_create") ||
     low.startsWith("copilot_find") ||
+    low.startsWith("copilot_replace") ||
+    low.startsWith("copilot_multireplace") ||
+    low.startsWith("copilot_list") ||
+    low.startsWith("copilot_search") ||
+    low === "copilot_geterrors" ||
+    low === "copilot_getchangedfiles" ||
     low === "copilot_edit"
   ) {
     return { id: "ext:fs", label: "Workspace FS" };

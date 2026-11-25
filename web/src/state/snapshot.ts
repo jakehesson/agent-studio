@@ -34,6 +34,7 @@ interface UsageDeltaLike {
   outputTokens?: number;
   cachedTokens?: number;
   contextTokens?: number;
+  contextWindow?: number;
   costUsd?: number;
   isTotal?: boolean;
 }
@@ -47,15 +48,31 @@ interface UsageAcc {
   outputTokens: number;
   cachedTokens: number;
   contextTokens: number;
+  contextWindow?: number;
   costUsd?: number;
 }
 
 export function inferContextWindow(model?: string, ide?: IdeSource): number {
   const low = (model ?? "").trim().toLowerCase();
   if (low.includes("[1m]")) return 1_000_000;
-  if (low.includes("gemini")) return 1_000_000;
-  if (low.includes("claude")) return 200_000;
-  if (low.includes("gpt-4.1") || low.includes("gpt 4.1")) return 1_000_000;
+  if (!low || low === "unknown") {
+    return ide === "antigravity" ? 1_000_000 : 200_000;
+  }
+  if (
+    low.includes("gemini") ||
+    low.includes("gpt-4.1") ||
+    low.includes("gpt 4.1")
+  ) {
+    return 1_000_000;
+  }
+  if (
+    low.includes("gpt-5") ||
+    low.includes("gpt 5") ||
+    low.includes("gpt-6") ||
+    low.includes("gpt 6")
+  ) {
+    return 400_000;
+  }
   if (
     low.includes("gpt-4o") ||
     low.includes("gpt 4o") ||
@@ -63,27 +80,103 @@ export function inferContextWindow(model?: string, ide?: IdeSource): number {
   ) {
     return 128_000;
   }
-  if ((!low || low === "unknown") && ide === "antigravity") {
-    return 1_000_000;
-  }
   return 200_000;
 }
 
-function estimateEventChars(ev: NormalizedEvent): { inChars: number; outChars: number } {
-  const sumLen = (ev.summary ?? "").length;
-  let payloadLen = 0;
-  if (ev.payload) {
+const MAX_FALLBACK_PAYLOAD_CHARS = 2000;
+const MAX_PRIOR_TURN_PROSE_CHARS = 4000;
+
+function fieldTextLen(val: unknown): number {
+  if (typeof val === "string") return val.length;
+  if (val && typeof val === "object") {
     try {
-      payloadLen = JSON.stringify(ev.payload).length;
+      return JSON.stringify(val).length;
     } catch {
-      payloadLen = 0;
+      return 0;
     }
   }
-  const total = sumLen + Math.min(payloadLen, 8000);
-  if (ev.kind === "user_input" || ev.kind === "tool_end") {
-    return { inChars: total, outChars: 0 };
+  return 0;
+}
+
+interface EventCharEstimate {
+  inChars: number;
+  outChars: number;
+  proseChars: number;
+  totalChars: number;
+}
+
+interface EstTokenAcc {
+  inChars: number;
+  outChars: number;
+  priorProseChars: number;
+  currentTurnProseChars: number;
+  currentTurnTotalChars: number;
+}
+
+function estimateEventChars(ev: NormalizedEvent): EventCharEstimate {
+  const sumLen = (ev.summary ?? "").length;
+  const p = ev.payload;
+  const bodyChars = Math.min(
+    MAX_FALLBACK_PAYLOAD_CHARS,
+    Math.max(
+      typeof ev.bodyLength === "number" && Number.isFinite(ev.bodyLength)
+        ? Math.max(0, Math.round(ev.bodyLength))
+        : 0,
+      fieldTextLen(p?.body),
+      fieldTextLen(p?.prompt)
+    )
+  );
+  const toolInChars = Math.min(
+    MAX_FALLBACK_PAYLOAD_CHARS,
+    Math.max(
+      fieldTextLen(p?.toolArgs),
+      fieldTextLen(p?.toolInput),
+      fieldTextLen(p?.args),
+      fieldTextLen(p?.input)
+    )
+  );
+  const toolOutChars = Math.min(
+    MAX_FALLBACK_PAYLOAD_CHARS,
+    Math.max(
+      fieldTextLen(p?.toolResult),
+      fieldTextLen(p?.resultDetails),
+      fieldTextLen(p?.preview)
+    )
+  );
+
+  if (ev.kind === "user_input") {
+    const totalChars = Math.max(sumLen, bodyChars);
+    return { inChars: totalChars, outChars: 0, proseChars: totalChars, totalChars };
   }
-  return { inChars: Math.round(total * 0.25), outChars: Math.round(total * 0.75) };
+  if (ev.kind === "tool_end") {
+    const totalChars = Math.max(sumLen, toolOutChars, bodyChars);
+    return { inChars: totalChars, outChars: 0, proseChars: 0, totalChars };
+  }
+  if (ev.kind === "tool_start" || ev.kind === "board_mutation") {
+    const totalChars = Math.max(sumLen, toolInChars);
+    return { inChars: 0, outChars: totalChars, proseChars: 0, totalChars };
+  }
+  if (
+    ev.kind === "subagent_spawn" ||
+    ev.kind === "message" ||
+    ev.kind === "assistant_turn_end" ||
+    ev.kind === "subagent_done" ||
+    ev.kind === "thinking_start"
+  ) {
+    const totalChars = Math.max(sumLen, bodyChars);
+    return { inChars: 0, outChars: totalChars, proseChars: totalChars, totalChars };
+  }
+  return { inChars: sumLen, outChars: 0, proseChars: sumLen, totalChars: sumLen };
+}
+
+function calcContextPercent(contextTokens: number, contextWindow: number): number {
+  if (contextTokens <= 0 || contextWindow <= 0) return 0;
+  const rawPct = (contextTokens / contextWindow) * 100;
+  const rounded1 = Math.round(rawPct * 10) / 10;
+  return Math.min(
+    100,
+    rounded1 > 0 ? rounded1 : Math.max(0.01, Math.round(rawPct * 100) / 100)
+  );
 }
 
 export function synthesizeSessionUsage(agents: AgentNodeSnapshot[]): SessionUsageSummary {
@@ -93,6 +186,7 @@ export function synthesizeSessionUsage(agents: AgentNodeSnapshot[]): SessionUsag
   let outputTokens = 0;
   let cachedTokens = 0;
   let peakContextPercent = 0;
+  let peakContextTokens = 0;
   let peakContextAgentId: string | null = null;
   let costSum = 0;
   let hasCost = false;
@@ -108,8 +202,15 @@ export function synthesizeSessionUsage(agents: AgentNodeSnapshot[]): SessionUsag
     inputTokens += u.inputTokens;
     outputTokens += u.outputTokens;
     cachedTokens += u.cachedTokens;
-    if (u.contextPercent >= peakContextPercent && u.contextPercent > 0) {
+    if (
+      u.contextTokens > 0 &&
+      (u.contextPercent > peakContextPercent ||
+        (u.contextPercent === peakContextPercent &&
+          u.contextTokens > peakContextTokens) ||
+        peakContextAgentId === null)
+    ) {
       peakContextPercent = u.contextPercent;
+      peakContextTokens = u.contextTokens;
       peakContextAgentId = a.id;
     }
     if (typeof u.costUsd === "number" && Number.isFinite(u.costUsd)) {
@@ -224,7 +325,7 @@ export function buildSnapshot(
   const reportedDone = new Map<string, boolean>();
   const hasBlocker = new Map<string, boolean>();
   const waitingReason = new Map<string, string | null>();
-  const estTokenAcc = new Map<string, { inChars: number; outChars: number }>();
+  const estTokenAcc = new Map<string, EstTokenAcc>();
   const usageAccById = new Map<string, UsageAcc>();
   const baseUsageById = new Map<string, AgentUsageMetrics>();
   const edgeMap = new Map<string, AgentEdgeSnapshot>();
@@ -356,10 +457,31 @@ export function buildSnapshot(
     actor.lastEpoch = ev.epoch;
     actor.steps = (actor.steps ?? 0) + 1;
 
-    const acc = estTokenAcc.get(actor.id) ?? { inChars: 0, outChars: 0 };
+    const acc = estTokenAcc.get(actor.id) ?? {
+      inChars: 0,
+      outChars: 0,
+      priorProseChars: 0,
+      currentTurnProseChars: 0,
+      currentTurnTotalChars: 0,
+    };
+    if (ev.kind === "user_input") {
+      acc.priorProseChars += Math.min(
+        MAX_PRIOR_TURN_PROSE_CHARS,
+        acc.currentTurnProseChars
+      );
+      acc.currentTurnProseChars = 0;
+      acc.currentTurnTotalChars = 0;
+    }
     const delta = estimateEventChars(ev);
     acc.inChars += delta.inChars;
     acc.outChars += delta.outChars;
+    acc.currentTurnTotalChars += delta.totalChars;
+    if (delta.proseChars > 0) {
+      acc.currentTurnProseChars = Math.min(
+        MAX_PRIOR_TURN_PROSE_CHARS,
+        acc.currentTurnProseChars + delta.proseChars
+      );
+    }
     estTokenAcc.set(actor.id, acc);
     if (!actor.model && typeof ev.payload?.model === "string" && ev.payload.model.trim()) {
       actor.model = ev.payload.model.trim();
@@ -391,6 +513,13 @@ export function buildSnapshot(
         }
       }
       if (
+        typeof uDelta.contextWindow === "number" &&
+        Number.isFinite(uDelta.contextWindow) &&
+        uDelta.contextWindow > 0
+      ) {
+        uAcc.contextWindow = Math.round(uDelta.contextWindow);
+      }
+      if (
         typeof uDelta.inputTokens === "number" ||
         typeof uDelta.outputTokens === "number" ||
         typeof uDelta.cachedTokens === "number"
@@ -414,15 +543,18 @@ export function buildSnapshot(
           uAcc.inputTokens += inTok;
           uAcc.outputTokens += outTok;
           uAcc.cachedTokens += cachedTok;
-          if (typeof uDelta.contextTokens === "number") {
+          if (
+            typeof uDelta.contextTokens === "number" &&
+            Number.isFinite(uDelta.contextTokens)
+          ) {
             uAcc.contextTokens = Math.max(
               uAcc.contextTokens,
               Math.round(uDelta.contextTokens)
             );
-          } else {
+          } else if (typeof uDelta.inputTokens === "number" && inTok > 0) {
             uAcc.contextTokens = Math.max(
               uAcc.contextTokens,
-              uAcc.inputTokens + uAcc.outputTokens
+              inTok + cachedTok + outTok
             );
           }
         }
@@ -765,12 +897,17 @@ export function buildSnapshot(
     if (uAcc?.hasExplicitUsage) {
       const model = uAcc.model || node.model || baseUsage?.model || "Unknown";
       const totalTokens = uAcc.inputTokens + uAcc.outputTokens + uAcc.cachedTokens;
-      const contextWindow = inferContextWindow(model, node.ide);
+      const explicitContextWindow =
+        uAcc.contextWindow && uAcc.contextWindow > 0
+          ? uAcc.contextWindow
+          : baseUsage?.contextWindow &&
+              baseUsage.contextWindow > 0 &&
+              (!uAcc.model || baseUsage.model === model)
+            ? baseUsage.contextWindow
+            : undefined;
+      const contextWindow = explicitContextWindow ?? inferContextWindow(model, node.ide);
       const contextTokens = uAcc.contextTokens;
-      const contextPercent =
-        contextWindow > 0
-          ? Math.min(100, Math.round((contextTokens / contextWindow) * 1000) / 10)
-          : 0;
+      const contextPercent = calcContextPercent(contextTokens, contextWindow);
       node.usage = {
         model,
         modelSource:
@@ -794,17 +931,29 @@ export function buildSnapshot(
     } else if (isAtLiveTail && baseUsage) {
       node.usage = baseUsage;
     } else {
-      const acc = estTokenAcc.get(node.id) ?? { inChars: 0, outChars: 0 };
+      const acc = estTokenAcc.get(node.id) ?? {
+        inChars: 0,
+        outChars: 0,
+        priorProseChars: 0,
+        currentTurnProseChars: 0,
+        currentTurnTotalChars: 0,
+      };
       const inputTokens = Math.round(acc.inChars / 4);
       const outputTokens = Math.round(acc.outChars / 4);
       const totalTokens = inputTokens + outputTokens;
       const model = uAcc?.model || node.model || baseUsage?.model || "Unknown";
-      const contextWindow = inferContextWindow(model, node.ide);
-      const contextTokens = totalTokens;
-      const contextPercent =
-        contextWindow > 0
-          ? Math.min(100, Math.round((contextTokens / contextWindow) * 1000) / 10)
-          : 0;
+      const explicitContextWindow =
+        uAcc?.contextWindow && uAcc.contextWindow > 0
+          ? uAcc.contextWindow
+          : baseUsage?.contextWindow &&
+              baseUsage.contextWindow > 0 &&
+              (!uAcc?.model || baseUsage.model === model)
+            ? baseUsage.contextWindow
+            : undefined;
+      const contextWindow = explicitContextWindow ?? inferContextWindow(model, node.ide);
+      const activeContextChars = acc.priorProseChars + acc.currentTurnTotalChars;
+      const contextTokens = Math.min(totalTokens, Math.round(activeContextChars / 4));
+      const contextPercent = calcContextPercent(contextTokens, contextWindow);
       const estUsage: AgentUsageMetrics = {
         model,
         modelSource: node.model ? "exact" : baseUsage?.modelSource ?? "unknown",

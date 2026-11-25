@@ -1,5 +1,5 @@
 import type { AgentNodeSnapshot, SessionUsageSummary } from "../types.js";
-import { synthesizeSessionUsage } from "../state/snapshot.js";
+import { inferContextWindow, synthesizeSessionUsage } from "../state/snapshot.js";
 import {
   escHtml,
   fmtContextWindow,
@@ -96,6 +96,21 @@ export class UsageDashboard {
         : 0;
     const srcBadge = usageSourceBadge(summary.usageSource);
     const peakZone = getContextZone(summary.peakContextPercent);
+    const peakAgent =
+      (summary.peakContextAgentId
+        ? aiAgents.find((a) => a.id === summary.peakContextAgentId)
+        : undefined) ??
+      [...aiAgents].sort(
+        (a, b) =>
+          (b.usage?.contextPercent ?? 0) - (a.usage?.contextPercent ?? 0) ||
+          (b.usage?.contextTokens ?? 0) - (a.usage?.contextTokens ?? 0)
+      )[0];
+    const peakCtxTok = peakAgent?.usage?.contextTokens ?? 0;
+    const peakCtxWin =
+      peakAgent?.usage?.contextWindow ??
+      (peakAgent
+        ? inferContextWindow(peakAgent.usage?.model || peakAgent.model, peakAgent.ide)
+        : 0);
     const peakAgentLabel = summary.peakContextAgentId
       ? formatActorName(summary.peakContextAgentId, opts.labelMap)
       : "—";
@@ -182,9 +197,15 @@ export class UsageDashboard {
         const cached = u?.cachedTokens ?? 0;
         const fresh = input + output;
         const agentCachePct = total > 0 ? Math.round((cached / total) * 100) : 0;
-        const ctxTok = u?.contextTokens ?? total;
-        const ctxWin = u?.contextWindow ?? 1_000_000;
-        const ctxPct = Math.max(0, Math.min(100, u?.contextPercent ?? 0));
+        const ctxTok = u?.contextTokens ?? fresh;
+        const ctxWin = u?.contextWindow ?? inferContextWindow(modelName, a.ide);
+        const ctxPct = Math.max(
+          0,
+          Math.min(
+            100,
+            u?.contextPercent ?? (ctxWin > 0 ? (ctxTok / ctxWin) * 100 : 0)
+          )
+        );
         const zone = getContextZone(ctxPct);
 
         const relScale = maxAgentTokens > 0 ? (total / maxAgentTokens) * 100 : 0;
@@ -298,7 +319,10 @@ export class UsageDashboard {
               <span>Peak Context</span>
               <span class="zone-pill zone-${peakZone.cssClass}">${escHtml(peakZone.label)}</span>
             </div>
-            <b class="kpi-${peakZone.cssClass}">${summary.peakContextPercent.toFixed(1)}%</b>
+            <div class="usage-kpi-val">
+              <b class="kpi-${peakZone.cssClass}">${summary.peakContextPercent.toFixed(1)}%</b>
+              ${peakCtxWin > 0 ? `<span class="usage-kpi-tot muted">${fmtTokens(peakCtxTok)} / ${fmtContextWindow(peakCtxWin)}</span>` : ""}
+            </div>
             <small class="muted">Peak: ${escHtml(trunc(peakAgentLabel, 22))}</small>
           </div>
 

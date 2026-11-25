@@ -15,6 +15,8 @@ import {
   STALE_SESSION_SEC,
   TelemetryAggregator,
   buildSessionSnapshot,
+  canonicalDedupToolName,
+  classifyExternalTool,
   cleanHumanSummary,
   deduplicateEvents,
   inferContextWindow,
@@ -1705,11 +1707,13 @@ describe("Hybrid Telemetry Adapters, Deduplication, State Machine & hook-emit", 
     });
     const rootNode = snap.agents.find((a) => a.id === "root");
     assert.equal(rootNode?.model, "GPT-5.2 Astra");
-    assert.equal(rootNode?.usage?.inputTokens, 58_000);
+    assert.equal(rootNode?.usage?.inputTokens, 46_000);
     assert.equal(rootNode?.usage?.outputTokens, 1500);
     assert.equal(rootNode?.usage?.cachedTokens, 12_000);
-    // Latest turn occupancy (8000 + 2000 + 500 = 10500), NOT latched at 61000
-    assert.equal(rootNode?.usage?.contextTokens, 10_500);
+    assert.equal(rootNode?.usage?.totalTokens, 59_500);
+    // Latest turn occupancy (8000 inclusive prompt + 500 output = 8500), NOT double-counted or latched at 61000
+    assert.equal(rootNode?.usage?.contextTokens, 8500);
+    assert.equal(rootNode?.usage?.contextWindow, 400_000);
     const bgNode = snap.agents.find((a) => a.id === "breakglass");
     assert.ok(bgNode);
     assert.equal(bgNode.status, "THINKING", "spawned subagent enters THINKING, not IDLE");
@@ -1776,8 +1780,10 @@ describe("Hybrid Telemetry Adapters, Deduplication, State Machine & hook-emit", 
     assert.ok(subBg);
     assert.equal(subBg.model, "GPT-5.2 Astra");
     assert.equal(subBg.usage?.usageSource, "exact");
-    assert.equal(subBg.usage?.inputTokens, 4000);
+    assert.equal(subBg.usage?.inputTokens, 3000);
+    assert.equal(subBg.usage?.cachedTokens, 1000);
     assert.equal(subBg.usage?.outputTokens, 300);
+    assert.equal(subBg.usage?.totalTokens, 4300);
 
     // Synthetic mcp-* sessions must sort below real IDE sessions
     agg.ingest([
@@ -3478,6 +3484,869 @@ describe("Hybrid Telemetry Adapters, Deduplication, State Machine & hook-emit", 
     assert.equal(subAgents[0]?.id, "hook-uuid-dual-1");
     assert.equal(subAgents[0]?.model, "Claude Sonnet 4.5");
     assert.equal(subAgents[0]?.status, "DONE");
+  });
+
+  it("S1-56 & BUG-20 (1): hook-emit root UUID guard, summarizeToolCall, write_agent/read_agent message edges, and Copilot inclusive usage", async () => {
+    const wsDir = path.join(tmpDir, "s156-hook-ws");
+    await fs.mkdir(wsDir, { recursive: true });
+    const offlineFetch: typeof fetch = () =>
+      Promise.reject(new Error("ECONNREFUSED"));
+
+    // 1. Root UUID guard: agent_id === sessionId on copilot-vscode stays "root" (never phantom UUID)
+    const rootUuidStop = await runHookEmit(
+      ["--ide", "copilot-vscode", "--event", "Stop"],
+      {
+        stdinText: JSON.stringify({
+          sessionId: "11111111-2222-3333-4444-555555555555",
+          agent_id: "11111111-2222-3333-4444-555555555555",
+          cwd: wsDir,
+        }),
+        stdout: () => undefined,
+        stderr: () => undefined,
+        fetchImpl: offlineFetch,
+      },
+    );
+    assert.equal(rootUuidStop.event?.agentId, "root");
+    assert.equal(rootUuidStop.event?.parentAgentId, undefined);
+    assert.equal(rootUuidStop.event?.kind, "assistant_turn_end");
+    assert.equal(rootUuidStop.event?.summary, "Stop (Coordinator)");
+
+    // parent_agent_id === sessionId resolves parentAgentId to "root"
+    const subWithParentUuid = await runHookEmit(
+      ["--ide", "copilot-vscode", "--event", "PreToolUse"],
+      {
+        stdinText: JSON.stringify({
+          sessionId: "11111111-2222-3333-4444-555555555555",
+          agent_id: "sub-worker-99",
+          parent_agent_id: "11111111-2222-3333-4444-555555555555",
+          agent_type: "qa-validator",
+          cwd: wsDir,
+          tool_name: "view",
+          tool_input: { path: "src/app.ts" },
+        }),
+        stdout: () => undefined,
+        stderr: () => undefined,
+        fetchImpl: offlineFetch,
+      },
+    );
+    assert.equal(subWithParentUuid.event?.agentId, "sub-worker-99");
+    assert.equal(subWithParentUuid.event?.parentAgentId, "root");
+    assert.equal(subWithParentUuid.event?.summary, "Read app.ts");
+
+    // 2. PreToolUse / PostToolUse / PostToolUseFailure use summarizeToolCall with Completed:/Failed: prefix
+    const preRead = await runHookEmit(
+      ["--ide", "copilot-vscode", "--event", "PreToolUse"],
+      {
+        stdinText: JSON.stringify({
+          sessionId: "s156-h1",
+          cwd: wsDir,
+          tool_name: "Read",
+          tool_use_id: "tc-r-1",
+          tool_input: { file_path: "src/telemetry/types.ts" },
+          usage: { promptTokens: 10_000, cachedTokens: 8000, completionTokens: 250 },
+        }),
+        stdout: () => undefined,
+        stderr: () => undefined,
+        fetchImpl: offlineFetch,
+      },
+    );
+    assert.equal(preRead.event?.summary, "Read types.ts");
+    assert.ok(!preRead.event?.summary.startsWith("PreToolUse:"));
+    assert.equal(preRead.event?.usageDelta?.inputTokens, 2000);
+    assert.equal(preRead.event?.usageDelta?.cachedTokens, 8000);
+    assert.equal(preRead.event?.usageDelta?.outputTokens, 250);
+    assert.equal(preRead.event?.usageDelta?.contextTokens, 10_250);
+
+    const postOk = await runHookEmit(
+      ["--ide", "copilot-vscode", "--event", "PostToolUse"],
+      {
+        stdinText: JSON.stringify({
+          sessionId: "s156-h1",
+          cwd: wsDir,
+          tool_name: "powershell",
+          tool_use_id: "tc-ps-1",
+          tool_input: { command: "npm test" },
+        }),
+        stdout: () => undefined,
+        stderr: () => undefined,
+        fetchImpl: offlineFetch,
+      },
+    );
+    assert.equal(postOk.event?.summary, "Completed: Ran unit tests");
+
+    const postFail = await runHookEmit(
+      ["--ide", "copilot-vscode", "--event", "PostToolUseFailure"],
+      {
+        stdinText: JSON.stringify({
+          sessionId: "s156-h1",
+          cwd: wsDir,
+          tool_name: "copilot_replaceString",
+          tool_use_id: "tc-rep-1",
+          tool_input: { filePath: "src/index.ts" },
+        }),
+        stdout: () => undefined,
+        stderr: () => undefined,
+        fetchImpl: offlineFetch,
+      },
+    );
+    assert.equal(postFail.event?.summary, "Failed: Edited index.ts");
+
+    // 3. write_agent & read_agent promote to kind="message" with targetAgentId edge
+    const writeAg = await runHookEmit(
+      ["--ide", "copilot-vscode", "--event", "PreToolUse"],
+      {
+        stdinText: JSON.stringify({
+          sessionId: "s156-h1",
+          cwd: wsDir,
+          tool_name: "write_agent",
+          tool_use_id: "tc-wa-1",
+          tool_input: { agent_id: "backend-engineer", message: "Implement API" },
+        }),
+        stdout: () => undefined,
+        stderr: () => undefined,
+        fetchImpl: offlineFetch,
+      },
+    );
+    assert.equal(writeAg.event?.kind, "message");
+    assert.equal(writeAg.event?.targetAgentId, "backend-engineer");
+    assert.match(writeAg.event?.summary ?? "", /Message backend-engineer: Implement API/);
+
+    const readAg = await runHookEmit(
+      ["--ide", "copilot-vscode", "--event", "PreToolUse"],
+      {
+        stdinText: JSON.stringify({
+          sessionId: "s156-h1",
+          cwd: wsDir,
+          tool_name: "read_agent",
+          tool_use_id: "tc-ra-1",
+          tool_input: { agent_id: "backend-engineer" },
+        }),
+        stdout: () => undefined,
+        stderr: () => undefined,
+        fetchImpl: offlineFetch,
+      },
+    );
+    assert.equal(readAg.event?.kind, "message");
+    assert.equal(readAg.event?.targetAgentId, "backend-engineer");
+
+    const msgSnap = buildSessionSnapshot([writeAg.event!, readAg.event!], {
+      sessionId: "s156-h1",
+      ide: "copilot-vscode",
+      nowEpochSec: Date.now() / 1000 + 2,
+    });
+    assert.ok(
+      msgSnap.edges.some((e) => e.from === "root" && e.to === "backend-engineer" && e.lastKind === "message"),
+      "write_agent/read_agent must create root -> target message edge",
+    );
+    assert.equal(
+      msgSnap.agents.some((a) => a.id.startsWith("ext:")),
+      false,
+      "write_agent/read_agent must return null external target",
+    );
+  });
+
+  it("S1-56 (2): cleanHumanSummary empty-label file:// links, expanded Copilot tools & classification, and inferContextWindow alignment", () => {
+    assert.equal(
+      cleanHumanSummary("Check [](file:///d:/repo/src/app.ts#L10-L20) and [types.ts](file:///d:/repo/types.ts)", 140),
+      "Check app.ts and types.ts",
+    );
+    assert.equal(
+      cleanHumanSummary("[](file:///c%3A/My%20Repo/my%20file.ts)", 140),
+      "my file.ts",
+    );
+    assert.ok(!cleanHumanSummary("[](file:///d:/repo/app.ts)", 140).includes("file://"));
+
+    // Expanded VS Code / Copilot tools: classification & summaries
+    const fsTools: Array<[string, Record<string, unknown>, string]> = [
+      ["view", { path: "src/view.ts" }, "Read view.ts"],
+      ["rg", { query: "normalizeCopilotUsage" }, "Search: normalizeCopilotUsage"],
+      ["glob", { pattern: "**/*.ts" }, "Find files: **/*.ts"],
+      ["apply_patch", { filePath: "src/patch.ts" }, "Edited patch.ts"],
+      ["copilot_replaceString", { filePath: "src/rep.ts" }, "Edited rep.ts"],
+      ["copilot_multiReplaceString", { filePath: "src/mrep.ts" }, "Edited mrep.ts"],
+      ["copilot_findFiles", { query: "*.md" }, "Find files: *.md"],
+      ["copilot_findTextInFiles", { query: "TODO" }, "Search: TODO"],
+      ["copilot_listDirectory", { path: "src/telemetry" }, "Listed telemetry"],
+      ["copilot_searchCodebase", { query: "auth flow" }, "Codebase search: auth flow"],
+      ["copilot_getErrors", { filePath: "src/bad.ts" }, "Checked errors: bad.ts"],
+      ["edit/editFiles", { filePath: "src/e.ts" }, "Edited e.ts"],
+    ];
+    for (const [tname, args, expectedSum] of fsTools) {
+      assert.equal(classifyExternalTool(tname, args)?.id, "ext:fs", `${tname} -> ext:fs`);
+      assert.equal(summarizeToolCall(tname, args), expectedSum);
+    }
+
+    assert.equal(classifyExternalTool("powershell")?.id, "ext:shell");
+    assert.equal(classifyExternalTool("execute/runInTerminal")?.id, "ext:shell");
+    assert.equal(summarizeToolCall("powershell", { command: "git status" }), "Checked git status");
+    assert.equal(summarizeToolCall("execute/runInTerminal", { command: "npm run check" }), "Ran TypeScript typecheck");
+
+    for (const internalTool of ["sql", "skill", "tool_search_tool", "rename_chat", "manage_todo_list", "write_agent", "read_agent"]) {
+      assert.equal(classifyExternalTool(internalTool), null, `${internalTool} -> null`);
+    }
+    assert.equal(summarizeToolCall("sql", { description: "List tasks" }), "SQL: List tasks");
+    assert.equal(summarizeToolCall("skill", { name: "qa-validation" }), "Loaded skill: qa-validation");
+    assert.equal(summarizeToolCall("tool_search_tool", { query: "board" }), "Search tools: board");
+    assert.equal(summarizeToolCall("rename_chat", { title: "Usage Fix" }), "Renamed chat: Usage Fix");
+    assert.equal(summarizeToolCall("manage_todo_list", {}), "Updated todo list");
+
+    // inferContextWindow alignment
+    assert.equal(inferContextWindow("GPT-5.2 Astra"), 400_000);
+    assert.equal(inferContextWindow("gpt 5 mini"), 400_000);
+    assert.equal(inferContextWindow("gpt-6-preview"), 400_000);
+    assert.equal(inferContextWindow("gpt-4.1"), 1_000_000);
+    assert.equal(inferContextWindow("gpt-4o"), 128_000);
+    assert.equal(inferContextWindow("o4-mini"), 128_000);
+    assert.equal(inferContextWindow("claude-opus-4-6[1m]"), 1_000_000);
+  });
+
+  it("BUG-20 & S1-56 (3): events.jsonl mixed incremental + cumulative (session.usage_checkpoint/session.shutdown), Anthropic vs OpenAI format, and rich assistant.message prose", async () => {
+    const vscDir = path.join(tmpDir, "vsc-events-jsonl");
+    const trDir = path.join(vscDir, "ws1", "GitHub.copilot-chat", "transcripts");
+    await fs.mkdir(trDir, { recursive: true });
+
+    // 1. Mixed incremental + session.usage_checkpoint + session.shutdown (must NOT double-count)
+    const mixedFile = path.join(trDir, "mixed-usage.jsonl");
+    await fs.writeFile(
+      mixedFile,
+      [
+        {
+          type: "session.start",
+          timestamp: "2026-11-25T18:00:00Z",
+          data: { sessionId: "mixed-u1", selectedModel: "claude-sonnet-4.5" },
+        },
+        {
+          type: "user.message",
+          timestamp: "2026-11-25T18:00:01Z",
+          data: { content: "Inspect [](file:///d:/repo/server.ts)" },
+        },
+        {
+          type: "assistant.message",
+          timestamp: "2026-11-25T18:00:02Z",
+          data: {
+            content: "Reading server implementation now.",
+            toolRequests: [
+              { name: "view", toolCallId: "tr-v-1", arguments: { path: "src/server.ts" } },
+            ],
+            usage: { promptTokens: 20_000, cachedTokens: 15_000, completionTokens: 400 },
+          },
+        },
+        {
+          type: "tool.execution_complete",
+          timestamp: "2026-11-25T18:00:03Z",
+          data: { toolCallId: "tr-v-1", toolName: "view", success: true },
+        },
+        {
+          type: "assistant.usage",
+          timestamp: "2026-11-25T18:00:04Z",
+          data: { inputTokens: 25_000, cacheReadTokens: 18_000, outputTokens: 600 },
+        },
+        {
+          type: "assistant.message",
+          timestamp: "2026-11-25T18:00:05Z",
+          data: { content: "Server looks healthy." },
+        },
+        {
+          // Same turn already emitted prose completion -> duplicate Turn completed must be suppressed
+          type: "assistant.turn_end",
+          timestamp: "2026-11-25T18:00:06Z",
+          data: {},
+        },
+        {
+          type: "session.usage_checkpoint",
+          timestamp: "2026-11-25T18:00:07Z",
+          data: {
+            currentTokens: 23_400,
+            tokenLimit: 271_805,
+            inputTokens: 45_000,
+            cachedTokens: 33_000,
+            outputTokens: 1000,
+          },
+        },
+        {
+          type: "session.shutdown",
+          timestamp: "2026-11-25T18:00:08Z",
+          data: {
+            modelMetrics: {
+              "claude-sonnet-4.5": {
+                usage: {
+                  inputTokens: 45_000,
+                  outputTokens: 1000,
+                  cacheReadTokens: 33_000,
+                },
+              },
+            },
+          },
+        },
+      ]
+        .map((r) => JSON.stringify(r))
+        .join("\n") + "\n",
+      "utf8",
+    );
+
+    const adapter = new CopilotVSCodeAdapter({ storageDir: vscDir });
+    const mixedEvs = await adapter.parseTranscriptFile(mixedFile, "mixed-u1", {
+      allowedRoots: [vscDir],
+    });
+    // assistant.message with content + toolRequests emits thinking_start before tool_start
+    const thinkEv = mixedEvs.find((e) => e.kind === "thinking_start");
+    assert.ok(thinkEv, "assistant.message with content + toolRequests must emit thinking_start");
+    assert.equal(thinkEv.summary, "Reading server implementation now.");
+    // Duplicate assistant.turn_end suppressed
+    const turnEnds = mixedEvs.filter((e) => e.kind === "assistant_turn_end");
+    assert.equal(turnEnds.length, 1);
+    assert.equal(turnEnds[0]?.summary, "Server looks healthy.");
+
+    const mixedSnap = buildSessionSnapshot(mixedEvs, {
+      sessionId: "mixed-u1",
+      ide: "copilot-vscode",
+      nowEpochSec: Date.parse("2026-11-25T18:00:10Z") / 1000,
+    });
+    const mRoot = mixedSnap.agents.find((a) => a.id === "root");
+    // Incremental sum: Turn1 fresh (20k-15k=5k) + Turn2 fresh (25k-18k=7k) = 12k; cached = 33k; out = 1000
+    assert.equal(mRoot?.usage?.inputTokens, 12_000);
+    assert.equal(mRoot?.usage?.cachedTokens, 33_000);
+    assert.equal(mRoot?.usage?.outputTokens, 1000);
+    assert.equal(mRoot?.usage?.totalTokens, 46_000);
+    // contextTokens uses checkpoint currentTokens (23_400), NOT shutdown cumulative totals
+    assert.equal(mRoot?.usage?.contextTokens, 23_400);
+    assert.equal(mRoot?.usage?.contextWindow, 271_805);
+
+    // 2. Cumulative-only fallback (0 incremental rows) + Anthropic raw format (inTok < cachedTok)
+    const cumOnlyFile = path.join(trDir, "cum-only.jsonl");
+    await fs.writeFile(
+      cumOnlyFile,
+      [
+        {
+          type: "session.start",
+          timestamp: "2026-11-25T18:05:00Z",
+          data: { sessionId: "cum-u2" },
+        },
+        {
+          type: "user.message",
+          timestamp: "2026-11-25T18:05:01Z",
+          data: { content: "Summarize" },
+        },
+        {
+          type: "session.usage_checkpoint",
+          timestamp: "2026-11-25T18:05:02Z",
+          data: { currentTokens: 19_500, tokenLimit: 921_805 },
+        },
+        {
+          type: "session.shutdown",
+          timestamp: "2026-11-25T18:05:03Z",
+          data: {
+            modelMetrics: {
+              "claude-opus-4.5": {
+                usage: {
+                  inputTokens: 1500,
+                  outputTokens: 500,
+                  cacheReadTokens: 18_000,
+                },
+              },
+            },
+          },
+        },
+      ]
+        .map((r) => JSON.stringify(r))
+        .join("\n") + "\n",
+      "utf8",
+    );
+    const cumEvs = await adapter.parseTranscriptFile(cumOnlyFile, "cum-u2", {
+      allowedRoots: [vscDir],
+    });
+    const cumSnap = buildSessionSnapshot(cumEvs, {
+      sessionId: "cum-u2",
+      ide: "copilot-vscode",
+      nowEpochSec: Date.parse("2026-11-25T18:05:10Z") / 1000,
+    });
+    const cRoot = cumSnap.agents.find((a) => a.id === "root");
+    assert.equal(cRoot?.model, "Claude Opus 4.5");
+    assert.equal(cRoot?.usage?.inputTokens, 1500, "inTok < cachedTok preserves raw fresh input");
+    assert.equal(cRoot?.usage?.cachedTokens, 18_000);
+    assert.equal(cRoot?.usage?.outputTokens, 500);
+    assert.equal(cRoot?.usage?.totalTokens, 20_000);
+    assert.equal(cRoot?.usage?.contextTokens, 19_500);
+    assert.equal(cRoot?.usage?.contextWindow, 921_805);
+  });
+
+  it("BUG-20 & S1-56 (4): chatSessions maxInputTokens, completionTokens-only turn preserves toolCallRounds, rich items, and non-cumulative fallback", async () => {
+    const vscDir = path.join(tmpDir, "vsc-chat-b20");
+    const chatDir = path.join(vscDir, "ws1", "chatSessions");
+    await fs.mkdir(chatDir, { recursive: true });
+    const baseMs = Date.parse("2026-11-25T19:00:00Z");
+
+    // 1. Exact usage + maxInputTokens (135805) + completionTokens-only turn + rich items
+    await fs.writeFile(
+      path.join(chatDir, "chat-rich-1.json"),
+      JSON.stringify({
+        sessionId: "chat-rich-1",
+        creationDate: baseMs,
+        inputState: {
+          selectedModel: {
+            id: "copilot/gpt-5",
+            metadata: { id: "gpt-5", maxInputTokens: 135_805 },
+          },
+        },
+        requests: [
+          {
+            requestId: "cr-1",
+            timestamp: baseMs,
+            message: { text: "Check [](file:///d:/repo/src/widget.ts)" },
+            completionTokens: 422,
+            response: [
+              {
+                kind: "thinking",
+                generatedTitle: "Analyzing widget layout",
+                value: "Detailed internal reasoning about widget padding and grid alignment.",
+              },
+              {
+                kind: "textEditGroup",
+                uri: { fsPath: "d:\\repo\\src\\widget.ts" },
+              },
+              {
+                kind: "markdownContent",
+                value: "Updated widget layout in [widget.ts](file:///d:/repo/src/widget.ts).",
+              },
+            ],
+            modelState: { completedAt: baseMs + 2000 },
+            result: {
+              metadata: {
+                toolCallRounds: [
+                  {
+                    usage: {
+                      promptTokens: 30_000,
+                      cachedTokens: 20_000,
+                      completionTokens: 422,
+                    },
+                  },
+                ],
+              },
+            },
+          },
+          {
+            // Turn 2 has bare completionTokens ONLY (no promptTokens/roundUsages) -> must preserve Turn 1 contextTokens!
+            requestId: "cr-2",
+            timestamp: baseMs + 5000,
+            message: { text: "Looks good?" },
+            completionTokens: 150,
+            response: [{ kind: "markdownContent", value: "All verified." }],
+            modelState: { completedAt: baseMs + 6000 },
+          },
+        ],
+      }),
+      "utf8",
+    );
+
+    const adapter = new CopilotVSCodeAdapter({ storageDir: vscDir });
+    const sessions = await adapter.discoverSessions();
+    const s1 = sessions.find((s) => s.sessionId === "chat-rich-1");
+    assert.ok(s1);
+    const evs1 = await adapter.parseSession(s1);
+    assert.ok(evs1.some((e) => e.kind === "user_input" && e.summary === "Human: Check widget.ts"));
+    const thinkEv = evs1.find((e) => e.kind === "thinking_start");
+    assert.equal(thinkEv?.summary, "Analyzing widget layout");
+    assert.ok((thinkEv?.bodyLength ?? 0) > 20);
+    assert.ok(evs1.some((e) => e.kind === "tool_start" && e.summary === "Edit widget.ts"));
+    assert.ok(evs1.some((e) => e.kind === "assistant_turn_end" && e.summary === "Updated widget layout in widget.ts."));
+
+    const snap1 = buildSessionSnapshot(evs1, {
+      sessionId: "chat-rich-1",
+      ide: "copilot-vscode",
+      nowEpochSec: (baseMs + 10_000) / 1000,
+    });
+    const r1 = snap1.agents.find((a) => a.id === "root");
+    assert.equal(r1?.usage?.contextWindow, 135_805);
+    assert.equal(r1?.usage?.inputTokens, 10_000, "roundUsages promptTokens minus cachedTokens");
+    assert.equal(r1?.usage?.cachedTokens, 20_000);
+    assert.equal(r1?.usage?.outputTokens, 572, "422 + 150");
+    assert.equal(r1?.usage?.contextTokens, 30_422, "completionTokens-only Turn 2 must NOT overwrite Turn 1 contextTokens with 150");
+
+    // 2. Fallback estimation without exact usage: never JSON.stringify(req.response), non-cumulative across turns
+    const hugeToolPayload = "X".repeat(20_000);
+    await fs.writeFile(
+      path.join(chatDir, "chat-est-2.json"),
+      JSON.stringify({
+        sessionId: "chat-est-2",
+        creationDate: baseMs + 20_000,
+        requests: [
+          {
+            requestId: "er-1",
+            timestamp: baseMs + 20_000,
+            message: { text: "First question" },
+            response: [
+              {
+                kind: "toolInvocationSerialized",
+                toolId: "copilot_readFile",
+                toolCallId: "e-tc-1",
+                isComplete: true,
+                pastTenseMessage: { value: "Read big.ts" },
+                toolSpecificData: { hugeBlob: hugeToolPayload },
+                resultDetails: hugeToolPayload,
+              },
+            ],
+            modelState: { completedAt: baseMs + 21_000 },
+          },
+          {
+            requestId: "er-2",
+            timestamp: baseMs + 25_000,
+            message: { text: "Second short turn" },
+            response: [{ kind: "markdownContent", value: "Short answer." }],
+            modelState: { completedAt: baseMs + 26_000 },
+          },
+        ],
+      }),
+      "utf8",
+    );
+    const sessions2 = await adapter.discoverSessions();
+    const s2 = sessions2.find((s) => s.sessionId === "chat-est-2");
+    assert.ok(s2);
+    const snap2 = buildSessionSnapshot(await adapter.parseSession(s2), {
+      sessionId: "chat-est-2",
+      ide: "copilot-vscode",
+      nowEpochSec: (baseMs + 30_000) / 1000,
+    });
+    const r2 = snap2.agents.find((a) => a.id === "root");
+    assert.equal(r2?.usage?.usageSource, "estimated");
+    assert.ok(
+      (r2?.usage?.totalTokens ?? 9999) < 100,
+      `huge toolSpecificData/resultDetails must not inflate estimated tokens (got ${r2?.usage?.totalTokens})`,
+    );
+  });
+
+  it("S1-56 & BUG-20 (5): normalizer canonicalDedupToolName Tier-2 dedup, VS Code Synced Data subagent reconciliation, and non-cumulative fallback cap", () => {
+    // 1. canonicalDedupToolName mapping
+    assert.equal(canonicalDedupToolName("Read"), "fs_read");
+    assert.equal(canonicalDedupToolName("view"), "fs_read");
+    assert.equal(canonicalDedupToolName("copilot_readFile"), "fs_read");
+    assert.equal(canonicalDedupToolName("Bash"), "shell");
+    assert.equal(canonicalDedupToolName("powershell"), "shell");
+    assert.equal(canonicalDedupToolName("run_in_terminal"), "shell");
+    assert.equal(canonicalDedupToolName("Edit"), "fs_edit");
+    assert.equal(canonicalDedupToolName("apply_patch"), "fs_edit");
+    assert.equal(canonicalDedupToolName("copilot_replaceString"), "fs_edit");
+    assert.equal(canonicalDedupToolName("Grep"), "fs_search");
+    assert.equal(canonicalDedupToolName("rg"), "fs_search");
+    assert.equal(canonicalDedupToolName("copilot_findTextInFiles"), "fs_search");
+    assert.equal(canonicalDedupToolName("Glob"), "fs_glob");
+    assert.equal(canonicalDedupToolName("glob"), "fs_glob");
+    assert.equal(canonicalDedupToolName("copilot_findFiles"), "fs_glob");
+    assert.equal(canonicalDedupToolName("Agent"), "subagent");
+    assert.equal(canonicalDedupToolName("runSubagent"), "subagent");
+
+    // Cross-channel Tier-2 dedup across tool aliases without toolCallId
+    const ep = 1_796_000_000;
+    const deduped = deduplicateEvents([
+      {
+        id: "h-view-1",
+        ts: toIsoTest(ep),
+        epoch: ep,
+        ide: "copilot-vscode",
+        channel: "hook",
+        sessionId: "alias-s1",
+        agentId: "root",
+        kind: "tool_start",
+        toolName: "view",
+        summary: "Read app.ts",
+      },
+      {
+        id: "p-copilot-read-1",
+        ts: toIsoTest(ep + 0.8),
+        epoch: ep + 0.8,
+        ide: "copilot-vscode",
+        channel: "passive",
+        sessionId: "alias-s1",
+        agentId: "root",
+        kind: "tool_start",
+        toolName: "copilot_readFile",
+        summary: "Read src/app.ts",
+      },
+    ]);
+    assert.equal(deduped.length, 1, "Tier-2 alias pair (view vs copilot_readFile) must merge");
+
+    // 2. "VS Code Synced Data:break-glass" vs "BreakGlass" reconciliation
+    const recSnap = buildSessionSnapshot(
+      [
+        {
+          id: "p-bg-spawn",
+          ts: toIsoTest(ep),
+          epoch: ep,
+          ide: "copilot-vscode",
+          channel: "passive",
+          sessionId: "ns-s1",
+          agentId: "root",
+          targetAgentId: "vs-code-synced-data-break-glass",
+          kind: "subagent_spawn",
+          toolName: "runSubagent",
+          summary: "Spawned VS Code Synced Data:break-glass",
+          payload: {
+            agentLabel: "VS Code Synced Data:break-glass",
+            _passiveSource: "chatSessions",
+          },
+        },
+        {
+          id: "h-bg-spawn",
+          ts: toIsoTest(ep + 0.5),
+          epoch: ep + 0.5,
+          ide: "copilot-vscode",
+          channel: "hook",
+          sessionId: "ns-s1",
+          agentId: "root",
+          targetAgentId: "uuid-breakglass-1",
+          kind: "subagent_spawn",
+          summary: "Spawned BreakGlass",
+          payload: { agentLabel: "BreakGlass", agentType: "BreakGlass" },
+        },
+      ],
+      { sessionId: "ns-s1", ide: "copilot-vscode", nowEpochSec: ep + 3 },
+    );
+    const recSubs = recSnap.agents.filter((a) => a.nodeType === "agent" && !a.isRoot);
+    assert.equal(recSubs.length, 1, "VS Code Synced Data:break-glass and BreakGlass must reconcile to 1 node");
+    assert.equal(recSubs[0]?.id, "uuid-breakglass-1");
+    assert.equal(recSubs[0]?.label, "BreakGlass");
+
+    // 3. Normalizer non-cumulative fallback cap (2000/event + latest user_input turn + bounded prior prose)
+    const fbNormSnap = buildSessionSnapshot(
+      [
+        {
+          id: "nf-u1",
+          ts: toIsoTest(ep),
+          epoch: ep,
+          ide: "copilot-vscode",
+          channel: "hook",
+          sessionId: "nf-s1",
+          agentId: "root",
+          kind: "user_input",
+          summary: "Human: Turn 1",
+          payload: { body: "P".repeat(8000) },
+        },
+        {
+          id: "nf-t1",
+          ts: toIsoTest(ep + 1),
+          epoch: ep + 1,
+          ide: "copilot-vscode",
+          channel: "hook",
+          sessionId: "nf-s1",
+          agentId: "root",
+          kind: "tool_end",
+          toolName: "read_file",
+          summary: "Completed: Read huge.ts",
+          payload: { toolResult: "R".repeat(30_000) },
+        },
+        {
+          id: "nf-u2",
+          ts: toIsoTest(ep + 10),
+          epoch: ep + 10,
+          ide: "copilot-vscode",
+          channel: "hook",
+          sessionId: "nf-s1",
+          agentId: "root",
+          kind: "user_input",
+          summary: "Human: Turn 2",
+          payload: { body: "Q".repeat(400) },
+        },
+      ],
+      { sessionId: "nf-s1", ide: "copilot-vscode", nowEpochSec: ep + 12 },
+    );
+    const nfRoot = fbNormSnap.agents.find((a) => a.id === "root");
+    // Turn 1 prose capped at 2000/event, Turn 1 tool_end excluded from prior prose, Turn 2 = 400 -> (2000 + 400)/4 = 600
+    assert.equal(nfRoot?.usage?.contextTokens, 600);
+  });
+
+  it("BUG-20 P1 & P2: incremental hook-emit deltas never inflate contextTokens cumulatively, completionTokens-only preserves prior context, [](file:///) -> link, and standalone checkpoint currentTokens", async () => {
+    // 1. P2: [](file:///) returns "link" instead of "file:"
+    assert.equal(cleanHumanSummary("See [](file:///)", 140), "See link");
+
+    // 2. P1: incremental hook-emit deltas (isTotal omitted) in buildSessionSnapshot
+    const wsDir = path.join(tmpDir, "b20-p1-ws");
+    await fs.mkdir(wsDir, { recursive: true });
+    const offlineFetch: typeof fetch = () =>
+      Promise.reject(new Error("ECONNREFUSED"));
+
+    const hTurn1 = await runHookEmit(
+      ["--ide", "copilot-vscode", "--event", "PostToolUse"],
+      {
+        stdinText: JSON.stringify({
+          sessionId: "b20-inc-s1",
+          cwd: wsDir,
+          tool_name: "view",
+          tool_call_id: "inc-tc-1",
+          tool_input: { path: "src/a.ts" },
+          usage: { promptTokens: 20_000, cachedTokens: 15_000, completionTokens: 500 },
+        }),
+        stdout: () => undefined,
+        stderr: () => undefined,
+        fetchImpl: offlineFetch,
+      },
+    );
+    const hTurn2 = await runHookEmit(
+      ["--ide", "copilot-vscode", "--event", "PostToolUse"],
+      {
+        stdinText: JSON.stringify({
+          sessionId: "b20-inc-s1",
+          cwd: wsDir,
+          tool_name: "view",
+          tool_call_id: "inc-tc-2",
+          tool_input: { path: "src/b.ts" },
+          usage: { promptTokens: 12_000, cachedTokens: 8000, completionTokens: 300 },
+        }),
+        stdout: () => undefined,
+        stderr: () => undefined,
+        fetchImpl: offlineFetch,
+      },
+    );
+    const hCompOnly = await runHookEmit(
+      ["--ide", "copilot-vscode", "--event", "Stop"],
+      {
+        stdinText: JSON.stringify({
+          sessionId: "b20-inc-s1",
+          cwd: wsDir,
+          usage: { completionTokens: 422 },
+        }),
+        stdout: () => undefined,
+        stderr: () => undefined,
+        fetchImpl: offlineFetch,
+      },
+    );
+    // Synthetic incremental delta without explicit contextTokens (tests normalizer else-if branch)
+    const rawIncDeltaEv: EnrichedEvent = {
+      id: "raw-inc-no-ctx",
+      ts: toIsoTest(1_797_000_000),
+      epoch: 1_797_000_000,
+      ide: "copilot-vscode",
+      channel: "hook",
+      sessionId: "b20-inc-noctx",
+      agentId: "root",
+      kind: "tool_end",
+      toolName: "view",
+      summary: "Completed: Read c.ts",
+      usageDelta: {
+        usageSource: "exact",
+        inputTokens: 4000,
+        cachedTokens: 6000,
+        outputTokens: 200,
+      },
+    };
+    const rawCompOnlyEv: EnrichedEvent = {
+      id: "raw-comp-only",
+      ts: toIsoTest(1_797_000_005),
+      epoch: 1_797_000_005,
+      ide: "copilot-vscode",
+      channel: "hook",
+      sessionId: "b20-inc-noctx",
+      agentId: "root",
+      kind: "assistant_turn_end",
+      summary: "Turn completed",
+      usageDelta: {
+        usageSource: "exact",
+        outputTokens: 422,
+      },
+    };
+
+    const hookSnap = buildSessionSnapshot(
+      [hTurn1.event!, hTurn2.event!, hCompOnly.event!],
+      {
+        sessionId: "b20-inc-s1",
+        ide: "copilot-vscode",
+        nowEpochSec: Date.now() / 1000 + 5,
+      },
+    );
+    const hRoot = hookSnap.agents.find((a) => a.id === "root");
+    // Fresh input = (20k-15k) + (12k-8k) = 9000; cached = 23000; output = 500+300+422 = 1222
+    assert.equal(hRoot?.usage?.inputTokens, 9000);
+    assert.equal(hRoot?.usage?.cachedTokens, 23_000);
+    assert.equal(hRoot?.usage?.outputTokens, 1222);
+    // Turn 2 active context = 12300 (smaller than Turn 1's 20500, and NOT overwritten by 422 or summed to 32800)
+    assert.equal(hRoot?.usage?.contextTokens, 12_300);
+
+    const noCtxSnap = buildSessionSnapshot(
+      [
+        { ...rawIncDeltaEv, id: "raw-inc-prev", epoch: 1_796_999_990, ts: toIsoTest(1_796_999_990), usageDelta: { usageSource: "exact", inputTokens: 8000, cachedTokens: 10_000, outputTokens: 100 } },
+        rawIncDeltaEv,
+        rawCompOnlyEv,
+      ],
+      {
+        sessionId: "b20-inc-noctx",
+        ide: "copilot-vscode",
+        nowEpochSec: 1_797_000_010,
+      },
+    );
+    const ncRoot = noCtxSnap.agents.find((a) => a.id === "root");
+    assert.equal(ncRoot?.usage?.inputTokens, 12_000);
+    assert.equal(ncRoot?.usage?.cachedTokens, 16_000);
+    assert.equal(ncRoot?.usage?.outputTokens, 722);
+    assert.equal(ncRoot?.usage?.contextTokens, 10_200, "else-if active turn = 4000 + 6000 + 200, preserved across completionTokens-only turn");
+
+    // 3. P2: extractUriBasename strips ?query#hash and standalone session.usage_checkpoint currentTokens sets hasExact
+    const vscDir = path.join(tmpDir, "b20-p2-vsc");
+    const chatDir = path.join(vscDir, "ws1", "chatSessions");
+    const trDir = path.join(vscDir, "ws1", "GitHub.copilot-chat", "transcripts");
+    await fs.mkdir(chatDir, { recursive: true });
+    await fs.mkdir(trDir, { recursive: true });
+
+    const baseMs = Date.parse("2026-11-25T20:00:00Z");
+    await fs.writeFile(
+      path.join(chatDir, "uri-q.json"),
+      JSON.stringify({
+        sessionId: "uri-q",
+        creationDate: baseMs,
+        requests: [
+          {
+            requestId: "uq-1",
+            timestamp: baseMs,
+            message: { text: "Edit file" },
+            response: [
+              {
+                kind: "textEditGroup",
+                uri: { external: "file:///d%3A/repo/src/clean.ts?v=1#L12" },
+              },
+            ],
+            modelState: { completedAt: baseMs + 1000 },
+          },
+        ],
+      }),
+      "utf8",
+    );
+    const trOnlyCk = path.join(trDir, "ck-only.jsonl");
+    await fs.writeFile(
+      trOnlyCk,
+      [
+        { type: "session.start", timestamp: "2026-11-25T20:05:00Z", data: { sessionId: "ck-only" } },
+        { type: "user.message", timestamp: "2026-11-25T20:05:01Z", data: { content: "Check" } },
+        {
+          type: "session.usage_checkpoint",
+          timestamp: "2026-11-25T20:05:02Z",
+          data: { currentTokens: 15_000, tokenLimit: 200_000 },
+        },
+      ]
+        .map((r) => JSON.stringify(r))
+        .join("\n") + "\n",
+      "utf8",
+    );
+
+    const adapter = new CopilotVSCodeAdapter({ storageDir: vscDir });
+    const chatEvs = await adapter.parseSession({
+      ide: "copilot-vscode",
+      sessionId: "uri-q",
+      filePath: path.join(chatDir, "uri-q.json"),
+      workspaces: [],
+      mtimeMs: baseMs,
+      sizeBytes: 100,
+      isMultiAgent: false,
+    });
+    assert.ok(chatEvs.some((e) => e.summary === "Edit clean.ts"));
+
+    const ckEvs = await adapter.parseTranscriptFile(trOnlyCk, "ck-only", {
+      allowedRoots: [vscDir],
+    });
+    const ckSnap = buildSessionSnapshot(ckEvs, {
+      sessionId: "ck-only",
+      ide: "copilot-vscode",
+      nowEpochSec: Date.parse("2026-11-25T20:05:10Z") / 1000,
+    });
+    const ckRoot = ckSnap.agents.find((a) => a.id === "root");
+    assert.equal(ckRoot?.usage?.contextTokens, 15_000);
+    assert.equal(ckRoot?.usage?.contextWindow, 200_000);
   });
 });
 
