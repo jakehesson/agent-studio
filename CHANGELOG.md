@@ -5,6 +5,15 @@ All notable changes to **Agent Studio** will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.9.1] - 2026-11-25
+
+### Fixed
+- **VS Code Copilot Telemetry Accuracy, Subagent Deduplication & Live Status (`BUG-19`):**
+  - Eliminated inflated `User` prompt counts and spurious `User -> subagent` edges by coercing subagent `UserPromptSubmit` hook events (`subagentId !== "root"`, parent-re-homed events, and orphan-migrated events) into `thinking_start` instead of `user_input`.
+  - Fixed duplicate subagent nodes between passive `chatSessions`/transcripts and live hooks by clamping `isComplete: true` session completion epochs, improving `subagentToParent` orphan migration and UUID-only matching, and preserving readable subagent identities across adapters and `PushBus`.
+  - Collapsed split root UUID nodes into the canonical `Coordinator` node in `buildSnapshot()` and `normalizer.ts`.
+  - Fixed `WORKING` `activeTool` status labels to display readable tool names instead of raw `call_...` tool-call IDs.
+
 ## [0.9.0] - 2026-11-25
 
 ### Added

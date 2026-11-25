@@ -124,6 +124,14 @@ function parseTier2Key(
   return { prefix: key.slice(0, lastColon), bucket };
 }
 
+function extractNormalizedPrompt(ev: EnrichedEvent): string {
+  const raw =
+    (typeof ev.payload?.prompt === "string" && ev.payload.prompt) ||
+    (typeof ev.payload?.body === "string" && ev.payload.body) ||
+    ev.summary.replace(/^Human:\s*/i, "");
+  return raw.replace(/\s+/g, " ").trim().toLowerCase().slice(0, 200);
+}
+
 /**
  * Deduplicates and merges events across passive transcripts, IDE hooks, and MCP calls.
  * - Tier-1: exact match on `t1:<session>:<agent>:<kind>:<toolCallId>`
@@ -135,6 +143,7 @@ export function deduplicateEvents(events: EnrichedEvent[]): EnrichedEvent[] {
   const tier1Index = new Map<string, number>();
   const tier2Index = new Map<string, number>();
   const idIndex = new Map<string, number>();
+  const userInputBySessionAgent = new Map<string, number[]>();
 
   for (const ev of ordered) {
     const mergeKey =
@@ -171,6 +180,27 @@ export function deduplicateEvents(events: EnrichedEvent[]): EnrichedEvent[] {
       }
     }
 
+    if (matchIdx === undefined && ev.kind === "user_input") {
+      const normPrompt = extractNormalizedPrompt(ev);
+      if (normPrompt) {
+        const uiKey = `${ev.sessionId}:${ev.agentId}`;
+        const candidates = userInputBySessionAgent.get(uiKey) ?? [];
+        for (const candidate of candidates) {
+          const existing = result[candidate];
+          if (!existing) continue;
+          const distinctSource =
+            existing.channel !== ev.channel ||
+            existing.payload?._passiveSource !== ev.payload?._passiveSource;
+          if (!distinctSource) continue;
+          if (Math.abs(ev.epoch - existing.epoch) > 15) continue;
+          if (extractNormalizedPrompt(existing) === normPrompt) {
+            matchIdx = candidate;
+            break;
+          }
+        }
+      }
+    }
+
     if (matchIdx !== undefined) {
       const merged = mergeTwoEvents(result[matchIdx]!, ev);
       result[matchIdx] = merged;
@@ -183,6 +213,15 @@ export function deduplicateEvents(events: EnrichedEvent[]): EnrichedEvent[] {
       idIndex.set(ev.id, idx);
       if (mergeKey.startsWith("t1:")) tier1Index.set(mergeKey, idx);
       if (mergeKey.startsWith("t2:")) tier2Index.set(mergeKey, idx);
+      if (ev.kind === "user_input") {
+        const uiKey = `${ev.sessionId}:${ev.agentId}`;
+        let list = userInputBySessionAgent.get(uiKey);
+        if (!list) {
+          list = [];
+          userInputBySessionAgent.set(uiKey, list);
+        }
+        list.push(idx);
+      }
     }
   }
 
@@ -235,7 +274,7 @@ interface MutableAgentState {
   messagesReceived: number;
   lastEventEpoch: number;
   firstEventEpoch: number;
-  openTools: Set<string>;
+  openTools: Map<string, string>;
   isThinking: boolean;
   thinkingSinceEpoch?: number;
   thinkingAction?: string;
@@ -280,12 +319,500 @@ function formatHms(epochSec: number): string {
   return `${hh}:${mm}:${ss}`;
 }
 
+function normalizeSubagentLabel(raw?: string): string {
+  if (!raw) return "";
+  return raw
+    .trim()
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, " ")
+    .trim();
+}
+
+function strVal(v: unknown): string | undefined {
+  return typeof v === "string" && v.trim() ? v.trim() : undefined;
+}
+
+function isUuidOrOpaqueId(raw?: string): boolean {
+  const s = (raw ?? "").trim();
+  if (!s) return true;
+  if (/^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$/i.test(s)) return true;
+  if (/^[0-9a-f]{12,}$/i.test(s)) return true;
+  if (/^(?:agent-)?[0-9a-f]{8,}$/i.test(s)) return true;
+  return false;
+}
+
+/**
+ * Reconciles VS Code Copilot passive subagent runs (slug/UUID from chatSessions or
+ * transcript.jsonl) with live hook subagents (SubagentStart/Stop UUIDs and orphan
+ * subagent hook events) onto a single canonical subagent ID per invocation.
+ */
+function reconcileCopilotSubagents(rawEvents: EnrichedEvent[]): EnrichedEvent[] {
+  if (!rawEvents.some((e) => e.ide === "copilot-vscode")) {
+    return rawEvents;
+  }
+
+  const events = rawEvents.map((e) => ({
+    ...e,
+    ...(e.payload ? { payload: { ...e.payload } } : {}),
+  }));
+
+  interface PassiveSubCand {
+    pId: string;
+    spawnEv: EnrichedEvent;
+    epoch: number;
+    normLabel: string;
+    readableLabel: string;
+    passiveSource?: string;
+    isGeneric: boolean;
+  }
+  interface HookSubCand {
+    hId: string;
+    spawnEv?: EnrichedEvent;
+    epoch: number;
+    normLabel: string;
+    readableLabel?: string;
+    isGeneric: boolean;
+  }
+
+  const passiveByPId = new Map<string, PassiveSubCand>();
+  const hookByHId = new Map<string, HookSubCand>();
+
+  for (const ev of events) {
+    if (ev.ide !== "copilot-vscode") continue;
+
+    if (
+      ev.channel === "passive" &&
+      ev.kind === "subagent_spawn" &&
+      ev.targetAgentId &&
+      ev.targetAgentId !== "root"
+    ) {
+      const pId = ev.targetAgentId;
+      const readable =
+        strVal(ev.payload?.agentLabel) ||
+        strVal(ev.payload?.agentType) ||
+        pId;
+      const labelCandidate =
+        strVal(ev.payload?.agentLabel) ||
+        strVal(ev.payload?.agentType) ||
+        pId.replace(/-\d+$/, "");
+      const normLabel = normalizeSubagentLabel(labelCandidate);
+      const isGen =
+        !normLabel ||
+        normLabel === "subagent" ||
+        isUuidOrOpaqueId(labelCandidate);
+      const passiveSource = strVal(ev.payload?._passiveSource);
+      const prev = passiveByPId.get(pId);
+      if (!prev || ev.epoch < prev.epoch) {
+        passiveByPId.set(pId, {
+          pId,
+          spawnEv: ev,
+          epoch: ev.epoch,
+          normLabel,
+          readableLabel: readable,
+          passiveSource,
+          isGeneric: isGen,
+        });
+      }
+      continue;
+    }
+
+    if (ev.channel === "hook") {
+      const registerHookCand = (
+        hId: string,
+        readable: string | undefined,
+        spawnEv?: EnrichedEvent,
+      ): void => {
+        const normLabel = normalizeSubagentLabel(readable || hId);
+        const isGen =
+          !readable ||
+          !normLabel ||
+          normLabel === "subagent" ||
+          isUuidOrOpaqueId(readable);
+        const prev = hookByHId.get(hId);
+        if (!prev) {
+          hookByHId.set(hId, {
+            hId,
+            ...(spawnEv ? { spawnEv } : {}),
+            epoch: ev.epoch,
+            normLabel,
+            readableLabel: readable,
+            isGeneric: isGen,
+          });
+        } else {
+          if (spawnEv && (!prev.spawnEv || ev.epoch < prev.spawnEv.epoch)) {
+            prev.spawnEv = spawnEv;
+          }
+          prev.epoch = Math.min(prev.epoch, ev.epoch);
+          if (!prev.readableLabel && readable) {
+            prev.readableLabel = readable;
+            prev.normLabel = normalizeSubagentLabel(readable);
+            prev.isGeneric =
+              !prev.normLabel ||
+              prev.normLabel === "subagent" ||
+              isUuidOrOpaqueId(readable);
+          }
+        }
+      };
+
+      if (
+        ev.kind === "subagent_spawn" &&
+        ev.targetAgentId &&
+        ev.targetAgentId !== "root"
+      ) {
+        const readable =
+          strVal(ev.payload?.agentLabel) || strVal(ev.payload?.agentType);
+        registerHookCand(ev.targetAgentId, readable, ev);
+      } else if (
+        ev.agentId &&
+        ev.agentId !== "root" &&
+        ev.agentId !== "human" &&
+        !ev.agentId.startsWith("ext:")
+      ) {
+        const readable =
+          strVal(ev.agentLabel) ||
+          strVal(ev.payload?.agentLabel) ||
+          strVal(ev.payload?.agentType);
+        registerHookCand(ev.agentId, readable);
+      } else if (
+        ev.kind === "subagent_done" &&
+        ev.targetAgentId &&
+        ev.targetAgentId !== "root"
+      ) {
+        const readable =
+          strVal(ev.payload?.agentLabel) || strVal(ev.payload?.agentType);
+        registerHookCand(ev.targetAgentId, readable);
+      }
+    }
+  }
+
+  if (passiveByPId.size === 0 || hookByHId.size === 0) {
+    return events;
+  }
+
+  const passiveList = [...passiveByPId.values()].sort(
+    (a, b) => a.epoch - b.epoch,
+  );
+  const hookList = [...hookByHId.values()].sort((a, b) => a.epoch - b.epoch);
+
+  const matchedHookIds = new Set<string>();
+  const matchedPassiveIds = new Set<string>();
+  const matches: Array<{ p: PassiveSubCand; h: HookSubCand }> = [];
+
+  // 1. Exact ID pre-match
+  for (const p of passiveList) {
+    const exactH = hookByHId.get(p.pId);
+    if (exactH && !matchedHookIds.has(exactH.hId)) {
+      matchedPassiveIds.add(p.pId);
+      matchedHookIds.add(exactH.hId);
+      matches.push({ p, h: exactH });
+    }
+  }
+
+  // 2. Best-pair matching by |h.epoch - p.epoch| ascending for named matches (<= 120s)
+  const namedPairs: Array<{ p: PassiveSubCand; h: HookSubCand; diff: number }> = [];
+  for (const p of passiveList) {
+    if (matchedPassiveIds.has(p.pId) || p.isGeneric) continue;
+    for (const h of hookList) {
+      if (matchedHookIds.has(h.hId) || h.isGeneric) continue;
+      if (h.normLabel !== p.normLabel) continue;
+      const diff = Math.abs(h.epoch - p.epoch);
+      if (diff <= 120) {
+        namedPairs.push({ p, h, diff });
+      }
+    }
+  }
+  namedPairs.sort(
+    (a, b) =>
+      Math.floor(a.diff) - Math.floor(b.diff) ||
+      a.p.epoch - b.p.epoch ||
+      a.h.epoch - b.h.epoch,
+  );
+  for (const pair of namedPairs) {
+    if (matchedPassiveIds.has(pair.p.pId) || matchedHookIds.has(pair.h.hId)) {
+      continue;
+    }
+    matchedPassiveIds.add(pair.p.pId);
+    matchedHookIds.add(pair.h.hId);
+    matches.push({ p: pair.p, h: pair.h });
+  }
+
+  // 3. Generic/UUID-only pairs: unambiguous within <= 5s (or <= 15s if unambiguous in 15s)
+  const remPassives = passiveList.filter((p) => !matchedPassiveIds.has(p.pId));
+  const remHooks = hookList.filter((h) => !matchedHookIds.has(h.hId));
+  const genericPairs: Array<{ p: PassiveSubCand; h: HookSubCand; diff: number }> = [];
+  for (const p of remPassives) {
+    for (const h of remHooks) {
+      if (!p.isGeneric && !h.isGeneric) continue;
+      const diff = Math.abs(h.epoch - p.epoch);
+      if (diff > 15) continue;
+      const windowSec = diff <= 5 ? 5 : 15;
+      const closeH = remHooks.filter((oh) => Math.abs(oh.epoch - p.epoch) <= windowSec);
+      const closeP = remPassives.filter((op) => Math.abs(h.epoch - op.epoch) <= windowSec);
+      if (closeH.length === 1 && closeP.length === 1) {
+        genericPairs.push({ p, h, diff });
+      }
+    }
+  }
+  genericPairs.sort(
+    (a, b) =>
+      Math.floor(a.diff) - Math.floor(b.diff) ||
+      a.p.epoch - b.p.epoch ||
+      a.h.epoch - b.h.epoch,
+  );
+  for (const pair of genericPairs) {
+    if (matchedPassiveIds.has(pair.p.pId) || matchedHookIds.has(pair.h.hId)) {
+      continue;
+    }
+    matchedPassiveIds.add(pair.p.pId);
+    matchedHookIds.add(pair.h.hId);
+    matches.push({ p: pair.p, h: pair.h });
+  }
+
+  if (matches.length === 0) {
+    return events;
+  }
+
+  const pToH = new Map<string, { hId: string; readableLabel?: string }>();
+  const hReadableById = new Map<string, string>();
+  const matchedHSet = new Set<string>();
+  const mergedSourcesByHId = new Map<string, Set<string>>();
+  for (const { p, h } of matches) {
+    const readableLabel =
+      (p.readableLabel && p.readableLabel !== "Subagent" && !isUuidOrOpaqueId(p.readableLabel)
+        ? p.readableLabel
+        : undefined) ||
+      (h.readableLabel && !isUuidOrOpaqueId(h.readableLabel)
+        ? h.readableLabel
+        : undefined) ||
+      p.readableLabel;
+    pToH.set(p.pId, { hId: h.hId, readableLabel });
+    matchedHSet.add(h.hId);
+    if (readableLabel) hReadableById.set(h.hId, readableLabel);
+    const srcs = new Set<string>();
+    if (p.passiveSource) srcs.add(p.passiveSource);
+    mergedSourcesByHId.set(h.hId, srcs);
+  }
+
+  // 4. Dual passive source reconciliation: remap secondary passive spawns from a different
+  // _passiveSource matching an already-matched p within ±15s onto the same matchedHId
+  const secondaryPassiveLinks: Array<{
+    secondary: PassiveSubCand;
+    primary: PassiveSubCand;
+    hId: string;
+  }> = [];
+  for (const p2 of passiveList) {
+    if (matchedPassiveIds.has(p2.pId)) continue;
+    if (!p2.passiveSource || p2.isGeneric) continue;
+    let bestMatch: { p: PassiveSubCand; h: HookSubCand; diff: number } | undefined;
+    for (const m of matches) {
+      if (!m.p.passiveSource || m.p.passiveSource === p2.passiveSource) continue;
+      if (mergedSourcesByHId.get(m.h.hId)?.has(p2.passiveSource)) continue;
+      if (m.p.isGeneric || m.p.normLabel !== p2.normLabel) continue;
+      const diff = Math.abs(p2.epoch - m.p.epoch);
+      if (diff <= 15 && (!bestMatch || diff < bestMatch.diff)) {
+        bestMatch = { p: m.p, h: m.h, diff };
+      }
+    }
+    if (bestMatch) {
+      matchedPassiveIds.add(p2.pId);
+      mergedSourcesByHId.get(bestMatch.h.hId)?.add(p2.passiveSource);
+      pToH.set(p2.pId, {
+        hId: bestMatch.h.hId,
+        readableLabel: hReadableById.get(bestMatch.h.hId),
+      });
+      secondaryPassiveLinks.push({
+        secondary: p2,
+        primary: bestMatch.p,
+        hId: bestMatch.h.hId,
+      });
+    }
+  }
+
+  // Canonicalize pId -> hId across all copilot-vscode events and collect O(N) done/epoch indices
+  const passiveDoneByHId = new Map<string, EnrichedEvent[]>();
+  const hookDoneByHId = new Map<string, EnrichedEvent[]>();
+  const maxHookEpochByHId = new Map<string, number>();
+
+  for (const ev of events) {
+    if (ev.ide !== "copilot-vscode") continue;
+    let remappedActor = false;
+    const pMapActor = pToH.get(ev.agentId);
+    if (pMapActor) {
+      ev.agentId = pMapActor.hId;
+      remappedActor = true;
+    }
+    const pMapTarget = ev.targetAgentId ? pToH.get(ev.targetAgentId) : undefined;
+    if (pMapTarget) {
+      ev.targetAgentId = pMapTarget.hId;
+    }
+    const pMapParent = ev.parentAgentId ? pToH.get(ev.parentAgentId) : undefined;
+    if (pMapParent) {
+      ev.parentAgentId = pMapParent.hId;
+    }
+
+    if (matchedHSet.has(ev.agentId)) {
+      if (!ev.parentAgentId) {
+        ev.parentAgentId = "root";
+      }
+      const lbl = hReadableById.get(ev.agentId);
+      if (lbl && (!ev.agentLabel || ev.agentLabel === ev.agentId || isUuidOrOpaqueId(ev.agentLabel))) {
+        ev.agentLabel = lbl;
+      }
+      if (lbl && ev.summary === `Stop (${ev.agentId})`) {
+        ev.summary = `Stop (${lbl})`;
+      }
+    }
+
+    if (
+      ev.targetAgentId &&
+      matchedHSet.has(ev.targetAgentId) &&
+      (ev.kind === "subagent_spawn" || ev.kind === "subagent_done")
+    ) {
+      const lbl = hReadableById.get(ev.targetAgentId);
+      if (lbl && (!strVal(ev.payload?.agentLabel) || isUuidOrOpaqueId(strVal(ev.payload?.agentLabel)))) {
+        ev.payload = { ...(ev.payload ?? {}), agentLabel: lbl };
+      }
+    }
+
+    if (remappedActor) {
+      ev.mergeKey = computeMergeKey({
+        sessionId: ev.sessionId,
+        agentId: ev.agentId,
+        kind: ev.kind,
+        toolCallId: ev.toolCallId,
+        toolName: ev.toolName,
+        epoch: ev.epoch,
+      });
+    }
+
+    // Pre-index subagent_done and hook max epochs per matched hId in O(N)
+    const relevantHId =
+      ev.targetAgentId && matchedHSet.has(ev.targetAgentId)
+        ? ev.targetAgentId
+        : matchedHSet.has(ev.agentId)
+          ? ev.agentId
+          : undefined;
+    if (relevantHId) {
+      if (ev.channel === "hook") {
+        const prevMax = maxHookEpochByHId.get(relevantHId);
+        if (prevMax === undefined || ev.epoch > prevMax) {
+          maxHookEpochByHId.set(relevantHId, ev.epoch);
+        }
+      }
+      if (ev.kind === "subagent_done") {
+        const map = ev.channel === "passive" ? passiveDoneByHId : ev.channel === "hook" ? hookDoneByHId : undefined;
+        if (map) {
+          let list = map.get(relevantHId);
+          if (!list) {
+            list = [];
+            map.set(relevantHId, list);
+          }
+          list.push(ev);
+        }
+      }
+    }
+  }
+
+  for (const { p, h } of matches) {
+    const spawnCallId = p.spawnEv.toolCallId || `reconcile-${h.hId}`;
+    p.spawnEv.toolCallId = spawnCallId;
+    p.spawnEv.mergeKey = computeMergeKey({
+      sessionId: p.spawnEv.sessionId,
+      agentId: p.spawnEv.agentId,
+      kind: p.spawnEv.kind,
+      toolCallId: spawnCallId,
+      toolName: p.spawnEv.toolName,
+      epoch: p.spawnEv.epoch,
+    });
+    if (h.spawnEv) {
+      h.spawnEv.toolCallId = spawnCallId;
+      h.spawnEv.toolName = h.spawnEv.toolName || p.spawnEv.toolName;
+      h.spawnEv.mergeKey = p.spawnEv.mergeKey;
+    }
+
+    const pDoneCandidates = passiveDoneByHId.get(h.hId) ?? [];
+    const pDone =
+      pDoneCandidates.find(
+        (e) => p.spawnEv.toolCallId && e.toolCallId === p.spawnEv.toolCallId,
+      ) ?? pDoneCandidates[0];
+    const hDone = (hookDoneByHId.get(h.hId) ?? [])[0];
+    if (pDone && hDone) {
+      // Prevent synthetic turn-start passive subagent_done from rewinding before hook tool calls
+      const laterEpoch = Math.max(pDone.epoch, hDone.epoch);
+      const laterTs = laterEpoch === hDone.epoch ? hDone.ts : pDone.ts;
+      pDone.epoch = laterEpoch;
+      pDone.ts = laterTs;
+      hDone.epoch = laterEpoch;
+      hDone.ts = laterTs;
+
+      const doneCallId =
+        pDone.toolCallId ||
+        hDone.toolCallId ||
+        p.spawnEv.toolCallId ||
+        `reconcile-done-${h.hId}`;
+      pDone.toolCallId = doneCallId;
+      pDone.mergeKey = computeMergeKey({
+        sessionId: pDone.sessionId,
+        agentId: pDone.agentId,
+        kind: pDone.kind,
+        toolCallId: doneCallId,
+        toolName: pDone.toolName,
+        epoch: pDone.epoch,
+      });
+      hDone.toolCallId = doneCallId;
+      hDone.toolName = hDone.toolName || pDone.toolName;
+      hDone.mergeKey = pDone.mergeKey;
+    } else if (pDone && !hDone) {
+      const maxHookEp = maxHookEpochByHId.get(h.hId);
+      if (maxHookEp !== undefined && pDone.epoch <= maxHookEp) {
+        pDone.epoch = maxHookEp + 0.001;
+        pDone.ts = toIsoUtc(pDone.epoch);
+        pDone.mergeKey = computeMergeKey({
+          sessionId: pDone.sessionId,
+          agentId: pDone.agentId,
+          kind: pDone.kind,
+          toolCallId: pDone.toolCallId,
+          toolName: pDone.toolName,
+          epoch: pDone.epoch,
+        });
+      }
+    }
+  }
+
+  for (const { secondary, primary, hId } of secondaryPassiveLinks) {
+    secondary.spawnEv.toolCallId = primary.spawnEv.toolCallId;
+    secondary.spawnEv.mergeKey = primary.spawnEv.mergeKey;
+    const pDones = passiveDoneByHId.get(hId) ?? [];
+    if (pDones.length > 1) {
+      const canonicalDone = pDones[0]!;
+      for (let i = 1; i < pDones.length; i++) {
+        const extraDone = pDones[i]!;
+        const laterEp = Math.max(canonicalDone.epoch, extraDone.epoch);
+        const laterTs = laterEp === extraDone.epoch ? extraDone.ts : canonicalDone.ts;
+        canonicalDone.epoch = laterEp;
+        canonicalDone.ts = laterTs;
+        extraDone.epoch = laterEp;
+        extraDone.ts = laterTs;
+        if (canonicalDone.toolCallId) {
+          extraDone.toolCallId = canonicalDone.toolCallId;
+        }
+        if (canonicalDone.mergeKey?.startsWith("t1:")) {
+          extraDone.mergeKey = canonicalDone.mergeKey;
+        }
+      }
+    }
+  }
+
+  return events;
+}
+
 export function buildSessionSnapshot(
   rawEvents: EnrichedEvent[],
   opts: SnapshotBuildOptions,
 ): RichSessionSnapshot {
   const nowSec = opts.nowEpochSec ?? Date.now() / 1000;
-  const deduped = deduplicateEvents(rawEvents);
+  const reconciled = reconcileCopilotSubagents(rawEvents);
+  const deduped = deduplicateEvents(reconciled);
 
   // Enforce strict monotonic numeric epoch (+0.0001 tie-breaker epsilon)
   let prevEpoch = 0;
@@ -304,15 +831,17 @@ export function buildSessionSnapshot(
   const projectId =
     opts.projectId ?? events.find((e) => e.projectId)?.projectId;
 
-  // Determine root agent ID (first non-human agent or "root")
+  // Determine root agent ID (prefer explicit "root" before falling back to first unparented agent)
   const rootId =
+    events.find((e) => e.agentId === "root" && !e.parentAgentId)?.agentId ??
     events.find(
       (e) =>
         e.agentId &&
         e.agentId !== "human" &&
         !e.agentId.startsWith("ext:") &&
         !e.parentAgentId,
-    )?.agentId ?? "root";
+    )?.agentId ??
+    "root";
 
   const agentMap = new Map<string, MutableAgentState>();
   const agentOrder: string[] = [];
@@ -364,7 +893,7 @@ export function buildSessionSnapshot(
         messagesReceived: 0,
         lastEventEpoch: extra?.epoch ?? 0,
         firstEventEpoch: extra?.epoch ?? 0,
-        openTools: new Set(),
+        openTools: new Map(),
         isThinking: false,
         hasBlocker: false,
         reportedDone: false,
@@ -609,6 +1138,26 @@ export function buildSessionSnapshot(
       }
 
       case "user_input": {
+        const isSubagentTarget =
+          !ag.isRoot || Boolean(ag.parentAgentId) || Boolean(ev.parentAgentId);
+
+        // Reset reportedDone + waiting/blocker when a turn starts!
+        ag.reportedDone = false;
+        ag.waitingReason = null;
+        ag.waitingDetail = null;
+        ag.hasBlocker = false;
+        ag.isThinking = true;
+        ag.thinkingSinceEpoch = ev.epoch;
+
+        if (isSubagentTarget) {
+          const cleanTask =
+            cleanHumanSummary(ev.summary.replace(/^Human:\s*/i, ""), 130) ||
+            "Starting task…";
+          ag.thinkingAction = cleanTask;
+          ag.action = cleanTask;
+          break;
+        }
+
         const human = ensureAgent("human");
         human.steps += 1;
         human.messagesSent += 1;
@@ -616,13 +1165,6 @@ export function buildSessionSnapshot(
         human.action = ev.summary.slice(0, 48);
         pushRecent(human, ev.ts, "USER_INPUT", ev.summary);
 
-        // Reset reportedDone + waiting/blocker when user sends a new turn!
-        ag.reportedDone = false;
-        ag.waitingReason = null;
-        ag.waitingDetail = null;
-        ag.hasBlocker = false;
-        ag.isThinking = true;
-        ag.thinkingSinceEpoch = ev.epoch;
         ag.thinkingAction = "Thinking on user prompt…";
         ag.messagesReceived += 1;
 
@@ -677,6 +1219,7 @@ export function buildSessionSnapshot(
         }
 
         const callKey = ev.toolCallId ?? `${ev.toolName ?? "tool"}:${ev.id}`;
+        const toolLabel = ev.toolName?.trim() || "tool";
         if (ev.status === "denied") {
           ag.hasBlocker = true;
           ag.action = `Blocked: ${ev.summary}`;
@@ -686,11 +1229,11 @@ export function buildSessionSnapshot(
             ev.waitingReason === "user"
               ? "Waiting for user answer"
               : "Waiting for tool approval";
-          ag.openTools.add(callKey);
+          ag.openTools.set(callKey, toolLabel);
         } else if (!ev.isSelfDaemon) {
           ag.hasBlocker = false;
           ag.waitingReason = null;
-          ag.openTools.add(callKey);
+          ag.openTools.set(callKey, toolLabel);
         }
 
         let targetId = ev.targetAgentId ?? ag.id;
@@ -774,8 +1317,21 @@ export function buildSessionSnapshot(
         if (ev.toolCallId && ag.openTools.has(ev.toolCallId)) {
           ag.openTools.delete(ev.toolCallId);
         } else if (ag.openTools.size > 0) {
-          const firstKey = ag.openTools.values().next().value;
-          if (firstKey !== undefined) ag.openTools.delete(firstKey);
+          let deleted = false;
+          const endToolName = ev.toolName?.trim();
+          if (endToolName) {
+            for (const [k, v] of ag.openTools.entries()) {
+              if (v === endToolName) {
+                ag.openTools.delete(k);
+                deleted = true;
+                break;
+              }
+            }
+          }
+          if (!deleted) {
+            const firstKey = ag.openTools.keys().next().value;
+            if (firstKey !== undefined) ag.openTools.delete(firstKey);
+          }
         }
 
         if (ag.waitingReason === "user" || ag.waitingReason === "tool_approval") {
@@ -869,6 +1425,15 @@ export function buildSessionSnapshot(
             ? ev.targetAgentId
             : ag.id;
         const doneAgent = ensureAgent(doneId, { ide: ev.ide, epoch: ev.epoch });
+        if (ev.toolCallId) {
+          if (ag.id !== doneAgent.id) {
+            ag.openTools.delete(ev.toolCallId);
+          }
+          const parentId = doneAgent.parentAgentId || ev.parentAgentId || rootId;
+          if (parentId && parentId !== doneAgent.id) {
+            agentMap.get(parentId)?.openTools.delete(ev.toolCallId);
+          }
+        }
         doneAgent.openTools.clear();
         doneAgent.isThinking = false;
         doneAgent.thinkingSinceEpoch = undefined;

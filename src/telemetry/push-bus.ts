@@ -463,8 +463,16 @@ export class PushBus extends EventEmitter {
           this.bodyStore.set(mapping.parentSessionId, oldEv.id, body.body);
         }
 
+        const coercedKind =
+          oldEv.kind === "user_input" ? "thinking_start" : oldEv.kind;
+        const coercedSummary =
+          oldEv.kind === "user_input"
+            ? oldEv.summary.replace(/^Human:\s*/i, "").trim() || "Starting task…"
+            : oldEv.summary;
         const migrated: EnrichedEvent = {
           ...oldEv,
+          kind: coercedKind,
+          summary: coercedSummary,
           sessionId: mapping.parentSessionId,
           agentId: mapping.agentId,
           parentAgentId: "root",
@@ -472,7 +480,7 @@ export class PushBus extends EventEmitter {
           mergeKey: computeMergeKey({
             sessionId: mapping.parentSessionId,
             agentId: mapping.agentId,
-            kind: oldEv.kind,
+            kind: coercedKind,
             toolCallId: oldEv.toolCallId,
             toolName: oldEv.toolName,
             epoch: oldEv.epoch,
@@ -519,7 +527,16 @@ export class PushBus extends EventEmitter {
 
       // Re-home events belonging to a known subagent session (or carrying explicit parentSessionId)
       const originalSessionId = ev.sessionId;
-      const parentMapping = this.subagentToParent.get(originalSessionId);
+      const directMapping = this.subagentToParent.get(originalSessionId);
+      const agentMapping =
+        !directMapping && ev.agentId !== "root"
+          ? this.subagentToParent.get(ev.agentId)
+          : undefined;
+      const parentMapping =
+        directMapping ??
+        (agentMapping && ev.sessionId !== agentMapping.parentSessionId
+          ? agentMapping
+          : undefined);
       const explicitParentSid =
         typeof ev.payload?.parentSessionId === "string" &&
         ev.payload.parentSessionId.trim() &&
@@ -528,6 +545,11 @@ export class PushBus extends EventEmitter {
           : undefined;
 
       if (parentMapping) {
+        if (ev.kind === "user_input") {
+          ev.kind = "thinking_start";
+          ev.summary =
+            ev.summary.replace(/^Human:\s*/i, "").trim() || "Starting task…";
+        }
         ev.sessionId = parentMapping.parentSessionId;
         ev.agentId = parentMapping.agentId;
         ev.parentAgentId = "root";
@@ -562,6 +584,11 @@ export class PushBus extends EventEmitter {
           ev.payload.agentType.trim()
             ? ev.payload.agentType.trim()
             : undefined;
+        if (ev.kind === "user_input") {
+          ev.kind = "thinking_start";
+          ev.summary =
+            ev.summary.replace(/^Human:\s*/i, "").trim() || "Starting task…";
+        }
         ev.sessionId = explicitParentSid;
         ev.agentId = resolvedAgentId;
         ev.parentAgentId = "root";

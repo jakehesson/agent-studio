@@ -204,8 +204,22 @@ export function buildSnapshot(
   const slice = safeIdx >= 0 ? events.slice(0, safeIdx + 1) : [];
 
   const defaultIde: IdeSource = baseSnapshot?.ide ?? events[0]?.ide ?? "unknown";
+  const rootId =
+    baseSnapshot?.agents?.find(
+      (a) => (a as AgentNodeSnapshot & { isRoot?: boolean }).isRoot
+    )?.id ??
+    slice.find((e) => e.agentId === "root" && !e.parentAgentId)?.agentId ??
+    slice.find(
+      (e) =>
+        e.agentId &&
+        e.agentId !== "human" &&
+        e.agentId !== "ext:human" &&
+        !e.agentId.startsWith("ext:") &&
+        !e.parentAgentId
+    )?.agentId ??
+    "root";
   const agentMap = new Map<string, AgentNodeSnapshot>();
-  const openTools = new Map<string, Set<string>>();
+  const openTools = new Map<string, Map<string, string>>();
   const activeChildren = new Map<string, Set<string>>();
   const reportedDone = new Map<string, boolean>();
   const hasBlocker = new Map<string, boolean>();
@@ -421,8 +435,11 @@ export function buildSnapshot(
       usageAccById.set(actor.id, uAcc);
     }
 
-    const toolSet = openTools.get(actor.id) ?? new Set<string>();
-    openTools.set(actor.id, toolSet);
+    let toolMap = openTools.get(actor.id);
+    if (!toolMap) {
+      toolMap = new Map<string, string>();
+      openTools.set(actor.id, toolMap);
+    }
 
     switch (ev.kind) {
       case "session_start": {
@@ -431,14 +448,23 @@ export function buildSnapshot(
         break;
       }
       case "user_input": {
-        const human = ensureNode("ext:human", { label: "User", nodeType: "human", ide: ev.ide });
-        human.messagesSent += 1;
-        human.lastEventAt = ev.ts;
-        human.lastEpoch = ev.epoch;
-        human.summary = ev.summary;
-        pushAction(human, ev);
+        const isSubagentTarget =
+          actor.id !== rootId ||
+          Boolean(actor.parentAgentId) ||
+          Boolean(ev.parentAgentId);
+        if (!isSubagentTarget) {
+          const human = ensureNode("ext:human", { label: "User", nodeType: "human", ide: ev.ide });
+          human.messagesSent += 1;
+          human.lastEventAt = ev.ts;
+          human.lastEpoch = ev.epoch;
+          human.summary = ev.summary;
+          pushAction(human, ev);
 
-        actor.messagesReceived += 1;
+          actor.messagesReceived += 1;
+          bumpEdge("ext:human", actor.id, ev.kind, ev.ts);
+          totalMessages += 1;
+        }
+
         actor.summary = `Prompt: ${ev.summary}`;
         actor.thinkingSince = ev.ts;
         actor.thinkingEpoch = ev.epoch;
@@ -446,8 +472,6 @@ export function buildSnapshot(
         hasBlocker.set(actor.id, false);
         waitingReason.set(actor.id, null);
         pushAction(actor, ev);
-        bumpEdge("ext:human", actor.id, ev.kind, ev.ts);
-        totalMessages += 1;
         break;
       }
       case "thinking_start": {
@@ -473,9 +497,10 @@ export function buildSnapshot(
           human.messagesReceived += 1;
           bumpEdge(actor.id, "ext:human", ev.kind, ev.ts);
         } else if (!isSelfDaemon) {
-          const callKey = ev.toolCallId ?? ev.toolName ?? ev.id;
-          toolSet.add(callKey);
-          actor.activeTool = ev.toolName ?? "tool";
+          const callKey = ev.toolCallId ?? `${ev.toolName ?? "tool"}:${ev.id}`;
+          const readableName = ev.toolName?.trim() || "tool";
+          toolMap.set(callKey, readableName);
+          actor.activeTool = toolMap.values().next().value;
           if (ev.payload?.isConfirmed === false) {
             waitingReason.set(actor.id, "tool_approval");
           }
@@ -500,14 +525,29 @@ export function buildSnapshot(
         break;
       }
       case "tool_end": {
-        const callKey = ev.toolCallId ?? ev.toolName;
-        if (callKey && toolSet.has(callKey)) {
-          toolSet.delete(callKey);
-        } else if (toolSet.size > 0) {
-          const first = toolSet.values().next().value;
-          if (first) toolSet.delete(first);
+        if (ev.toolCallId && toolMap.has(ev.toolCallId)) {
+          toolMap.delete(ev.toolCallId);
+        } else if (ev.toolName) {
+          const targetName = ev.toolName.trim();
+          let matchedKey: string | undefined;
+          for (const [k, v] of toolMap.entries()) {
+            if (v === targetName || v === ev.toolName) {
+              matchedKey = k;
+              break;
+            }
+          }
+          if (matchedKey !== undefined) {
+            toolMap.delete(matchedKey);
+          } else if (toolMap.size > 0) {
+            const first = toolMap.keys().next().value;
+            if (first !== undefined) toolMap.delete(first);
+          }
+        } else if (toolMap.size > 0) {
+          const first = toolMap.keys().next().value;
+          if (first !== undefined) toolMap.delete(first);
         }
-        if (toolSet.size === 0) actor.activeTool = undefined;
+        actor.activeTool =
+          toolMap.size > 0 ? toolMap.values().next().value : undefined;
         if (waitingReason.get(actor.id) === "tool_approval") {
           waitingReason.set(actor.id, null);
         }
@@ -554,7 +594,7 @@ export function buildSnapshot(
         break;
       }
       case "subagent_done": {
-        if (!ev.targetAgentId && actor.id === "root") {
+        if (!ev.targetAgentId && (actor.id === "root" || actor.id === rootId)) {
           pushAction(actor, ev);
           break;
         }
@@ -572,6 +612,11 @@ export function buildSnapshot(
               });
         openTools.get(doneNode.id)?.clear();
         doneNode.activeTool = undefined;
+        if (ev.toolCallId && actor.id !== doneId && toolMap.has(ev.toolCallId)) {
+          toolMap.delete(ev.toolCallId);
+          actor.activeTool =
+            toolMap.size > 0 ? toolMap.values().next().value : undefined;
+        }
         doneNode.thinkingSince = undefined;
         doneNode.thinkingEpoch = undefined;
         doneNode.lastEventAt = ev.ts;
@@ -591,6 +636,17 @@ export function buildSnapshot(
         const parentId =
           doneNode.parentAgentId ?? (doneId !== actor.id ? actor.id : undefined);
         if (parentId) {
+          if (ev.toolCallId && parentId !== doneId) {
+            const parentTools = openTools.get(parentId);
+            if (parentTools?.has(ev.toolCallId)) {
+              parentTools.delete(ev.toolCallId);
+              const parentNode = agentMap.get(parentId);
+              if (parentNode) {
+                parentNode.activeTool =
+                  parentTools.size > 0 ? parentTools.values().next().value : undefined;
+              }
+            }
+          }
           activeChildren.get(parentId)?.delete(doneNode.id);
           bumpEdge(doneNode.id, parentId, ev.kind, ev.ts);
         }
@@ -632,7 +688,7 @@ export function buildSnapshot(
         break;
       }
       case "assistant_turn_end": {
-        toolSet.clear();
+        toolMap.clear();
         actor.activeTool = undefined;
         waitingReason.set(actor.id, null);
         reportedDone.set(actor.id, true);
@@ -643,6 +699,10 @@ export function buildSnapshot(
         }
         actor.summary = ev.summary || "Turn completed";
         pushAction(actor, ev);
+        const parentId = actor.parentAgentId ?? ev.parentAgentId;
+        if (parentId && parentId !== actor.id) {
+          activeChildren.get(parentId)?.delete(actor.id);
+        }
         break;
       }
     }

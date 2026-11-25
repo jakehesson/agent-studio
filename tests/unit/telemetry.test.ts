@@ -2531,4 +2531,956 @@ describe("Hybrid Telemetry Adapters, Deduplication, State Machine & hook-emit", 
     );
     assert.equal(disc.isMultiAgent, true);
   });
+
+  it("BUG-19 (1): hook-emit Copilot subagent UserPromptSubmit -> thinking_start + parentAgentId='root' and Stop -> 'Stop (<agentLabel>)'", async () => {
+    const wsDir = path.join(tmpDir, "bug19-1-ws");
+    await fs.mkdir(wsDir, { recursive: true });
+    const offlineFetch: typeof fetch = () =>
+      Promise.reject(new Error("ECONNREFUSED"));
+
+    const subPrompt = await runHookEmit(
+      ["--ide", "copilot-vscode", "--event", "UserPromptSubmit"],
+      {
+        stdinText: JSON.stringify({
+          sessionId: "b19-s1",
+          cwd: wsDir,
+          agent_id: "uuid-sub-1111",
+          agent_type: "qa-specialist",
+          prompt: "Verify telemetry fixes and run unit tests",
+        }),
+        stdout: () => undefined,
+        stderr: () => undefined,
+        fetchImpl: offlineFetch,
+      },
+    );
+    assert.equal(subPrompt.event?.kind, "thinking_start");
+    assert.equal(subPrompt.event?.agentId, "uuid-sub-1111");
+    assert.equal(subPrompt.event?.parentAgentId, "root");
+    assert.ok(!subPrompt.event?.summary.startsWith("Human:"));
+    assert.match(subPrompt.event?.summary ?? "", /Verify telemetry fixes/);
+
+    const subPre = await runHookEmit(
+      ["--ide", "copilot-vscode", "--event", "PreToolUse"],
+      {
+        stdinText: JSON.stringify({
+          sessionId: "b19-s1",
+          cwd: wsDir,
+          agent_id: "uuid-sub-1111",
+          agent_type: "qa-specialist",
+          tool_name: "read_file",
+          tool_call_id: "call_read_1",
+        }),
+        stdout: () => undefined,
+        stderr: () => undefined,
+        fetchImpl: offlineFetch,
+      },
+    );
+    assert.equal(subPre.event?.parentAgentId, "root");
+
+    const subStop = await runHookEmit(
+      ["--ide", "copilot-vscode", "--event", "Stop"],
+      {
+        stdinText: JSON.stringify({
+          sessionId: "b19-s1",
+          cwd: wsDir,
+          agent_id: "uuid-sub-1111",
+          agent_type: "qa-specialist",
+        }),
+        stdout: () => undefined,
+        stderr: () => undefined,
+        fetchImpl: offlineFetch,
+      },
+    );
+    assert.equal(subStop.event?.kind, "assistant_turn_end");
+    assert.equal(subStop.event?.parentAgentId, "root");
+    assert.equal(subStop.event?.summary, "Stop (qa-specialist)");
+
+    const rootStop = await runHookEmit(
+      ["--ide", "copilot-vscode", "--event", "Stop"],
+      {
+        stdinText: JSON.stringify({
+          sessionId: "b19-s1",
+          cwd: wsDir,
+        }),
+        stdout: () => undefined,
+        stderr: () => undefined,
+        fetchImpl: offlineFetch,
+      },
+    );
+    assert.equal(rootStop.event?.agentId, "root");
+    assert.equal(rootStop.event?.summary, "Stop (Coordinator)");
+  });
+
+  it("BUG-19 (2): subagent transcript user.message -> thinking_start, normalizer user_input guard, PushBus agentId re-homing, and root transcriptPath ordering", async () => {
+    const vscDir = path.join(tmpDir, "bug19-2-vsc");
+    const wsHash = path.join(vscDir, "ws-hash");
+    const transcriptsDir = path.join(wsHash, "GitHub.copilot-chat", "transcripts");
+    await fs.mkdir(transcriptsDir, { recursive: true });
+
+    const subTr = path.join(transcriptsDir, "sub-tr.jsonl");
+    await fs.writeFile(
+      subTr,
+      [
+        {
+          type: "user.message",
+          timestamp: "2026-11-25T13:00:00Z",
+          data: { content: "Audit backend telemetry changes" },
+        },
+        {
+          type: "assistant.message",
+          timestamp: "2026-11-25T13:00:02Z",
+          data: { content: "Audited changes." },
+        },
+      ]
+        .map((r) => JSON.stringify(r))
+        .join("\n") + "\n",
+      "utf8",
+    );
+
+    const adapter = new CopilotVSCodeAdapter({ storageDir: vscDir });
+    const subEvents = await adapter.parseTranscriptFile(subTr, "b19-s2", {
+      agentIdOverride: "sub-agent-2",
+      parentAgentIdOverride: "root",
+      allowedRoots: [vscDir],
+    });
+    assert.equal(subEvents[0]?.kind, "thinking_start");
+    assert.ok(!subEvents[0]?.summary.startsWith("Human:"));
+
+    // Direct normalizer guard: rogue user_input targeting a subagent must NOT increment human.messagesSent or add human -> subagent edge
+    const snap = buildSessionSnapshot(
+      [
+        {
+          id: "root-init",
+          ts: "2026-11-25T13:00:00Z",
+          epoch: 1_795_200_000,
+          ide: "copilot-vscode",
+          channel: "hook",
+          sessionId: "b19-s2",
+          agentId: "root",
+          kind: "user_input",
+          summary: "Human: Run QA",
+          payload: { prompt: "Run QA" },
+        },
+        {
+          id: "sub-rogue-ui",
+          ts: "2026-11-25T13:00:01Z",
+          epoch: 1_795_200_001,
+          ide: "copilot-vscode",
+          channel: "hook",
+          sessionId: "b19-s2",
+          agentId: "sub-agent-2",
+          parentAgentId: "root",
+          kind: "user_input",
+          summary: "Human: Subagent task prompt",
+        },
+      ],
+      {
+        sessionId: "b19-s2",
+        ide: "copilot-vscode",
+        nowEpochSec: 1_795_200_005,
+      },
+    );
+    const humanNode = snap.agents.find((a) => a.id === "human");
+    assert.equal(humanNode?.messagesSent, 1, "human.messagesSent must count only root prompt");
+    assert.equal(
+      snap.edges.some((e) => e.from === "human" && e.to === "sub-agent-2"),
+      false,
+      "must not create human -> subagent edge",
+    );
+    const subNode = snap.agents.find((a) => a.id === "sub-agent-2");
+    assert.equal(subNode?.status, "THINKING");
+
+    // PushBus fallback re-homing by ev.agentId when sessionId !== parentSessionId, coercing user_input -> thinking_start
+    const bus = new PushBus({ includeGlobalTelemetryFile: false });
+    bus.ingest([
+      {
+        id: "b19-spawn",
+        ts: "2026-11-25T13:01:00Z",
+        ide: "copilot-vscode",
+        sessionId: "parent-b19",
+        agentId: "root",
+        targetAgentId: "sub-uuid-99",
+        kind: "subagent_spawn",
+        summary: "Spawned qa-specialist",
+        payload: { agentLabel: "qa-specialist" },
+      },
+      {
+        id: "b19-orphan-ui",
+        ts: "2026-11-25T13:01:01Z",
+        ide: "copilot-vscode",
+        sessionId: "different-child-sid",
+        agentId: "sub-uuid-99",
+        kind: "user_input",
+        summary: "Human: Subagent prompt",
+      },
+    ]);
+    assert.ok(!bus.getAllSessionIds().includes("different-child-sid"));
+    const migratedEv = bus.getSessionEvents("parent-b19").find((e) => e.id === "b19-orphan-ui");
+    assert.equal(migratedEv?.kind, "thinking_start");
+    assert.equal(migratedEv?.parentAgentId, "root");
+
+    // TelemetryAggregator parses root's shared transcriptPath before subagent's entry even if subagent was registered first
+    const sharedMainTr = path.join(transcriptsDir, "shared-main.jsonl");
+    await fs.writeFile(
+      sharedMainTr,
+      [
+        {
+          type: "user.message",
+          timestamp: "2026-11-25T13:02:00Z",
+          data: { content: "Main coordinator prompt" },
+        },
+        {
+          type: "tool.execution_start",
+          timestamp: "2026-11-25T13:02:01Z",
+          data: { toolName: "read_file", toolCallId: "tc-main-1" },
+        },
+      ]
+        .map((r) => JSON.stringify(r))
+        .join("\n") + "\n",
+      "utf8",
+    );
+    const agg = new TelemetryAggregator({
+      brainDir: path.join(tmpDir, "empty-brain-b19"),
+      claudeDir: path.join(tmpDir, "empty-claude-b19"),
+      vscodeDir: vscDir,
+      extraWorkspaces: [vscDir],
+      includeGlobalTelemetryFile: false,
+    });
+    agg.ingest([
+      {
+        id: "sub-first",
+        ts: "2026-11-25T13:02:00Z",
+        ide: "copilot-vscode",
+        sessionId: "shared-tr-sess",
+        agentId: "sub-first-id",
+        parentAgentId: "root",
+        kind: "tool_start",
+        toolName: "grep_search",
+        summary: "Search",
+        payload: { transcriptPath: sharedMainTr },
+      },
+      {
+        id: "root-second",
+        ts: "2026-11-25T13:02:01Z",
+        ide: "copilot-vscode",
+        sessionId: "shared-tr-sess",
+        agentId: "root",
+        kind: "session_start",
+        summary: "Start",
+        payload: { transcriptPath: sharedMainTr },
+      },
+    ]);
+    const aggSnap = await agg.getSessionSnapshot("shared-tr-sess");
+    const rootAg = aggSnap.snapshot.agents.find((a) => a.id === "root");
+    assert.ok((rootAg?.toolCalls ?? 0) >= 1, "shared transcript tool_start must attribute to root");
+    assert.equal(
+      aggSnap.snapshot.events.some((e) => e.agentId === "sub-first-id" && e.toolCallId === "tc-main-1"),
+      false,
+    );
+  });
+
+  it("BUG-19 (3): chatSessions UUID modeInfo & custom mode collapse to 'root', isMultiAgent=false, and user_input dedups across hook + chatSessions + transcript.jsonl", async () => {
+    const vscDir = path.join(tmpDir, "bug19-3-vsc");
+    const wsHash = path.join(vscDir, "ws-hash");
+    const chatDir = path.join(wsHash, "chatSessions");
+    const trDir = path.join(wsHash, "GitHub.copilot-chat", "transcripts");
+    await fs.mkdir(chatDir, { recursive: true });
+    await fs.mkdir(trDir, { recursive: true });
+
+    const baseMs = Date.parse("2026-11-25T14:00:00Z");
+    const chatFile = path.join(chatDir, "b19-root-collapse.json");
+    await fs.writeFile(
+      chatFile,
+      JSON.stringify({
+        sessionId: "b19-root-collapse",
+        creationDate: baseMs,
+        requests: [
+          {
+            requestId: "req-1",
+            timestamp: baseMs,
+            modeInfo: { modeName: "cfccd03f-1111-2222-3333-444455556666" },
+            message: { text: "Explain the telemetry normalizer architecture" },
+            response: [
+              {
+                kind: "toolInvocationSerialized",
+                toolId: "copilot_readFile",
+                toolCallId: "rc-1",
+                isComplete: true,
+                pastTenseMessage: { value: "Read normalizer.ts" },
+              },
+            ],
+            modelState: { completedAt: baseMs + 4000 },
+          },
+          {
+            requestId: "req-2",
+            timestamp: baseMs + 20_000,
+            modeInfo: { modeName: "Architect" },
+            agent: { name: "custom-mode", id: "custom.id" },
+            message: { text: "Now review edge cases" },
+            response: [],
+            modelState: { completedAt: baseMs + 22_000 },
+          },
+        ],
+      }),
+      "utf8",
+    );
+
+    const trFile = path.join(trDir, "b19-root-collapse.jsonl");
+    await fs.writeFile(
+      trFile,
+      [
+        {
+          type: "session.start",
+          timestamp: "2026-11-25T14:00:00Z",
+          data: { sessionId: "b19-root-collapse" },
+        },
+        {
+          type: "user.message",
+          timestamp: "2026-11-25T14:00:06Z", // 6s drift from chatSessions req-1
+          data: { content: "Explain the telemetry normalizer architecture" },
+        },
+      ]
+        .map((r) => JSON.stringify(r))
+        .join("\n") + "\n",
+      "utf8",
+    );
+
+    const adapter = new CopilotVSCodeAdapter({ storageDir: vscDir });
+    const sessions = await adapter.discoverSessions();
+    const sess = sessions.find((s) => s.sessionId === "b19-root-collapse");
+    assert.ok(sess);
+    assert.equal(sess.isMultiAgent, false, "UUID/custom modeInfo must NOT mark session multi-agent");
+
+    const chatEvents = await adapter.parseSession(sess);
+    const trEvents = await adapter.parseTranscriptFile(trFile, "b19-root-collapse", {
+      allowedRoots: [vscDir],
+    });
+    const hookPrompt: EnrichedEvent = {
+      id: "hook-ui-1",
+      ts: "2026-11-25T14:00:09Z", // 9s drift from chatSessions req-1, 3s from transcript
+      epoch: baseMs / 1000 + 9,
+      ide: "copilot-vscode",
+      channel: "hook",
+      sessionId: "b19-root-collapse",
+      agentId: "root",
+      kind: "user_input",
+      summary: "Human: Explain the telemetry normalizer architecture",
+      payload: { prompt: "Explain the telemetry normalizer architecture" },
+    };
+
+    const snap = buildSessionSnapshot([...chatEvents, ...trEvents, hookPrompt], {
+      sessionId: "b19-root-collapse",
+      ide: "copilot-vscode",
+      nowEpochSec: baseMs / 1000 + 30,
+    });
+
+    const agentNodes = snap.agents.filter((a) => a.nodeType === "agent");
+    assert.equal(agentNodes.length, 1, "only single root agent node must exist");
+    assert.equal(agentNodes[0]?.id, "root");
+    assert.equal(agentNodes[0]?.label, "Copilot Agent");
+    assert.equal(
+      snap.agents.find((a) => a.id === "human")?.messagesSent,
+      2,
+      "3-source duplicate prompt for req-1 must dedup to 1, plus req-2 = 2 total human turns",
+    );
+  });
+
+  it("BUG-19 (4): mixed chatSessions (isComplete:false + repeated qa-specialist) + live hooks (SubagentStart UUID + orphan hook without SubagentStart) reconcile to 1 node per invocation", async () => {
+    const vscDir = path.join(tmpDir, "bug19-4-vsc");
+    const wsHash = path.join(vscDir, "ws-hash");
+    const chatDir = path.join(wsHash, "chatSessions");
+    await fs.mkdir(chatDir, { recursive: true });
+
+    const baseMs = Date.parse("2026-11-25T15:00:00Z");
+    const chatFile = path.join(chatDir, "b19-reconcile.json");
+    await fs.writeFile(
+      chatFile,
+      JSON.stringify({
+        sessionId: "b19-reconcile",
+        creationDate: baseMs,
+        requests: [
+          {
+            requestId: "r-rec-1",
+            timestamp: baseMs,
+            message: { text: "Run two QA passes" },
+            response: [
+              {
+                kind: "toolInvocationSerialized",
+                toolId: "runSubagent",
+                toolCallId: "tc-run-1",
+                isComplete: false,
+                toolSpecificData: {
+                  agentName: "qa-specialist",
+                  model: "claude-sonnet-4-5",
+                  prompt: "Run pass 1",
+                },
+              },
+              {
+                kind: "toolInvocationSerialized",
+                toolId: "runSubagent",
+                toolCallId: "tc-run-2",
+                isComplete: false,
+                toolSpecificData: {
+                  agentName: "qa-specialist",
+                  model: "claude-haiku-4-5",
+                  prompt: "Run pass 2",
+                },
+              },
+            ],
+          },
+        ],
+      }),
+      "utf8",
+    );
+
+    const adapter = new CopilotVSCodeAdapter({ storageDir: vscDir });
+    const [sess] = await adapter.discoverSessions();
+    assert.ok(sess);
+    assert.equal(sess.isMultiAgent, true);
+
+    const passiveEvents = await adapter.parseSession(sess);
+    const passiveSpawns = passiveEvents.filter((e) => e.kind === "subagent_spawn");
+    assert.equal(passiveSpawns[0]?.targetAgentId, "qa-specialist");
+    assert.equal(passiveSpawns[1]?.targetAgentId, "qa-specialist-2");
+    assert.equal(passiveSpawns[0]?.payload?.agentType, "qa-specialist");
+
+    const baseSec = baseMs / 1000;
+    const subTr1 = path.join(vscDir, "sub-1.jsonl");
+    const hookEvents: EnrichedEvent[] = [
+      // Run 1: SubagentStart with UUID + tool + SubagentStop
+      {
+        id: "h-start-1",
+        ts: new Date((baseSec + 0.2) * 1000).toISOString(),
+        epoch: baseSec + 0.2,
+        ide: "copilot-vscode",
+        channel: "hook",
+        sessionId: "b19-reconcile",
+        agentId: "root",
+        targetAgentId: "uuid-qa-1",
+        kind: "subagent_spawn",
+        summary: "Spawned qa-specialist",
+        payload: {
+          agentType: "qa-specialist",
+          agentLabel: "qa-specialist",
+          agentTranscriptPath: subTr1,
+        },
+      },
+      {
+        id: "h-tool-1",
+        ts: new Date((baseSec + 1.0) * 1000).toISOString(),
+        epoch: baseSec + 1.0,
+        ide: "copilot-vscode",
+        channel: "hook",
+        sessionId: "b19-reconcile",
+        agentId: "uuid-qa-1",
+        parentAgentId: "root",
+        agentLabel: "qa-specialist",
+        kind: "tool_start",
+        toolName: "run_in_terminal",
+        toolCallId: "h-tc-1",
+        summary: "PreToolUse: run_in_terminal",
+      },
+      {
+        id: "h-stop-1",
+        ts: new Date((baseSec + 2.0) * 1000).toISOString(),
+        epoch: baseSec + 2.0,
+        ide: "copilot-vscode",
+        channel: "hook",
+        sessionId: "b19-reconcile",
+        agentId: "root",
+        targetAgentId: "uuid-qa-1",
+        kind: "subagent_done",
+        summary: "Completed qa-specialist",
+      },
+      // Run 2: Orphan hook subagent (NO SubagentStart, only PreToolUse + Stop)
+      {
+        id: "h-orphan-tool-2",
+        ts: new Date((baseSec + 5.0) * 1000).toISOString(),
+        epoch: baseSec + 5.0,
+        ide: "copilot-vscode",
+        channel: "hook",
+        sessionId: "b19-reconcile",
+        agentId: "uuid-qa-2",
+        agentLabel: "qa-specialist",
+        kind: "tool_start",
+        toolName: "read_file",
+        toolCallId: "h-tc-2",
+        summary: "PreToolUse: read_file",
+        payload: { agentType: "qa-specialist", agentLabel: "qa-specialist" },
+      },
+    ];
+
+    const snap = buildSessionSnapshot([...passiveEvents, ...hookEvents], {
+      sessionId: "b19-reconcile",
+      ide: "copilot-vscode",
+      nowEpochSec: baseSec + 6,
+    });
+
+    const subAgents = snap.agents.filter((a) => a.nodeType === "agent" && !a.isRoot);
+    assert.equal(subAgents.length, 2, "must reconcile to exactly 1 node per invocation (no 0t Spawned ghosts)");
+    const ag1 = subAgents.find((a) => a.id === "uuid-qa-1");
+    const ag2 = subAgents.find((a) => a.id === "uuid-qa-2");
+    assert.ok(ag1, "run 1 reconciled onto hook UUID");
+    assert.ok(ag2, "run 2 reconciled onto orphan hook UUID");
+    assert.equal(ag1.model, "Claude Sonnet 4.5");
+    assert.equal(ag1.toolCalls, 1);
+    assert.equal(ag1.status, "DONE");
+    assert.equal(ag2.model, "Claude Haiku 4.5");
+    assert.equal(ag2.parentAgentId, "root");
+    assert.equal(ag2.status, "WORKING");
+
+    const spawnEv1 = snap.events.find(
+      (e) => e.kind === "subagent_spawn" && e.targetAgentId === "uuid-qa-1",
+    );
+    assert.equal(spawnEv1?.payload?.agentTranscriptPath, subTr1);
+    assert.equal(spawnEv1?.payload?.prompt, "Run pass 1");
+  });
+
+  it("BUG-19 (5): openTools Map exports readable toolName as activeTool across overlapping concurrent tool calls and out-of-order completion", () => {
+    const baseEpoch = 1_795_300_000;
+    const events: EnrichedEvent[] = [
+      {
+        id: "ot-1",
+        ts: toIsoTest(baseEpoch),
+        epoch: baseEpoch,
+        ide: "copilot-vscode",
+        channel: "hook",
+        sessionId: "b19-opentools",
+        agentId: "root",
+        kind: "tool_start",
+        toolName: "read_file",
+        toolCallId: "call_1111aaaa",
+        summary: "Read A",
+      },
+      {
+        id: "ot-2",
+        ts: toIsoTest(baseEpoch + 1),
+        epoch: baseEpoch + 1,
+        ide: "copilot-vscode",
+        channel: "hook",
+        sessionId: "b19-opentools",
+        agentId: "root",
+        kind: "tool_start",
+        toolName: "grep_search",
+        toolCallId: "call_2222bbbb",
+        summary: "Search B",
+      },
+      // Complete call_1111aaaa out-of-order; grep_search must remain activeTool!
+      {
+        id: "ot-3",
+        ts: toIsoTest(baseEpoch + 2),
+        epoch: baseEpoch + 2,
+        ide: "copilot-vscode",
+        channel: "hook",
+        sessionId: "b19-opentools",
+        agentId: "root",
+        kind: "tool_end",
+        toolName: "read_file",
+        toolCallId: "call_1111aaaa",
+        summary: "Completed A",
+      },
+    ];
+
+    const snap1 = buildSessionSnapshot(events, {
+      sessionId: "b19-opentools",
+      ide: "copilot-vscode",
+      nowEpochSec: baseEpoch + 3,
+    });
+    const root1 = snap1.agents.find((a) => a.id === "root");
+    assert.equal(root1?.status, "WORKING");
+    assert.equal(root1?.activeTool, "grep_search", "activeTool must be readable toolName, never call_...");
+
+    // Now complete remaining tool without toolCallId (falls back to matching toolName)
+    const snap2 = buildSessionSnapshot(
+      [
+        ...events,
+        {
+          id: "ot-4",
+          ts: toIsoTest(baseEpoch + 3),
+          epoch: baseEpoch + 3,
+          ide: "copilot-vscode",
+          channel: "hook",
+          sessionId: "b19-opentools",
+          agentId: "root",
+          kind: "tool_end",
+          toolName: "grep_search",
+          summary: "Completed B",
+        },
+      ],
+      {
+        sessionId: "b19-opentools",
+        ide: "copilot-vscode",
+        nowEpochSec: baseEpoch + 4,
+      },
+    );
+    const root2 = snap2.agents.find((a) => a.id === "root");
+    assert.equal(root2?.activeTool, undefined);
+    assert.equal(root2?.status, "THINKING");
+  });
+
+  it("BUG-19 P1-1 & P1-3: isComplete:true chatSessions (pDone at turn start) + later hook tools/SubagentStop stay DONE and clear root.openTools even when merged agentId===doneAgent.id", async () => {
+    const vscDir = path.join(tmpDir, "bug19-p1-13-vsc");
+    const wsHash = path.join(vscDir, "ws-hash");
+    const chatDir = path.join(wsHash, "chatSessions");
+    await fs.mkdir(chatDir, { recursive: true });
+
+    const baseMs = Date.parse("2026-11-25T16:00:00Z");
+    const baseSec = baseMs / 1000;
+    const chatFile = path.join(chatDir, "b19-complete-late-hook.json");
+    await fs.writeFile(
+      chatFile,
+      JSON.stringify({
+        sessionId: "b19-complete-late-hook",
+        creationDate: baseMs,
+        requests: [
+          {
+            requestId: "r-done-1",
+            timestamp: baseMs,
+            message: { text: "Run backend check" },
+            response: [
+              {
+                kind: "prepareToolInvocation",
+                toolName: "runSubagent",
+                toolCallId: "tc-sub-complete-1",
+              },
+              {
+                kind: "toolInvocationSerialized",
+                toolId: "runSubagent",
+                toolCallId: "tc-sub-complete-1",
+                isComplete: true,
+                pastTenseMessage: { value: "Finished backend check" },
+                toolSpecificData: {
+                  agentName: "backend-engineer",
+                  prompt: "Verify API",
+                },
+              },
+            ],
+            modelState: { completedAt: baseMs + 60_000 },
+          },
+        ],
+      }),
+      "utf8",
+    );
+
+    const adapter = new CopilotVSCodeAdapter({ storageDir: vscDir });
+    const [sess] = await adapter.discoverSessions();
+    assert.ok(sess);
+    const passiveEvents = await adapter.parseSession(sess);
+
+    // Live hooks arrive 10-40s later than synthetic chatSessions pDone (baseSec + 0.025)
+    const hookEvents: EnrichedEvent[] = [
+      {
+        id: "h-late-start",
+        ts: toIsoTest(baseSec + 1),
+        epoch: baseSec + 1,
+        ide: "copilot-vscode",
+        channel: "hook",
+        sessionId: "b19-complete-late-hook",
+        agentId: "root",
+        targetAgentId: "uuid-be-1",
+        kind: "subagent_spawn",
+        summary: "Spawned backend-engineer",
+        payload: { agentType: "backend-engineer", agentLabel: "backend-engineer" },
+      },
+      {
+        id: "h-late-tool-start",
+        ts: toIsoTest(baseSec + 15),
+        epoch: baseSec + 15,
+        ide: "copilot-vscode",
+        channel: "hook",
+        sessionId: "b19-complete-late-hook",
+        agentId: "uuid-be-1",
+        parentAgentId: "root",
+        agentLabel: "backend-engineer",
+        kind: "tool_start",
+        toolName: "read_file",
+        toolCallId: "be-tc-1",
+        summary: "Read file",
+      },
+      {
+        id: "h-late-tool-end",
+        ts: toIsoTest(baseSec + 20),
+        epoch: baseSec + 20,
+        ide: "copilot-vscode",
+        channel: "hook",
+        sessionId: "b19-complete-late-hook",
+        agentId: "uuid-be-1",
+        parentAgentId: "root",
+        agentLabel: "backend-engineer",
+        kind: "tool_end",
+        toolName: "read_file",
+        toolCallId: "be-tc-1",
+        summary: "Completed Read file",
+      },
+      {
+        id: "h-late-stop",
+        ts: toIsoTest(baseSec + 40),
+        epoch: baseSec + 40,
+        ide: "copilot-vscode",
+        channel: "hook",
+        sessionId: "b19-complete-late-hook",
+        agentId: "root",
+        targetAgentId: "uuid-be-1",
+        kind: "subagent_done",
+        summary: "Completed backend-engineer",
+      },
+    ];
+
+    const snap = buildSessionSnapshot([...passiveEvents, ...hookEvents], {
+      sessionId: "b19-complete-late-hook",
+      ide: "copilot-vscode",
+      nowEpochSec: baseSec + 65,
+    });
+    const subAg = snap.agents.find((a) => a.id === "uuid-be-1");
+    assert.ok(subAg);
+    assert.equal(subAg.status, "DONE", "pDone must not rewind before hook tool calls");
+    const rootAg = snap.agents.find((a) => a.id === "root");
+    assert.equal(rootAg?.status, "DONE", "root must not stay stuck WORKING or WAITING");
+    assert.equal(rootAg?.activeTool, undefined, "root.openTools must be cleared when subagent finishes");
+
+    // Also verify P1-3 directly when merged subagent_done has ev.agentId === doneAgent.id (no targetAgentId) while parent holds open toolCallId
+    const directSnap = buildSessionSnapshot(
+      [
+        {
+          id: "p13-root-prep",
+          ts: toIsoTest(baseSec),
+          epoch: baseSec,
+          ide: "copilot-vscode",
+          channel: "passive",
+          sessionId: "p13-direct",
+          agentId: "root",
+          kind: "tool_start",
+          toolName: "runSubagent",
+          toolCallId: "tc-parent-open",
+          summary: "Preparing: runSubagent",
+        },
+        {
+          id: "p13-spawn",
+          ts: toIsoTest(baseSec + 1),
+          epoch: baseSec + 1,
+          ide: "copilot-vscode",
+          channel: "passive",
+          sessionId: "p13-direct",
+          agentId: "root",
+          targetAgentId: "uuid-child-1",
+          kind: "subagent_spawn",
+          toolName: "runSubagent",
+          toolCallId: "tc-parent-open",
+          summary: "Spawned child",
+        },
+        {
+          id: "p13-done-self",
+          ts: toIsoTest(baseSec + 5),
+          epoch: baseSec + 5,
+          ide: "copilot-vscode",
+          channel: "passive",
+          sessionId: "p13-direct",
+          agentId: "uuid-child-1",
+          parentAgentId: "root",
+          kind: "subagent_done",
+          toolName: "runSubagent",
+          toolCallId: "tc-parent-open",
+          summary: "Subagent finished",
+        },
+      ],
+      {
+        sessionId: "p13-direct",
+        ide: "copilot-vscode",
+        nowEpochSec: baseSec + 6,
+      },
+    );
+    const dRoot = directSnap.agents.find((a) => a.id === "root");
+    assert.equal(dRoot?.activeTool, undefined, "parent openTools cleared even when ev.agentId === doneAgent.id");
+    assert.equal(directSnap.agents.find((a) => a.id === "uuid-child-1")?.status, "DONE");
+  });
+
+  it("BUG-19 P1-2: orphan hook subagent with UUID agent_id and NO agent_type/SubagentStart reconciles with passive runSubagent under readable label", async () => {
+    const baseEpoch = 1_795_400_000;
+    const orphanUuid = "cfccd03f-1111-4222-8333-444455556666";
+    const passiveSpawn: EnrichedEvent = {
+      id: "p-orphan-uuid-spawn",
+      ts: toIsoTest(baseEpoch),
+      epoch: baseEpoch,
+      ide: "copilot-vscode",
+      channel: "passive",
+      sessionId: "b19-uuid-orphan",
+      agentId: "root",
+      targetAgentId: "qa-specialist",
+      kind: "subagent_spawn",
+      toolName: "runSubagent",
+      toolCallId: "tc-uo-1",
+      summary: "Spawned qa-specialist",
+      payload: {
+        agentLabel: "qa-specialist",
+        agentType: "qa-specialist",
+        _passiveSource: "chatSessions",
+      },
+    };
+    const orphanTool: EnrichedEvent = {
+      id: "h-orphan-uuid-tool",
+      ts: toIsoTest(baseEpoch + 1),
+      epoch: baseEpoch + 1,
+      ide: "copilot-vscode",
+      channel: "hook",
+      sessionId: "b19-uuid-orphan",
+      agentId: orphanUuid,
+      parentAgentId: "root",
+      kind: "tool_start",
+      toolName: "grep_search",
+      toolCallId: "h-uo-tc-1",
+      summary: "PreToolUse: grep_search",
+    };
+    const orphanStop: EnrichedEvent = {
+      id: "h-orphan-uuid-stop",
+      ts: toIsoTest(baseEpoch + 3),
+      epoch: baseEpoch + 3,
+      ide: "copilot-vscode",
+      channel: "hook",
+      sessionId: "b19-uuid-orphan",
+      agentId: orphanUuid,
+      parentAgentId: "root",
+      kind: "assistant_turn_end",
+      summary: `Stop (${orphanUuid})`,
+    };
+
+    const snap = buildSessionSnapshot([passiveSpawn, orphanTool, orphanStop], {
+      sessionId: "b19-uuid-orphan",
+      ide: "copilot-vscode",
+      nowEpochSec: baseEpoch + 5,
+    });
+
+    const subAgents = snap.agents.filter((a) => a.nodeType === "agent" && !a.isRoot);
+    assert.equal(subAgents.length, 1, "UUID-only orphan must reconcile to single subagent node");
+    assert.equal(subAgents[0]?.id, orphanUuid);
+    assert.equal(subAgents[0]?.label, "qa-specialist");
+    assert.equal(subAgents[0]?.status, "DONE");
+    assert.equal(subAgents[0]?.action, "Stop (qa-specialist)");
+    assert.ok(!subAgents[0]?.action.includes(orphanUuid), "must rewrite Stop (<uuid>) to Stop (<readableLabel>)");
+  });
+
+  it("BUG-19 P2-6: dual passive sources (chatSessions + transcripts/*.jsonl) + hook subagent reconcile to 1 node", async () => {
+    const vscDir = path.join(tmpDir, "bug19-dual-passive-vsc");
+    const wsHash = path.join(vscDir, "ws-hash");
+    const chatDir = path.join(wsHash, "chatSessions");
+    const trDir = path.join(wsHash, "GitHub.copilot-chat", "transcripts");
+    await fs.mkdir(chatDir, { recursive: true });
+    await fs.mkdir(trDir, { recursive: true });
+
+    const baseMs = Date.parse("2026-11-25T17:00:00Z");
+    const baseSec = baseMs / 1000;
+
+    const chatFile = path.join(chatDir, "b19-dual.json");
+    await fs.writeFile(
+      chatFile,
+      JSON.stringify({
+        sessionId: "b19-dual",
+        creationDate: baseMs,
+        requests: [
+          {
+            requestId: "r-dual-1",
+            timestamp: baseMs,
+            message: { text: "Verify dual passive" },
+            response: [
+              {
+                kind: "toolInvocationSerialized",
+                toolId: "runSubagent",
+                toolCallId: "tc-chat-dual-1",
+                isComplete: true,
+                toolSpecificData: {
+                  subAgentInvocationId: "chat-inv-uuid-1",
+                  subAgentName: "qa-specialist",
+                  model: "claude-sonnet-4-5",
+                  prompt: "Run checks",
+                },
+              },
+            ],
+          },
+        ],
+      }),
+      "utf8",
+    );
+
+    const trFile = path.join(trDir, "b19-dual.jsonl");
+    await fs.writeFile(
+      trFile,
+      [
+        {
+          type: "session.start",
+          timestamp: toIsoTest(baseSec),
+          data: { sessionId: "b19-dual" },
+        },
+        {
+          type: "subagent.started",
+          timestamp: toIsoTest(baseSec + 1),
+          data: {
+            toolCallId: "tc-tr-dual-1",
+            agentName: "qa-specialist",
+            prompt: "Run checks",
+          },
+        },
+        {
+          type: "subagent.completed",
+          timestamp: toIsoTest(baseSec + 3),
+          data: {
+            toolCallId: "tc-tr-dual-1",
+            agentName: "qa-specialist",
+            result: "All green",
+          },
+        },
+      ]
+        .map((r) => JSON.stringify(r))
+        .join("\n") + "\n",
+      "utf8",
+    );
+
+    const adapter = new CopilotVSCodeAdapter({ storageDir: vscDir });
+    const [sess] = await adapter.discoverSessions();
+    assert.ok(sess);
+    const chatEvs = await adapter.parseSession(sess);
+    const trEvs = await adapter.parseTranscriptFile(trFile, "b19-dual", {
+      allowedRoots: [vscDir],
+    });
+    const hookEvents: EnrichedEvent[] = [
+      {
+        id: "h-dual-start",
+        ts: toIsoTest(baseSec + 0.5),
+        epoch: baseSec + 0.5,
+        ide: "copilot-vscode",
+        channel: "hook",
+        sessionId: "b19-dual",
+        agentId: "root",
+        targetAgentId: "hook-uuid-dual-1",
+        kind: "subagent_spawn",
+        summary: "Spawned qa-specialist",
+        payload: { agentType: "qa-specialist", agentLabel: "qa-specialist" },
+      },
+      {
+        id: "h-dual-stop",
+        ts: toIsoTest(baseSec + 4),
+        epoch: baseSec + 4,
+        ide: "copilot-vscode",
+        channel: "hook",
+        sessionId: "b19-dual",
+        agentId: "root",
+        targetAgentId: "hook-uuid-dual-1",
+        kind: "subagent_done",
+        summary: "Completed qa-specialist",
+      },
+    ];
+
+    const snap = buildSessionSnapshot([...chatEvs, ...trEvs, ...hookEvents], {
+      sessionId: "b19-dual",
+      ide: "copilot-vscode",
+      nowEpochSec: baseSec + 10,
+    });
+    const subAgents = snap.agents.filter((a) => a.nodeType === "agent" && !a.isRoot);
+    assert.equal(subAgents.length, 1, "dual passive sources + hook must reconcile to 1 node");
+    assert.equal(subAgents[0]?.id, "hook-uuid-dual-1");
+    assert.equal(subAgents[0]?.model, "Claude Sonnet 4.5");
+    assert.equal(subAgents[0]?.status, "DONE");
+  });
 });
+
+function toIsoTest(epochSec: number): string {
+  return new Date(Math.round(epochSec * 1000)).toISOString();
+}

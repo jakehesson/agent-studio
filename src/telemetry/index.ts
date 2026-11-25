@@ -352,8 +352,13 @@ export class TelemetryAggregator {
     };
 
     const agentPaths = this.pushBus.getAgentTranscriptPaths(sessionId);
+    const rootPath = agentPaths.get("root");
+    if (rootPath) {
+      await parseOne(rootPath, undefined);
+    }
     for (const [aid, tp] of agentPaths.entries()) {
-      await parseOne(tp, aid === "root" ? undefined : aid);
+      if (aid === "root") continue;
+      await parseOne(tp, aid);
     }
     for (const tp of this.pushBus.getTranscriptPaths(sessionId)) {
       await parseOne(tp, undefined);

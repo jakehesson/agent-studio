@@ -120,12 +120,12 @@ function loadTeamManifestBestEffort(cwd: string): TeamManifest | null {
   }
 }
 
-function mapHookEventToKind(hookEvent: string): EventKind {
+function mapHookEventToKind(hookEvent: string, isSubagent = false): EventKind {
   switch (hookEvent.toLowerCase()) {
     case "sessionstart":
       return "session_start";
     case "userpromptsubmit":
-      return "user_input";
+      return isSubagent ? "thinking_start" : "user_input";
     case "pretooluse":
       return "tool_start";
     case "posttooluse":
@@ -482,8 +482,9 @@ export async function runHookEmit(
     flags.role ??
     strField(payload, "agent_role", "agentRole", "role", "agent_type", "agentName");
 
+  const isSubagentContext = Boolean(subagentId && subagentId !== "root");
   const epoch = Date.now() / 1000;
-  let kind = mapHookEventToKind(hookEvent);
+  let kind = mapHookEventToKind(hookEvent, isSubagentContext);
   const lowTool = (toolName ?? "").toLowerCase();
   if (hookLow === "pretooluse" && toolName) {
     if ((lowTool === "agent" || lowTool === "task") && targetAgentId) {
@@ -553,15 +554,20 @@ export async function runHookEmit(
     isError = toolIsError;
   }
 
+  const readableActor = agentLabel || (agentId === "root" ? "Coordinator" : agentId);
   const summary = denyReason
     ? `DENIED ${toolName ?? "tool"}: ${denyReason}`
     : isSubagentLifecycle
       ? `${hookLow === "subagentstart" ? "Spawned" : "Completed"} ${subagentType || normalizedSubagentId}`
-      : hookLow === "userpromptsubmit" && promptText
-        ? `Human: ${cleanHumanSummary(promptText, 130)}`
+      : hookLow === "userpromptsubmit"
+        ? isSubagentContext
+          ? (promptText ? cleanHumanSummary(promptText, 130) : "") || "Starting task…"
+          : promptText
+            ? `Human: ${cleanHumanSummary(promptText, 130)}`
+            : `${hookEvent} (${readableActor})`
         : toolName
           ? `${hookEvent}: ${toolName}`
-          : `${hookEvent} (${agentId})`;
+          : `${hookEvent} (${readableActor})`;
 
   const usageDelta = extractHookUsageDelta(payload, modelRaw);
 

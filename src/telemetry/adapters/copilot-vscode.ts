@@ -602,15 +602,16 @@ export class CopilotVSCodeAdapter implements PassiveIdeAdapter {
             firstPrompt?.slice(0, 80) ||
             `Copilot ${sessionId.slice(0, 8)}`;
 
-          const distinctAgents = new Set<string>();
           let hasSubagent = false;
           for (const req of requests) {
-            const aid = req.modeInfo?.modeName || req.agent?.name || req.agent?.id;
-            if (aid) distinctAgents.add(aid);
             for (const resp of req.response ?? []) {
               const tid = (resp.toolId ?? resp.toolName ?? "").toLowerCase();
-              if (isSubagentToolName(tid)) hasSubagent = true;
+              if (isSubagentToolName(tid)) {
+                hasSubagent = true;
+                break;
+              }
             }
+            if (hasSubagent) break;
           }
 
           const candidate: DiscoveredSession = {
@@ -623,7 +624,7 @@ export class CopilotVSCodeAdapter implements PassiveIdeAdapter {
             title,
             mtimeMs: fst.mtimeMs,
             sizeBytes: fst.size,
-            isMultiAgent: hasSubagent || distinctAgents.size > 1,
+            isMultiAgent: hasSubagent,
           };
           const prev = byId.get(sessionId);
           if (!prev || candidate.mtimeMs > prev.mtimeMs) {
@@ -864,6 +865,7 @@ export class CopilotVSCodeAdapter implements PassiveIdeAdapter {
       string,
       { subId: string; subLabel: string }
     >();
+    const usedSubagentSlugs = new Set<string>();
     let fallbackEpoch = mtimeMs / 1000 - Math.max(rows.length, 1);
 
     for (let idx = 0; idx < rows.length; idx++) {
@@ -1054,14 +1056,28 @@ export class CopilotVSCodeAdapter implements PassiveIdeAdapter {
         if (txt) {
           acc.estInputChars += txt.length;
           const inlineBody = txt.slice(0, 1400);
-          emit({
-            kind: "user_input",
-            targetAgentId: agentId,
-            summary: `Human: ${cleanHumanSummary(txt, 130)}`,
-            payload: { body: inlineBody, prompt: inlineBody },
-            fullBody: txt,
-            inlineBody,
-          });
+          if (agentId !== "root") {
+            emit({
+              kind: "thinking_start",
+              summary: cleanHumanSummary(txt, 130) || "Starting task…",
+              payload: { body: inlineBody, prompt: inlineBody },
+              fullBody: txt,
+              inlineBody,
+            });
+          } else {
+            emit({
+              kind: "user_input",
+              targetAgentId: agentId,
+              summary: `Human: ${cleanHumanSummary(txt, 130)}`,
+              payload: {
+                body: inlineBody,
+                prompt: inlineBody,
+                _passiveSource: "transcript",
+              },
+              fullBody: txt,
+              inlineBody,
+            });
+          }
         }
       } else if (rtype === "assistant.message") {
         const msgText =
@@ -1190,11 +1206,37 @@ export class CopilotVSCodeAdapter implements PassiveIdeAdapter {
             d.description ??
             "Subagent",
         ).trim();
-        const rawSubId =
-          (typeof d.agentId === "string" && d.agentId.trim()) ||
-          (typeof d.subagentId === "string" && d.subagentId.trim()) ||
-          subLabel.toLowerCase().replace(/[^a-z0-9_-]+/g, "-") ||
-          "subagent";
+        const explicitSubId =
+          (typeof d.subAgentInvocationId === "string" &&
+            d.subAgentInvocationId.trim() &&
+            d.subAgentInvocationId.trim() !== "root" &&
+            d.subAgentInvocationId.trim()) ||
+          (typeof d.agentId === "string" &&
+            d.agentId.trim() &&
+            d.agentId.trim() !== "root" &&
+            d.agentId.trim()) ||
+          (typeof d.subagentId === "string" &&
+            d.subagentId.trim() &&
+            d.subagentId.trim() !== "root" &&
+            d.subagentId.trim()) ||
+          undefined;
+        const baseSlug =
+          subLabel
+            .toLowerCase()
+            .replace(/[^a-z0-9_-]+/g, "-")
+            .replace(/^-+|-+$/g, "") || "subagent";
+        let rawSubId: string;
+        if (explicitSubId) {
+          rawSubId = explicitSubId;
+          usedSubagentSlugs.add(rawSubId);
+        } else {
+          rawSubId = baseSlug;
+          let suffix = 2;
+          while (usedSubagentSlugs.has(rawSubId)) {
+            rawSubId = `${baseSlug}-${suffix++}`;
+          }
+          usedSubagentSlugs.add(rawSubId);
+        }
         if (callId) {
           subagentIdByCallId.set(callId, { subId: rawSubId, subLabel });
         }
@@ -1226,6 +1268,8 @@ export class CopilotVSCodeAdapter implements PassiveIdeAdapter {
           summary: `Spawned ${subLabel}`,
           payload: {
             agentLabel: subLabel,
+            agentType: subLabel,
+            _passiveSource: "transcript",
             ...(subModel
               ? { childModel: subModel, childModelSource: "exact" }
               : {}),
@@ -1404,6 +1448,8 @@ export class CopilotVSCodeAdapter implements PassiveIdeAdapter {
       return acc;
     };
 
+    const usedSubagentSlugs = new Set<string>();
+
     for (let rIdx = 0; rIdx < requests.length; rIdx++) {
       const req = requests[rIdx]!;
       const reqEpoch = parseEpochSeconds(
@@ -1411,18 +1457,9 @@ export class CopilotVSCodeAdapter implements PassiveIdeAdapter {
         (state.creationDate ? state.creationDate / 1000 : session.mtimeMs / 1000) +
           rIdx,
       );
-      const rawAgent =
-        req.modeInfo?.modeName || req.agent?.name || req.agent?.id || "root";
-      const agentId =
-        rawAgent.toLowerCase() === "agent" ||
-        rawAgent.toLowerCase() === "github.copilot.editsagent" ||
-        rawAgent.toLowerCase() === "github.copilot.default"
-          ? "root"
-          : rawAgent.toLowerCase().replace(/[^a-z0-9_-]+/g, "-");
-      const agentLabel =
-        agentId === "root"
-          ? "Copilot Agent"
-          : prettifyAgentLabel(rawAgent);
+      // Top-level requests[] always belong to the root coordinator thread
+      const agentId = "root";
+      const agentLabel = "Copilot Agent";
 
       const acc = ensureAcc(agentId);
       const rawModel =
@@ -1584,7 +1621,11 @@ export class CopilotVSCodeAdapter implements PassiveIdeAdapter {
           kind: "user_input",
           targetAgentId: agentId,
           summary: `Human: ${promptText.replace(/\s+/g, " ").slice(0, 90)}`,
-          payload: { body: inlineBody, requestId: req.requestId },
+          payload: {
+            body: inlineBody,
+            requestId: req.requestId,
+            _passiveSource: "chatSessions",
+          },
           fullBody: promptText,
           inlineBody,
         });
@@ -1650,10 +1691,23 @@ export class CopilotVSCodeAdapter implements PassiveIdeAdapter {
                 tsd.subagentId.trim() !== "root" &&
                 tsd.subagentId.trim()) ||
               undefined;
-            const subId =
-              explicitSubId ||
-              subLabel.toLowerCase().replace(/[^a-z0-9_-]+/g, "-") ||
-              "subagent";
+            const baseSlug =
+              subLabel
+                .toLowerCase()
+                .replace(/[^a-z0-9_-]+/g, "-")
+                .replace(/^-+|-+$/g, "") || "subagent";
+            let subId: string;
+            if (explicitSubId) {
+              subId = explicitSubId;
+              usedSubagentSlugs.add(subId);
+            } else {
+              subId = baseSlug;
+              let suffix = 2;
+              while (usedSubagentSlugs.has(subId)) {
+                subId = `${baseSlug}-${suffix++}`;
+              }
+              usedSubagentSlugs.add(subId);
+            }
             const subModelRaw =
               typeof tsd?.model === "string" && tsd.model.trim()
                 ? tsd.model.trim()
@@ -1691,6 +1745,8 @@ export class CopilotVSCodeAdapter implements PassiveIdeAdapter {
               summary: `Spawned ${subLabel}`,
               payload: {
                 agentLabel: subLabel,
+                agentType: subLabel,
+                _passiveSource: "chatSessions",
                 ...(subModel
                   ? { childModel: subModel, childModelSource: "exact" }
                   : {}),
