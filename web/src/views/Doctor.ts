@@ -3,6 +3,7 @@ import { IdeUsageGuides, type GuideIdeId } from "../components/IdeUsageGuides.js
 import type {
   CheckStatus,
   DoctorApiResponse,
+  DoctorMigrationWarning,
   EmbedScope,
   HostIde,
   IdeHealthCard,
@@ -26,6 +27,14 @@ function isModelMessageRelevantToIde(msg: string, lockedIde: HostIde | null): bo
     low.includes("vs code") ||
     low.includes("vscode") ||
     low.includes(".agent.md") ||
+    low.includes(".github/") ||
+    low.includes(".vscode/mcp.json") ||
+    low.includes("$copilot_home") ||
+    low.includes(".copilot") ||
+    low.includes("pascalcase") ||
+    low.includes("learn.prompt.md") ||
+    low.includes("vscodeuserdir") ||
+    low.includes("session-state") ||
     low.includes("(copilot)") ||
     low.includes("fusion") ||
     low.includes("vscode-lm") ||
@@ -34,11 +43,13 @@ function isModelMessageRelevantToIde(msg: string, lockedIde: HostIde | null): bo
   const mentionsAntigravity =
     low.includes("antigravity") ||
     low.includes("/swarm") ||
-    low.includes(".agents/plugins");
+    low.includes(".agents/plugins") ||
+    low.includes(".gemini/");
   const mentionsClaude =
     low.includes("claude code") ||
     low.includes("claude-code") ||
     low.includes(".claude/") ||
+    low.includes("claude.md") ||
     low.includes("claude_code_subagent_model") ||
     low.includes("claudecode");
 
@@ -48,6 +59,45 @@ function isModelMessageRelevantToIde(msg: string, lockedIde: HostIde | null): bo
   if (lockedIde === "copilot-vscode") return mentionsCopilot;
   if (lockedIde === "antigravity") return mentionsAntigravity;
   return mentionsClaude;
+}
+
+const KNOWN_HOST_IDES = new Set<HostIde>([
+  "antigravity",
+  "claude-code",
+  "copilot-vscode",
+]);
+
+function parseIdeTokens(rawIde?: string): HostIde[] {
+  if (typeof rawIde !== "string") return [];
+  const out: HostIde[] = [];
+  for (const part of rawIde.split(",")) {
+    const token = part.trim().toLowerCase() as HostIde;
+    if (KNOWN_HOST_IDES.has(token) && !out.includes(token)) {
+      out.push(token);
+    }
+  }
+  return out;
+}
+
+function isMigrationWarningRelevantToIde(
+  warning: DoctorMigrationWarning,
+  lockedIde: HostIde | null
+): boolean {
+  if (!lockedIde) return true;
+  const tokens = parseIdeTokens(warning.ide);
+  if (tokens.length > 0) {
+    return tokens.includes(lockedIde);
+  }
+  const combined = [
+    warning.id,
+    warning.path,
+    warning.title,
+    warning.message,
+    warning.fixHint,
+  ]
+    .filter(Boolean)
+    .join(" ");
+  return isModelMessageRelevantToIde(combined, lockedIde);
 }
 
 async function copyTextSafe(text: string): Promise<boolean> {
@@ -346,6 +396,8 @@ export class DoctorView {
           ${visibleIdes.map((card) => this.renderIdeCard(card)).join("")}
         </section>
 
+        ${this.renderMigrationWarningsCard(doc?.migrationWarnings, lockedIde)}
+
         ${this.renderModelIndexHealthCard(doc?.modelIndex, lockedIde)}
 
         <div class="doctor-bottom-grid">
@@ -368,7 +420,19 @@ export class DoctorView {
                   ? ""
                   : `<div class="issue-row ${guard?.blockDirectBoardEdits !== false ? "ok" : "warn"}">
                       <span>${guard?.blockDirectBoardEdits !== false ? "✓" : "⚠"}</span>
-                      <span><strong>PreToolUse Hook Protection</strong> — Blocks direct edits to <code>pipeline/board.json</code> in Claude Code &amp; VS Code.</span>
+                      <span><strong>${
+                        lockedIde === "copilot-vscode"
+                          ? "preToolUse Hook Protection"
+                          : lockedIde === "claude-code"
+                            ? "PreToolUse Hook Protection"
+                            : "PreToolUse / preToolUse Hook Protection"
+                      }</strong> — Blocks direct edits to <code>pipeline/board.json</code> in ${
+                        lockedIde === "copilot-vscode"
+                          ? "VS Code / Copilot"
+                          : lockedIde === "claude-code"
+                            ? "Claude Code"
+                            : "Claude Code &amp; VS Code / Copilot"
+                      }.</span>
                     </div>`
               }
             </div>
@@ -395,14 +459,18 @@ export class DoctorView {
                           </div>
                         `
                       ),
-                      ...driftFiles.map(
-                        (d) => `
+                      ...driftFiles.map((d) => {
+                        const needsForce =
+                          d.status === "modified" ||
+                          (d.reason ?? "").toLowerCase().includes("--force");
+                        const syncCmd = needsForce ? "agent-studio sync --force" : "agent-studio sync";
+                        return `
                           <div class="issue-row warn">
                             <span class="check-tag">DRIFT</span>
-                            <div><code>${escHtml(d.file)}</code> (${escHtml(d.status)})${d.reason ? ` — ${escHtml(d.reason)}` : ""} · run <code>agent-studio sync</code></div>
+                            <div><code>${escHtml(d.file)}</code> (${escHtml(d.status)})${d.reason ? ` — ${escHtml(d.reason)}` : ""} · run <code>${escHtml(syncCmd)}</code></div>
                           </div>
-                        `
-                      ),
+                        `;
+                      }),
                     ].join("")
               }
             </div>
@@ -458,15 +526,102 @@ export class DoctorView {
       btn.addEventListener("click", async () => {
         const cmd = btn.dataset.docCopyCmd ?? "";
         if (!cmd) return;
+        const origLabel = btn.dataset.origLabel ?? (btn.textContent || "Copy CLI");
+        btn.dataset.origLabel = origLabel;
         const ok = await copyTextSafe(cmd);
         btn.textContent = ok ? "Copied ✓" : "Failed";
         btn.classList.toggle("copied", ok);
         window.setTimeout(() => {
-          btn.textContent = "Copy CLI";
+          btn.textContent = origLabel;
           btn.classList.remove("copied");
         }, 1500);
       });
     });
+  }
+
+  private renderMigrationWarningsCard(
+    warnings: DoctorMigrationWarning[] | undefined,
+    lockedIde: HostIde | null
+  ): string {
+    if (!warnings || warnings.length === 0) return "";
+    const visible = warnings.filter((w) => isMigrationWarningRelevantToIde(w, lockedIde));
+    if (visible.length === 0) return "";
+
+    return `
+      <section class="card migration-warnings-card" aria-labelledby="docMigrationHeading">
+        <div class="card-head">
+          <div class="mi-health-title-group">
+            <span class="card-title" id="docMigrationHeading">Migration &amp; Upgrade Advisories</span>
+            <span class="cp-badge cp-running">${visible.length} notice${visible.length === 1 ? "" : "s"}</span>
+          </div>
+          <div class="mi-health-actions">
+            <button
+              type="button"
+              class="guide-copy-btn"
+              data-doc-copy-cmd="agent-studio upgrade --dry-run"
+              aria-label="Copy agent-studio upgrade dry-run command"
+            >Copy Upgrade CLI</button>
+          </div>
+        </div>
+        <div class="board-panel-body">
+          <p class="migration-warnings-intro muted">
+            Preview changes with <code>agent-studio upgrade --dry-run</code> or run <code>agent-studio upgrade</code> to migrate cleanly (customized <code>.agent-team/*.md</code> files are preserved unless <code>--force</code> is passed).
+          </p>
+          <ul class="migration-warnings-ul">
+            ${visible
+              .map((w) => {
+                const sevClass =
+                  w.severity === "error" ? "error" : w.severity === "info" ? "info" : "warn";
+                const sevTag =
+                  w.severity === "error"
+                    ? "✕ ACTION"
+                    : w.severity === "info"
+                      ? "• INFO"
+                      : "⚠ MIGRATE";
+                const ideMetas = !lockedIde
+                  ? parseIdeTokens(w.ide).map((id) => getIdeMeta(id))
+                  : [];
+                return `
+                  <li class="issue-row ${sevClass} migration-warning-item">
+                    <span class="check-tag">${sevTag}</span>
+                    <div class="migration-warning-body">
+                      ${
+                        w.title || ideMetas.length > 0 || w.path
+                          ? `<div class="migration-warning-head">
+                              ${w.title ? `<strong>${escHtml(w.title)}</strong>` : ""}
+                              ${ideMetas
+                                .map(
+                                  (m) =>
+                                    `<span class="ide-chip" style="color:${m.color};border-color:${m.border};background:${m.bg}">${escHtml(m.short)}</span>`
+                                )
+                                .join("")}
+                              ${w.path ? `<code class="migration-warning-path">${escHtml(w.path)}</code>` : ""}
+                            </div>`
+                          : ""
+                      }
+                      <div class="migration-warning-msg">${escHtml(w.message)}</div>
+                      ${
+                        w.fixHint
+                          ? `<div class="migration-warning-fix muted">
+                              <span>Fix: <code>${escHtml(w.fixHint)}</code></span>
+                              <button
+                                type="button"
+                                class="guide-copy-btn migration-fix-copy"
+                                data-doc-copy-cmd="${escHtml(w.fixHint)}"
+                                aria-label="Copy fix command"
+                              >Copy</button>
+                            </div>`
+                          : ""
+                      }
+                    </div>
+                  </li>
+                `;
+              })
+              .join("")}
+          </ul>
+        </div>
+      </section>
+    `;
   }
 
   private renderModelIndexHealthCard(

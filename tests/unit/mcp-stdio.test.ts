@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import fs from "node:fs/promises";
+import http from "node:http";
 import os from "node:os";
 import path from "node:path";
 import readline from "node:readline";
@@ -189,6 +190,7 @@ describe("MCP stdio server (node dist/cli/index.js mcp)", () => {
           "open_studio",
           "app_get_state",
           "app_get_event_body",
+          "app_get_chat",
           "app_get_board",
           "app_get_team",
           "app_get_doctor",
@@ -211,6 +213,7 @@ describe("MCP stdio server (node dist/cli/index.js mcp)", () => {
       for (const appOnlyName of [
         "app_get_state",
         "app_get_event_body",
+        "app_get_chat",
         "app_get_board",
         "app_get_team",
         "app_get_doctor",
@@ -402,6 +405,51 @@ describe("MCP stdio server (node dist/cli/index.js mcp)", () => {
       };
       assert.notEqual(telResult.isError, true);
 
+      // 9b. S1-65 board handoff & split via MCP stdio (keeping MCP_TOOLS top-level count unchanged)
+      const hoAddResp = await client.request("tools/call", {
+        name: "board",
+        arguments: {
+          op: "add",
+          type: "story",
+          title: "MCP Handoff & Split Story",
+          role: "backend",
+        },
+      });
+      assert.notEqual((hoAddResp.result as { isError?: boolean }).isError, true);
+
+      const hoResp = await client.request("tools/call", {
+        name: "board",
+        arguments: {
+          op: "handoff",
+          itemId: "S1-02",
+          kind: "task_split",
+          actor: "backend-engineer",
+          summary: "Checkpointing before split",
+          modifiedFiles: ["src/a.ts"],
+          remainingWork: ["Split remaining scopes"],
+          continuationBrief: "Dispatch split children",
+          contextPercent: 57,
+          splitProposals: [
+            { title: "Child A", role: "backend", ac: ["A works"] },
+          ],
+        },
+      });
+      const hoRes = hoResp.result as { content: Array<{ text: string }>; isError?: boolean };
+      assert.notEqual(hoRes.isError, true);
+      assert.match(hoRes.content[0]?.text ?? "", /S1-02 PENDING_SPLIT/);
+
+      const splitResp = await client.request("tools/call", {
+        name: "board",
+        arguments: {
+          op: "split",
+          itemId: "S1-02",
+          actor: "orchestrator",
+        },
+      });
+      const splitRes = splitResp.result as { content: Array<{ text: string }>; isError?: boolean };
+      assert.notEqual(splitRes.isError, true);
+      assert.match(splitRes.content[0]?.text ?? "", /split S1-02 -> S1-03/);
+
       // 10. Verify telemetry.jsonl contains valid NormalizedEvent entries
       const telemetryPath = path.join(projDir, ".agent-studio", "telemetry.jsonl");
       const rawLines = (await fs.readFile(telemetryPath, "utf8"))
@@ -519,6 +567,39 @@ describe("MCP stdio server (node dist/cli/index.js mcp)", () => {
         "Event body not found",
       );
 
+      // Verify app_get_chat returns structured error for unknown session and works on active session
+      const missingChatResp = await client.request("tools/call", {
+        name: "app_get_chat",
+        arguments: { session: "does-not-exist" },
+      });
+      const missingChatRes = missingChatResp.result as {
+        isError?: boolean;
+        structuredContent?: { ok?: boolean; error?: string };
+      };
+      assert.equal(missingChatRes.isError, true);
+      assert.equal(missingChatRes.structuredContent?.ok, false);
+      assert.equal(missingChatRes.structuredContent?.error, "Session not found");
+
+      const chatResp = await client.request("tools/call", {
+        name: "app_get_chat",
+        arguments: { session: "doctor-probe", agent: "doctor" },
+      });
+      const chatRes = chatResp.result as {
+        isError?: boolean;
+        structuredContent?: {
+          ok?: boolean;
+          sessionId?: string;
+          agentId?: string;
+          messages?: Array<{ text?: string }>;
+          pendingPrompt?: unknown;
+        };
+      };
+      assert.notEqual(chatRes.isError, true);
+      assert.equal(chatRes.structuredContent?.ok, true);
+      assert.equal(chatRes.structuredContent?.sessionId, "doctor-probe");
+      assert.ok((chatRes.structuredContent?.messages?.length ?? 0) >= 1);
+      assert.equal(chatRes.structuredContent?.pendingPrompt, null);
+
       // 11. Verify every single line on stdout was valid JSON-RPC 2.0
       for (const line of client.rawStdoutLines) {
         const obj = JSON.parse(line) as { jsonrpc: string };
@@ -526,6 +607,119 @@ describe("MCP stdio server (node dist/cli/index.js mcp)", () => {
       }
     } finally {
       const exitCode = await client.close();
+      assert.equal(exitCode, 0, `MCP server exited with ${String(exitCode)}; stderr=${client.stderrChunks.join("")}`);
+    }
+  });
+
+  it("maybeAppendContextAdvisory handles slow/timeout HTTP probes without unhandled rejections, appends advisory >=55%, suppresses on op=handoff, and stores S1-67 handoff fields", async () => {
+    const projDir = path.join(tmpDir, "advisory-proj");
+    const boardPath = path.join(projDir, "pipeline", "board.json");
+    await initBoardFile(boardPath, {
+      projectId: "adv-demo",
+      sprintId: "S1",
+      suites: { smoke: ["CP0"] },
+    });
+
+    let slowMode = true;
+    const mockServer = http.createServer((_req, res) => {
+      if (slowMode) {
+        // Exceeds 75ms probe timeout to verify timer cleanup + zero unhandled rejections
+        setTimeout(() => {
+          if (!res.writableEnded) {
+            res.writeHead(200, { "Content-Type": "application/json" });
+            res.end(JSON.stringify({ agents: [] }));
+          }
+        }, 200);
+        return;
+      }
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end(
+        JSON.stringify({
+          agents: [
+            {
+              id: "root",
+              isRoot: true,
+              model: "Mai Code 2",
+              usage: { contextTokens: 600_000, contextWindow: 1_000_000 },
+            },
+          ],
+        }),
+      );
+    });
+    await new Promise<void>((resolve) => mockServer.listen(0, "127.0.0.1", resolve));
+    const addr = mockServer.address();
+    const port = typeof addr === "object" && addr ? addr.port : 0;
+
+    const client = new StdioMcpClient(["mcp", "--project", projDir], {
+      ...process.env,
+      AGENT_STUDIO_HOME: path.join(tmpDir, "home"),
+      AGENT_STUDIO_PORT: String(port),
+      AGENT_STUDIO_MCP_NO_HTTP: "0",
+    });
+
+    try {
+      await client.request("initialize", {
+        protocolVersion: "2024-11-05",
+        capabilities: {},
+        clientInfo: { name: "advisory-test", version: "1.0.0" },
+      });
+
+      // 1. Slow server (>75ms timeout) completes cleanly with no advisory and zero crash
+      const slowResp = await client.request("tools/call", {
+        name: "board",
+        arguments: { op: "status" },
+      });
+      const slowRes = slowResp.result as { content: Array<{ text: string }>; isError?: boolean };
+      assert.notEqual(slowRes.isError, true);
+      assert.ok(!slowRes.content[0]?.text.includes("[CONTEXT_ADVISORY]"));
+
+      // 2. Fast active daemon >=55% appends [CONTEXT_ADVISORY] on non-handoff ops
+      slowMode = false;
+      await client.request("tools/call", {
+        name: "board",
+        arguments: { op: "add", type: "task", title: "Adv Task", role: "backend" },
+      });
+      const advResp = await client.request("tools/call", {
+        name: "board",
+        arguments: { op: "status" },
+      });
+      const advText = (advResp.result as { content: Array<{ text: string }> }).content[0]?.text ?? "";
+      assert.match(advText, /\[CONTEXT_ADVISORY\] Context at 60%/);
+
+      // 3. op="handoff" suppresses [CONTEXT_ADVISORY] and stores S1-67 aligned fields
+      const hoResp = await client.request("tools/call", {
+        name: "board",
+        arguments: {
+          op: "handoff",
+          itemId: "S1-01",
+          kind: "fresh_context",
+          actor: "backend-engineer",
+          objective: "Ship S1-67 board handoff alignment",
+          summary: "Schema and MCP handlers implemented",
+          evidenceItems: ["npm run check PASS"],
+          decisions: ["Kept evidenceItems separate from evidence string"],
+          assumptions: ["Legacy board.json rows remain valid"],
+          unresolvedIssues: ["Pending QA run"],
+          modifiedFiles: ["src/schema/board.ts"],
+          remainingWork: ["Run QA checkpoints"],
+          continuationBrief: "Run testrun on S1-01",
+          contextPercent: 60,
+        },
+      });
+      const hoText = (hoResp.result as { content: Array<{ text: string }> }).content[0]?.text ?? "";
+      assert.match(hoText, /S1-01 PENDING_HANDOFF/);
+      assert.ok(!hoText.includes("[CONTEXT_ADVISORY]"));
+
+      const showResp = await client.request("tools/call", {
+        name: "board",
+        arguments: { op: "show", itemId: "S1-01" },
+      });
+      const showText = (showResp.result as { content: Array<{ text: string }> }).content[0]?.text ?? "";
+      assert.match(showText, /objective: Ship S1-67 board handoff alignment/);
+      assert.match(showText, /decisions:\s*\n\s*- Kept evidenceItems/);
+    } finally {
+      const exitCode = await client.close();
+      await new Promise<void>((resolve) => mockServer.close(() => resolve()));
       assert.equal(exitCode, 0, `MCP server exited with ${String(exitCode)}; stderr=${client.stderrChunks.join("")}`);
     }
   });

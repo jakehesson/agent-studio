@@ -1,11 +1,15 @@
 import type {
+  AgentChatMessage,
+  AgentChatResponse,
   BoardApiResponse,
   BoardData,
   BoardItem,
+  ChatToolCallRef,
   CheckStatus,
   ConnectionState,
   DoctorApiResponse,
   DoctorCheckItem,
+  DoctorMigrationWarning,
   FeedbackStatusResponse,
   FeedbackSubmissionPayload,
   FeedbackSubmitResult,
@@ -29,7 +33,10 @@ import type {
   TestrunRecord,
   WorkflowModelRouting,
 } from "./types.js";
-import { normalizeServerSnapshot } from "./state/snapshot.js";
+import {
+  normalizePendingHumanPrompt,
+  normalizeServerSnapshot,
+} from "./state/snapshot.js";
 import {
   normalizeModelIndexHealth,
   normalizeModelIndexView,
@@ -66,12 +73,28 @@ const MCP_MAX_CONCURRENT = 2;
 let mcpInFlight = 0;
 const mcpWaitQueue: Array<() => void> = [];
 
+export type McpChatLoader = (params: FetchAgentChatParams) => Promise<unknown>;
+let mcpChatLoader: McpChatLoader | null = null;
+
 export function setMcpAppTransport(client: McpAppClientLike | null): void {
   mcpTransport = client;
 }
 
+export function setMcpChatLoader(loader: McpChatLoader | null): void {
+  mcpChatLoader = loader;
+}
+
 export function isMcpAppTransportActive(): boolean {
   return mcpTransport !== null;
+}
+
+export async function withMcpConcurrencySlot<T>(fn: () => Promise<T>): Promise<T> {
+  await acquireMcpSlot();
+  try {
+    return await fn();
+  } finally {
+    releaseMcpSlot();
+  }
 }
 
 function cleanArgs(args: Record<string, unknown>): Record<string, unknown> {
@@ -276,6 +299,166 @@ export async function fetchState(opts: {
         })}`
       );
   return normalizeServerSnapshot(raw);
+}
+
+export interface FetchAgentChatParams {
+  session?: string;
+  agent?: string;
+  ide?: IdeFilter | IdeSource | string;
+  project?: string;
+  workspace?: string;
+  limit?: number;
+  before?: string;
+}
+
+function normalizeChatToolRef(raw: unknown): ChatToolCallRef | null {
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return null;
+  const r = raw as Record<string, unknown>;
+  const toolName = typeof r.toolName === "string" ? r.toolName : "";
+  if (!toolName) return null;
+  const status =
+    r.status === "running" ||
+    r.status === "ok" ||
+    r.status === "error" ||
+    r.status === "denied"
+      ? r.status
+      : undefined;
+  return {
+    toolCallId: typeof r.toolCallId === "string" ? r.toolCallId : undefined,
+    toolName,
+    summary: typeof r.summary === "string" ? r.summary : toolName,
+    status,
+    inputPreview: typeof r.inputPreview === "string" ? r.inputPreview : undefined,
+    output: typeof r.output === "string" ? r.output : undefined,
+  };
+}
+
+function normalizeChatMessage(raw: unknown, defaultAgentId: string): AgentChatMessage | null {
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return null;
+  const r = raw as Record<string, unknown>;
+  const id = typeof r.id === "string" ? r.id : "";
+  const rawRole = r.role;
+  const role: AgentChatMessage["role"] =
+    rawRole === "user" ||
+    rawRole === "assistant" ||
+    rawRole === "thinking" ||
+    rawRole === "tool" ||
+    rawRole === "question" ||
+    rawRole === "subagent"
+      ? rawRole
+      : "assistant";
+  const tools = Array.isArray(r.tools)
+    ? r.tools.map(normalizeChatToolRef).filter((t): t is ChatToolCallRef => t !== null)
+    : undefined;
+  return {
+    id: id || `msg-${Math.random().toString(36).slice(2, 8)}`,
+    ts: typeof r.ts === "string" ? r.ts : "",
+    epoch: typeof r.epoch === "number" && Number.isFinite(r.epoch) ? r.epoch : 0,
+    agentId: typeof r.agentId === "string" ? r.agentId : defaultAgentId,
+    role,
+    text: typeof r.text === "string" ? r.text : "",
+    thinking: typeof r.thinking === "string" ? r.thinking : undefined,
+    tools: tools && tools.length > 0 ? tools : undefined,
+    pendingPromptId:
+      typeof r.pendingPromptId === "string" ? r.pendingPromptId : undefined,
+    subagentId: typeof r.subagentId === "string" ? r.subagentId : undefined,
+    subagentLabel: typeof r.subagentLabel === "string" ? r.subagentLabel : undefined,
+  };
+}
+
+export function normalizeAgentChatResponse(
+  raw: unknown,
+  fallbackParams: FetchAgentChatParams
+): AgentChatResponse {
+  const obj = asRecord(raw);
+  if (obj.ok === false) {
+    throw new Error(
+      typeof obj.error === "string" && obj.error
+        ? obj.error
+        : "Unable to load agent conversation"
+    );
+  }
+  const agentId =
+    typeof obj.agentId === "string" && obj.agentId
+      ? obj.agentId
+      : fallbackParams.agent || "";
+  const rawMsgs = Array.isArray(obj.messages) ? obj.messages : [];
+  const messages = rawMsgs
+    .map((m) => normalizeChatMessage(m, agentId))
+    .filter((m): m is AgentChatMessage => m !== null);
+
+  return {
+    ok: true,
+    sessionId:
+      typeof obj.sessionId === "string"
+        ? obj.sessionId
+        : fallbackParams.session || "",
+    agentId,
+    agentLabel:
+      typeof obj.agentLabel === "string" && obj.agentLabel
+        ? obj.agentLabel
+        : agentId || "Agent",
+    ide:
+      typeof obj.ide === "string"
+        ? obj.ide
+        : typeof fallbackParams.ide === "string"
+          ? fallbackParams.ide
+          : "unknown",
+    messages,
+    totalMessages:
+      typeof obj.totalMessages === "number" && Number.isFinite(obj.totalMessages)
+        ? obj.totalMessages
+        : messages.length,
+    hasMore: Boolean(obj.hasMore),
+    nextCursor:
+      typeof obj.nextCursor === "string" && obj.nextCursor
+        ? obj.nextCursor
+        : undefined,
+    pendingPrompt: normalizePendingHumanPrompt(obj.pendingPrompt),
+  };
+}
+
+export async function fetchAgentChat(
+  params: FetchAgentChatParams
+): Promise<AgentChatResponse> {
+  const raw = mcpChatLoader
+    ? await mcpChatLoader(params)
+    : mcpTransport
+      ? await callMcpToolJson<unknown>("app_get_chat", {
+          session: params.session,
+          agent: params.agent,
+          ide: params.ide && params.ide !== "all" ? params.ide : undefined,
+          project: params.project,
+          workspace: params.workspace,
+          limit: params.limit,
+          before: params.before,
+        })
+      : await fetchJson<unknown>(
+          `/api/chat${qs({
+            session: params.session || undefined,
+            agent: params.agent || undefined,
+            ide: params.ide && params.ide !== "all" ? String(params.ide) : undefined,
+            project: params.project || undefined,
+            workspace: params.workspace || undefined,
+            limit: params.limit !== undefined ? String(params.limit) : undefined,
+            before: params.before || undefined,
+          })}`
+        );
+
+  return normalizeAgentChatResponse(raw, params);
+}
+
+export function extractMcpResultPayload<T>(
+  res: McpToolCallResult,
+  toolName: string
+): T {
+  return extractMcpPayload<T>(res, toolName);
+}
+
+export function cleanMcpArgs(
+  args: Record<string, unknown>
+): Record<string, unknown> {
+  return cleanArgs(args);
 }
 
 export interface EventBodyResult {
@@ -776,6 +959,104 @@ export async function patchTeamRouting(payload: {
   });
 }
 
+function inferMigrationWarningIde(text: string): IdeSource | undefined {
+  const low = text.toLowerCase();
+  if (
+    low.includes("copilot") ||
+    low.includes(".vscode/mcp.json") ||
+    low.includes(".github/") ||
+    low.includes("vscodeuserdir") ||
+    low.includes("pascalcase") ||
+    low.includes("learn.prompt.md") ||
+    low.includes("$copilot_home") ||
+    low.includes(".copilot")
+  ) {
+    return "copilot-vscode";
+  }
+  if (
+    low.includes("claude-code") ||
+    low.includes("claude code") ||
+    low.includes(".claude/") ||
+    low.includes("claude.md")
+  ) {
+    return "claude-code";
+  }
+  if (
+    low.includes("antigravity") ||
+    low.includes(".agents/plugins") ||
+    low.includes(".gemini/")
+  ) {
+    return "antigravity";
+  }
+  return undefined;
+}
+
+function normalizeDoctorMigrationWarnings(
+  rawWarnings: unknown
+): DoctorMigrationWarning[] | undefined {
+  if (!Array.isArray(rawWarnings)) return undefined;
+  const out: DoctorMigrationWarning[] = [];
+  for (const item of rawWarnings) {
+    if (typeof item === "string") {
+      const msg = item.trim();
+      if (!msg) continue;
+      const ide = inferMigrationWarningIde(msg);
+      out.push({
+        severity: "warn",
+        ...(ide ? { ide } : {}),
+        message: msg,
+      });
+      continue;
+    }
+    if (item && typeof item === "object" && !Array.isArray(item)) {
+      const rec = item as Record<string, unknown>;
+      const rawMsg =
+        typeof rec.message === "string"
+          ? rec.message
+          : typeof rec.detail === "string"
+            ? rec.detail
+            : typeof rec.summary === "string"
+              ? rec.summary
+              : typeof rec.warning === "string"
+                ? rec.warning
+                : typeof rec.text === "string"
+                  ? rec.text
+                  : "";
+      const message = rawMsg.trim();
+      if (!message) continue;
+      const sev =
+        rec.severity === "error" || rec.severity === "info" || rec.severity === "warn"
+          ? rec.severity
+          : "warn";
+      const pathVal =
+        typeof rec.path === "string" && rec.path.trim()
+          ? rec.path.trim()
+          : typeof rec.file === "string" && rec.file.trim()
+            ? rec.file.trim()
+            : undefined;
+      const fixVal =
+        typeof rec.fixHint === "string" && rec.fixHint.trim()
+          ? rec.fixHint.trim()
+          : typeof rec.fix === "string" && rec.fix.trim()
+            ? rec.fix.trim()
+            : undefined;
+      const explicitIde =
+        typeof rec.ide === "string" && rec.ide.trim() ? rec.ide.trim() : undefined;
+      const inferredIde = explicitIde ?? inferMigrationWarningIde(`${pathVal ?? ""} ${message}`);
+      out.push({
+        ...(typeof rec.id === "string" && rec.id.trim() ? { id: rec.id.trim() } : {}),
+        ...(inferredIde ? { ide: inferredIde } : {}),
+        severity: sev,
+        ...(pathVal ? { path: pathVal } : {}),
+        ...(typeof rec.title === "string" && rec.title.trim() ? { title: rec.title.trim() } : {}),
+        message,
+        ...(fixVal ? { fixHint: fixVal } : {}),
+      });
+    }
+  }
+  return out.length > 0 ? out : undefined;
+}
+
 export async function fetchDoctor(
   project?: string,
   workspace?: string
@@ -796,7 +1077,12 @@ export async function fetchDoctor(
   if (Array.isArray(raw.ides) && !raw.doctor) {
     const out = raw as unknown as DoctorApiResponse;
     const mi = normalizeModelIndexHealth(raw.modelIndex);
-    return mi ? { ...out, modelIndex: mi } : out;
+    const migrationWarnings = normalizeDoctorMigrationWarnings(raw.migrationWarnings);
+    return {
+      ...out,
+      ...(mi ? { modelIndex: mi } : {}),
+      ...(migrationWarnings ? { migrationWarnings } : {}),
+    };
   }
 
   const doc = asRecord(raw.doctor);
@@ -1001,6 +1287,10 @@ export async function fetchDoctor(
     });
   }
 
+  const migrationWarnings = normalizeDoctorMigrationWarnings(
+    doc.migrationWarnings ?? raw.migrationWarnings
+  );
+
   return {
     ok: hasDoc ? Boolean(doc.ok) : Boolean(raw.ok),
     project:
@@ -1019,6 +1309,7 @@ export async function fetchDoctor(
       blockDirectBoardEdits: hasDoc ? docHooks.ok === true : true,
     },
     driftFiles,
+    ...(migrationWarnings ? { migrationWarnings } : {}),
     modelIndex: normalizeModelIndexHealth(doc.modelIndex ?? raw.modelIndex),
     timestamp:
       typeof raw.timestamp === "string"

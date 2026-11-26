@@ -35,3 +35,8 @@ description: Core playbook for minimizing token and context usage across all age
 ## 5. Minimal Edits & Script Hygiene
 - Use surgical, contiguous edits instead of rewriting whole files; do not re-read a file immediately after a clean edit unless verification fails.
 - Keep throwaway diagnostic scripts out of the repository (use temporary/scratch directories or extend existing reusable helpers).
+
+## 6. Context-Budget Handoff & Task-Splitting (`>= 55%` / `PreCompact`)
+- **Thresholds:** `45%` warn -> `55%` handoff (`15%` margin before `70%` Compact).
+- **Fresh-Context Handoff (`kind: "fresh_context"`):** When remaining work is cohesive and fits in one fresh Smart Zone (`<= 40%`), checkpoint verified state via `board { op: "handoff", ... }`, return `ITEM <ID> | HANDOFF_PENDING`, and stop so `orchestrator` dispatches a fresh subagent from `board { op: "show", itemId }`.
+- **Orchestrator Task-Split (`kind: "task_split"`):** When remaining work spans multiple modules/roles, attach `splitProposals` (exclusive file scopes + ACs) via `board { op: "handoff", kind: "task_split", ... }` and stop so `orchestrator` runs `board { op: "split", itemId }`.

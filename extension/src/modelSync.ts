@@ -5,6 +5,7 @@ export interface LanguageModelChatLike {
   name?: string;
   vendor?: string;
   family?: string;
+  version?: string;
   maxInputTokens?: number;
 }
 
@@ -45,6 +46,7 @@ export interface DiscoveredModelPayload {
   label: string;
   vendor?: string;
   family?: string;
+  version?: string;
   maxInputTokens?: number;
 }
 
@@ -64,6 +66,8 @@ function escapeRegExp(text: string): string {
 }
 
 /**
+ * @deprecated Copilot now preserves native runtime model IDs (`m.id`).
+ * Kept only for legacy helper compatibility until callers migrate.
  * Formats Copilot picker labels as `"${name} (${vendor})"` without duplicating
  * an existing `(vendor)` suffix.
  */
@@ -101,6 +105,7 @@ export function mapLanguageModelsForHost(
     const rawId = (m.id ?? m.name ?? "").trim();
     const vendor = m.vendor?.trim() || undefined;
     const family = m.family?.trim() || undefined;
+    const version = m.version?.trim() || undefined;
     const maxInputTokens =
       typeof m.maxInputTokens === "number" &&
       Number.isFinite(m.maxInputTokens) &&
@@ -108,10 +113,7 @@ export function mapLanguageModelsForHost(
         ? Math.floor(m.maxInputTokens)
         : undefined;
 
-    const id =
-      hostIde === "copilot-vscode"
-        ? formatPickerLabel(rawName || rawId, vendor)
-        : rawId || rawName;
+    const id = rawId || rawName;
     if (!id || seen.has(id)) continue;
     seen.add(id);
 
@@ -120,6 +122,7 @@ export function mapLanguageModelsForHost(
       label: rawName || id,
       ...(vendor ? { vendor } : {}),
       ...(family ? { family } : {}),
+      ...(version ? { version } : {}),
       ...(maxInputTokens !== undefined ? { maxInputTokens } : {}),
     });
   }

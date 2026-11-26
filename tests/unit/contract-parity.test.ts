@@ -166,7 +166,7 @@ describe("Cross-Package Contract Parity", () => {
       { model: "Claude Sonnet 4.5 [1M]", expected: 1_000_000 },
       { model: "gpt-4o [1m]", expected: 1_000_000 },
       { model: "unknown [1m]", expected: 1_000_000 },
-      // 1M models (Gemini, GPT-4.1)
+      // 1M models (Gemini, GPT-4.1, GPT-5.4, MAI)
       { model: "gemini-2.5-pro", expected: 1_000_000 },
       { model: "gemini-2.5-flash", expected: 1_000_000 },
       { model: "Gemini 3 Pro (High)", expected: 1_000_000 },
@@ -174,6 +174,14 @@ describe("Cross-Package Contract Parity", () => {
       { model: "gpt-4.1", expected: 1_000_000 },
       { model: "gpt-4.1-mini", expected: 1_000_000 },
       { model: "GPT 4.1", expected: 1_000_000 },
+      { model: "gpt-5.4", expected: 1_000_000 },
+      { model: "GPT 5.4", expected: 1_000_000 },
+      { model: "Mai Code 2", expected: 1_000_000 },
+      { model: "mai-code-2-flash", expected: 1_000_000 },
+      { model: "Mai Code 2 (copilot)", expected: 1_000_000 },
+      // Boundary non-matches for mai (must stay 200k)
+      { model: "email-assistant", expected: 200_000 },
+      { model: "main-model", expected: 200_000 },
       // 400k models (GPT-5, GPT-6)
       { model: "gpt-5", expected: 400_000 },
       { model: "gpt-5.1-codex", expected: 400_000 },

@@ -4,8 +4,12 @@ import {
   getAntigravityPluginRelDir,
 } from "../../compiler/antigravity.js";
 import { CLAUDE_HOOK_EVENTS } from "../../compiler/claude-code.js";
-import { COPILOT_HOOK_EVENTS } from "../../compiler/copilot-vscode.js";
 import {
+  COPILOT_HOOK_EVENTS_CANONICAL,
+  LEGACY_COPILOT_HOOK_EVENTS,
+} from "../../compiler/copilot-vscode.js";
+import {
+  resolveCopilotHomeDir,
   resolveEffectiveHomeDir,
   resolveVsCodeUserDir,
 } from "../../compiler/global-install.js";
@@ -14,8 +18,13 @@ import {
   loadTeamManifest,
   planCompiledFiles,
 } from "../../compiler/index.js";
-import { HOOK_TAG_NEEDLE, type DriftReport } from "../../compiler/merge.js";
+import {
+  HOOK_TAG_NEEDLE,
+  isManagedHookEntry,
+  type DriftReport,
+} from "../../compiler/merge.js";
 import { resolveProject } from "../../board/registry.js";
+import { isLegacyCopilotPickerId } from "../../models/defaults.js";
 import { resolveRoleModel } from "../../models/resolve.js";
 import {
   getGlobalModelIndexPath,
@@ -23,8 +32,17 @@ import {
   inspectModelIndexLayerSync,
   mergeModelIndexLayers,
 } from "../../models/store.js";
-import type { ModelRoutingPolicy } from "../../schema/model-index.js";
-import type { IdeModelOverride, IdeTarget, TeamManifest } from "../../schema/team.js";
+import type {
+  ModelIndexOverlay,
+  ModelRoutingPolicy,
+} from "../../schema/model-index.js";
+import {
+  resolveCopilotHarness,
+  type CopilotHarness,
+  type IdeModelOverride,
+  type IdeTarget,
+  type TeamManifest,
+} from "../../schema/team.js";
 
 const ALL_IDES: IdeTarget[] = ["antigravity", "claude-code", "copilot-vscode"];
 
@@ -98,6 +116,16 @@ export interface ArchitectureReviewHealthInfo {
   customized: boolean;
 }
 
+export interface DoctorMigrationWarning {
+  id?: string;
+  ide?: IdeTarget | string;
+  severity?: "warn" | "info" | "error";
+  path?: string;
+  title?: string;
+  message: string;
+  fixHint?: string;
+}
+
 export interface DoctorReport {
   ok: boolean;
   projectId: string | null;
@@ -112,6 +140,7 @@ export interface DoctorReport {
   hooksStatus: HooksStatusReport;
   modelIndex: ModelIndexHealthInfo;
   architectureReview: ArchitectureReviewHealthInfo;
+  migrationWarnings: DoctorMigrationWarning[];
   telemetryFallbackPath: string;
   telemetryFallbackExists: boolean;
 }
@@ -151,6 +180,7 @@ export function detectInstalledIdes(options?: {
   const { homeDir, isOverridden } = resolveEffectiveHomeDir(options?.homeDir);
   const telemetryPaths = getTelemetryPaths(homeDir, isOverridden);
   const vscodeUserDir = resolveVsCodeUserDir(homeDir, isOverridden);
+  const copilotHomeDir = resolveCopilotHomeDir(homeDir);
 
   const agyCandidates = [
     path.join(homeDir, ".gemini", "antigravity"),
@@ -166,6 +196,7 @@ export function detectInstalledIdes(options?: {
   const claudeDetected = claudeCandidates.filter((p) => fs.existsSync(p));
 
   const vscodeCandidates = [
+    copilotHomeDir,
     vscodeUserDir,
     telemetryPaths["copilot-vscode"],
   ];
@@ -191,7 +222,9 @@ export function detectInstalledIdes(options?: {
       installed: vscodeDetected.length > 0,
       detectedPaths: vscodeDetected,
       telemetryDir: telemetryPaths["copilot-vscode"],
-      telemetryDirExists: fs.existsSync(telemetryPaths["copilot-vscode"]),
+      telemetryDirExists:
+        fs.existsSync(telemetryPaths["copilot-vscode"]) ||
+        fs.existsSync(path.join(copilotHomeDir, "session-state")),
     },
   };
 }
@@ -279,16 +312,39 @@ function inspectClaudeHooks(filePath: string): {
   return { present: true, events, missingEvents };
 }
 
-function inspectCopilotHooks(filePath: string): {
+function isCopilotStudioHookEntry(entry: unknown): boolean {
+  if (isManagedHookEntry(entry)) return true;
+  if (!entry || typeof entry !== "object" || Array.isArray(entry)) return false;
+  const rec = entry as { command?: unknown; timeoutSec?: unknown; timeout?: unknown };
+  const hasTimeout =
+    typeof rec.timeoutSec === "number" || typeof rec.timeout === "number";
+  return (
+    hasTimeout &&
+    typeof rec.command === "string" &&
+    rec.command.includes(HOOK_TAG_NEEDLE)
+  );
+}
+
+function inspectCopilotHooks(
+  filePath: string,
+  harness: CopilotHarness = "copilot",
+): {
   present: boolean;
   events: string[];
   missingEvents: string[];
+  legacyEventsFound: string[];
 } {
+  const expectedEvents =
+    harness === "legacy-local"
+      ? LEGACY_COPILOT_HOOK_EVENTS
+      : COPILOT_HOOK_EVENTS_CANONICAL;
+
   if (!fs.existsSync(filePath)) {
     return {
       present: false,
       events: [],
-      missingEvents: [...COPILOT_HOOK_EVENTS],
+      missingEvents: [...expectedEvents],
+      legacyEventsFound: [],
     };
   }
   const obj = tryReadJsonObject(filePath);
@@ -300,17 +356,11 @@ function inspectCopilotHooks(filePath: string): {
   const events: string[] = [];
   const missingEvents: string[] = [];
 
-  for (const eventName of COPILOT_HOOK_EVENTS) {
+  for (const eventName of expectedEvents) {
     const rawList = hooksObj[eventName];
     const hasStudioHook =
       Array.isArray(rawList) &&
-      rawList.some(
-        (entry) =>
-          Boolean(entry) &&
-          typeof entry === "object" &&
-          typeof (entry as { command?: unknown }).command === "string" &&
-          (entry as { command: string }).command.includes(HOOK_TAG_NEEDLE),
-      );
+      rawList.some((entry) => isCopilotStudioHookEntry(entry));
     if (hasStudioHook) {
       events.push(eventName);
     } else {
@@ -318,7 +368,48 @@ function inspectCopilotHooks(filePath: string): {
     }
   }
 
-  return { present: true, events, missingEvents };
+  const legacyEventsFound: string[] = [];
+  if (harness === "copilot") {
+    for (const legacyEvent of LEGACY_COPILOT_HOOK_EVENTS) {
+      const rawList = hooksObj[legacyEvent];
+      if (
+        Array.isArray(rawList) &&
+        rawList.some((entry) => isCopilotStudioHookEntry(entry))
+      ) {
+        legacyEventsFound.push(legacyEvent);
+      }
+    }
+  }
+
+  return { present: true, events, missingEvents, legacyEventsFound };
+}
+
+function collectLegacyCopilotIdsFromLayer(
+  layer: ModelIndexOverlay | null | undefined,
+): string[] {
+  const copilot = layer?.ides?.["copilot-vscode"];
+  if (!copilot) return [];
+  const found = new Set<string>();
+  if (copilot.tiers) {
+    for (const tier of ["fast", "balanced", "reasoning"] as const) {
+      const binding = copilot.tiers[tier];
+      if (!binding) continue;
+      if (binding.primary && isLegacyCopilotPickerId(binding.primary)) {
+        found.add(binding.primary);
+      }
+      for (const fb of binding.fallback ?? []) {
+        if (isLegacyCopilotPickerId(fb)) {
+          found.add(fb);
+        }
+      }
+    }
+  }
+  for (const entry of copilot.catalog ?? []) {
+    if (entry.id && isLegacyCopilotPickerId(entry.id)) {
+      found.add(entry.id);
+    }
+  }
+  return [...found];
 }
 
 function extractCopilotOverrideIds(override: IdeModelOverride | undefined): string[] {
@@ -388,7 +479,13 @@ export function buildDoctorReport(projectRoot: string): DoctorReport {
       modelIndex: deterministicModelIndex,
     });
     for (const file of planned.files) {
-      fileCountByIde[file.ide]++;
+      const contributors =
+        file.contributors && file.contributors.length > 0
+          ? new Set(file.contributors)
+          : [file.ide];
+      for (const ide of contributors) {
+        fileCountByIde[ide]++;
+      }
     }
     drift = checkTeamDrift(root, {
       manifest,
@@ -503,6 +600,11 @@ export function buildDoctorReport(projectRoot: string): DoctorReport {
     "servers",
   );
 
+  const copilotHarness = resolveCopilotHarness(manifest);
+  const copilotMcpPath =
+    copilotHarness === "legacy-local" ? ".vscode/mcp.json" : ".mcp.json";
+  const copilotMcp = copilotHarness === "legacy-local" ? vscodeMcp : claudeMcp;
+
   const mcpConfigs: Record<IdeTarget, McpConfigCheck> = {
     antigravity: {
       path: agyMcpRel,
@@ -519,11 +621,11 @@ export function buildDoctorReport(projectRoot: string): DoctorReport {
       ok: !enabledTargets.has("claude-code") || claudeMcp.configured,
     },
     "copilot-vscode": {
-      path: ".vscode/mcp.json",
+      path: copilotMcpPath,
       enabled: enabledTargets.has("copilot-vscode"),
-      present: vscodeMcp.present,
-      configured: vscodeMcp.configured,
-      ok: !enabledTargets.has("copilot-vscode") || vscodeMcp.configured,
+      present: copilotMcp.present,
+      configured: copilotMcp.configured,
+      ok: !enabledTargets.has("copilot-vscode") || copilotMcp.configured,
     },
   };
   const mcpStatus: McpStatusReport = {
@@ -536,6 +638,7 @@ export function buildDoctorReport(projectRoot: string): DoctorReport {
   );
   const copilotHooksInfo = inspectCopilotHooks(
     path.join(root, ".github", "hooks", "agent-studio.json"),
+    copilotHarness,
   );
 
   const hooksConfigs: Record<"claude-code" | "copilot-vscode", HookConfigCheck> =
@@ -608,6 +711,156 @@ export function buildDoctorReport(projectRoot: string): DoctorReport {
     customized: architectureCustomized,
   };
 
+  const migrationWarnings: DoctorMigrationWarning[] = [];
+  if (enabledTargets.has("copilot-vscode") && copilotHarness === "copilot") {
+    if (vscodeMcp.configured) {
+      migrationWarnings.push({
+        id: "legacy-vscode-mcp",
+        ide: "copilot-vscode",
+        severity: "warn",
+        path: ".vscode/mcp.json",
+        title: "Stale .vscode/mcp.json entry",
+        message:
+          'Found legacy servers["agent-studio"] in .vscode/mcp.json; unified Copilot harness uses .mcp.json (mcpServers["agent-studio"]).',
+        fixHint: "agent-studio upgrade",
+      });
+    }
+
+    const legacyLearnPromptPath = path.join(
+      root,
+      ".github",
+      "prompts",
+      "learn.prompt.md",
+    );
+    if (fs.existsSync(legacyLearnPromptPath)) {
+      migrationWarnings.push({
+        id: "legacy-learn-prompt",
+        ide: "copilot-vscode",
+        severity: "warn",
+        path: ".github/prompts/learn.prompt.md",
+        title: "Legacy Copilot learn.prompt.md",
+        message:
+          "Legacy .github/prompts/learn.prompt.md is superseded by .github/skills/learn/SKILL.md in Copilot harness mode.",
+        fixHint: "agent-studio upgrade",
+      });
+    }
+
+    if (copilotHooksInfo.legacyEventsFound.length > 0) {
+      migrationWarnings.push({
+        id: "legacy-copilot-hooks",
+        ide: "copilot-vscode",
+        severity: "warn",
+        path: ".github/hooks/agent-studio.json",
+        title: "Legacy PascalCase Copilot hooks",
+        message: `Found legacy PascalCase hook entries (${copilotHooksInfo.legacyEventsFound.join(", ")}) in .github/hooks/agent-studio.json; canonical Copilot harness uses camelCase events.`,
+        fixHint: "agent-studio upgrade",
+      });
+    }
+
+    const { homeDir, isOverridden } = resolveEffectiveHomeDir();
+    const vscodeUserDir = resolveVsCodeUserDir(homeDir, isOverridden);
+    const copilotHomeDir = resolveCopilotHomeDir(homeDir);
+    const legacyGlobalNames = [
+      "team-setup.agent.md",
+      "team-setup.instructions.md",
+      "learn.prompt.md",
+    ];
+    for (const legacyName of legacyGlobalNames) {
+      const legacyGlobalPath = path.join(vscodeUserDir, "prompts", legacyName);
+      if (fs.existsSync(legacyGlobalPath)) {
+        migrationWarnings.push({
+          id: `legacy-global-copilot-${legacyName}`,
+          ide: "copilot-vscode",
+          severity: "warn",
+          path: legacyGlobalPath,
+          title: `Legacy global VS Code prompts/${legacyName}`,
+          message: `Found legacy global Copilot file (${legacyName}) in VSCodeUserDir prompts/; unified Copilot harness uses $COPILOT_HOME (${copilotHomeDir}).`,
+          fixHint: "agent-studio upgrade --global",
+        });
+      }
+    }
+  }
+
+  if (manifest) {
+    const manifestLegacyIds = new Set<string>();
+    for (const role of manifest.roster) {
+      for (const id of extractCopilotOverrideIds(role.models?.["copilot-vscode"])) {
+        if (isLegacyCopilotPickerId(id)) {
+          manifestLegacyIds.add(id);
+        }
+      }
+    }
+    if (manifestLegacyIds.size > 0) {
+      migrationWarnings.push({
+        id: "legacy-copilot-models-team-yaml",
+        ide: "copilot-vscode",
+        severity: "warn",
+        path: ".agent-team/team.yaml",
+        title: 'Legacy "(copilot)" model IDs in team.yaml',
+        message: `Found legacy "(copilot)" picker IDs in .agent-team/team.yaml: ${[...manifestLegacyIds].join(", ")}.`,
+        fixHint: "agent-studio upgrade",
+      });
+    }
+  }
+
+  const wsLegacyIds = collectLegacyCopilotIdsFromLayer(workspaceInspect.data);
+  if (wsLegacyIds.length > 0) {
+    migrationWarnings.push({
+      id: "legacy-copilot-models-workspace",
+      ide: "copilot-vscode",
+      severity: "warn",
+      path: ".agent-team/model-index.json",
+      title: 'Legacy "(copilot)" model IDs in workspace model index',
+      message: `Found legacy "(copilot)" picker IDs in .agent-team/model-index.json: ${wsLegacyIds.join(", ")}.`,
+      fixHint: "agent-studio upgrade",
+    });
+  }
+
+  const globalLegacyIds = collectLegacyCopilotIdsFromLayer(globalInspect.data);
+  if (globalLegacyIds.length > 0) {
+    migrationWarnings.push({
+      id: "legacy-copilot-models-global",
+      ide: "copilot-vscode",
+      severity: "warn",
+      path: globalIndexPath,
+      title: 'Legacy "(copilot)" model IDs in global model index',
+      message: `Found legacy "(copilot)" picker IDs in ${globalIndexPath}: ${globalLegacyIds.join(", ")}.`,
+      fixHint: "agent-studio upgrade --global",
+    });
+  }
+
+  const emittedModifiedById = new Map<string, DoctorMigrationWarning>();
+  for (const entry of drift.entries) {
+    if (entry.status === "modified") {
+      const warningId = `modified-compiled-${entry.path}`;
+      const existing = emittedModifiedById.get(warningId);
+      if (existing) {
+        const existingIdes = new Set(
+          String(existing.ide ?? "")
+            .split(",")
+            .map((s) => s.trim())
+            .filter(Boolean),
+        );
+        if (!existingIdes.has(entry.ide)) {
+          existingIdes.add(entry.ide);
+          existing.ide = [...existingIdes].join(", ");
+        }
+        continue;
+      }
+      const warning: DoctorMigrationWarning = {
+        id: warningId,
+        ide: entry.ide,
+        severity: "warn",
+        path: entry.path,
+        title: "Manually modified compiled file",
+        message: `${entry.path} was manually modified and is skipped by safe sync/upgrade unless --force is passed.`,
+        fixHint: "agent-studio sync --force",
+      };
+      emittedModifiedById.set(warningId, warning);
+      migrationWarnings.push(warning);
+    }
+  }
+
   const ok =
     nodeVersion.ok &&
     manifestValid &&
@@ -630,6 +883,7 @@ export function buildDoctorReport(projectRoot: string): DoctorReport {
     hooksStatus,
     modelIndex,
     architectureReview,
+    migrationWarnings,
     telemetryFallbackPath,
     telemetryFallbackExists,
   };
@@ -709,6 +963,13 @@ function formatDoctorText(report: DoctorReport): string {
   }
   for (const warn of report.modelIndex.warnings) {
     lines.push(`  Model Index Warning: ${warn}`);
+  }
+  if (report.migrationWarnings.length > 0) {
+    lines.push("  Migration Advisories:");
+    for (const mw of report.migrationWarnings) {
+      const fix = mw.fixHint ? ` (fix: ${mw.fixHint})` : "";
+      lines.push(`    - [${mw.ide ?? "all"}] ${mw.message}${fix}`);
+    }
   }
 
   if (!report.drift.ok) {

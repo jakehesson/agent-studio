@@ -9,11 +9,11 @@
 
 | Concern | Antigravity | Claude Code | GitHub Copilot / VS Code |
 | :--- | :--- | :--- | :--- |
-| **Compiled Agents** | `.agents/plugins/<id>-team/agents/<role>.md` | `.claude/agents/<role>.md` | `.github/agents/<role>.agent.md` *(with `handoffs:`)* |
-| **Compiled Skills** | `.agents/plugins/<id>-team/skills/<skill>/SKILL.md` | `.claude/skills/<skill>/SKILL.md` | `.github/skills/<skill>/SKILL.md` |
+| **Compiled Agents** | `.agents/plugins/<id>-team/agents/<role>.md` | `.claude/agents/<role>.md` | `.github/agents/<role>.agent.md` *(with `user-invocable` & portable tools)* |
+| **Compiled Skills** | `.agents/plugins/<id>-team/skills/<skill>/SKILL.md` | `.claude/skills/<skill>/SKILL.md` | `.github/skills/<skill>/SKILL.md` *(incl. `/learn`)* |
 | **Rules / Instructions** | `.agents/plugins/<id>-team/rules/AGENTS.md` | `CLAUDE.md` *(managed block)* | `.github/copilot-instructions.md` *(managed block)* |
-| **MCP Config** | `.agents/plugins/<id>-team/mcp_config.json` | `.mcp.json` *(key-scoped merge)* | `.vscode/mcp.json` *(key-scoped merge, `"servers"`)* |
-| **Telemetry & Hooks** | Passive brain JSONL + MCP events | `.claude/settings.json` (`hook-emit`) + passive JSONL | `.github/hooks/agent-studio.json` (`hook-emit`) + passive chatSessions |
+| **MCP Config** | `.agents/plugins/<id>-team/mcp_config.json` | `.mcp.json` *(key-scoped merge)* | `.mcp.json` *(shared key-scoped merge, `tools: ["*"]`)* |
+| **Telemetry & Hooks** | Passive brain JSONL + MCP events | `.claude/settings.json` (`hook-emit`) + passive JSONL | `.github/hooks/agent-studio.json` (10 camelCase `json-merge` hooks) + `chatSessions` + `$COPILOT_HOME/session-state` |
 
 ---
 
@@ -66,23 +66,20 @@ Under `.agents/plugins/<projectId>-team/`:
 ## 3. GitHub Copilot / VS Code
 
 ### What `agent-studio sync` Generates / Merges
-- `.github/agents/<role>.agent.md` — Custom Copilot Chat agents with native VS Code tool allowlists (`read/readFile`, `search/*`, `edit/*`, `execute/runInTerminal`, `agent/runSubagent`, `agent-studio/*`).
-  - `orchestrator.agent.md` includes native **`handoffs:`** buttons (`→ System Architect`, `→ UX Engineer & Designer`, `→ Backend Engineer`, `→ Frontend Engineer`, `→ QA Validator`) and omits all edit/terminal tools.
-- `.github/skills/<skill>/SKILL.md` — Portable skills for Copilot agents.
+Under default `workflow.copilotHarness: "copilot"` (use `"legacy-local"` only if you need `.vscode/mcp.json`, `handoffs:`, `.github/prompts/learn.prompt.md`, or PascalCase hooks):
+- `.github/agents/<role>.agent.md` — Custom Copilot agents with portable tool allowlists (`read`, `search`, `edit`, `execute`, `agent`, `agent-studio/*`), `user-invocable` (`true` for `orchestrator`/`team-setup`, `false` for specialists), and `disable-model-invocation`. `orchestrator.agent.md` omits `edit` and `execute`.
+- `.github/skills/<skill>/SKILL.md` — Portable skills for Copilot agents (including `learn/SKILL.md` with `disable-model-invocation: true`).
 - `.github/copilot-instructions.md` — Non-destructive managed block (`<!-- agent-studio:begin/end -->`) preserving existing repository Copilot instructions.
-- `.vscode/mcp.json` — Non-destructively merges `servers["agent-studio"]` using VS Code's `"servers"` schema (`type: "stdio"`) while preserving existing user servers and `inputs`.
-- `.github/hooks/agent-studio.json` — Wires `PreToolUse`, `PostToolUse`, `SubagentStart`, `SubagentStop`, and `Stop` hooks invoking:
-  ```bash
-  npx agent-studio hook-emit --ide copilot-vscode --event <Event>
-  ```
+- `.mcp.json` — Shared with Claude Code; non-destructively merges `mcpServers["agent-studio"]` (`type: "stdio"`, `tools: ["*"]`) while preserving existing user servers.
+- `.github/hooks/agent-studio.json` — Non-destructively merges all 10 canonical camelCase hooks (`sessionStart`, `userPromptSubmitted`, `preCompact`, `preToolUse`, `postToolUse`, `postToolUseFailure`, `subagentStart`, `subagentStop`, `agentStop`, `sessionEnd`) with `timeoutSec: 5`, preserving user-authored hooks and pruning only legacy Agent Studio PascalCase entries.
 
 ### Enabling & Invoking
-1. Run `npx agent-studio sync --ides copilot-vscode`.
-2. Open the repository in VS Code and trust/start the `agent-studio` MCP server in `.vscode/mcp.json` when prompted.
-3. Open **GitHub Copilot Chat**, select **`Team Orchestrator`** (`orchestrator`) from the Agent dropdown, and use the built-in **Handoffs** buttons to transition work seamlessly to specialists (`Architect`, `Backend Engineer`, `Frontend Engineer`, `QA Validator`).
+1. Run `npx agent-studio sync --ides copilot-vscode` (or `npx agent-studio upgrade` to migrate an existing repository safely).
+2. Open the repository in VS Code and trust/start the `agent-studio` MCP server in `.mcp.json` when prompted.
+3. Open **GitHub Copilot Chat**, select **`Team Orchestrator`** (`orchestrator`) from the Agent dropdown, and let it dispatch specialists (`architect`, `ux-designer`, `backend-engineer`, `frontend-engineer`, `code-reviewer`, `qa-validator`) via the `agent` tool.
 
 ### Telemetry & Partial Storage Fallback
-- **Passive Chat Sessions:** `CopilotVSCodeAdapter` reads VS Code `workspaceStorage/<hash>/chatSessions/*.{json,jsonl}` (supporting both legacy `.json` snapshots and modern delta-encoded `.jsonl` logs, plus `Code - Insiders`; override via `--vscode-dir <path>` or `VSCODE_STORAGE_DIR`).
+- **Passive Chat Sessions & `$COPILOT_HOME`:** `CopilotVSCodeAdapter` reads VS Code `workspaceStorage/<hash>/chatSessions/*.{json,jsonl}`, `GitHub.copilot-chat/transcripts/*.jsonl`, and workspace-scoped `$COPILOT_HOME/session-state/*/events.jsonl` (deduplicated by `sessionId`).
 - **Graceful Fallback When Session Storage Is Partial or Unavailable:** If a VS Code build changes chat session storage, runs in a remote container, or delays flushing `.jsonl` deltas, **active hooks** (`.github/hooks/agent-studio.json`) and **MCP board/telemetry events** (`agent-studio mcp`) continue streaming full live activity through `POST /api/ingest` and `.agent-studio/telemetry.jsonl` without interruption.
 
 ---
@@ -98,7 +95,7 @@ Agent Studio routes models per role using `.agent-team/team.yaml` (`workflow.mod
 | Policy | Antigravity | Claude Code | VS Code Copilot |
 | :--- | :--- | :--- | :--- |
 | **`defer-to-host`** | `model: inherit` | `model: inherit` (yields to `CLAUDE_CODE_SUBAGENT_MODEL` / `/model`) | Omits `model` & `model-policy` (unlocks **Copilot Fusion / Auto**) |
-| **`prefer-fallback`** *(default)* | `flash_lite` \| `flash` \| `pro` (compatible with `/swarm` & UI picker) | `haiku` \| `sonnet` \| `opus` (overridden by env/invocation/`/model`) | Ordered fallback array + `model-policy: preferred` (`handoffs[].model` omitted by default) |
+| **`prefer-fallback`** *(default)* | `flash_lite` \| `flash` \| `pro` (compatible with `/swarm` & UI picker) | `haiku` \| `sonnet` \| `opus` (overridden by env/invocation/`/model`) | Ordered runtime ID fallback array (`claude-sonnet-4.6`, etc.) + `model-policy: preferred` |
 | **`pinned`** | Concrete model ID or tier enum | Concrete model ID or alias | Explicit `model` + `model-policy: required` |
 
 Manage routing from the CLI without hand-editing compiled files:

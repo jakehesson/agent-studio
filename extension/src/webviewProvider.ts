@@ -10,19 +10,211 @@ import {
   validateFeedbackExternalUrl,
   type VscodeAuthLike,
 } from "./feedback";
+import {
+  appendDeepLinkParams,
+  isSessionWaitingForHuman,
+} from "./scoping";
 import type { ServerManager } from "./serverManager";
 
 export type StudioViewName = "studio" | "board" | "team" | "mockups" | "doctor";
 
+export interface StudioPanelOpenOptions {
+  sessionId?: string;
+  openWaiting?: boolean;
+  openChatAgentId?: string;
+}
+
+export const REPLY_MAX_TEXT_BYTES = 32 * 1024;
+
+export type ReplyToAgentMode =
+  | "prefilled"
+  | "focused_copied"
+  | "copied"
+  | "error";
+
+export interface ReplyToAgentResult {
+  type: "agentStudio:replyResult";
+  requestId: string;
+  ok: boolean;
+  mode: ReplyToAgentMode;
+  message: string;
+}
+
+export interface ReplyBridgeDeps {
+  writeClipboard(text: string): Promise<void>;
+  getCommands(filterInternal?: boolean): Promise<string[]>;
+  executeCommand(command: string, ...rest: unknown[]): Promise<unknown>;
+}
+
+export function validateReplyToAgentMessage(
+  raw: unknown,
+):
+  | { ok: true; requestId: string; text: string; blockingToolCall: boolean }
+  | { ok: false; requestId: string; reason: string } {
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) {
+    return { ok: false, requestId: "", reason: "Invalid reply payload." };
+  }
+  const obj = raw as Record<string, unknown>;
+  const rawReqId = obj.requestId;
+  const requestId =
+    typeof rawReqId === "string" && rawReqId.trim().length > 0 && rawReqId.length <= 256
+      ? rawReqId.trim()
+      : "";
+  if (!requestId) {
+    return { ok: false, requestId: "", reason: "Missing or invalid requestId." };
+  }
+  if (typeof obj.text !== "string") {
+    return { ok: false, requestId, reason: "Reply text must be a string." };
+  }
+  if (obj.text.trim().length === 0) {
+    return { ok: false, requestId, reason: "Reply text cannot be empty." };
+  }
+  if (Buffer.byteLength(obj.text, "utf8") > REPLY_MAX_TEXT_BYTES) {
+    return {
+      ok: false,
+      requestId,
+      reason: `Reply text exceeds maximum size (${REPLY_MAX_TEXT_BYTES} bytes).`,
+    };
+  }
+  if (typeof obj.blockingToolCall !== "boolean") {
+    return {
+      ok: false,
+      requestId,
+      reason: "blockingToolCall must be a boolean.",
+    };
+  }
+  return {
+    ok: true,
+    requestId,
+    text: obj.text,
+    blockingToolCall: obj.blockingToolCall,
+  };
+}
+
+export async function handleReplyToAgent(
+  raw: unknown,
+  deps: ReplyBridgeDeps,
+): Promise<ReplyToAgentResult> {
+  const checked = validateReplyToAgentMessage(raw);
+  if (!checked.ok) {
+    return {
+      type: "agentStudio:replyResult",
+      requestId: checked.requestId,
+      ok: false,
+      mode: "error",
+      message: checked.reason,
+    };
+  }
+
+  const { requestId, text, blockingToolCall } = checked;
+  let clipboardCopied = false;
+  try {
+    await deps.writeClipboard(text);
+    clipboardCopied = true;
+  } catch {
+    clipboardCopied = false;
+  }
+
+  let chatCommandAvailable = true;
+  try {
+    const commands = await deps.getCommands(true);
+    if (Array.isArray(commands)) {
+      chatCommandAvailable = commands.includes("workbench.action.chat.open");
+    }
+  } catch {
+    chatCommandAvailable = true;
+  }
+
+  if (!blockingToolCall) {
+    if (chatCommandAvailable) {
+      try {
+        await deps.executeCommand("workbench.action.chat.open", {
+          query: text,
+          isPartialQuery: true,
+        });
+        return {
+          type: "agentStudio:replyResult",
+          requestId,
+          ok: true,
+          mode: "prefilled",
+          message: clipboardCopied
+            ? "Prefilled IDE chat input (and copied to clipboard) — review and press Enter to send."
+            : "Prefilled IDE chat input — review and press Enter to send.",
+        };
+      } catch {
+        // Fall through to clipboard fallback
+      }
+    }
+    if (clipboardCopied) {
+      return {
+        type: "agentStudio:replyResult",
+        requestId,
+        ok: true,
+        mode: "copied",
+        message:
+          "Copied answer to clipboard — paste or select in the active IDE prompt.",
+      };
+    }
+    return {
+      type: "agentStudio:replyResult",
+      requestId,
+      ok: false,
+      mode: "error",
+      message: "Unable to prefill IDE chat or copy reply to clipboard.",
+    };
+  }
+
+  if (chatCommandAvailable) {
+    try {
+      await deps.executeCommand("workbench.action.chat.open");
+      return {
+        type: "agentStudio:replyResult",
+        requestId,
+        ok: true,
+        mode: "focused_copied",
+        message: clipboardCopied
+          ? "Copied answer & focused IDE chat — select/paste in the active prompt to confirm."
+          : "Focused IDE chat — select/paste in the active prompt to confirm.",
+      };
+    } catch {
+      // Fall through to clipboard fallback
+    }
+  }
+
+  if (clipboardCopied) {
+    return {
+      type: "agentStudio:replyResult",
+      requestId,
+      ok: true,
+      mode: "copied",
+      message:
+        "Copied answer to clipboard — paste or select in the active IDE prompt.",
+    };
+  }
+
+  return {
+    type: "agentStudio:replyResult",
+    requestId,
+    ok: false,
+    mode: "error",
+    message: "Unable to focus IDE chat or copy reply to clipboard.",
+  };
+}
+
+export interface SidebarSessionItem {
+  sessionId: string;
+  ide?: string;
+  projectId?: string;
+  title?: string;
+  status?: string;
+  isMultiAgent?: boolean;
+  waitingOn?: string | null;
+  pendingQuestionCount?: number;
+  waitingSummary?: string;
+}
+
 interface SessionsApiResponse {
-  sessions?: Array<{
-    sessionId: string;
-    ide?: string;
-    projectId?: string;
-    title?: string;
-    status?: string;
-    isMultiAgent?: boolean;
-  }>;
+  sessions?: SidebarSessionItem[];
 }
 
 interface BoardApiResponse {
@@ -65,6 +257,7 @@ export class StudioPanel {
   private currentSessionId: string | undefined;
   private currentResolvedUrl = "";
   private currentOnline = false;
+  private isDisposed = false;
 
   private constructor(
     panel: vscode.WebviewPanel,
@@ -120,6 +313,17 @@ export class StudioPanel {
             return;
           }
           await vscode.env.openExternal(vscode.Uri.parse(checked.url));
+        } else if (msg?.type === "agentStudio:replyToAgent") {
+          const reply = await handleReplyToAgent(msg, {
+            writeClipboard: async (text) => {
+              await vscode.env.clipboard.writeText(text);
+            },
+            getCommands: async (filterInternal) =>
+              await vscode.commands.getCommands(filterInternal),
+            executeCommand: async (command, ...args) =>
+              await vscode.commands.executeCommand(command, ...args),
+          });
+          void this.panel.webview.postMessage(reply);
         }
       },
       null,
@@ -192,13 +396,33 @@ export class StudioPanel {
   public static async createOrShow(
     serverManager: ServerManager,
     view: StudioViewName = "studio",
-    sessionId?: string,
+    sessionIdOrOptions?: string | StudioPanelOpenOptions,
   ): Promise<void> {
     await serverManager.ensureRunning(true);
 
+    const openOptions: StudioPanelOpenOptions =
+      typeof sessionIdOrOptions === "string"
+        ? { sessionId: sessionIdOrOptions }
+        : sessionIdOrOptions ?? {};
+
     if (StudioPanel.currentPanel) {
-      StudioPanel.currentPanel.panel.reveal(vscode.ViewColumn.One);
-      await StudioPanel.currentPanel.render(view, sessionId);
+      const current = StudioPanel.currentPanel;
+      current.panel.reveal(vscode.ViewColumn.One);
+      const status = serverManager.getStatus();
+      const hasFocusTarget =
+        openOptions.sessionId !== undefined ||
+        openOptions.openWaiting !== undefined ||
+        openOptions.openChatAgentId !== undefined;
+      if (
+        hasFocusTarget &&
+        current.currentResolvedUrl &&
+        view === current.currentView &&
+        status.online === current.currentOnline
+      ) {
+        await current.postFocusSession(openOptions);
+        return;
+      }
+      await current.render(view, openOptions);
       return;
     }
 
@@ -214,28 +438,51 @@ export class StudioPanel {
 
     const instance = new StudioPanel(panel, serverManager);
     StudioPanel.currentPanel = instance;
-    await instance.render(view, sessionId);
+    await instance.render(view, openOptions);
+  }
+
+  public async postFocusSession(opts: StudioPanelOpenOptions): Promise<void> {
+    if (opts.sessionId !== undefined) {
+      this.currentSessionId = opts.sessionId;
+    }
+    await this.panel.webview.postMessage({
+      type: "agentStudio:focusSession",
+      ...(opts.sessionId !== undefined ? { sessionId: opts.sessionId } : {}),
+      ...(opts.openWaiting !== undefined ? { openWaiting: opts.openWaiting } : {}),
+      ...(opts.openChatAgentId !== undefined
+        ? { openChatAgentId: opts.openChatAgentId }
+        : {}),
+    });
   }
 
   public async render(
     view: StudioViewName,
-    sessionId?: string,
+    sessionIdOrOptions?: string | (StudioPanelOpenOptions & { force?: boolean }),
     opts?: { force?: boolean },
   ): Promise<void> {
+    const openOpts: StudioPanelOpenOptions & { force?: boolean } =
+      typeof sessionIdOrOptions === "string"
+        ? { sessionId: sessionIdOrOptions }
+        : sessionIdOrOptions ?? {};
+
     const effectiveSessionId =
-      sessionId !== undefined
-        ? sessionId
+      openOpts.sessionId !== undefined
+        ? openOpts.sessionId
         : view === this.currentView
           ? this.currentSessionId
           : undefined;
 
     const status = this.serverManager.getStatus();
-    const rawTargetUrl = this.serverManager.buildViewUrl(
+    const baseTargetUrl = this.serverManager.buildViewUrl(
       status.online ? status.localBaseUrl : status.browserBaseUrl,
       view,
       undefined,
       { embed: true, sessionId: effectiveSessionId },
     );
+    const rawTargetUrl = appendDeepLinkParams(baseTargetUrl, {
+      openWaiting: openOpts.openWaiting,
+      openChatAgentId: openOpts.openChatAgentId,
+    });
 
     let resolvedUrl = rawTargetUrl;
     try {
@@ -249,6 +496,7 @@ export class StudioPanel {
 
     if (
       !opts?.force &&
+      !openOpts.force &&
       this.currentResolvedUrl &&
       view === this.currentView &&
       resolvedUrl === this.currentResolvedUrl &&
@@ -372,10 +620,15 @@ export class StudioPanel {
     const statusTitle = document.getElementById("statusTitle");
     const spinner = document.getElementById("spinner");
     let loaded = false;
+    let pendingFocusMessage = null;
 
     frame.addEventListener("load", () => {
       loaded = true;
       overlay.classList.add("hidden");
+      if (pendingFocusMessage && expectedOrigin && frame.contentWindow) {
+        frame.contentWindow.postMessage(pendingFocusMessage, expectedOrigin);
+        pendingFocusMessage = null;
+      }
     });
 
     setTimeout(() => {
@@ -402,9 +655,15 @@ export class StudioPanel {
           expectedOrigin &&
           frame.contentWindow &&
           (data.type === "agentStudio:feedbackStatus" ||
-            data.type === "agentStudio:submitFeedbackResult")
+            data.type === "agentStudio:submitFeedbackResult" ||
+            data.type === "agentStudio:focusSession" ||
+            data.type === "agentStudio:replyResult")
         ) {
-          frame.contentWindow.postMessage(data, expectedOrigin);
+          if (data.type === "agentStudio:focusSession" && !loaded) {
+            pendingFocusMessage = data;
+          } else {
+            frame.contentWindow.postMessage(data, expectedOrigin);
+          }
         }
         return;
       }
@@ -432,6 +691,13 @@ export class StudioPanel {
           type: "agentStudio:openFeedbackUrl",
           url: data.url,
         });
+      } else if (data.type === "agentStudio:replyToAgent") {
+        vscode.postMessage({
+          type: "agentStudio:replyToAgent",
+          requestId: typeof data.requestId === "string" ? data.requestId : "",
+          text: typeof data.text === "string" && data.text.length <= 65536 ? data.text : "",
+          blockingToolCall: typeof data.blockingToolCall === "boolean" ? data.blockingToolCall : null,
+        });
       }
     });
   </script>
@@ -440,12 +706,78 @@ export class StudioPanel {
   }
 
   public dispose(): void {
+    if (this.isDisposed) return;
+    this.isDisposed = true;
     StudioPanel.currentPanel = undefined;
     this.panel.dispose();
     while (this.disposables.length > 0) {
       this.disposables.pop()?.dispose();
     }
   }
+}
+
+export function renderSidebarSessionsHtml(
+  sessions: SidebarSessionItem[],
+  limit = 4,
+): string {
+  if (sessions.length === 0) {
+    return `<div class="muted">No recent sessions detected yet.</div>`;
+  }
+
+  const ordered = [...sessions].sort((a, b) => {
+    const aWait = isSessionWaitingForHuman(a) ? 0 : 1;
+    const bWait = isSessionWaitingForHuman(b) ? 0 : 1;
+    return aWait - bWait;
+  });
+
+  return ordered
+    .slice(0, limit)
+    .map((s) => {
+      const isWaiting = isSessionWaitingForHuman(s);
+      const st = (s.status ?? "IDLE").toUpperCase();
+      const dotClass = isWaiting
+        ? "waiting"
+        : st === "THINKING"
+          ? "thinking"
+          : st === "WORKING"
+            ? "working"
+            : st === "BLOCKED"
+              ? "blocked"
+              : st === "DONE"
+                ? "done"
+                : "idle";
+      const label = escapeHtml(s.title || s.sessionId.slice(0, 8));
+      const ide = escapeHtml(s.ide || "ide");
+      const rawSummary =
+        isWaiting && typeof s.waitingSummary === "string"
+          ? s.waitingSummary.trim()
+          : "";
+      const summaryHtml = rawSummary
+        ? `<span class="session-sub">${escapeHtml(rawSummary)}</span>`
+        : "";
+      const pendingCount =
+        typeof s.pendingQuestionCount === "number" && s.pendingQuestionCount > 0
+          ? s.pendingQuestionCount
+          : 0;
+      const waitingBadgeText =
+        pendingCount > 1 ? `Needs Input (${pendingCount})` : "Needs Input";
+      const titleAttr = escapeHtml(
+        rawSummary ? `${s.sessionId} — ${rawSummary}` : s.sessionId,
+      );
+
+      return `<button class="session-row${isWaiting ? " waiting" : ""}" data-cmd="agentStudio.openStudio" data-session-id="${escapeHtml(s.sessionId)}"${isWaiting ? ' data-open-waiting="1"' : ""} title="${titleAttr}">
+                <span class="dot ${dotClass}"></span>
+                <span class="session-main">
+                  <span class="session-top">
+                    <span class="session-name">${label}</span>
+                    ${isWaiting ? `<span class="waiting-badge">${waitingBadgeText}</span>` : ""}
+                    <span class="pill">${ide}</span>
+                  </span>
+                  ${summaryHtml}
+                </span>
+              </button>`;
+    })
+    .join("");
 }
 
 export class StudioSidebarProvider
@@ -469,7 +801,11 @@ export class StudioSidebarProvider
     webviewView.webview.options = { enableScripts: true };
 
     webviewView.webview.onDidReceiveMessage(
-      async (msg: { command?: string; sessionId?: string }) => {
+      async (msg: {
+        command?: string;
+        sessionId?: string;
+        openWaiting?: boolean;
+      }) => {
         if (!msg?.command) return;
         if (msg.command === "refresh") {
           await this.serverManager.ensureRunning(false);
@@ -477,7 +813,14 @@ export class StudioSidebarProvider
           return;
         }
         if (msg.sessionId) {
-          await vscode.commands.executeCommand(msg.command, msg.sessionId);
+          if (msg.openWaiting) {
+            await vscode.commands.executeCommand(msg.command, {
+              sessionId: msg.sessionId,
+              openWaiting: true,
+            });
+          } else {
+            await vscode.commands.executeCommand(msg.command, msg.sessionId);
+          }
         } else {
           await vscode.commands.executeCommand(msg.command);
         }
@@ -546,10 +889,11 @@ export class StudioSidebarProvider
       : [null, null];
 
     const sessions = sessionsData?.sessions ?? [];
-    const activeSessions = sessions.filter((s) =>
-      ["THINKING", "WORKING", "WAITING", "BLOCKED"].includes(
-        (s.status ?? "").toUpperCase(),
-      ),
+    const activeSessions = sessions.filter(
+      (s) =>
+        ["THINKING", "WORKING", "WAITING", "BLOCKED"].includes(
+          (s.status ?? "").toUpperCase(),
+        ) || isSessionWaitingForHuman(s),
     );
     const items = boardData?.board?.items ?? [];
     const openItems = items.filter((i) => i.state !== "done");
@@ -565,32 +909,7 @@ export class StudioSidebarProvider
           : "Offline";
 
     const nonce = getNonce();
-    const topSessionsHtml =
-      sessions.slice(0, 4).length > 0
-        ? sessions
-            .slice(0, 4)
-            .map((s) => {
-              const st = (s.status ?? "IDLE").toUpperCase();
-              const dotClass =
-                st === "THINKING"
-                  ? "thinking"
-                  : st === "WORKING"
-                    ? "working"
-                    : st === "BLOCKED"
-                      ? "blocked"
-                      : st === "DONE"
-                        ? "done"
-                        : "idle";
-              const label = escapeHtml(s.title || s.sessionId.slice(0, 8));
-              const ide = escapeHtml(s.ide || "ide");
-              return `<button class="session-row" data-cmd="agentStudio.openStudio" data-session-id="${escapeHtml(s.sessionId)}" title="${escapeHtml(s.sessionId)}">
-                <span class="dot ${dotClass}"></span>
-                <span class="session-name">${label}</span>
-                <span class="pill">${ide}</span>
-              </button>`;
-            })
-            .join("")
-        : `<div class="muted">No recent sessions detected yet.</div>`;
+    const topSessionsHtml = renderSidebarSessionsHtml(sessions, 4);
 
     this.view.webview.html = `<!DOCTYPE html>
 <html lang="en">
@@ -645,7 +964,24 @@ export class StudioSidebarProvider
     .dot.online, .dot.done { background: #22c55e; }
     .dot.offline, .dot.blocked { background: #ef4444; }
     .dot.thinking { background: #a855f7; }
-    .dot.working { background: #f59e0b; }
+    .dot.working { background: #3b82f6; }
+    .dot.waiting {
+      background: #f59e0b;
+      box-shadow: 0 0 0 2px rgba(245, 158, 11, 0.28);
+      animation: pulse-waiting 1.6s ease-in-out infinite;
+    }
+    body.vscode-light .dot.waiting,
+    body.vscode-high-contrast-light .dot.waiting {
+      background: #b45309;
+      box-shadow: 0 0 0 2px rgba(180, 83, 9, 0.22);
+    }
+    @keyframes pulse-waiting {
+      0%, 100% { transform: scale(1); opacity: 1; }
+      50% { transform: scale(1.22); opacity: 0.72; }
+    }
+    @media (prefers-reduced-motion: reduce) {
+      .dot.waiting { animation: none; }
+    }
     .dot.idle { background: #64748b; }
     .kpis {
       display: grid;
@@ -708,11 +1044,64 @@ export class StudioSidebarProvider
       font-size: 11px;
     }
     .session-row:hover { filter: brightness(1.1); }
+    .session-row.waiting {
+      border: 1px solid rgba(245, 158, 11, 0.45);
+      background: rgba(245, 158, 11, 0.08);
+    }
+    body.vscode-light .session-row.waiting,
+    body.vscode-high-contrast-light .session-row.waiting {
+      border-color: rgba(180, 83, 9, 0.45);
+      background: rgba(254, 243, 199, 0.55);
+    }
+    .session-main {
+      flex: 1;
+      min-width: 0;
+      display: flex;
+      flex-direction: column;
+      gap: 2px;
+    }
+    .session-top {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      min-width: 0;
+    }
     .session-name {
       flex: 1;
       overflow: hidden;
       text-overflow: ellipsis;
       white-space: nowrap;
+    }
+    .session-sub {
+      font-size: 10px;
+      color: var(--vscode-descriptionForeground, var(--vscode-foreground));
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+    .waiting-badge {
+      font-size: 10px;
+      font-weight: 600;
+      padding: 1px 6px;
+      border-radius: 999px;
+      background: rgba(217, 119, 6, 0.28);
+      color: #fef3c7;
+      border: 1px solid rgba(245, 158, 11, 0.55);
+      flex: 0 0 auto;
+    }
+    body.vscode-light .waiting-badge,
+    body.vscode-high-contrast-light .waiting-badge {
+      color: #78350f;
+      background: #fef3c7;
+      border-color: #b45309;
+    }
+    @media (forced-colors: active) {
+      .dot.waiting { border: 1px solid CanvasText; }
+      .waiting-badge {
+        border: 1px solid CanvasText;
+        color: CanvasText;
+        background: Canvas;
+      }
     }
     .pill {
       font-size: 10px;
@@ -775,8 +1164,13 @@ export class StudioSidebarProvider
       el.addEventListener("click", () => {
         const cmd = el.getAttribute("data-cmd");
         const sessionId = el.getAttribute("data-session-id");
+        const openWaiting = el.getAttribute("data-open-waiting") === "1";
         if (cmd) {
-          vscode.postMessage(sessionId ? { command: cmd, sessionId } : { command: cmd });
+          vscode.postMessage({
+            command: cmd,
+            ...(sessionId ? { sessionId } : {}),
+            ...(openWaiting ? { openWaiting: true } : {}),
+          });
         }
       });
     });

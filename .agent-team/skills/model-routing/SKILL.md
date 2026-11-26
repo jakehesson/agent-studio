@@ -1,9 +1,130 @@
 ---
 name: model-routing
-description: Inspect and update Agent Studio's 3-layer Model Index (model-index.json), per-role tiers, and host-compatible IDE routing policies (Antigravity /swarm, VS Code Copilot Fusion/Auto, Claude Code).
+description: Select or reroute models using 10 ordered decision rules, expected_cost, smart-zone decomposition, 11 rerouting triggers, or structured routing JSON; or inspect and update Agent Studio's 3-layer Model Index (model-index.json) and host policies.
 ---
 
 # Model Routing & Agent-Readable Model Index Skill
+
+## 10 Ordered Decision Rules (Strict Precedence 1–10)
+1. **Enforce hard constraints first:** Eliminate candidates failing required capabilities, privacy/data-residency rules, `available === false` availability, safety boundaries, or context limits (treat `deprecated: true` as ineligible when non-deprecated candidates exist).
+2. **Keep reasoning-heavy work inside the validated smart zone:** Route complex reasoning tasks comfortably inside the model's empirically validated smart zone (`<= 40%` target; `55%` handoff / `70%` compact ceiling).
+3. **Decompose work exceeding the smart zone:** Partition tasks exceeding the best eligible model's smart zone into bounded subtasks with complete handoffs (`board { op: "handoff" }` / `board { op: "split" }`) rather than running in drift/red zone.
+4. **Select models using task-specific evidence:** Rank eligible candidates via `selectionPriority: ["accuracy", "cost", "speed"]` using verified catalog capability metadata and task-relevant benchmark evidence.
+5. **Reserve strongest model for high-leverage phases:** Assign the strongest (`reasoning`) model to planning, integration, architecture/code review, or difficult exceptions when cheaper workers (`balanced`/`fast`) can safely execute bounded tasks.
+6. **Require validation before accepting worker output:** Gate every worker deliverable on an explicit validation check (typecheck, automated test, schema check, or review) before downstream integration or `test -> done`.
+7. **Minimize total expected cost including retries and review:**
+   `expected_cost = initial_cost + retry_probability * retry_cost + review_cost`
+8. **Return uncertainty explicitly:** Surface missing capability/benchmark metadata or ambiguous context bounds in `uncertainties` and set `confidence < 0.7`.
+9. **Re-route when execution conditions materially differ:** Re-evaluate only when one of the 11 rerouting triggers below fires.
+10. **Stop or escalate when no eligible model meets hard requirements:** Emit `decision.primary_model: null` with unmet constraints explained rather than guessing.
+
+## 11 Rerouting Triggers & Anti-Churn Rule
+1. Actual context usage exceeds estimate by **> +25%**.
+2. Execution enters **amber (`> 40%`–`55%` handoff) or red (`>= 70%` compact) zone**.
+3. A **required modality or tool** is discovered mid-task.
+4. Selected model becomes **unavailable / rate-limited / `available: false`**.
+5. Selected model **fails validation twice** on the same subtask.
+6. Repeated **tool-call or formatting/schema failures** occur.
+7. New **privacy or data-residency constraints** tighten eligibility.
+8. **Failure impact / blast radius increases** (auth, locks, migrations, trust boundaries).
+9. User **materially changes scope** or acceptance criteria.
+10. Orchestrator **cannot produce a complete handoff** (`handoff_policy.required_fields`).
+11. Catalog evidence becomes **stale or contradictory** (`catalog_warnings`).
+- **Anti-Churn Rule:** Do not re-run routing after every successful phase unless the next phase has materially different requirements.
+
+## Routing Decision JSON Output Contract
+```json
+{
+  "decision": {
+    "strategy": "single_model | planner_executor | coordinator_workers | specialist_pipeline | planner_workers_reviewer",
+    "primary_model": "model-id",
+    "confidence": 0.0,
+    "summary": "Short explanation of the routing decision"
+  },
+  "request_analysis": {
+    "task_categories": [],
+    "reasoning_complexity": "low | medium | high | frontier",
+    "failure_impact": "low | medium | high | critical",
+    "execution_pattern": "single-pass | iterative | parallelizable | sequential | coordinator-worker | planner-executor-reviewer",
+    "required_capabilities": [],
+    "hard_constraints": [],
+    "estimated_peak_tokens": 0,
+    "context_estimate_confidence": "low | medium | high"
+  },
+  "routing_plan": [
+    {
+      "phase": 1,
+      "name": "phase name",
+      "objective": "bounded objective",
+      "model": "model-id",
+      "model_role": "planner | coordinator | worker | specialist | integrator | reviewer",
+      "estimated_input_tokens": 0,
+      "estimated_output_tokens": 0,
+      "context_zone": "green | amber | red | unknown",
+      "required_tools": [],
+      "inputs": [],
+      "output_contract": "expected artifact or schema",
+      "validation": [],
+      "parallel_group": null
+    }
+  ],
+  "model_evidence": [
+    {
+      "model": "model-id",
+      "selected_for": [],
+      "supporting_evidence": [
+        {
+          "type": "internal_eval | independent_benchmark | routing_history | provider_benchmark | capability_metadata",
+          "name": "evidence name",
+          "value": "score or finding",
+          "relevance": "why this evidence predicts success"
+        }
+      ],
+      "limitations": []
+    }
+  ],
+  "rejected_candidates": [
+    {
+      "model": "model-id",
+      "reason": "hard constraint or material disadvantage"
+    }
+  ],
+  "fallbacks": [
+    {
+      "trigger": "condition",
+      "action": "routing change",
+      "model": "fallback-model-id"
+    }
+  ],
+  "handoff_policy": {
+    "create_handoffs": true,
+    "maximum_phase_tokens": 0,
+    "required_fields": [
+      "objective",
+      "completed_work",
+      "evidence",
+      "decisions",
+      "assumptions",
+      "unresolved_issues",
+      "artifacts",
+      "validation_results",
+      "next_steps"
+    ]
+  },
+  "validation_plan": [],
+  "uncertainties": [],
+  "catalog_warnings": []
+}
+```
+
+## Output & Anti-Fabrication Requirements
+- When producing a routing decision payload, output **valid raw JSON without Markdown fences** or surrounding commentary.
+- Populate `primary_model`, `routing_plan[].model`, `model_evidence[].model`, and `fallbacks[].model` strictly from observed catalog model IDs (`available !== false`); never select an unavailable model as primary or fallback.
+- Use `null` when a value is undetermined; never manufacture benchmark evidence, context limits, costs, availability, or capabilities.
+- Include only serious alternatives in `rejected_candidates`, cite benchmark `relevance` (not just benchmark names), and emit a bounded executable `routing_plan`.
+- Set `confidence < 0.7` when material capability or benchmark data is missing, record stale or conflicting catalog metadata in `catalog_warnings`, and state explicit uncertainties in `uncertainties`.
+- Never assign the same large context to multiple workers unless genuinely needed; worker count != decomposition; prefer a single bounded call whenever more reliable and economical.
+- If hard constraints are unsatisfied, set `decision.primary_model: null` with a clear explanation; decompose if it materially improves reliability/cost rather than running in red zone; require an approval or review gate before consequential or irreversible actions.
 
 ## 3-Layer Model Index Architecture
 1. **Layer 0 (Built-in Seed):** Default role recommendations, portable tier bindings (`fast`, `balanced`, `reasoning`), and seed catalogs bundled in `agent-studio`.
@@ -18,17 +139,18 @@ description: Inspect and update Agent Studio's 3-layer Model Index (model-index.
 - **`prefer-fallback` (default):**
   - **Antigravity:** Emits portable tier enums (`flash_lite`, `flash`, `pro`) — compatible with `/swarm` and UI selection.
   - **Claude Code:** Emits family aliases (`haiku`, `sonnet`, `opus`) — yields automatically to `CLAUDE_CODE_SUBAGENT_MODEL`, invocation overrides, and `/model`.
-  - **VS Code Copilot:** Emits ordered fallback picker arrays (`["Claude Sonnet 4.5 (copilot)", ...]`) with `model-policy: preferred` so Fusion/Auto and org overrides are never blocked.
+  - **VS Code Copilot:** Emits ordered fallback runtime model ID arrays (`["claude-sonnet-4.6", ...]`) with `model-policy: preferred` so Fusion/Auto and org overrides are never blocked (legacy `"Name (copilot)"` IDs are auto-mapped at compile time).
 - **`defer-to-host`:** Emits `model: inherit` for Antigravity/Claude Code and omits `model` & `model-policy` for Copilot (unlocks pure Copilot Fusion/Auto).
 - **`pinned`:** Emits explicit model IDs and Copilot `model-policy: required` (bypasses Copilot Auto; `doctor` flags a warning).
+- **Ranking Priority:** `selectionPriority: ["accuracy", "cost", "speed"]` ranks available non-deprecated candidates by accuracy first, then premium multiplier cost, then speed.
 
 ## Key Schema Fields
 - `.agent-team/model-index.json`: `roleRecommendations.<roleId>.tier`, `ides.<ide>.tiers.<tier>.{primary,fallback,omitOnDefer}`, `ides.<ide>.catalog[]` (`id`, `label`, `tier`, `capabilities`, `available`, `source`).
-- `.agent-team/team.yaml`: `workflow.modelRouting.{policy,respectBuiltInOrchestrators,allowSubagentModelHints,copilotHandoffModels,idePolicies}` and `roster[].{modelTier,modelPolicy,models}`.
+- `.agent-team/team.yaml`: `workflow.modelRouting.{policy,respectBuiltInOrchestrators,allowSubagentModelHints,copilotHandoffModels,selectionPriority,idePolicies}` and `roster[].{modelTier,modelPolicy,models}`.
 
 ## Safe Agent & CLI Update Commands
 - Inspect effective index & resolved per-IDE models: `agent-studio models show`
-- Update a tier binding in workspace index: `agent-studio models set-tier copilot-vscode balanced "Claude Sonnet 4.5 (copilot)" --fallback "Claude Sonnet 4.5 (copilot),GPT-4.1 (copilot)" --sync`
+- Update a tier binding in workspace index: `agent-studio models set-tier copilot-vscode balanced claude-sonnet-4.6 --fallback claude-sonnet-4.6,gpt-5.4 --sync`
 - Update a role's tier or policy: `agent-studio models set-role architect --tier reasoning --sync`
 - Switch workflow routing policy: `agent-studio models set-policy defer-to-host --sync`
 - Upsert a model into catalog: `agent-studio models upsert --ide antigravity --id gemini-4-neon --tier reasoning`

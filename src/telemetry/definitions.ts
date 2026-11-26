@@ -4,6 +4,11 @@ import path from "node:path";
 import { parse as parseYaml } from "yaml";
 import { getAgentStudioHome } from "../board/registry.js";
 import {
+  resolveCopilotHomeDir,
+  resolveEffectiveHomeDir,
+  resolveVsCodeUserDir,
+} from "../compiler/global-install.js";
+import {
   buildWorkflowRoutingSummary,
   resolveRoleModel,
   type WorkflowRoutingSummary,
@@ -21,11 +26,12 @@ import type {
 import {
   parseTeamYaml,
   type CheckpointDefinition,
+  type ContextThresholds,
   type IdeModelOverride,
   type IdeTarget,
   type TeamManifest,
 } from "../schema/team.js";
-import { normalizeWsPath } from "./types.js";
+import { normalizeWsPath, prettifyModelName } from "./types.js";
 
 export type DefinitionSourceIde =
   | "canonical"
@@ -122,6 +128,8 @@ export interface TeamDetails {
   };
   modelRouting?: WorkflowRoutingSummary;
   modelIndexSummary?: ModelIndexSummary;
+  modelContextWindows?: Record<string, number>;
+  contextThresholds?: ContextThresholds;
   roster: TeamRosterEntry[];
   skills: TeamSkillEntry[];
   definitions: AgentDefinitionEntry[];
@@ -131,6 +139,7 @@ export interface TeamDetails {
 export interface DiscoverTeamOptions {
   includeGlobal?: boolean;
   homeDir?: string;
+  copilotHomeDir?: string;
 }
 
 const PREVIEW_MAX_CHARS = 4000;
@@ -361,7 +370,9 @@ export async function discoverTeamDetails(
   opts?: DiscoverTeamOptions,
 ): Promise<TeamDetails> {
   const includeGlobal = opts?.includeGlobal ?? true;
-  const homeDir = opts?.homeDir ?? os.homedir();
+  const { homeDir, isOverridden } = resolveEffectiveHomeDir(opts?.homeDir);
+  const copilotHomeDir = resolveCopilotHomeDir(homeDir, opts?.copilotHomeDir);
+  const vscodeUserDir = resolveVsCodeUserDir(homeDir, isOverridden);
 
   // Deduplicate candidate roots in priority order
   const orderedRoots: string[] = [];
@@ -444,6 +455,49 @@ export async function discoverTeamDetails(
           }
         : {}),
   };
+
+  const modelContextWindows: Record<string, number> = {};
+  const recordCatalogWindow = (
+    key: string | undefined,
+    win: number,
+  ): void => {
+    const clean = key?.trim().toLowerCase();
+    if (!clean) return;
+    modelContextWindows[clean] = win;
+  };
+  for (const ide of ["antigravity", "claude-code", "copilot-vscode"] as const) {
+    const catalog = effectiveModelIndex.ides[ide].catalog;
+    // Built-in entries first, then live/user/agent entries overwrite with live maxInputTokens
+    const ordered = [
+      ...catalog.filter((e) => e.source === "built-in"),
+      ...catalog.filter((e) => e.source !== "built-in"),
+    ];
+    for (const entry of ordered) {
+      if (
+        typeof entry.contextWindow !== "number" ||
+        !Number.isFinite(entry.contextWindow) ||
+        entry.contextWindow <= 0
+      ) {
+        continue;
+      }
+      const win = Math.round(entry.contextWindow);
+      const version = (entry as { version?: unknown }).version;
+      recordCatalogWindow(entry.id, win);
+      recordCatalogWindow(entry.label, win);
+      recordCatalogWindow(entry.family, win);
+      if (typeof version === "string") {
+        recordCatalogWindow(version, win);
+        const prettyVer = prettifyModelName(version);
+        if (prettyVer) recordCatalogWindow(prettyVer, win);
+      }
+      const prettyId = prettifyModelName(entry.id);
+      if (prettyId) recordCatalogWindow(prettyId, win);
+      if (entry.family) {
+        const prettyFam = prettifyModelName(entry.family);
+        if (prettyFam) recordCatalogWindow(prettyFam, win);
+      }
+    }
+  }
 
   // Build enriched canonical roster
   const roster: TeamRosterEntry[] = [];
@@ -529,6 +583,24 @@ export async function discoverTeamDetails(
     }
   }
 
+  if (includeGlobal) {
+    for (const f of await listPluginSkillFiles(
+      path.join(homeDir, ".gemini", "config", "plugins"),
+    )) {
+      skillCandidates.push({ filePath: f, sourceIde: "antigravity" });
+    }
+    for (const f of await listSkillMdFiles(
+      path.join(homeDir, ".claude", "skills"),
+    )) {
+      skillCandidates.push({ filePath: f, sourceIde: "claude-code" });
+    }
+    for (const f of await listSkillMdFiles(
+      path.join(copilotHomeDir, "skills"),
+    )) {
+      skillCandidates.push({ filePath: f, sourceIde: "copilot-vscode" });
+    }
+  }
+
   const seenSkillFiles = new Set<string>();
   const skills: TeamSkillEntry[] = [];
   for (const cand of skillCandidates) {
@@ -598,6 +670,18 @@ export async function discoverTeamDetails(
     }
     for (const f of await listMdFiles(path.join(homeDir, ".claude", "agents"))) {
       defCandidates.push({ filePath: f, sourceIde: "claude-code" });
+    }
+    for (const f of await listMdFiles(
+      path.join(copilotHomeDir, "agents"),
+      ".agent.md",
+    )) {
+      defCandidates.push({ filePath: f, sourceIde: "copilot-vscode" });
+    }
+    for (const f of await listMdFiles(
+      path.join(vscodeUserDir, "prompts"),
+      ".agent.md",
+    )) {
+      defCandidates.push({ filePath: f, sourceIde: "copilot-vscode" });
     }
   }
 
@@ -709,6 +793,12 @@ export async function discoverTeamDetails(
     },
     ...(manifest ? { modelRouting: buildWorkflowRoutingSummary(manifest) } : {}),
     modelIndexSummary,
+    ...(Object.keys(modelContextWindows).length > 0
+      ? { modelContextWindows }
+      : {}),
+    ...(manifest?.workflow.contextThresholds
+      ? { contextThresholds: manifest.workflow.contextThresholds }
+      : {}),
     roster,
     skills,
     definitions,
@@ -738,6 +828,7 @@ export async function discoverTeamDetailsCached(
       normalizeWsPath(resolveWorkspaceRootPath(w)),
     ),
     includeGlobal: opts?.includeGlobal ?? true,
+    copilotHomeDir: opts?.copilotHomeDir ?? process.env.COPILOT_HOME ?? "",
   });
   const now = Date.now();
   const hit = teamDetailsCache.get(key);

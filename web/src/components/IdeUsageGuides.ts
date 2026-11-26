@@ -259,14 +259,18 @@ const GUIDE_SPECS: Record<GuideIdeId, IdeGuideSpec> = {
     id: "copilot-vscode",
     name: "GitHub Copilot / VS Code",
     tagline:
-      "Custom .github/agents/*.agent.md with native handoffs: buttons, .vscode/mcp.json servers merge, and hybrid hooks + chatSessions replay.",
+      "Unified .github/agents/*.agent.md (user-invocable & agent tool), shared .mcp.json wiring, camelCase hooks, and $COPILOT_HOME session-state + chatSessions replay.",
     setupCommands: [
       {
         label: "Per-project setup & compile",
         code: `agent-studio init --ides copilot-vscode\nagent-studio sync --ides copilot-vscode && agent-studio doctor`,
       },
       {
-        label: "One-time global setup (installs VS Code user prompt agent)",
+        label: "Upgrade existing workspaces safely (preserves custom Markdown)",
+        code: `agent-studio upgrade --dry-run\nagent-studio upgrade --global`,
+      },
+      {
+        label: "One-time global setup (installs ~/.copilot/ / $COPILOT_HOME)",
         code: `agent-studio init --global`,
       },
       {
@@ -275,34 +279,34 @@ const GUIDE_SPECS: Record<GuideIdeId, IdeGuideSpec> = {
       },
     ],
     activationSteps: [
-      "Open the repository in VS Code and click Trust / Start on the agent-studio MCP server inside .vscode/mcp.json.",
-      "Open GitHub Copilot Chat and choose Team Orchestrator (orchestrator) or Team Setup Agent (team-setup) in the Agent dropdown.",
-      "Use the compiled Handoffs buttons (→ System Architect, → Backend Engineer, → Frontend Engineer, → QA Validator) to pass context cleanly between stages.",
+      "Open the repository in VS Code or Copilot CLI and trust/approve the agent-studio MCP server inside .mcp.json.",
+      "Open GitHub Copilot Chat (or Copilot CLI) and choose Team Orchestrator (orchestrator) or Team Setup Agent (team-setup) — specialists use user-invocable: false so they stay scoped to subagent delegation.",
+      "Orchestrator delegates to specialists via the native agent tool (or task in Copilot CLI) while .github/hooks/agent-studio.json streams camelCase lifecycle hooks live.",
     ],
     prompts: [
       {
         badge: "Team Setup Agent",
-        title: "Onboard or customize repository",
+        title: "Onboard or upgrade repository",
         prompt:
-          "Inspect this workspace, tailor .agent-team/team.yaml with our specialist roster and QA checkpoints, then run agent-studio sync and agent-studio doctor.",
+          "Inspect this workspace, tailor .agent-team/team.yaml with our specialist roster and QA checkpoints, then run agent-studio upgrade (or sync) and agent-studio doctor.",
       },
       {
         badge: "Team Orchestrator",
-        title: "Run sprint with native Handoffs",
+        title: "Run sprint with native agent delegation",
         prompt:
-          "Check agent-studio board status and next ready items, plan the active sprint, and guide handoffs to Architect, Engineers, and QA Validator while enforcing the test → done QA gate.",
+          "Check agent-studio board status and next ready items, plan the active sprint, and delegate to Architect, Engineers, and QA Validator via the agent tool while enforcing the test → done QA gate.",
       },
     ],
     files: [
       {
         concern: "Custom Agents",
         path: ".github/agents/<role>.agent.md",
-        note: "Includes native handoffs: buttons; orchestrator omits edit/terminal",
+        note: "Portable tools (read/search/edit/execute/agent), user-invocable, model-policy; orchestrator omits edit/execute",
       },
       {
         concern: "Skills",
         path: ".github/skills/<skill>/SKILL.md",
-        note: "Portable domain & QA workflow skills",
+        note: "Portable domain, QA, and /learn skills (replaces learn.prompt.md)",
       },
       {
         concern: "Instructions",
@@ -311,18 +315,18 @@ const GUIDE_SPECS: Record<GuideIdeId, IdeGuideSpec> = {
       },
       {
         concern: "MCP Wiring",
-        path: ".vscode/mcp.json",
-        note: "Key-scoped merge into servers['agent-studio'] (type: stdio)",
+        path: ".mcp.json",
+        note: "Key-scoped merge into mcpServers['agent-studio'] (type: stdio, tools: ['*']); shared with Claude Code",
       },
       {
         concern: "Live Hooks",
         path: ".github/hooks/agent-studio.json",
-        note: "PreToolUse, PostToolUse, SubagentStart/Stop, Stop -> hook-emit",
+        note: "10 camelCase events (sessionStart, preToolUse, postToolUse, subagentStart/Stop, agentStop, sessionEnd) -> hook-emit",
       },
       {
         concern: "Global Setup",
-        path: "<VSCodeUserDir>/prompts/team-setup.agent.md",
-        note: "Installed once by --global (Windows/macOS/Linux)",
+        path: "~/.copilot/ ($COPILOT_HOME)",
+        note: "Installs agents/team-setup.agent.md, instructions/, and skills/{team-setup,learn}/ via --global",
       },
     ],
     sprintSteps: [
@@ -334,31 +338,31 @@ const GUIDE_SPECS: Record<GuideIdeId, IdeGuideSpec> = {
       },
       {
         num: "2",
-        title: "One-Click Specialist Handoff",
+        title: "Native Subagent Delegation (agent)",
         detail:
-          "Click the compiled handoff button (or runSubagent) to dispatch Architect / Engineers with full context.",
+          "Dispatch Architect / Engineers via the native agent tool (or task); subagentStart/subagentStop hooks correlate runs live.",
       },
       {
         num: "3",
         title: "Run QA Suite & Record Testrun",
         detail:
-          "Hand off to QA Validator to execute CP0/CP1/CP2 and log results via agent-studio/testrun.",
+          "Delegate to QA Validator to execute CP0/CP1/CP2 and log results via agent-studio/testrun.",
       },
       {
         num: "4",
         title: "Hook + MCP Guardrails",
         detail:
-          "PreToolUse blocks raw pipeline/board.json writes; MCP rejects test → done without a passing testrun.",
+          "preToolUse blocks raw pipeline/board.json writes ({ permissionDecision: 'deny' }, exit 0); MCP rejects test → done without a passing testrun.",
       },
     ],
     guardrailNote:
-      "Compiled orchestrator.agent.md strips edit/* and execute/runInTerminal tools, while .github/hooks/agent-studio.json enforces PreToolUse board protection and pushes live events with a 150ms fail-safe fallback to .agent-studio/telemetry.jsonl.",
+      "Compiled orchestrator.agent.md strips edit and execute tools, while .github/hooks/agent-studio.json enforces camelCase preToolUse board protection and pushes live events with a 150ms fail-safe fallback to .agent-studio/telemetry.jsonl.",
     overrideFlag: "--vscode-dir <path>",
-    overrideEnv: "VSCODE_STORAGE_DIR",
+    overrideEnv: "COPILOT_HOME / VSCODE_STORAGE_DIR",
     overrideCmd:
-      'VSCODE_STORAGE_DIR="%APPDATA%/Code/User/workspaceStorage" agent-studio serve --vscode-dir "%APPDATA%/Code/User/workspaceStorage"',
+      'COPILOT_HOME="~/.copilot" VSCODE_STORAGE_DIR="%APPDATA%/Code/User/workspaceStorage" agent-studio serve --vscode-dir "%APPDATA%/Code/User/workspaceStorage"',
     troubleshootingNote:
-      "Reads both legacy .json snapshots and modern delta-encoded .jsonl chatSessions (including Code - Insiders). If VS Code runs remotely or delays flushing chatSessions, active hooks (.github/hooks/agent-studio.json) and MCP events continue streaming full live activity via /api/ingest + .agent-studio/telemetry.jsonl.",
+      "Discovers workspace-scoped $COPILOT_HOME/session-state/*/events.jsonl alongside VS Code workspaceStorage chatSessions (.json and delta .jsonl, including Code - Insiders) and deduplicates by sessionId. Run agent-studio upgrade to migrate legacy .vscode/mcp.json, PascalCase hooks, or (copilot) model IDs.",
   },
 };
 

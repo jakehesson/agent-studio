@@ -2,11 +2,15 @@ import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import {
+  capChatText,
   cleanHumanSummary,
   computeDeterministicEventId,
   computeMergeKey,
+  computePendingPromptId,
+  formatQuestionsPreview,
   isBoardMutationToolCall,
   isSelfDaemonCommand,
+  normalizePendingQuestions,
   normalizeWsPath,
   parseEpochSeconds,
   prettifyAgentLabel,
@@ -14,8 +18,12 @@ import {
   summarizeToolCall,
   toIsoUtc,
   type AdapterHealth,
+  type AgentChatMessage,
+  type AgentStatus,
+  type ChatToolCallRef,
   type DiscoveredSession,
   type EnrichedEvent,
+  type ParseChatOptions,
   type ParseSessionOptions,
   type PassiveIdeAdapter,
   type UsageDelta,
@@ -150,9 +158,22 @@ function extractTextFromContent(
     .join("\n");
 }
 
+interface CachedClaudeDiscoveryMeta {
+  mtimeMs: number;
+  sizeBytes: number;
+  cwd?: string;
+  title: string;
+  isMultiAgent: boolean;
+  waitingOn: "user" | "tool_approval" | "subagent" | null;
+  pendingQuestionCount: number;
+  waitingSummary?: string;
+  tailStatus?: AgentStatus;
+}
+
 export class ClaudeCodeAdapter implements PassiveIdeAdapter {
   readonly ide = "claude-code" as const;
   private readonly projectsDir: string;
+  private readonly discoveryCache = new Map<string, CachedClaudeDiscoveryMeta>();
 
   constructor(options?: ClaudeCodeAdapterOptions) {
     this.projectsDir =
@@ -290,54 +311,166 @@ export class ClaudeCodeAdapter implements PassiveIdeAdapter {
     const sessions: DiscoveredSession[] = [];
 
     for (const cand of candidates.slice(0, limit * 2)) {
-      let headText = "";
-      try {
-        const fh = await fs.open(cand.filePath, "r");
+      let meta = this.discoveryCache.get(cand.filePath);
+      if (
+        !meta ||
+        meta.mtimeMs !== cand.mtimeMs ||
+        meta.sizeBytes !== cand.sizeBytes
+      ) {
+        let headText = "";
+        let tailText = "";
         try {
-          const buf = Buffer.alloc(Math.min(cand.sizeBytes, 32768));
-          const { bytesRead } = await fh.read(buf, 0, buf.length, 0);
-          headText = buf.subarray(0, bytesRead).toString("utf8");
-        } finally {
-          await fh.close();
-        }
-      } catch {
-        continue;
-      }
-
-      let cwd: string | undefined;
-      let title = `Claude ${cand.sessionId.slice(0, 8)}`;
-      let isMultiAgent = cand.hasSubagentFiles;
-
-      for (const line of headText.split(/\r?\n/)) {
-        const t = line.trim();
-        if (!t) continue;
-        try {
-          const row = JSON.parse(t) as ClaudeRow;
-          if (!cwd && row.cwd) {
-            cwd = normalizeWsPath(row.cwd);
-          }
-          if (row.isSidechain) {
-            isMultiAgent = true;
-          }
-          if (row.type === "user" && title.startsWith("Claude ")) {
-            const txt = extractTextFromContent(row.message?.content)
-              .replace(/\s+/g, " ")
-              .trim();
-            if (txt) title = txt.slice(0, 80);
-          }
-          if (row.type === "assistant" && Array.isArray(row.message?.content)) {
-            for (const b of row.message.content) {
-              if (
-                b.type === "tool_use" &&
-                (b.name === "Agent" || b.name === "Task" || b.name === "SendMessage")
-              ) {
-                isMultiAgent = true;
-              }
+          const fh = await fs.open(cand.filePath, "r");
+          try {
+            const headBuf = Buffer.alloc(Math.min(cand.sizeBytes, 32768));
+            const { bytesRead } = await fh.read(headBuf, 0, headBuf.length, 0);
+            headText = headBuf.subarray(0, bytesRead).toString("utf8");
+            if (cand.sizeBytes > 32768) {
+              const tailLen = 32768;
+              const tailBuf = Buffer.alloc(tailLen);
+              const tailOffset = Math.max(0, cand.sizeBytes - tailLen);
+              const tailRes = await fh.read(tailBuf, 0, tailLen, tailOffset);
+              tailText = tailBuf.subarray(0, tailRes.bytesRead).toString("utf8");
+            } else {
+              tailText = headText;
             }
+          } finally {
+            await fh.close();
           }
         } catch {
-          // ignore
+          continue;
         }
+
+        let cwd: string | undefined;
+        let title = `Claude ${cand.sessionId.slice(0, 8)}`;
+        let isMultiAgent = cand.hasSubagentFiles;
+
+        for (const line of headText.split(/\r?\n/)) {
+          const t = line.trim();
+          if (!t) continue;
+          try {
+            const row = JSON.parse(t) as ClaudeRow;
+            if (!cwd && row.cwd) {
+              cwd = normalizeWsPath(row.cwd);
+            }
+            if (row.isSidechain) {
+              isMultiAgent = true;
+            }
+            if (row.type === "user" && title.startsWith("Claude ")) {
+              const txt = extractTextFromContent(row.message?.content)
+                .replace(/\s+/g, " ")
+                .trim();
+              if (txt) title = txt.slice(0, 80);
+            }
+            if (row.type === "assistant" && Array.isArray(row.message?.content)) {
+              for (const b of row.message.content) {
+                if (
+                  b.type === "tool_use" &&
+                  (b.name === "Agent" || b.name === "Task" || b.name === "SendMessage")
+                ) {
+                  isMultiAgent = true;
+                }
+              }
+            }
+          } catch {
+            // ignore
+          }
+        }
+
+        let pendingAskCallId: string | null = null;
+        let pendingQuestionCount = 0;
+        let waitingSummary: string | undefined;
+        let tailStatus: AgentStatus | undefined;
+
+        for (const line of tailText.split(/\r?\n/)) {
+          const t = line.trim();
+          if (!t) continue;
+          try {
+            const row = JSON.parse(t) as ClaudeRow;
+            if (!cwd && row.cwd) cwd = normalizeWsPath(row.cwd);
+            if (row.isSidechain) isMultiAgent = true;
+            if (row.type === "user") {
+              const content = row.message?.content;
+              if (Array.isArray(content)) {
+                let hasUserText = false;
+                for (const b of content) {
+                  if (b.type === "tool_result") {
+                    if (pendingAskCallId && (!b.tool_use_id || b.tool_use_id === pendingAskCallId)) {
+                      pendingAskCallId = null;
+                      pendingQuestionCount = 0;
+                      waitingSummary = undefined;
+                      if (tailStatus === "WAITING") {
+                        tailStatus = "WORKING";
+                      }
+                    }
+                  } else if (b.type === "text" && b.text?.trim()) {
+                    hasUserText = true;
+                  }
+                }
+                if (hasUserText) {
+                  pendingAskCallId = null;
+                  pendingQuestionCount = 0;
+                  waitingSummary = undefined;
+                  tailStatus = "THINKING";
+                }
+              } else if (typeof content === "string" && content.trim()) {
+                pendingAskCallId = null;
+                pendingQuestionCount = 0;
+                waitingSummary = undefined;
+                tailStatus = "THINKING";
+              }
+            } else if (row.type === "assistant") {
+              const blocks = Array.isArray(row.message?.content)
+                ? row.message.content
+                : [];
+              let hasTool = false;
+              for (const b of blocks) {
+                if (b.type === "tool_use") {
+                  hasTool = true;
+                  if (b.name === "AskUserQuestion") {
+                    const qs = normalizePendingQuestions(b.input ?? {}, {
+                      defaultAllowCustomInput: true,
+                    });
+                    pendingAskCallId = b.id ?? "__ask__";
+                    pendingQuestionCount = Math.max(1, qs.length);
+                    waitingSummary =
+                      cleanHumanSummary(
+                        qs[0]?.header ?? qs[0]?.question ?? "Asked user a question",
+                        80,
+                      ) || "Asked user a question";
+                    tailStatus = "WAITING";
+                  } else {
+                    pendingAskCallId = null;
+                    pendingQuestionCount = 0;
+                    waitingSummary = undefined;
+                    tailStatus = "WORKING";
+                  }
+                }
+              }
+              if (row.message?.stop_reason === "end_turn" && !hasTool) {
+                pendingAskCallId = null;
+                pendingQuestionCount = 0;
+                waitingSummary = undefined;
+                tailStatus = "DONE";
+              }
+            }
+          } catch {
+            // ignore partial leading/trailing line
+          }
+        }
+
+        meta = {
+          mtimeMs: cand.mtimeMs,
+          sizeBytes: cand.sizeBytes,
+          cwd,
+          title,
+          isMultiAgent,
+          waitingOn: pendingAskCallId ? "user" : null,
+          pendingQuestionCount,
+          waitingSummary,
+          tailStatus,
+        };
+        this.discoveryCache.set(cand.filePath, meta);
       }
 
       const decodedFolderWs = resolveEncodedFolderWorkspace(
@@ -345,8 +478,8 @@ export class ClaudeCodeAdapter implements PassiveIdeAdapter {
         candidateRoots,
       );
       const workspaces = [
-        ...(cwd ? [cwd] : []),
-        ...(decodedFolderWs && decodedFolderWs !== cwd
+        ...(meta.cwd ? [meta.cwd] : []),
+        ...(decodedFolderWs && decodedFolderWs !== meta.cwd
           ? [decodedFolderWs]
           : []),
       ];
@@ -362,10 +495,15 @@ export class ClaudeCodeAdapter implements PassiveIdeAdapter {
         workspacePath,
         workspaces,
         projectId,
-        title,
+        title: meta.title,
         mtimeMs: cand.mtimeMs,
         sizeBytes: cand.sizeBytes,
-        isMultiAgent,
+        isMultiAgent: meta.isMultiAgent,
+        ...(meta.tailStatus ? { status: meta.tailStatus } : {}),
+        waitingOn: meta.waitingOn,
+        pendingQuestionCount: meta.pendingQuestionCount,
+        ...(meta.waitingSummary ? { waitingSummary: meta.waitingSummary } : {}),
+        ...(meta.waitingOn ? { isWaiting: true } : {}),
       });
     }
 
@@ -376,8 +514,29 @@ export class ClaudeCodeAdapter implements PassiveIdeAdapter {
     session: DiscoveredSession,
     opts?: ParseSessionOptions,
   ): Promise<EnrichedEvent[]> {
+    const res = await this.parseSessionInternal(session, opts);
+    return res.events;
+  }
+
+  async parseChat(
+    session: DiscoveredSession,
+    opts?: ParseChatOptions,
+  ): Promise<AgentChatMessage[]> {
+    const res = await this.parseSessionInternal(session, { includeChat: true });
+    const reqAgent = opts?.agentId?.trim();
+    const filtered = reqAgent
+      ? res.chatMessages.filter((m) => m.agentId === reqAgent)
+      : res.chatMessages;
+    filtered.sort((a, b) => a.epoch - b.epoch);
+    return filtered;
+  }
+
+  private async parseSessionInternal(
+    session: DiscoveredSession,
+    opts?: ParseSessionOptions & { includeChat?: boolean },
+  ): Promise<{ events: EnrichedEvent[]; chatMessages: AgentChatMessage[] }> {
     const mainRows = await readClaudeJsonl(session.filePath);
-    if (mainRows.length === 0) return [];
+    if (mainRows.length === 0) return { events: [], chatMessages: [] };
 
     const knownProjects = getKnownProjects();
     const allWorkspaces = [...session.workspaces];
@@ -395,7 +554,25 @@ export class ClaudeCodeAdapter implements PassiveIdeAdapter {
         knownProjects,
       ) ?? session.projectId;
 
+    const includeChat = Boolean(opts?.includeChat);
     const events: EnrichedEvent[] = [];
+    const chatMessages: AgentChatMessage[] = [];
+    const chatToolRefById = new Map<string, ChatToolCallRef>();
+    const seenChatToolUseIds = new Set<string>();
+    const lastAssistantByMsgId = new Map<string, AgentChatMessage>();
+    const assistantProseByMsgId = new Map<string, string>();
+    const mergeStreamingText = (
+      prev: string | undefined,
+      next: string,
+    ): string => {
+      const a = (prev ?? "").trim();
+      const b = next.trim();
+      if (!a) return b;
+      if (!b) return a;
+      if (a === b || a.includes(b)) return a;
+      if (b.startsWith(a) || b.includes(a)) return b;
+      return `${a}\n\n${b}`;
+    };
     const spawnToolUseMap = new Map<
       string,
       {
@@ -407,6 +584,7 @@ export class ClaudeCodeAdapter implements PassiveIdeAdapter {
         matchedFromResult?: string;
         spawnEvent?: EnrichedEvent;
         doneEvent?: EnrichedEvent;
+        chatSpawnMsg?: AgentChatMessage;
       }
     >();
     const spawnRecords: Array<{
@@ -418,6 +596,7 @@ export class ClaudeCodeAdapter implements PassiveIdeAdapter {
       matchedFromResult?: string;
       spawnEvent?: EnrichedEvent;
       doneEvent?: EnrichedEvent;
+      chatSpawnMsg?: AgentChatMessage;
     }> = [];
     const toolSummaryMap = new Map<string, { toolName: string; summary: string }>();
 
@@ -658,15 +837,24 @@ export class ClaudeCodeAdapter implements PassiveIdeAdapter {
                 const callId = block.tool_use_id ?? `${row.uuid ?? i}:${bIdx}`;
                 const spawnInfo = spawnToolUseMap.get(callId);
                 const isErr = Boolean(block.is_error);
+                const resultText =
+                  typeof block.content === "string"
+                    ? block.content.trim()
+                    : Array.isArray(block.content)
+                      ? extractTextFromContent(
+                          block.content as ClaudeContentBlock[],
+                        ).trim()
+                      : "";
+                if (includeChat) {
+                  const ref = chatToolRefById.get(callId);
+                  if (ref) {
+                    ref.status = isErr ? "error" : "ok";
+                    if (resultText) {
+                      ref.output = capChatText(resultText);
+                    }
+                  }
+                }
                 if (spawnInfo) {
-                  const resultText =
-                    typeof block.content === "string"
-                      ? block.content.trim()
-                      : Array.isArray(block.content)
-                        ? extractTextFromContent(
-                            block.content as ClaudeContentBlock[],
-                          ).trim()
-                        : "";
                   const turAgent =
                     row.toolUseResult &&
                     typeof row.toolUseResult === "object" &&
@@ -721,26 +909,36 @@ export class ClaudeCodeAdapter implements PassiveIdeAdapter {
                       preview:
                         typeof block.content === "string"
                           ? block.content.slice(0, 300)
-                          : undefined,
+                          : resultText
+                            ? resultText.slice(0, 300)
+                            : undefined,
                     },
                     offset: bIdx * 0.0001,
                   });
                 }
               }
             });
-            if (!hadToolResult) {
-              const txt = extractTextFromContent(content).trim();
-              if (txt) {
-                const inlineBody = txt.slice(0, 1400);
-                emit({
-                  kind: "user_input",
-                  targetAgentId: agentId,
-                  summary: `Human: ${cleanHumanSummary(txt, 130)}`,
-                  payload: { body: inlineBody },
-                  fullBody: txt,
-                  inlineBody,
-                });
-              }
+            const txt = extractTextFromContent(content).trim();
+            if (!hadToolResult && txt) {
+              const inlineBody = txt.slice(0, 1400);
+              emit({
+                kind: "user_input",
+                targetAgentId: agentId,
+                summary: `Human: ${cleanHumanSummary(txt, 130)}`,
+                payload: { body: inlineBody },
+                fullBody: txt,
+                inlineBody,
+              });
+            }
+            if (includeChat && txt) {
+              chatMessages.push({
+                id: `chat:cc:${agentId}:${i}:user`,
+                ts: toIsoUtc(epoch),
+                epoch,
+                agentId,
+                role: "user",
+                text: capChatText(txt),
+              });
             }
           } else if (typeof content === "string" && content.trim()) {
             const inlineBody = content.slice(0, 1400);
@@ -752,25 +950,51 @@ export class ClaudeCodeAdapter implements PassiveIdeAdapter {
               fullBody: content,
               inlineBody,
             });
+            if (includeChat) {
+              chatMessages.push({
+                id: `chat:cc:${agentId}:${i}:user`,
+                ts: toIsoUtc(epoch),
+                epoch,
+                agentId,
+                role: "user",
+                text: capChatText(content.trim()),
+              });
+            }
           }
         } else if (rtype === "assistant") {
           const content = row.message?.content;
           const blocks = Array.isArray(content) ? content : [];
           let hasToolUse = false;
+          const chatThinkingParts: string[] = [];
+          const chatTextParts: string[] = [];
+          const chatTurnTools: ChatToolCallRef[] = [];
+          const chatSpecialMsgs: AgentChatMessage[] = [];
+          if (typeof content === "string" && content.trim()) {
+            chatTextParts.push(content.trim());
+          }
 
           blocks.forEach((block, bIdx) => {
             if (block.type === "thinking") {
+              if (includeChat && typeof block.thinking === "string" && block.thinking.trim()) {
+                chatThinkingParts.push(block.thinking.trim());
+              }
               emit({
                 kind: "thinking_start",
                 summary:
                   cleanHumanSummary(block.thinking ?? "", 100) || "Thinking…",
                 offset: bIdx * 0.0001,
               });
+            } else if (block.type === "text") {
+              if (includeChat && typeof block.text === "string" && block.text.trim()) {
+                chatTextParts.push(block.text.trim());
+              }
             } else if (block.type === "tool_use") {
               hasToolUse = true;
               const tname = block.name ?? "tool";
               const input = block.input ?? {};
               const callId = block.id ?? `${row.uuid ?? i}:${bIdx}`;
+              const isNewChatTool = !seenChatToolUseIds.has(callId);
+              if (includeChat) seenChatToolUseIds.add(callId);
 
               if (tname === "Agent" || tname === "Task") {
                 const subType = String(
@@ -824,12 +1048,27 @@ export class ClaudeCodeAdapter implements PassiveIdeAdapter {
                     : {}),
                   offset: bIdx * 0.0001,
                 });
+                let chatSpawnMsg: AgentChatMessage | undefined;
+                if (includeChat && isNewChatTool) {
+                  chatSpawnMsg = {
+                    id: `chat:cc:${agentId}:${i}:sub:${bIdx}`,
+                    ts: toIsoUtc(epoch + (bIdx + 1) * 0.0001),
+                    epoch: epoch + (bIdx + 1) * 0.0001,
+                    agentId,
+                    role: "subagent",
+                    text: capChatText(rawPrompt.trim() || `Spawned ${subLabel}`),
+                    subagentId: subId,
+                    subagentLabel: subLabel,
+                  };
+                  chatSpecialMsgs.push(chatSpawnMsg);
+                }
                 const rec = {
                   callId,
                   targetAgentId: subId,
                   agentLabel: subLabel,
                   prompt: rawPrompt.trim(),
                   spawnEvent: spawnEv,
+                  ...(chatSpawnMsg ? { chatSpawnMsg } : {}),
                 };
                 spawnToolUseMap.set(callId, rec);
                 spawnRecords.push(rec);
@@ -858,19 +1097,67 @@ export class ClaudeCodeAdapter implements PassiveIdeAdapter {
                   ...(body ? { fullBody: body, inlineBody } : {}),
                   offset: bIdx * 0.0001,
                 });
+                if (includeChat && isNewChatTool) {
+                  chatSpecialMsgs.push({
+                    id: `chat:cc:${agentId}:${i}:msg:${bIdx}`,
+                    ts: toIsoUtc(epoch + (bIdx + 1) * 0.0001),
+                    epoch: epoch + (bIdx + 1) * 0.0001,
+                    agentId,
+                    role: "subagent",
+                    text: capChatText(body || msgSummary),
+                    subagentId: target,
+                  });
+                }
               } else if (tname === "AskUserQuestion") {
-                const qSummary = "Asked user a question";
-                toolSummaryMap.set(callId, { toolName: tname, summary: qSummary });
+                const parsedQuestions = normalizePendingQuestions(input, {
+                  defaultAllowCustomInput: true,
+                });
+                const qSummary = parsedQuestions[0]?.question
+                  ? cleanHumanSummary(parsedQuestions[0].question, 100)
+                  : "Asked user a question";
+                const qTitle =
+                  cleanHumanSummary(
+                    parsedQuestions[0]?.header ??
+                      parsedQuestions[0]?.question ??
+                      "Question for user",
+                    100,
+                  ) || "Question for user";
+                toolSummaryMap.set(callId, {
+                  toolName: tname,
+                  summary: qSummary || "Asked user a question",
+                });
                 emit({
                   kind: "tool_start",
                   toolName: tname,
                   toolCallId: callId,
                   targetAgentId: "human",
-                  summary: qSummary,
+                  summary: qSummary || "Asked user a question",
                   waitingReason: "user",
-                  payload: { input },
+                  payload: {
+                    input,
+                    questions: parsedQuestions,
+                    promptTitle: qTitle,
+                    promptKind: "question",
+                    blockingToolCall: true,
+                  },
                   offset: bIdx * 0.0001,
                 });
+                if (includeChat && isNewChatTool) {
+                  chatSpecialMsgs.push({
+                    id: `chat:cc:${agentId}:${i}:ask:${bIdx}`,
+                    ts: toIsoUtc(epoch + (bIdx + 1) * 0.0001),
+                    epoch: epoch + (bIdx + 1) * 0.0001,
+                    agentId,
+                    role: "question",
+                    text: capChatText(
+                      formatQuestionsPreview(
+                        parsedQuestions,
+                        qSummary || "Asked user a question",
+                      ),
+                    ),
+                    pendingPromptId: computePendingPromptId(agentId, callId),
+                  });
+                }
               } else {
                 const cmd = String(input.command ?? "");
                 const selfDaemon = isSelfDaemonCommand(
@@ -888,9 +1175,101 @@ export class ClaudeCodeAdapter implements PassiveIdeAdapter {
                   payload: { input },
                   offset: bIdx * 0.0001,
                 });
+                if (includeChat && isNewChatTool) {
+                  const ref: ChatToolCallRef = {
+                    toolCallId: callId,
+                    toolName: tname,
+                    summary: actionSummary,
+                    status: "running",
+                    inputPreview: capChatText(JSON.stringify(input), 4096),
+                  };
+                  chatTurnTools.push(ref);
+                  chatToolRefById.set(callId, ref);
+                }
               }
             }
           });
+
+          if (includeChat) {
+            const joinedThinking = chatThinkingParts.join("\n\n").trim();
+            const joinedText = chatTextParts.join("\n\n").trim();
+            if (joinedThinking || joinedText || chatTurnTools.length > 0) {
+              const msgId = row.message?.id;
+              const groupKey = msgId ? `${agentId}\0${msgId}` : undefined;
+              const existingMsg = groupKey
+                ? lastAssistantByMsgId.get(groupKey)
+                : undefined;
+
+              if (existingMsg) {
+                if (joinedThinking) {
+                  existingMsg.thinking = capChatText(
+                    mergeStreamingText(existingMsg.thinking, joinedThinking),
+                  );
+                  if (existingMsg.role === "thinking" && !joinedText && chatTurnTools.length === 0) {
+                    existingMsg.text = existingMsg.thinking;
+                  }
+                }
+                if (joinedText) {
+                  const prevProse = groupKey
+                    ? assistantProseByMsgId.get(groupKey)
+                    : undefined;
+                  const mergedProse = mergeStreamingText(prevProse, joinedText);
+                  if (groupKey) {
+                    assistantProseByMsgId.set(groupKey, mergedProse);
+                  }
+                  if (existingMsg.role === "thinking") {
+                    existingMsg.role = "assistant";
+                  }
+                  existingMsg.text = capChatText(mergedProse);
+                }
+                if (chatTurnTools.length > 0) {
+                  if (existingMsg.role === "thinking") {
+                    existingMsg.role = "assistant";
+                    if (!joinedText) {
+                      existingMsg.text =
+                        chatTurnTools.length === 1
+                          ? chatTurnTools[0]!.summary
+                          : `Ran ${chatTurnTools.length} tools`;
+                    }
+                  }
+                  existingMsg.tools = [
+                    ...(existingMsg.tools ?? []),
+                    ...chatTurnTools,
+                  ];
+                }
+              } else {
+                const hasAssistantContent =
+                  joinedText.length > 0 || chatTurnTools.length > 0;
+                const msg: AgentChatMessage = {
+                  id: `chat:cc:${agentId}:${i}:ast`,
+                  ts: toIsoUtc(epoch),
+                  epoch,
+                  agentId,
+                  role: hasAssistantContent ? "assistant" : "thinking",
+                  text: capChatText(
+                    joinedText ||
+                      (chatTurnTools.length > 0
+                        ? chatTurnTools.length === 1
+                          ? chatTurnTools[0]!.summary
+                          : `Ran ${chatTurnTools.length} tools`
+                        : joinedThinking),
+                  ),
+                  ...(joinedThinking
+                    ? { thinking: capChatText(joinedThinking) }
+                    : {}),
+                  ...(chatTurnTools.length > 0 ? { tools: chatTurnTools } : {}),
+                };
+                chatMessages.push(msg);
+                if (groupKey) {
+                  lastAssistantByMsgId.set(groupKey, msg);
+                  if (joinedText) {
+                    assistantProseByMsgId.set(groupKey, joinedText);
+                  }
+                }
+              }
+            }
+            chatMessages.push(...chatSpecialMsgs);
+          }
 
           if (row.message?.stop_reason === "end_turn" && !hasToolUse) {
             const txt = extractTextFromContent(content).trim();
@@ -986,6 +1365,10 @@ export class ClaudeCodeAdapter implements PassiveIdeAdapter {
               targetAgentId: sub.subId,
             };
           }
+          if (matched.chatSpawnMsg) {
+            matched.chatSpawnMsg.subagentId = sub.subId;
+            matched.chatSpawnMsg.subagentLabel = resolvedLabel;
+          }
         }
 
         parseRowsForAgent(sub.rows, sub.subId, "root", resolvedLabel);
@@ -1027,6 +1410,6 @@ export class ClaudeCodeAdapter implements PassiveIdeAdapter {
       targetEv.payload = { ...(targetEv.payload ?? {}), _usageDelta: usageDelta };
     }
 
-    return events;
+    return { events, chatMessages };
   }
 }

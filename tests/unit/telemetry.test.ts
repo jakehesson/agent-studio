@@ -4,7 +4,12 @@ import os from "node:os";
 import path from "node:path";
 import { afterEach, beforeEach, describe, it } from "node:test";
 import { registerProject } from "../../src/board/registry.js";
-import { runHookEmit } from "../../src/cli/commands/hook-emit.js";
+import {
+  normalizeHookEventName,
+  runHookEmit,
+} from "../../src/cli/commands/hook-emit.js";
+import { resolveCopilotHomeDir } from "../../src/telemetry/adapters/copilot-vscode.js";
+import { MAX_CORRELATION_ENTRIES } from "../../src/telemetry/push-bus.js";
 import {
   ACTIVE_DECAY_SEC,
   AntigravityAdapter,
@@ -22,6 +27,7 @@ import {
   inferContextWindow,
   isBoardMutationToolCall,
   isOpaqueAgentId,
+  normalizePendingQuestions,
   prettifyAgentLabel,
   prettifyModelName,
   reconstructVSCodeDeltaJsonl,
@@ -4637,6 +4643,1799 @@ describe("Hybrid Telemetry Adapters, Deduplication, State Machine & hook-emit", 
     assert.equal(nsSubs.length, 1);
     assert.equal(nsSubs[0]?.id, rawUuid);
     assert.equal(nsSubs[0]?.label, "Docs Writer");
+  });
+
+  it("BUG-26: resolves Copilot Auto version metadata, 1M MAI / 921805 effective window, nominalContextWindow, subagent propagation, and modelContextWindows", async () => {
+    const vscDir = path.join(tmpDir, "vscode-ws-b26");
+    const wsHashDir = path.join(vscDir, "ws-mai");
+    const chatDir = path.join(wsHashDir, "chatSessions");
+    await fs.mkdir(chatDir, { recursive: true });
+    await fs.writeFile(
+      path.join(wsHashDir, "workspace.json"),
+      JSON.stringify({ folder: "file:///d:/Work/MaiDemo" }),
+      "utf8",
+    );
+    const baseMs = Date.now() - 20_000;
+    await fs.writeFile(
+      path.join(chatDir, "mai-auto-session.json"),
+      JSON.stringify({
+        sessionId: "mai-auto-1",
+        creationDate: baseMs,
+        inputState: {
+          selectedModel: {
+            id: "auto",
+            family: "vscModelF",
+            version: "mai-code-2-flash",
+            metadata: {
+              id: "auto",
+              family: "vscModelF",
+              version: "mai-code-2-flash",
+              maxInputTokens: 921_805,
+            },
+          },
+        },
+        requests: [
+          {
+            requestId: "r-mai-1",
+            timestamp: baseMs + 1000,
+            modelId: "copilot/auto",
+            message: { text: "Inspect repo" },
+            response: [
+              {
+                kind: "toolInvocationSerialized",
+                toolId: "runSubagent",
+                toolCallId: "sub-tc-mai-1",
+                isComplete: true,
+                toolSpecificData: {
+                  subAgentName: "researcher",
+                  subAgentInvocationId: "sub-mai-1",
+                  prompt: "Survey files",
+                },
+              },
+              { kind: "markdownContent", value: "Done." },
+            ],
+            result: {
+              metadata: {
+                toolCallRounds: [
+                  {
+                    usage: {
+                      promptTokens: 108_000,
+                      cachedTokens: 0,
+                      completionTokens: 500,
+                    },
+                  },
+                ],
+              },
+            },
+            modelState: { completedAt: baseMs + 2000 },
+          },
+        ],
+      }),
+      "utf8",
+    );
+
+    const adapter = new CopilotVSCodeAdapter({ storageDir: vscDir });
+    const sessions = await adapter.discoverSessions();
+    const s = sessions.find((x) => x.sessionId === "mai-auto-1");
+    assert.ok(s);
+    const evs = await adapter.parseSession(s);
+    const snap = buildSessionSnapshot(evs, {
+      sessionId: "mai-auto-1",
+      ide: "copilot-vscode",
+      nowEpochSec: (baseMs + 5000) / 1000,
+    });
+
+    const root = snap.agents.find((a) => a.id === "root");
+    const sub = snap.agents.find((a) => a.id === "sub-mai-1");
+    assert.equal(root?.usage?.model, "Mai Code 2 Flash");
+    assert.equal(root?.usage?.contextWindow, 921_805);
+    assert.equal(root?.usage?.nominalContextWindow, 1_000_000);
+    assert.equal(sub?.usage?.model, "Mai Code 2 Flash");
+    assert.equal(sub?.usage?.contextWindow, 921_805);
+    assert.equal(sub?.usage?.nominalContextWindow, 1_000_000);
+
+    // Tier 3 modelContextWindows lookup when live usageDelta omits contextWindow
+    const baseEp = baseMs / 1000;
+    const tier3Snap = buildSessionSnapshot(
+      [
+        {
+          id: "t3-1",
+          ts: toIsoTest(baseEp),
+          epoch: baseEp,
+          ide: "copilot-vscode",
+          channel: "hook",
+          sessionId: "t3-sess",
+          agentId: "root",
+          kind: "tool_end",
+          toolName: "read_file",
+          summary: "Read file",
+          usageDelta: {
+            model: "Custom Org Model",
+            modelSource: "exact",
+            usageSource: "exact",
+            inputTokens: 100_000,
+            outputTokens: 1_000,
+            cachedTokens: 0,
+            contextTokens: 101_000,
+          },
+        },
+      ],
+      {
+        sessionId: "t3-sess",
+        ide: "copilot-vscode",
+        nowEpochSec: baseEp + 5,
+        modelContextWindows: { "custom org model": 512_000 },
+      },
+    );
+    const t3Root = tier3Snap.agents.find((a) => a.id === "root");
+    assert.equal(t3Root?.usage?.contextWindow, 512_000);
+    assert.equal(tier3Snap.modelContextWindows?.["custom org model"], 512_000);
+  });
+
+  it("S1-65: emits debounced context advisories across aggregator+PushBus, hook-emit PreCompact/advisory, and preserves PreToolUse deny priority", async () => {
+    // 1. TelemetryAggregator combines cached passive snapshot tokens with tokenless Copilot hook event
+    const agg = new TelemetryAggregator({
+      brainDir: path.join(tmpDir, "no-brain"),
+      claudeDir: path.join(tmpDir, "no-claude"),
+      vscodeDir: path.join(tmpDir, "no-vscode"),
+      includeGlobalTelemetryFile: false,
+    });
+    agg.ingest([
+      {
+        id: "s65-seed",
+        ts: new Date().toISOString(),
+        ide: "copilot-vscode",
+        sessionId: "s65-sess",
+        agentId: "root",
+        kind: "tool_end",
+        toolName: "read_file",
+        summary: "Read large file",
+        usageDelta: {
+          model: "Mai Code 2",
+          modelSource: "exact",
+          usageSource: "exact",
+          inputTokens: 560_000,
+          outputTokens: 2_000,
+          cachedTokens: 0,
+          contextTokens: 562_000,
+          contextWindow: 1_000_000,
+        },
+      },
+    ]);
+    await agg.getSessionSnapshot("s65-sess");
+
+    // Tokenless hook arrives -> evaluates 56.2% >= 55% handoff threshold
+    const ingest1 = agg.ingest([
+      {
+        id: "s65-hook-1",
+        ts: new Date(Date.now() + 500).toISOString(),
+        ide: "copilot-vscode",
+        sessionId: "s65-sess",
+        agentId: "root",
+        kind: "tool_start",
+        toolName: "edit_file",
+        summary: "Edit file",
+      },
+    ]);
+    const adv1 = agg.evaluateIngestAdvisory(ingest1.events);
+    assert.equal(adv1?.band, "handoff");
+    assert.match(adv1?.message ?? "", /Drift\/Handoff threshold reached/);
+
+    // Same band on next hook is debounced (returns null)
+    const ingest2 = agg.ingest([
+      {
+        id: "s65-hook-2",
+        ts: new Date(Date.now() + 1000).toISOString(),
+        ide: "copilot-vscode",
+        sessionId: "s65-sess",
+        agentId: "root",
+        kind: "tool_end",
+        toolName: "edit_file",
+        summary: "Edited file",
+      },
+    ]);
+    assert.equal(agg.evaluateIngestAdvisory(ingest2.events), null);
+
+    // PreCompact always emits compact advisory
+    const ingestPre = agg.ingest([
+      {
+        id: "s65-precompact",
+        ts: new Date(Date.now() + 1500).toISOString(),
+        ide: "copilot-vscode",
+        sessionId: "s65-sess",
+        agentId: "root",
+        kind: "message",
+        summary: "PreCompact",
+        payload: { hookEvent: "PreCompact", isPreCompact: true },
+      },
+    ]);
+    const advPre = agg.evaluateIngestAdvisory(ingestPre.events);
+    assert.equal(advPre?.band, "compact");
+    assert.equal(advPre?.isPreCompact, true);
+
+    // 2. runHookEmit: PreCompact offline emits hookSpecificOutput.additionalContext, while PreToolUse denyReason keeps top priority
+    const ws = path.join(tmpDir, "hook-ws");
+    await fs.mkdir(path.join(ws, ".agent-team"), { recursive: true });
+    let stdoutText = "";
+    const preCompactRes = await runHookEmit(
+      ["--ide", "claude-code", "--event", "PreCompact", "--cwd", ws, "--port", "59999"],
+      {
+        stdinText: JSON.stringify({
+          session_id: "cc-s65",
+          model: "claude-sonnet-4-6",
+          usage: { input_tokens: 115_000, output_tokens: 500 },
+        }),
+        stdout: (c) => {
+          stdoutText += c;
+        },
+        fetchImpl: (async () => {
+          throw new Error("offline");
+        }) as unknown as typeof fetch,
+      },
+    );
+    assert.equal(preCompactRes.exitCode, 0);
+    assert.equal(preCompactRes.advisory?.band, "compact");
+    const parsedOut = JSON.parse(stdoutText.trim()) as {
+      hookSpecificOutput?: { hookEventName?: string; additionalContext?: string };
+    };
+    assert.equal(parsedOut.hookSpecificOutput?.hookEventName, "PreCompact");
+    assert.match(parsedOut.hookSpecificOutput?.additionalContext ?? "", /Compact threshold reached/);
+
+    // PreToolUse guardrail deny takes strict priority over high context advisory
+    let denyStdout = "";
+    const denyRes = await runHookEmit(
+      ["--ide", "claude-code", "--event", "PreToolUse", "--cwd", ws, "--port", "59999"],
+      {
+        stdinText: JSON.stringify({
+          session_id: "cc-s65-deny",
+          tool_name: "Edit",
+          tool_input: { file_path: path.join(ws, "pipeline", "board.json") },
+          model: "claude-sonnet-4-6",
+          usage: { input_tokens: 150_000, output_tokens: 500 },
+        }),
+        stdout: (c) => {
+          denyStdout += c;
+        },
+        fetchImpl: (async () => {
+          throw new Error("offline");
+        }) as unknown as typeof fetch,
+      },
+    );
+    assert.equal(denyRes.denied, true);
+    const denyJson = JSON.parse(denyStdout.trim()) as {
+      hookSpecificOutput?: { permissionDecision?: string };
+    };
+    assert.equal(denyJson.hookSpecificOutput?.permissionDecision, "deny");
+
+    // 3. Cross-agent context bleed guard: fresh subagent absent from snapshot does NOT inherit root's >=55% usage
+    assert.equal(agg.getCachedAgentUsage("s65-sess", "root")?.contextTokens, 562_000);
+    const freshSubCached = agg.getCachedAgentUsage("s65-sess", "fresh-subagent-1");
+    assert.equal(freshSubCached?.contextTokens, undefined);
+    assert.equal(freshSubCached?.contextWindow, undefined);
+    const subIngest = agg.ingest([
+      {
+        id: "s65-fresh-sub-1",
+        ts: new Date(Date.now() + 2000).toISOString(),
+        ide: "copilot-vscode",
+        sessionId: "s65-sess",
+        agentId: "fresh-subagent-1",
+        parentAgentId: "root",
+        kind: "tool_start",
+        toolName: "read_file",
+        summary: "Read small file",
+      },
+    ]);
+    assert.equal(agg.evaluateIngestAdvisory(subIngest.events), null);
+
+    // 4. PushBus.migrateOrphanSession transfers & deletes orphan contextTrackers keys cleanly
+    const pb = agg.pushBus;
+    pb.ingest([
+      {
+        id: "orp-1",
+        ts: new Date().toISOString(),
+        ide: "copilot-vscode",
+        sessionId: "orphan-sub-sess",
+        agentId: "root",
+        kind: "tool_end",
+        toolName: "read_file",
+        summary: "Read file",
+        usageDelta: {
+          model: "Mai Code 2",
+          modelSource: "exact",
+          usageSource: "exact",
+          inputTokens: 120_000,
+          outputTokens: 500,
+          cachedTokens: 0,
+          contextTokens: 120_500,
+          contextWindow: 1_000_000,
+        },
+      },
+    ]);
+    assert.equal(pb.getAgentContextState("orphan-sub-sess", "root")?.contextTokens, 120_500);
+    pb.ingest([
+      {
+        id: "spawn-1",
+        ts: new Date(Date.now() + 100).toISOString(),
+        ide: "copilot-vscode",
+        sessionId: "parent-sess",
+        agentId: "root",
+        targetAgentId: "orphan-sub-sess",
+        kind: "subagent_spawn",
+        summary: "Spawned researcher",
+        payload: { agentLabel: "researcher", agentId: "orphan-sub-sess" },
+      },
+    ]);
+    assert.equal(pb.getAgentContextState("orphan-sub-sess", "root"), undefined);
+    assert.equal(pb.getAgentContextState("parent-sess", "orphan-sub-sess")?.contextTokens, 120_500);
+
+    // 5. Offline hook-emit falls back to inputTokens + cachedTokens + outputTokens when contextTokens is omitted
+    let fallbackStdout = "";
+    const sumFallbackRes = await runHookEmit(
+      ["--ide", "claude-code", "--event", "PostToolUse", "--cwd", ws, "--port", "59999"],
+      {
+        stdinText: JSON.stringify({
+          session_id: "cc-sum-fallback",
+          tool_name: "Read",
+          model: "claude-sonnet-4-6",
+          usage: {
+            input_tokens: 40_000,
+            cache_read_input_tokens: 75_000,
+            output_tokens: 1_000,
+          },
+        }),
+        stdout: (c) => {
+          fallbackStdout += c;
+        },
+        fetchImpl: (async () => {
+          throw new Error("offline");
+        }) as unknown as typeof fetch,
+      },
+    );
+    assert.equal(sumFallbackRes.advisory?.band, "handoff");
+    assert.equal(sumFallbackRes.advisory?.contextTokens, 116_000);
+    assert.match(fallbackStdout, /Drift\/Handoff threshold reached/);
+  });
+
+  it("S1-70 (1): hook-emit top-level JSON on camelCase Copilot events, dual 14 camelCase + 9 PascalCase parsing, response extraction, and guardrails", async () => {
+    const ws = path.join(tmpDir, "s170-hook-ws");
+    await fs.mkdir(path.join(ws, ".agent-team"), { recursive: true });
+    const offlineFetch: typeof fetch = () =>
+      Promise.reject(new Error("ECONNREFUSED"));
+
+    // 1. normalizeHookEventName covers all 14 camelCase + 9 PascalCase aliases
+    const camelCases = [
+      "sessionStart",
+      "sessionEnd",
+      "userPromptSubmitted",
+      "userPromptTransformed",
+      "preToolUse",
+      "postToolUse",
+      "postToolUseFailure",
+      "preCompact",
+      "subagentStart",
+      "subagentStop",
+      "agentStop",
+      "permissionRequest",
+      "notification",
+      "errorOccurred",
+    ];
+    for (const ev of camelCases) {
+      assert.equal(normalizeHookEventName(ev), ev);
+    }
+    const pascalMap: Array<[string, string]> = [
+      ["SessionStart", "sessionStart"],
+      ["UserPromptSubmit", "userPromptSubmitted"],
+      ["PreToolUse", "preToolUse"],
+      ["PostToolUse", "postToolUse"],
+      ["PostToolUseFailure", "postToolUseFailure"],
+      ["PreCompact", "preCompact"],
+      ["SubagentStart", "subagentStart"],
+      ["SubagentStop", "subagentStop"],
+      ["Stop", "agentStop"],
+    ];
+    for (const [pascal, canon] of pascalMap) {
+      assert.equal(normalizeHookEventName(pascal), canon);
+    }
+
+    // 2. preToolUse (camelCase) deny emits top-level JSON + exitCode 0 on create, str_replace, str_replace_editor (edit)
+    for (const [tname, tinput] of [
+      ["create", { path: path.join(ws, "pipeline", "board.json") }],
+      ["str_replace", { target_file: "pipeline/board.json" }],
+      ["str_replace_editor", { command: "str_replace", path: "pipeline/board.json" }],
+      ["str_replace_editor", { path: "pipeline/board.json" }],
+    ] as Array<[string, Record<string, unknown>]>) {
+      let out = "";
+      let err = "";
+      const res = await runHookEmit(
+        ["--ide", "copilot-vscode", "--event", "preToolUse", "--cwd", ws],
+        {
+          stdinText: JSON.stringify({
+            sessionId: "s170-deny",
+            toolName: tname,
+            toolArgs: JSON.stringify(tinput),
+          }),
+          stdout: (c) => {
+            out += c;
+          },
+          stderr: (c) => {
+            err += c;
+          },
+          fetchImpl: offlineFetch,
+        },
+      );
+      assert.equal(res.denied, true, `${tname} targeting board.json must be denied`);
+      assert.equal(res.exitCode, 0, "camelCase copilot preToolUse deny must exit 0");
+      const parsed = JSON.parse(out.trim()) as Record<string, unknown>;
+      assert.equal(parsed.permissionDecision, "deny");
+      assert.match(String(parsed.permissionDecisionReason ?? ""), /pipeline\/board\.json/);
+      assert.equal(parsed.hookSpecificOutput, undefined, "camelCase deny must be top-level JSON");
+      assert.match(err, /agent-studio guardrail/);
+    }
+
+    // Orchestrator read-only guardrail blocks create/str_replace/str_replace_editor (non-view) and allows command="view"
+    let orchDenyOut = "";
+    const orchDeny = await runHookEmit(
+      ["--ide", "copilot-vscode", "--role", "orchestrator", "--cwd", ws],
+      {
+        stdinText: JSON.stringify({
+          hookEventName: "preToolUse",
+          sessionId: "s170-orch",
+          toolName: "create",
+          toolArgs: { path: "src/app.ts" },
+        }),
+        stdout: (c) => {
+          orchDenyOut += c;
+        },
+        stderr: () => undefined,
+        fetchImpl: offlineFetch,
+      },
+    );
+    assert.equal(orchDeny.denied, true);
+    assert.equal(orchDeny.exitCode, 0);
+    assert.equal((JSON.parse(orchDenyOut.trim()) as { permissionDecision?: string }).permissionDecision, "deny");
+
+    let viewOut = "";
+    const orchView = await runHookEmit(
+      ["--ide", "copilot-vscode", "--event", "preToolUse", "--role", "orchestrator", "--cwd", ws],
+      {
+        stdinText: JSON.stringify({
+          sessionId: "s170-orch",
+          toolName: "str_replace_editor",
+          toolArgs: { command: "view", path: "pipeline/board.json" },
+        }),
+        stdout: (c) => {
+          viewOut += c;
+        },
+        stderr: () => undefined,
+        fetchImpl: offlineFetch,
+      },
+    );
+    assert.equal(orchView.denied, false, "str_replace_editor command=view must NOT be blocked");
+    assert.equal(orchView.exitCode, 0);
+    assert.equal(orchView.event?.summary, "Read board.json");
+    assert.equal(viewOut, "");
+
+    // Legacy PascalCase PreToolUse on copilot-vscode preserves hookSpecificOutput + exitCode 2
+    let legacyDenyOut = "";
+    const legacyDeny = await runHookEmit(
+      ["--ide", "copilot-vscode", "--event", "PreToolUse", "--cwd", ws],
+      {
+        stdinText: JSON.stringify({
+          sessionId: "s170-legacy",
+          toolName: "create",
+          toolArgs: { path: "pipeline/board.json" },
+        }),
+        stdout: (c) => {
+          legacyDenyOut += c;
+        },
+        stderr: () => undefined,
+        fetchImpl: offlineFetch,
+      },
+    );
+    assert.equal(legacyDeny.denied, true);
+    assert.equal(legacyDeny.exitCode, 2);
+    const legacyParsed = JSON.parse(legacyDenyOut.trim()) as {
+      hookSpecificOutput?: { hookEventName?: string; permissionDecision?: string };
+    };
+    assert.equal(legacyParsed.hookSpecificOutput?.hookEventName, "PreToolUse");
+    assert.equal(legacyParsed.hookSpecificOutput?.permissionDecision, "deny");
+
+    // 3. Stdout advisory formatting in camelCase Copilot vs silent events + online deferred preCompact
+    const advisoryFetch: typeof fetch = (async () =>
+      new Response(
+        JSON.stringify({
+          ok: true,
+          advisory: {
+            band: "compact",
+            sessionId: "s170-adv",
+            agentId: "root",
+            contextTokens: 150_000,
+            contextWindow: 200_000,
+            contextPercent: 75,
+            message: "[agent-studio context-budget: 75% of 200k] Compact threshold reached.",
+          },
+        }),
+        { status: 202, headers: { "Content-Type": "application/json" } },
+      )) as unknown as typeof fetch;
+
+    for (const advEvent of [
+      "sessionStart",
+      "postToolUse",
+      "postToolUseFailure",
+      "subagentStart",
+      "notification",
+    ]) {
+      let stdoutText = "";
+      const res = await runHookEmit(
+        ["--ide", "copilot-vscode", "--event", advEvent, "--cwd", ws],
+        {
+          stdinText: JSON.stringify({
+            sessionId: "s170-adv",
+            ...(advEvent.includes("Tool") ? { toolName: "view", toolArgs: { path: "a.ts" } } : {}),
+            ...(advEvent === "subagentStart" ? { agentName: "explore" } : {}),
+            ...(advEvent === "notification" ? { message: "Heads up" } : {}),
+          }),
+          stdout: (c) => {
+            stdoutText += c;
+          },
+          fetchImpl: advisoryFetch,
+        },
+      );
+      assert.equal(res.exitCode, 0);
+      const outJson = JSON.parse(stdoutText.trim()) as Record<string, unknown>;
+      assert.match(String(outJson.additionalContext ?? ""), /Compact threshold reached/, `${advEvent} must emit top-level additionalContext`);
+      assert.equal(outJson.hookSpecificOutput, undefined);
+    }
+
+    for (const silentEvent of [
+      "preCompact",
+      "userPromptSubmitted",
+      "userPromptTransformed",
+      "sessionEnd",
+      "errorOccurred",
+      "permissionRequest",
+      "preToolUse",
+      "agentStop",
+      "subagentStop",
+    ]) {
+      let stdoutText = "";
+      const res = await runHookEmit(
+        ["--ide", "copilot-vscode", "--event", silentEvent, "--cwd", ws],
+        {
+          stdinText: JSON.stringify({
+            sessionId: "s170-silent",
+            ...(silentEvent === "preToolUse" ? { toolName: "view", toolArgs: { path: "src/a.ts" } } : {}),
+            ...(silentEvent === "userPromptSubmitted" ? { prompt: "Go" } : {}),
+            ...(silentEvent === "userPromptTransformed" ? { transformedPrompt: "Go now" } : {}),
+            ...(silentEvent === "errorOccurred" ? { error: "Rate limited" } : {}),
+            ...(silentEvent === "permissionRequest" ? { toolName: "bash", toolArgs: { command: "rm -rf tmp" } } : {}),
+          }),
+          stdout: (c) => {
+            stdoutText += c;
+          },
+          fetchImpl: advisoryFetch,
+        },
+      );
+      assert.equal(res.exitCode, 0);
+      assert.equal(stdoutText, "", `${silentEvent} in camelCase copilot-vscode must emit zero stdout`);
+    }
+
+    // End-to-end TelemetryAggregator deferred preCompact -> next postToolUse surfaces advisory
+    const agg = new TelemetryAggregator({
+      brainDir: path.join(tmpDir, "no-brain"),
+      claudeDir: path.join(tmpDir, "no-claude"),
+      vscodeDir: path.join(tmpDir, "no-vsc"),
+      includeGlobalTelemetryFile: false,
+    });
+    const aggFetch = (async (
+      _url: Parameters<typeof fetch>[0],
+      init?: Parameters<typeof fetch>[1],
+    ) => {
+      const body = JSON.parse(String(init?.body ?? "{}")) as unknown;
+      const ingested = agg.ingest([body]);
+      const adv = agg.evaluateIngestAdvisory(ingested.events);
+      return new Response(
+        JSON.stringify({ ok: true, ...(adv ? { advisory: adv } : {}) }),
+        { status: 202, headers: { "Content-Type": "application/json" } },
+      );
+    }) as unknown as typeof fetch;
+
+    let preCompactOut = "";
+    const pcRes = await runHookEmit(
+      ["--ide", "copilot-vscode", "--event", "preCompact", "--cwd", ws],
+      {
+        stdinText: JSON.stringify({
+          sessionId: "s170-defer",
+          model: "claude-sonnet-4.6",
+          usage: { promptTokens: 110_000, completionTokens: 1_000 },
+        }),
+        stdout: (c) => {
+          preCompactOut += c;
+        },
+        fetchImpl: aggFetch,
+      },
+    );
+    assert.equal(preCompactOut, "");
+    assert.equal(pcRes.advisory?.isPreCompact, true);
+
+    let followPostOut = "";
+    await runHookEmit(
+      ["--ide", "copilot-vscode", "--event", "postToolUse", "--cwd", ws],
+      {
+        stdinText: JSON.stringify({
+          sessionId: "s170-defer",
+          toolName: "view",
+          toolArgs: { path: "src/app.ts" },
+        }),
+        stdout: (c) => {
+          followPostOut += c;
+        },
+        fetchImpl: aggFetch,
+      },
+    );
+    const deferredJson = JSON.parse(followPostOut.trim()) as { additionalContext?: string };
+    assert.match(deferredJson.additionalContext ?? "", /Compact threshold reached \(PreCompact\)/);
+
+    // 4. subagentStop & agentStop extract response / last_assistant_message into payload.body + bodyLength
+    const subStopRes = await runHookEmit(
+      ["--ide", "copilot-vscode", "--event", "subagentStop", "--cwd", ws],
+      {
+        stdinText: JSON.stringify({
+          sessionId: "s170-stop",
+          agentId: "11111111-2222-4333-8444-555555555555",
+          agentName: "explore",
+          agentType: "Explore",
+          response: "Found 4 matching handlers.",
+        }),
+        stdout: () => undefined,
+        fetchImpl: offlineFetch,
+      },
+    );
+    assert.equal(subStopRes.event?.kind, "subagent_done");
+    assert.equal(subStopRes.event?.payload?.body, "Found 4 matching handlers.");
+    assert.equal(subStopRes.event?.bodyLength, "Found 4 matching handlers.".length);
+    assert.equal(subStopRes.event?.payload?.agentLabel, "Explore");
+
+    const agentStopRes = await runHookEmit(
+      ["--ide", "copilot-vscode", "--event", "agentStop", "--cwd", ws],
+      {
+        stdinText: JSON.stringify({
+          sessionId: "s170-stop",
+          last_assistant_message: "All tasks completed cleanly.",
+        }),
+        stdout: () => undefined,
+        fetchImpl: offlineFetch,
+      },
+    );
+    assert.equal(agentStopRes.event?.kind, "assistant_turn_end");
+    assert.equal(agentStopRes.event?.payload?.body, "All tasks completed cleanly.");
+    assert.equal(agentStopRes.event?.bodyLength, "All tasks completed cleanly.".length);
+
+    // 5. ask_user (WAITING + choices + allow_freeform), task, permissionRequest, errorOccurred, sessionEnd
+    const askRes = await runHookEmit(
+      ["--ide", "copilot-vscode", "--event", "preToolUse", "--cwd", ws],
+      {
+        stdinText: JSON.stringify({
+          sessionId: "s170-tools",
+          toolName: "ask_user",
+          toolCallId: "tc-ask-1",
+          toolArgs: {
+            question: "Pick storage backend",
+            choices: ["SQLite", "JSONL"],
+            allow_freeform: false,
+          },
+        }),
+        stdout: () => undefined,
+        fetchImpl: offlineFetch,
+      },
+    );
+    assert.equal(askRes.event?.kind, "tool_start");
+    assert.equal(askRes.event?.waitingReason, "user");
+    assert.equal(askRes.event?.targetAgentId, "human");
+    const askQs = askRes.event?.payload?.questions as Array<{
+      type: string;
+      options: Array<{ label: string }>;
+      allowCustomInput?: boolean;
+    }>;
+    assert.equal(askQs[0]?.type, "single_select");
+    assert.deepEqual(askQs[0]?.options.map((o) => o.label), ["SQLite", "JSONL"]);
+    assert.equal(askQs[0]?.allowCustomInput, false);
+
+    const permRes = await runHookEmit(
+      ["--ide", "copilot-vscode", "--event", "permissionRequest", "--cwd", ws],
+      {
+        stdinText: JSON.stringify({
+          sessionId: "s170-tools",
+          toolName: "powershell",
+          toolArgs: { command: "npm test" },
+        }),
+        stdout: () => undefined,
+        fetchImpl: offlineFetch,
+      },
+    );
+    assert.equal(permRes.event?.kind, "message");
+    assert.equal(permRes.event?.waitingReason, "tool_approval");
+    assert.equal(permRes.event?.targetAgentId, "human");
+
+    const errRes = await runHookEmit(
+      ["--ide", "copilot-vscode", "--event", "errorOccurred", "--cwd", ws],
+      {
+        stdinText: JSON.stringify({
+          sessionId: "s170-tools",
+          error: { message: "Model quota exceeded" },
+        }),
+        stdout: () => undefined,
+        fetchImpl: offlineFetch,
+      },
+    );
+    assert.equal(errRes.event?.isError, true);
+    assert.equal(errRes.event?.status, "error");
+    assert.match(errRes.event?.summary ?? "", /Error: Model quota exceeded/);
+
+    const endRes = await runHookEmit(
+      ["--ide", "copilot-vscode", "--event", "sessionEnd", "--cwd", ws],
+      {
+        stdinText: JSON.stringify({ sessionId: "s170-tools" }),
+        stdout: () => undefined,
+        fetchImpl: offlineFetch,
+      },
+    );
+    assert.equal(endRes.event?.kind, "assistant_turn_end");
+  });
+
+  it("S1-70 (2): Copilot native tool classification (create, str_replace, str_replace_editor, ask_user, task, web_fetch, etc.) & normalizer dedup", () => {
+    // External tool classification
+    for (const fsTool of ["create", "str_replace", "str_replace_editor", "view", "grep", "glob"]) {
+      assert.equal(classifyExternalTool(fsTool)?.id, "ext:fs", `${fsTool} -> ext:fs`);
+    }
+    assert.equal(classifyExternalTool("bash")?.id, "ext:shell");
+    assert.equal(classifyExternalTool("powershell")?.id, "ext:shell");
+    assert.equal(classifyExternalTool("web_fetch")?.id, "ext:web");
+    assert.equal(classifyExternalTool("ask_user")?.id, "ext:human");
+    assert.equal(classifyExternalTool("task"), null);
+
+    // Summaries (including str_replace_editor command=view awareness)
+    assert.equal(summarizeToolCall("create", { path: "src/new.ts" }), "Wrote new.ts");
+    assert.equal(summarizeToolCall("str_replace", { path: "src/app.ts" }), "Edited app.ts");
+    assert.equal(
+      summarizeToolCall("str_replace_editor", { command: "view", path: "src/app.ts" }),
+      "Read app.ts",
+    );
+    assert.equal(
+      summarizeToolCall("str_replace_editor", { command: "create", path: "src/created.ts" }),
+      "Wrote created.ts",
+    );
+    assert.equal(
+      summarizeToolCall("str_replace_editor", { command: "str_replace", path: "src/app.ts" }),
+      "Edited app.ts",
+    );
+    assert.equal(
+      summarizeToolCall("ask_user", { question: "Which DB?" }),
+      "Ask user: Which DB?",
+    );
+    assert.equal(
+      summarizeToolCall("task", { agent_type: "explore", description: "Search" }),
+      "Spawned explore",
+    );
+    assert.equal(
+      summarizeToolCall("web_fetch", { url: "https://example.com/docs" }),
+      "Fetch https://example.com/docs",
+    );
+    assert.equal(summarizeToolCall("view", { path: "README.md" }), "Read README.md");
+    assert.equal(summarizeToolCall("bash", { command: "npm test" }), "Ran unit tests");
+    assert.equal(summarizeToolCall("powershell", { command: "git status" }), "Checked git status");
+    assert.equal(summarizeToolCall("grep", { pattern: "hookEvent" }), "Search: hookEvent");
+    assert.equal(summarizeToolCall("glob", { pattern: "src/**/*.ts" }), "Find files: src/**/*.ts");
+
+    // normalizePendingQuestions choices + allow_freeform
+    const nq = normalizePendingQuestions({
+      question: "Select mode",
+      choices: ["Fast", { label: "Thorough (Recommended)" }],
+      allow_freeform: true,
+    });
+    assert.equal(nq.length, 1);
+    assert.equal(nq[0]?.type, "single_select");
+    assert.equal(nq[0]?.allowCustomInput, true);
+    assert.equal(nq[0]?.options[1]?.recommended, true);
+
+    // canonicalDedupToolName + Tier-2 dedup
+    assert.equal(canonicalDedupToolName("create"), "fs_edit");
+    assert.equal(canonicalDedupToolName("str_replace"), "fs_edit");
+    assert.equal(canonicalDedupToolName("str_replace_editor"), "fs_edit");
+    assert.equal(canonicalDedupToolName("web_fetch"), "web_fetch");
+    assert.equal(canonicalDedupToolName("webfetch"), "web_fetch");
+    assert.equal(canonicalDedupToolName("task"), "subagent");
+
+    const ep = 1_796_200_000;
+    const deduped = deduplicateEvents([
+      {
+        id: "hk-edit",
+        ts: toIsoTest(ep),
+        epoch: ep,
+        ide: "copilot-vscode",
+        channel: "hook",
+        sessionId: "s-dedup",
+        agentId: "root",
+        kind: "tool_start",
+        toolName: "str_replace",
+        summary: "Edited app.ts",
+      },
+      {
+        id: "ps-edit",
+        ts: toIsoTest(ep + 0.4),
+        epoch: ep + 0.4,
+        ide: "copilot-vscode",
+        channel: "passive",
+        sessionId: "s-dedup",
+        agentId: "root",
+        kind: "tool_start",
+        toolName: "edit_file",
+        summary: "Edited app.ts",
+      },
+    ]);
+    assert.equal(deduped.length, 1, "str_replace (hook) and edit_file (passive) must Tier-2 dedup");
+  });
+
+  it("S1-70 (3): correlates label-only subagentStart with UUID subagentStop, child hooks, and passive task/subagent.started in PushBus & normalizer", async () => {
+    const ws = path.join(tmpDir, "s170-sub-ws");
+    await fs.mkdir(ws, { recursive: true });
+    const offlineFetch: typeof fetch = () =>
+      Promise.reject(new Error("ECONNREFUSED"));
+
+    // A. PushBus FIFO in-order correlation (2 concurrent "explore" spawns + child hook + 2 UUID stops)
+    const bus = new PushBus({ includeGlobalTelemetryFile: false });
+    const sStart1 = await runHookEmit(
+      ["--ide", "copilot-vscode", "--event", "subagentStart", "--cwd", ws],
+      {
+        stdinText: JSON.stringify({
+          sessionId: "s170-fifo",
+          agentName: "explore",
+          agentDisplayName: "Explore",
+        }),
+        stdout: () => undefined,
+        fetchImpl: offlineFetch,
+      },
+    );
+    const sStart2 = await runHookEmit(
+      ["--ide", "copilot-vscode", "--event", "subagentStart", "--cwd", ws],
+      {
+        stdinText: JSON.stringify({
+          sessionId: "s170-fifo",
+          agentName: "explore",
+          agentDisplayName: "Explore",
+        }),
+        stdout: () => undefined,
+        fetchImpl: offlineFetch,
+      },
+    );
+    const childHook1 = await runHookEmit(
+      ["--ide", "copilot-vscode", "--event", "preToolUse", "--cwd", ws],
+      {
+        stdinText: JSON.stringify({
+          sessionId: "s170-fifo",
+          agentId: "aaaaaaaa-1111-4111-8111-111111111111",
+          agentType: "Explore",
+          toolName: "grep",
+          toolCallId: "tc-child-1",
+          toolArgs: { pattern: "runHookEmit" },
+        }),
+        stdout: () => undefined,
+        fetchImpl: offlineFetch,
+      },
+    );
+    const sStop1 = await runHookEmit(
+      ["--ide", "copilot-vscode", "--event", "subagentStop", "--cwd", ws],
+      {
+        stdinText: JSON.stringify({
+          sessionId: "s170-fifo",
+          agentId: "aaaaaaaa-1111-4111-8111-111111111111",
+          agentName: "explore",
+          agentType: "Explore",
+          response: "First explore complete",
+        }),
+        stdout: () => undefined,
+        fetchImpl: offlineFetch,
+      },
+    );
+    const sStop2 = await runHookEmit(
+      ["--ide", "copilot-vscode", "--event", "subagentStop", "--cwd", ws],
+      {
+        stdinText: JSON.stringify({
+          sessionId: "s170-fifo",
+          agentId: "bbbbbbbb-2222-4222-8222-222222222222",
+          agentName: "explore",
+          response: "Second explore complete",
+        }),
+        stdout: () => undefined,
+        fetchImpl: offlineFetch,
+      },
+    );
+
+    bus.ingest([
+      sStart1.event!,
+      sStart2.event!,
+      childHook1.event!,
+      sStop1.event!,
+      sStop2.event!,
+    ]);
+    const fifoSnap = buildSessionSnapshot(bus.getSessionEvents("s170-fifo"), {
+      sessionId: "s170-fifo",
+      ide: "copilot-vscode",
+      nowEpochSec: Date.now() / 1000 + 2,
+    });
+    const fifoSubagents = fifoSnap.agents.filter(
+      (a) => a.nodeType === "agent" && !a.isRoot,
+    );
+    assert.equal(fifoSubagents.length, 2, "must have exactly 2 correlated subagent nodes (no UUID splits)");
+    assert.ok(fifoSubagents.every((a) => a.status === "DONE"), "both subagents must reach DONE");
+    assert.ok(fifoSubagents.every((a) => !isOpaqueAgentId(a.id)), "PushBus mapped UUIDs onto slug IDs");
+
+    // B. PushBus out-of-order: UUID child + subagentStop arrive BEFORE label-only subagentStart
+    const oooBus = new PushBus({ includeGlobalTelemetryFile: false });
+    const oooUuid = "cccccccc-3333-4333-8333-333333333333";
+    const oooStart = await runHookEmit(
+      ["--ide", "copilot-vscode", "--event", "subagentStart", "--cwd", ws],
+      {
+        stdinText: JSON.stringify({
+          sessionId: "s170-ooo",
+          agentName: "backend-engineer",
+          agentDisplayName: "Backend Engineer",
+        }),
+        stdout: () => undefined,
+        fetchImpl: offlineFetch,
+      },
+    );
+    const oooChild = await runHookEmit(
+      ["--ide", "copilot-vscode", "--event", "preToolUse", "--cwd", ws],
+      {
+        stdinText: JSON.stringify({
+          sessionId: "s170-ooo",
+          agentId: oooUuid,
+          agentType: "Backend Engineer",
+          toolName: "view",
+          toolCallId: "tc-ooo-1",
+          toolArgs: { path: "src/index.ts" },
+        }),
+        stdout: () => undefined,
+        fetchImpl: offlineFetch,
+      },
+    );
+    const oooStop = await runHookEmit(
+      ["--ide", "copilot-vscode", "--event", "subagentStop", "--cwd", ws],
+      {
+        stdinText: JSON.stringify({
+          sessionId: "s170-ooo",
+          agentId: oooUuid,
+          agentName: "backend-engineer",
+          response: "Backend done",
+        }),
+        stdout: () => undefined,
+        fetchImpl: offlineFetch,
+      },
+    );
+    // Ensure distinct monotonic timestamps while delivering out of order
+    oooStart.event!.epoch -= 0.2;
+    oooChild.event!.epoch -= 0.1;
+    oooBus.ingest([oooChild.event!, oooStop.event!, oooStart.event!]);
+    const oooSnap = buildSessionSnapshot(oooBus.getSessionEvents("s170-ooo"), {
+      sessionId: "s170-ooo",
+      ide: "copilot-vscode",
+      nowEpochSec: Date.now() / 1000 + 2,
+    });
+    const oooSubagents = oooSnap.agents.filter(
+      (a) => a.nodeType === "agent" && !a.isRoot,
+    );
+    assert.equal(oooSubagents.length, 1);
+    assert.equal(oooSubagents[0]?.status, "DONE");
+    assert.equal(oooSubagents[0]?.label, "Backend Engineer");
+
+    // C. Direct normalizer reconcileCopilotSubagents (without PushBus) collapses label-only subagentStart
+    //    + UUID subagentStop + passive task/subagent.started onto 1 canonical DONE node
+    const ep = 1_796_300_000;
+    const directSnap = buildSessionSnapshot(
+      [
+        {
+          id: "d-hk-start",
+          ts: toIsoTest(ep),
+          epoch: ep,
+          ide: "copilot-vscode",
+          channel: "hook",
+          sessionId: "s170-direct",
+          agentId: "root",
+          targetAgentId: "explore",
+          kind: "subagent_spawn",
+          summary: "Spawned Explore",
+          payload: { hookEvent: "subagentStart", agentType: "Explore", agentLabel: "Explore" },
+        },
+        {
+          id: "d-ps-start",
+          ts: toIsoTest(ep + 0.2),
+          epoch: ep + 0.2,
+          ide: "copilot-vscode",
+          channel: "passive",
+          sessionId: "s170-direct",
+          agentId: "root",
+          targetAgentId: "explore",
+          kind: "subagent_spawn",
+          toolName: "task",
+          toolCallId: "tc-pass-1",
+          summary: "Spawned Explore",
+          payload: { agentType: "Explore", agentLabel: "Explore", _passiveSource: "transcript" },
+        },
+        {
+          id: "d-hk-tool",
+          ts: toIsoTest(ep + 1),
+          epoch: ep + 1,
+          ide: "copilot-vscode",
+          channel: "hook",
+          sessionId: "s170-direct",
+          agentId: "dddddddd-4444-4444-8444-444444444444",
+          parentAgentId: "root",
+          agentLabel: "Explore",
+          kind: "tool_start",
+          toolName: "grep",
+          toolCallId: "tc-d-1",
+          summary: "Search: foo",
+        },
+        {
+          id: "d-hk-stop",
+          ts: toIsoTest(ep + 2),
+          epoch: ep + 2,
+          ide: "copilot-vscode",
+          channel: "hook",
+          sessionId: "s170-direct",
+          agentId: "root",
+          targetAgentId: "dddddddd-4444-4444-8444-444444444444",
+          kind: "subagent_done",
+          summary: "Completed Explore",
+          payload: {
+            hookEvent: "subagentStop",
+            agentId: "dddddddd-4444-4444-8444-444444444444",
+            agentName: "explore",
+            body: "Done!",
+          },
+        },
+        {
+          id: "d-ps-done",
+          ts: toIsoTest(ep + 2.1),
+          epoch: ep + 2.1,
+          ide: "copilot-vscode",
+          channel: "passive",
+          sessionId: "s170-direct",
+          agentId: "root",
+          targetAgentId: "explore",
+          kind: "subagent_done",
+          toolName: "task",
+          toolCallId: "tc-pass-1",
+          summary: "Subagent finished: Explore",
+        },
+      ],
+      {
+        sessionId: "s170-direct",
+        ide: "copilot-vscode",
+        nowEpochSec: ep + 3,
+      },
+    );
+    const directSubs = directSnap.agents.filter(
+      (a) => a.nodeType === "agent" && !a.isRoot,
+    );
+    assert.equal(directSubs.length, 1, "must collapse to 1 canonical subagent node");
+    assert.equal(directSubs[0]?.label, "Explore");
+    assert.equal(directSubs[0]?.status, "DONE");
+  });
+
+  it("S1-70 (4): $COPILOT_HOME/session-state/*/events.jsonl workspace-scoped passive discovery, allowed roots, inclusive usage dedup & workspaceStorage merge", async () => {
+    const vscDir = path.join(tmpDir, "s170-vsc-storage");
+    const copilotHome = path.join(tmpDir, "s170-copilot-home");
+    const wsA = path.join(tmpDir, "repos", "proj-a");
+    const wsB = path.join(tmpDir, "repos", "proj-b");
+    await fs.mkdir(wsA, { recursive: true });
+    await fs.mkdir(wsB, { recursive: true });
+
+    // Session A: workspace.yaml cwd + rich events (ask_user, task, str_replace_editor, web_fetch, assistant.usage + session.shutdown)
+    const dirA = path.join(copilotHome, "session-state", "11111111-aaaa-4aaa-8aaa-111111111111");
+    await fs.mkdir(dirA, { recursive: true });
+    await fs.writeFile(
+      path.join(dirA, "workspace.yaml"),
+      `id: 11111111-aaaa-4aaa-8aaa-111111111111\ncwd: ${JSON.stringify(wsA)}\ngit_root: ${JSON.stringify(wsA)}\nsummary: Build Copilot Harness\n`,
+      "utf8",
+    );
+    await fs.writeFile(
+      path.join(dirA, "events.jsonl"),
+      [
+        {
+          type: "session.start",
+          timestamp: "2026-11-26T10:00:00Z",
+          data: {
+            sessionId: "11111111-aaaa-4aaa-8aaa-111111111111",
+            selectedModel: "claude-sonnet-4.6",
+          },
+        },
+        {
+          type: "user.message",
+          timestamp: "2026-11-26T10:00:01Z",
+          data: { content: "Implement harness updates" },
+        },
+        {
+          type: "assistant.message",
+          timestamp: "2026-11-26T10:00:02Z",
+          data: {
+            content: "Checking docs and asking question.",
+            toolRequests: [
+              {
+                toolCallId: "tc-web-1",
+                name: "web_fetch",
+                arguments: { url: "https://code.visualstudio.com/docs" },
+              },
+              {
+                toolCallId: "tc-edit-1",
+                name: "str_replace_editor",
+                arguments: { command: "str_replace", path: "src/app.ts" },
+              },
+              {
+                toolCallId: "tc-task-1",
+                name: "task",
+                arguments: { agent_type: "explore", description: "Search repo" },
+              },
+            ],
+            usage: { promptTokens: 20_000, cachedTokens: 15_000, completionTokens: 400 },
+          },
+        },
+        {
+          type: "subagent.started",
+          timestamp: "2026-11-26T10:00:03Z",
+          data: { toolCallId: "tc-task-1", agentName: "explore", agentDisplayName: "Explore" },
+        },
+        {
+          type: "subagent.completed",
+          timestamp: "2026-11-26T10:00:04Z",
+          data: { toolCallId: "tc-task-1", agentName: "explore", result: "Found 2 files" },
+        },
+        {
+          type: "tool.execution_start",
+          timestamp: "2026-11-26T10:00:05Z",
+          data: {
+            toolCallId: "tc-ask-ss",
+            toolName: "ask_user",
+            arguments: { question: "Proceed?", choices: ["Yes", "No"], allow_freeform: false },
+          },
+        },
+        {
+          type: "session.shutdown",
+          timestamp: "2026-11-26T10:00:06Z",
+          data: {
+            modelMetrics: {
+              "claude-sonnet-4.6": {
+                usage: { inputTokens: 99_000, outputTokens: 9_000, cacheReadTokens: 80_000 },
+              },
+            },
+          },
+        },
+      ]
+        .map((r) => JSON.stringify(r))
+        .join("\n") + "\n",
+      "utf8",
+    );
+
+    // Session B: NO workspace.yaml, workspace extracted from session.start data.context.cwd
+    const dirB = path.join(copilotHome, "session-state", "22222222-bbbb-4bbb-8bbb-222222222222");
+    await fs.mkdir(dirB, { recursive: true });
+    await fs.writeFile(
+      path.join(dirB, "events.jsonl"),
+      [
+        {
+          type: "session.start",
+          timestamp: "2026-11-26T10:01:00Z",
+          data: {
+            sessionId: "22222222-bbbb-4bbb-8bbb-222222222222",
+            context: { cwd: wsB },
+          },
+        },
+        {
+          type: "user.message",
+          timestamp: "2026-11-26T10:01:01Z",
+          data: { content: "Check proj-b" },
+        },
+      ]
+        .map((r) => JSON.stringify(r))
+        .join("\n") + "\n",
+      "utf8",
+    );
+
+    // Session C: No workspace at all (must be excluded when workspaceRoots scoping is active)
+    const dirC = path.join(copilotHome, "session-state", "33333333-cccc-4ccc-8ccc-333333333333");
+    await fs.mkdir(dirC, { recursive: true });
+    await fs.writeFile(
+      path.join(dirC, "events.jsonl"),
+      JSON.stringify({
+        type: "session.start",
+        timestamp: "2026-11-26T10:02:00Z",
+        data: { sessionId: "33333333-cccc-4ccc-8ccc-333333333333" },
+      }) + "\n",
+      "utf8",
+    );
+
+    // Duplicate sessionId in workspaceStorage/ws1/chatSessions matching Session A
+    const wsHash = path.join(vscDir, "ws1");
+    const chatDir = path.join(wsHash, "chatSessions");
+    await fs.mkdir(chatDir, { recursive: true });
+    await fs.writeFile(
+      path.join(wsHash, "workspace.json"),
+      JSON.stringify({ folder: wsA }),
+      "utf8",
+    );
+    await fs.writeFile(
+      path.join(chatDir, "11111111-aaaa-4aaa-8aaa-111111111111.json"),
+      JSON.stringify({
+        sessionId: "11111111-aaaa-4aaa-8aaa-111111111111",
+        creationDate: Date.parse("2026-11-26T09:59:50Z"),
+        requests: [
+          {
+            requestId: "r0",
+            timestamp: Date.parse("2026-11-26T09:59:50Z"),
+            message: { text: "Implement harness updates" },
+          },
+        ],
+      }),
+      "utf8",
+    );
+
+    // Verify COPILOT_HOME env discovery + workspaceRoots scoping + workspaceStorage dedup
+    const origCopilotHome = process.env.COPILOT_HOME;
+    process.env.COPILOT_HOME = copilotHome;
+    try {
+      const adapter = new CopilotVSCodeAdapter({ storageDir: vscDir });
+      const allDiscovered = await adapter.discoverSessions();
+      assert.equal(
+        allDiscovered.filter((s) => s.sessionId === "11111111-aaaa-4aaa-8aaa-111111111111").length,
+        1,
+        "duplicate sessionId across workspaceStorage and session-state must merge into 1 DiscoveredSession",
+      );
+      assert.equal(allDiscovered.length, 3);
+
+      const scopedA = await adapter.discoverSessions({ workspaceRoots: [wsA] });
+      assert.deepEqual(
+        scopedA.map((s) => s.sessionId),
+        ["11111111-aaaa-4aaa-8aaa-111111111111"],
+      );
+      const scopedB = await adapter.discoverSessions({ workspaceRoots: [wsB] });
+      assert.deepEqual(
+        scopedB.map((s) => s.sessionId),
+        ["22222222-bbbb-4bbb-8bbb-222222222222"],
+      );
+    } finally {
+      if (origCopilotHome === undefined) {
+        delete process.env.COPILOT_HOME;
+      } else {
+        process.env.COPILOT_HOME = origCopilotHome;
+      }
+    }
+
+    // Verify copilotHomeDir option on TelemetryAggregator (without workspaceStorage clash for Session A)
+    const agg = new TelemetryAggregator({
+      brainDir: path.join(tmpDir, "no-brain"),
+      claudeDir: path.join(tmpDir, "no-claude"),
+      vscodeDir: path.join(tmpDir, "no-vsc"),
+      copilotHomeDir: copilotHome,
+      includeGlobalTelemetryFile: false,
+    });
+    const aggSessionsA = await agg.discoverSessions({ workspace: wsA });
+    assert.equal(aggSessionsA.length, 1);
+    assert.equal(aggSessionsA[0]?.title, "Build Copilot Harness");
+    assert.equal(aggSessionsA[0]?.isWaiting, true);
+    assert.equal(aggSessionsA[0]?.waitingOn, "user");
+    assert.equal(aggSessionsA[0]?.isMultiAgent, true);
+
+    const { snapshot: snapA } = await agg.getSessionSnapshot(
+      "11111111-aaaa-4aaa-8aaa-111111111111",
+      { workspace: wsA },
+    );
+    const rootA = snapA.agents.find((a) => a.id === "root");
+    // Inclusive prompt-token normalization (20_000 - 15_000 = 5_000 freshIn, 15_000 cached, 400 out, 20_400 ctx)
+    // AND incremental assistant.message wins over cumulative session.shutdown (no 99_000 double-count)
+    assert.equal(rootA?.usage?.inputTokens, 5_000);
+    assert.equal(rootA?.usage?.cachedTokens, 15_000);
+    assert.equal(rootA?.usage?.outputTokens, 400);
+    assert.equal(rootA?.usage?.contextTokens, 20_400);
+    assert.equal(rootA?.status, "WAITING");
+    assert.equal(snapA.pendingPrompts?.[0]?.options?.length, 2);
+    assert.ok(snapA.agents.some((a) => a.id === "ext:web"));
+    assert.ok(snapA.agents.some((a) => a.id === "ext:fs"));
+    assert.ok(snapA.agents.some((a) => a.id === "explore" && a.status === "DONE"));
+
+    // Verify parseChat + validateTranscriptPath accept $COPILOT_HOME/session-state/*/events.jsonl
+    const chatRes = await agg.getAgentChat({
+      sessionId: "11111111-aaaa-4aaa-8aaa-111111111111",
+      workspace: wsA,
+    });
+    assert.ok(chatRes && chatRes.messages.length > 0);
+    assert.ok(chatRes.messages.some((m) => m.role === "question"));
+  });
+
+  it("BUG-29 security: hook-emit blocks apply_patch/multiedit/TargetFile/path-traversal, shell bypasses, malformed/truncated stdin (fail-closed), and roster-named orchestrator", async () => {
+    const ws = path.join(tmpDir, "bug29-ws");
+    await fs.mkdir(path.join(ws, ".agent-team"), { recursive: true });
+    await fs.writeFile(
+      path.join(ws, ".agent-team", "team.yaml"),
+      [
+        "schemaVersion: 1",
+        "project:",
+        "  id: bug29-demo",
+        "  title: BUG-29 Demo",
+        "targets: [claude-code, copilot-vscode]",
+        "workflow:",
+        "  boardPath: pipeline/board.json",
+        "  enforcement:",
+        "    orchestratorReadOnly: true",
+        "    qaGateRequired: true",
+        "    blockDirectBoardEdits: true",
+        "roster:",
+        "  - id: lead-orch",
+        "    name: Team Orchestrator",
+        "    roleType: orchestrator",
+        "    boardRole: orchestrator",
+        "    promptFile: agents/orchestrator.md",
+      ].join("\n"),
+      "utf8",
+    );
+
+    const offlineFetch: typeof fetch = () =>
+      Promise.reject(new Error("ECONNREFUSED"));
+
+    // 1. apply_patch (Codex format & unified diff), multiedit (nested edits[]/files[]), and PascalCase TargetFile + traversal
+    const boardEditCases: Array<{ name: string; toolName: string; toolInput: Record<string, unknown> }> = [
+      {
+        name: "PascalCase TargetFile with dot-dot traversal",
+        toolName: "multi_replace_file_content",
+        toolInput: { TargetFile: "./pipeline/../pipeline/board.json", ReplacementChunks: [] },
+      },
+      {
+        name: "multiedit nested edits[]",
+        toolName: "MultiEdit",
+        toolInput: {
+          edits: [
+            { file_path: "src/ok.ts", old_string: "a", new_string: "b" },
+            { filePath: "./pipeline/../pipeline/board.json", old_string: "x", new_string: "y" },
+          ],
+        },
+      },
+      {
+        name: "multiedit nested files[]",
+        toolName: "MultiEdit",
+        toolInput: { files: [{ path: "pipeline/board.json" }] },
+      },
+      {
+        name: "apply_patch Codex *** Update File:",
+        toolName: "apply_patch",
+        toolInput: {
+          patch: "*** Begin Patch\n*** Update File: ./pipeline/../pipeline/board.json\n@@\n-ready\n+done\n*** End Patch\n",
+        },
+      },
+      {
+        name: "copilot_applypatch unified diff +++ b/",
+        toolName: "copilot_applypatch",
+        toolInput: {
+          diff: "--- a/pipeline/board.json\n+++ b/pipeline/board.json\n@@ -1 +1 @@\n-a\n+b\n",
+        },
+      },
+    ];
+
+    for (const tc of boardEditCases) {
+      let out = "";
+      const res = await runHookEmit(
+        ["--ide", "copilot-vscode", "--event", "preToolUse", "--cwd", ws],
+        {
+          stdinText: JSON.stringify({
+            sessionId: "s-bug29-edit",
+            toolName: tc.toolName,
+            toolInput: tc.toolInput,
+          }),
+          stdout: (c) => {
+            out += c;
+          },
+          stderr: () => undefined,
+          fetchImpl: offlineFetch,
+        },
+      );
+      assert.equal(res.denied, true, `${tc.name} must be denied`);
+      assert.equal(res.exitCode, 0);
+      assert.equal((JSON.parse(out.trim()) as { permissionDecision?: string }).permissionDecision, "deny");
+    }
+
+    // Benign edit to src/board.json must NOT be falsely blocked
+    const safeEditRes = await runHookEmit(
+      ["--ide", "copilot-vscode", "--event", "preToolUse", "--cwd", ws],
+      {
+        stdinText: JSON.stringify({
+          sessionId: "s-bug29-edit",
+          toolName: "multi_replace_file_content",
+          toolInput: { TargetFile: "src/board.json" },
+        }),
+        stdout: () => undefined,
+        stderr: () => undefined,
+        fetchImpl: offlineFetch,
+      },
+    );
+    assert.equal(safeEditRes.denied, false, "src/board.json is not pipeline/board.json");
+
+    // 2. Fail-closed on >256KB truncated & malformed JSON preToolUse stdin across all envelopes
+    const oversizedPayload = JSON.stringify({
+      sessionId: "s-bug29-big",
+      toolName: "view",
+      pad: "x".repeat(260 * 1024),
+    });
+
+    let camelTruncOut = "";
+    const camelTrunc = await runHookEmit(
+      ["--ide", "copilot-vscode", "--event", "preToolUse", "--cwd", ws],
+      {
+        stdinText: oversizedPayload,
+        stdout: (c) => {
+          camelTruncOut += c;
+        },
+        stderr: () => undefined,
+        fetchImpl: offlineFetch,
+      },
+    );
+    assert.equal(camelTrunc.denied, true);
+    assert.equal(camelTrunc.exitCode, 0);
+    const camelTruncJson = JSON.parse(camelTruncOut.trim()) as Record<string, unknown>;
+    assert.equal(camelTruncJson.permissionDecision, "deny");
+    assert.match(String(camelTruncJson.permissionDecisionReason ?? ""), /256KB|malformed/i);
+
+    let ccMalformedOut = "";
+    const ccMalformed = await runHookEmit(
+      ["--ide", "claude-code", "--event", "PreToolUse", "--cwd", ws],
+      {
+        stdinText: "{bad-json",
+        stdout: (c) => {
+          ccMalformedOut += c;
+        },
+        stderr: () => undefined,
+        fetchImpl: offlineFetch,
+      },
+    );
+    assert.equal(ccMalformed.denied, true);
+    assert.equal(ccMalformed.exitCode, 0);
+    const ccMalformedJson = JSON.parse(ccMalformedOut.trim()) as {
+      hookSpecificOutput?: { permissionDecision?: string; permissionDecisionReason?: string };
+    };
+    assert.equal(ccMalformedJson.hookSpecificOutput?.permissionDecision, "deny");
+
+    let pascalMalformedOut = "";
+    const pascalMalformed = await runHookEmit(
+      ["--ide", "copilot-vscode", "--event", "PreToolUse", "--cwd", ws],
+      {
+        stdinText: "{bad-json",
+        stdout: (c) => {
+          pascalMalformedOut += c;
+        },
+        stderr: () => undefined,
+        fetchImpl: offlineFetch,
+      },
+    );
+    assert.equal(pascalMalformed.denied, true);
+    assert.equal(pascalMalformed.exitCode, 2);
+    const pascalMalformedJson = JSON.parse(pascalMalformedOut.trim()) as {
+      hookSpecificOutput?: { permissionDecision?: string };
+    };
+    assert.equal(pascalMalformedJson.hookSpecificOutput?.permissionDecision, "deny");
+
+    // Non-preToolUse malformed JSON must NOT fail closed
+    const postMalformed = await runHookEmit(
+      ["--ide", "copilot-vscode", "--event", "postToolUse", "--cwd", ws],
+      {
+        stdinText: "{bad-json",
+        stdout: () => undefined,
+        stderr: () => undefined,
+        fetchImpl: offlineFetch,
+      },
+    );
+    assert.equal(postMalformed.denied, false);
+    assert.equal(postMalformed.exitCode, 0);
+
+    // 3. SHELL_TOOLS (`execute`) board-write detection vs benign read-only commands
+    const shellDenyCmds = [
+      "cd pipeline && echo '{}' > board.json",
+      `node -e "require('fs').writeFileSync('pipeline/board.json', '{}')"`,
+      `python -c "open('board.json','w').write('{}')"`,
+      "mv tmp.json pipeline/board.json",
+      "Set-Content pipeline/board.json '{}'",
+    ];
+    for (const cmd of shellDenyCmds) {
+      const res = await runHookEmit(
+        ["--ide", "copilot-vscode", "--event", "preToolUse", "--cwd", ws],
+        {
+          stdinText: JSON.stringify({
+            sessionId: "s-bug29-shell",
+            toolName: "execute",
+            toolArgs: { command: cmd },
+          }),
+          stdout: () => undefined,
+          stderr: () => undefined,
+          fetchImpl: offlineFetch,
+        },
+      );
+      assert.equal(res.denied, true, `shell command "${cmd}" must be denied`);
+    }
+
+    for (const safeCmd of [
+      "cat pipeline/board.json",
+      "npx agent-studio board show --id BUG-29",
+    ]) {
+      const res = await runHookEmit(
+        ["--ide", "copilot-vscode", "--event", "preToolUse", "--cwd", ws],
+        {
+          stdinText: JSON.stringify({
+            sessionId: "s-bug29-shell",
+            toolName: "execute",
+            toolArgs: { command: safeCmd },
+          }),
+          stdout: () => undefined,
+          stderr: () => undefined,
+          fetchImpl: offlineFetch,
+        },
+      );
+      assert.equal(res.denied, false, `read-only/CLI command "${safeCmd}" must be allowed`);
+    }
+
+    // 4. Roster-matched orchestrator (`name: "Team Orchestrator"`) without `--role` flag
+    for (const [toolName, toolInput] of [
+      ["edit", { filePath: "src/app.ts" }],
+      ["create", { path: "src/new.ts" }],
+      ["execute", { command: "npm test" }],
+    ] as Array<[string, Record<string, unknown>]>) {
+      const res = await runHookEmit(
+        ["--ide", "copilot-vscode", "--event", "preToolUse", "--cwd", ws],
+        {
+          stdinText: JSON.stringify({
+            sessionId: "s-bug29-orch",
+            agentName: "Team Orchestrator",
+            toolName,
+            toolInput,
+          }),
+          stdout: () => undefined,
+          stderr: () => undefined,
+          fetchImpl: offlineFetch,
+        },
+      );
+      assert.equal(res.denied, true, `Team Orchestrator calling ${toolName} must be denied`);
+    }
+
+    const orchViewOk = await runHookEmit(
+      ["--ide", "copilot-vscode", "--event", "preToolUse", "--cwd", ws],
+      {
+        stdinText: JSON.stringify({
+          sessionId: "s-bug29-orch",
+          agentName: "Team Orchestrator",
+          toolName: "str_replace_editor",
+          toolInput: { command: "view", path: "src/app.ts" },
+        }),
+        stdout: () => undefined,
+        stderr: () => undefined,
+        fetchImpl: offlineFetch,
+      },
+    );
+    assert.equal(orchViewOk.denied, false);
+  });
+
+  it("BUG-30 (Part B): CopilotVSCodeAdapter normalizes resolveCopilotHomeDir, rejects symlink escapes & oversized workspace.yaml, and PushBus backfills out-of-order labels + bounds correlation maps", async () => {
+    // 1. resolveCopilotHomeDir normalizes relative / unnormalized paths via path.resolve
+    assert.equal(
+      resolveCopilotHomeDir(tmpDir, path.join(tmpDir, "a", "..", "copilot-home")),
+      path.resolve(path.join(tmpDir, "copilot-home")),
+    );
+
+    // 2. CopilotVSCodeAdapter rejects symlink escapes in session-state and oversized/symlinked workspace.yaml
+    const copilotHome = path.join(tmpDir, "bug30-copilot-home");
+    const sessionState = path.join(copilotHome, "session-state");
+    const outsideDir = path.join(tmpDir, "bug30-outside");
+    await fs.mkdir(sessionState, { recursive: true });
+    await fs.mkdir(outsideDir, { recursive: true });
+    await fs.writeFile(
+      path.join(outsideDir, "events.jsonl"),
+      JSON.stringify({
+        type: "session.start",
+        timestamp: "2026-11-26T12:00:00Z",
+        data: { sessionId: "escaped-session" },
+      }) + "\n",
+      "utf8",
+    );
+    await fs.writeFile(
+      path.join(outsideDir, "workspace.yaml"),
+      `id: escaped-ws\ncwd: ${JSON.stringify(outsideDir)}\n`,
+      "utf8",
+    );
+
+    const escapedSessionDir = path.join(sessionState, "escaped-session");
+    let createdSessionEscape = false;
+    try {
+      await fs.symlink(
+        outsideDir,
+        escapedSessionDir,
+        process.platform === "win32" ? "junction" : "dir",
+      );
+      createdSessionEscape = true;
+    } catch {
+      // Symlinks/junctions unavailable
+    }
+
+    // Valid session with oversized workspace.yaml (>64KB) -> workspace.yaml ignored safely, session still discovered
+    const validSessDir = path.join(sessionState, "valid-big-yaml-session");
+    await fs.mkdir(validSessDir, { recursive: true });
+    await fs.writeFile(
+      path.join(validSessDir, "workspace.yaml"),
+      `id: yaml-id-should-be-ignored\ncwd: ${JSON.stringify(tmpDir)}\n# ${"z".repeat(70 * 1024)}\n`,
+      "utf8",
+    );
+    await fs.writeFile(
+      path.join(validSessDir, "events.jsonl"),
+      JSON.stringify({
+        type: "session.start",
+        timestamp: "2026-11-26T12:01:00Z",
+        data: { sessionId: "valid-big-yaml-session" },
+      }) + "\n",
+      "utf8",
+    );
+
+    const adapter = new CopilotVSCodeAdapter({
+      storageDir: path.join(tmpDir, "no-vsc-storage"),
+      copilotHomeDir: copilotHome,
+    });
+    const discovered = await adapter.discoverSessions();
+    if (createdSessionEscape) {
+      assert.ok(
+        !discovered.some((s) => s.sessionId === "escaped-session"),
+        "symlink/junction escaping $COPILOT_HOME/session-state must be rejected",
+      );
+    }
+    const bigYamlSess = discovered.find((s) => s.sessionId === "valid-big-yaml-session");
+    assert.ok(bigYamlSess, "valid events.jsonl with oversized workspace.yaml still discovers session");
+    assert.equal(
+      bigYamlSess?.workspacePath,
+      undefined,
+      "oversized (>64KB) workspace.yaml must not be read",
+    );
+
+    // 3. PushBus out-of-order: opaque subagentStop (no label) -> labeled child hook -> label-only subagentStart
+    //    (plus concurrent second subagent to verify disambiguation via backfilled label!)
+    const offlineFetch: typeof fetch = () =>
+      Promise.reject(new Error("ECONNREFUSED"));
+    const bus = new PushBus({ includeGlobalTelemetryFile: false });
+    const uuid1 = "11111111-aaaa-4aaa-8aaa-111111111111";
+    const uuid2 = "22222222-bbbb-4bbb-8bbb-222222222222";
+
+    const stop1NoLabel = await runHookEmit(
+      ["--ide", "copilot-vscode", "--event", "subagentStop", "--cwd", tmpDir],
+      {
+        stdinText: JSON.stringify({
+          sessionId: "s-bug30-ooo",
+          agentId: uuid1,
+          response: "Backend finished",
+        }),
+        stdout: () => undefined,
+        fetchImpl: offlineFetch,
+      },
+    );
+    const stop2NoLabel = await runHookEmit(
+      ["--ide", "copilot-vscode", "--event", "subagentStop", "--cwd", tmpDir],
+      {
+        stdinText: JSON.stringify({
+          sessionId: "s-bug30-ooo",
+          agentId: uuid2,
+          response: "Explore finished",
+        }),
+        stdout: () => undefined,
+        fetchImpl: offlineFetch,
+      },
+    );
+    const child1Labeled = await runHookEmit(
+      ["--ide", "copilot-vscode", "--event", "preToolUse", "--cwd", tmpDir],
+      {
+        stdinText: JSON.stringify({
+          sessionId: "s-bug30-ooo",
+          agentId: uuid1,
+          agentType: "Backend Engineer",
+          toolName: "view",
+          toolCallId: "tc-ooo-b1",
+          toolArgs: { path: "src/index.ts" },
+        }),
+        stdout: () => undefined,
+        fetchImpl: offlineFetch,
+      },
+    );
+    const child2Labeled = await runHookEmit(
+      ["--ide", "copilot-vscode", "--event", "preToolUse", "--cwd", tmpDir],
+      {
+        stdinText: JSON.stringify({
+          sessionId: "s-bug30-ooo",
+          agentId: uuid2,
+          agentType: "Explore",
+          toolName: "grep",
+          toolCallId: "tc-ooo-e1",
+          toolArgs: { pattern: "PushBus" },
+        }),
+        stdout: () => undefined,
+        fetchImpl: offlineFetch,
+      },
+    );
+    const start1 = await runHookEmit(
+      ["--ide", "copilot-vscode", "--event", "subagentStart", "--cwd", tmpDir],
+      {
+        stdinText: JSON.stringify({
+          sessionId: "s-bug30-ooo",
+          agentName: "backend-engineer",
+          agentDisplayName: "Backend Engineer",
+        }),
+        stdout: () => undefined,
+        fetchImpl: offlineFetch,
+      },
+    );
+    const start2 = await runHookEmit(
+      ["--ide", "copilot-vscode", "--event", "subagentStart", "--cwd", tmpDir],
+      {
+        stdinText: JSON.stringify({
+          sessionId: "s-bug30-ooo",
+          agentName: "explore",
+          agentDisplayName: "Explore",
+        }),
+        stdout: () => undefined,
+        fetchImpl: offlineFetch,
+      },
+    );
+
+    const baseEp = Date.now() / 1000;
+    start1.event!.epoch = baseEp;
+    child1Labeled.event!.epoch = baseEp + 0.1;
+    stop1NoLabel.event!.epoch = baseEp + 0.2;
+    start2.event!.epoch = baseEp + 0.05;
+    child2Labeled.event!.epoch = baseEp + 0.15;
+    stop2NoLabel.event!.epoch = baseEp + 0.25;
+
+    // Deliver opaque subagentStops FIRST, then labeled child hooks, then label-only subagentStarts
+    bus.ingest([
+      stop1NoLabel.event!,
+      stop2NoLabel.event!,
+      child1Labeled.event!,
+      child2Labeled.event!,
+      start1.event!,
+      start2.event!,
+    ]);
+
+    const snap = buildSessionSnapshot(bus.getSessionEvents("s-bug30-ooo"), {
+      sessionId: "s-bug30-ooo",
+      ide: "copilot-vscode",
+      nowEpochSec: baseEp + 2,
+    });
+    const subs = snap.agents.filter((a) => a.nodeType === "agent" && !a.isRoot);
+    assert.equal(subs.length, 2, "both concurrent out-of-order subagents must correlate cleanly");
+    assert.ok(subs.every((a) => !isOpaqueAgentId(a.id) && a.status === "DONE"));
+    assert.ok(subs.some((a) => a.label === "Backend Engineer"));
+    assert.ok(subs.some((a) => a.label === "Explore"));
+
+    // 4. PushBus bounded correlation maps cap at MAX_CORRELATION_ENTRIES (500)
+    const capBus = new PushBus({ includeGlobalTelemetryFile: false });
+    const bulkEvents: EnrichedEvent[] = [];
+    for (let i = 0; i < MAX_CORRELATION_ENTRIES + 25; i++) {
+      bulkEvents.push({
+        id: `cap-ev-${i}`,
+        ts: toIsoTest(baseEp + i * 0.001),
+        epoch: baseEp + i * 0.001,
+        ide: "copilot-vscode",
+        channel: "hook",
+        sessionId: `cap-sess-${i}`,
+        agentId: "root",
+        targetAgentId: "explore",
+        kind: "subagent_spawn",
+        summary: "Spawned Explore",
+        payload: { hookEvent: "subagentStart", agentType: "Explore", agentLabel: "Explore" },
+      });
+    }
+    capBus.ingest(bulkEvents);
+    const openSpawns = (capBus as unknown as { openUnlinkedSpawns: Map<string, unknown> }).openUnlinkedSpawns;
+    const subParents = (capBus as unknown as { subagentToParent: Map<string, unknown> }).subagentToParent;
+    assert.ok(openSpawns.size <= MAX_CORRELATION_ENTRIES, `openUnlinkedSpawns (${openSpawns.size}) must be <= ${MAX_CORRELATION_ENTRIES}`);
+    assert.ok(subParents.size <= MAX_CORRELATION_ENTRIES, `subagentToParent (${subParents.size}) must be <= ${MAX_CORRELATION_ENTRIES}`);
   });
 });
 

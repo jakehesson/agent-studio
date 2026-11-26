@@ -7,6 +7,7 @@ import type {
   ModelCatalogEntry,
   ModelIndex,
   ModelIndexView,
+  ModelSelectionCriterion,
   ModelSourceTag,
   ModelTier,
   RoleRecommendation,
@@ -36,7 +37,7 @@ const IDE_HOST_HINTS: Record<HostIde, string> = {
   "claude-code":
     "Uses family aliases (haiku, sonnet, opus, inherit). Yields to CLAUDE_CODE_SUBAGENT_MODEL & /model.",
   "copilot-vscode":
-    "Uses ordered VS Code picker strings + model-policy: preferred (or omits model on defer-to-host for Fusion / Auto).",
+    "Uses ordered Copilot runtime model IDs + model-policy: preferred (or omits model on defer-to-host for Fusion / Auto).",
 };
 
 const IDE_ENTRY_EXAMPLES: Record<HostIde, { desc: string; example: string }> = {
@@ -49,10 +50,18 @@ const IDE_ENTRY_EXAMPLES: Record<HostIde, { desc: string; example: string }> = {
     example: "sonnet",
   },
   "copilot-vscode": {
-    desc: "Exact VS Code picker ID",
-    example: "Claude Sonnet 4.5 (copilot)",
+    desc: "Runtime Copilot model ID",
+    example: "claude-sonnet-4.6",
   },
 };
+
+function formatSelectionPriority(priority?: readonly ModelSelectionCriterion[]): string {
+  const list = priority && priority.length > 0 ? priority : ["accuracy", "cost", "speed"];
+  return list
+    .map((p) => (p ? p.charAt(0).toUpperCase() + p.slice(1) : ""))
+    .filter(Boolean)
+    .join(" → ");
+}
 
 function shellQuote(arg: string): string {
   return `"${arg.replace(/(["\\$`])/g, "\\$1")}"`;
@@ -472,10 +481,15 @@ export class ModelIndexDialog {
       return true;
     });
 
+    const priorityLabel = formatSelectionPriority(
+      this.view.effective.selectionPriority ?? this.view.routing.selectionPriority
+    );
+
     return `
       <div class="mi-ide-section">
         <div class="mi-ide-meta-banner">
           <span class="pill dispatch">Mode: ${escHtml(ideCfg.mode)}</span>
+          <span class="pill tool" title="Deterministic candidate ranking order">Priority: ${escHtml(priorityLabel)}</span>
           ${
             ideCfg.syncSource
               ? `<span class="pill tool">Source: ${escHtml(ideCfg.syncSource)}</span>`
@@ -666,9 +680,13 @@ export class ModelIndexDialog {
     const ctxText = entry.contextWindow ? `${fmtContextWindow(entry.contextWindow)} ctx` : "";
     const multText =
       entry.premiumMultiplier !== undefined ? `${entry.premiumMultiplier}x` : "";
+    const accText =
+      typeof entry.accuracyRank === "number" && Number.isFinite(entry.accuracyRank)
+        ? `Acc ${entry.accuracyRank}`
+        : "";
 
     return `
-      <article class="model-catalog-card">
+      <article class="model-catalog-card ${entry.deprecated ? "is-deprecated" : ""}">
         <div class="mi-cat-head">
           <div class="mi-cat-title">
             <strong>${escHtml(entry.label)}</strong>
@@ -676,6 +694,11 @@ export class ModelIndexDialog {
           </div>
           <div class="mi-cat-badges">
             <span class="tier-pill tier-${entry.tier}">${escHtml(entry.tier)}</span>
+            ${
+              entry.deprecated
+                ? `<span class="pill human mi-deprecated-pill" title="Legacy superseded model — ranked below modern models">Deprecated</span>`
+                : ""
+            }
             <span class="pill ${availClass}">${availText}</span>
           </div>
         </div>
@@ -685,6 +708,7 @@ export class ModelIndexDialog {
           ${entry.family ? `<span>Family: <code>${escHtml(entry.family)}</code></span>` : ""}
           ${ctxText ? `<span>${escHtml(ctxText)}</span>` : ""}
           ${multText ? `<span>Multiplier: <b>${escHtml(multText)}</b></span>` : ""}
+          ${accText ? `<span>${escHtml(accText)}</span>` : ""}
         </div>
         ${
           entry.capabilities.length > 0
@@ -1210,6 +1234,9 @@ export class ModelIndexDialog {
             .filter((c): c is ModelCapabilityTag =>
               ALL_CAPABILITIES.includes(c as ModelCapabilityTag)
             );
+          const existing = this.view?.effective.ides[ide].catalog.find(
+            (c) => c.id === idVal
+          );
           const entry: ModelCatalogEntry = {
             id: idVal,
             label: labelVal,
@@ -1217,6 +1244,21 @@ export class ModelIndexDialog {
             vendor: String(fd.get("vendor") ?? "").trim() || undefined,
             family: String(fd.get("family") ?? "").trim() || undefined,
             capabilities: caps,
+            ...(existing?.contextWindow !== undefined
+              ? { contextWindow: existing.contextWindow }
+              : {}),
+            ...(existing?.premiumMultiplier !== undefined
+              ? { premiumMultiplier: existing.premiumMultiplier }
+              : {}),
+            ...(existing?.accuracyRank !== undefined
+              ? { accuracyRank: existing.accuracyRank }
+              : {}),
+            ...(existing?.speedRank !== undefined
+              ? { speedRank: existing.speedRank }
+              : {}),
+            ...(existing?.deprecated !== undefined
+              ? { deprecated: existing.deprecated }
+              : {}),
             available: fd.get("available") !== null,
             source: "user",
             notes: String(fd.get("notes") ?? "").trim() || undefined,

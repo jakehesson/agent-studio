@@ -146,16 +146,18 @@ Also export `ModelIndexOverlaySchema` (same top-level `schemaVersion: 1` with `r
 
 #### Built-In IDE Tier Bindings
 
-| Tier | Antigravity (`tier-enum`) | Claude Code (`family-alias`) | VS Code Copilot (`picker-array`) |
+> **Update (`S1-68` Copilot Harness):** `DEFAULT_MODEL_INDEX` and `mapLanguageModelsForHost("copilot-vscode", ...)` now emit native Copilot **runtime model IDs** (e.g. `claude-sonnet-4.6`, `gpt-5.4`, `claude-opus-4.6`, `gemini-3-flash`, `claude-haiku-4.5`), while `LEGACY_COPILOT_MODEL_ALIASES` maps legacy `"<Label> (copilot)"` IDs deterministically during `sync` and `agent-studio upgrade` without altering custom/BYOK model IDs.
+
+| Tier | Antigravity (`tier-enum`) | Claude Code (`family-alias`) | VS Code Copilot (`picker-array` / runtime IDs) |
 | :--- | :--- | :--- | :--- |
-| `fast` | `primary: "flash_lite"`, `fallback: ["flash_lite", "flash", "inherit"]` | `primary: "haiku"`, `fallback: ["haiku", "sonnet", "inherit"]` | `primary: "Claude Haiku 4.5 (copilot)"`, `fallback: ["Claude Haiku 4.5 (copilot)", "Gemini 3 Flash (copilot)", "GPT-4.1 (copilot)", "GPT-4o mini (copilot)"]`, `omitOnDefer: true` |
-| `balanced` | `primary: "flash"`, `fallback: ["flash", "pro", "inherit"]` | `primary: "sonnet"`, `fallback: ["sonnet", "opus", "inherit"]` | `primary: "Claude Sonnet 4.5 (copilot)"`, `fallback: ["Claude Sonnet 4.5 (copilot)", "Claude Sonnet 4 (copilot)", "GPT-4.1 (copilot)", "Gemini 2.5 Pro (copilot)"]`, `omitOnDefer: true` |
-| `reasoning` | `primary: "pro"`, `fallback: ["pro", "flash", "inherit"]` | `primary: "opus"`, `fallback: ["opus", "sonnet", "inherit"]` | `primary: "Claude Opus 4.5 (copilot)"`, `fallback: ["Claude Opus 4.5 (copilot)", "Claude Opus 4.1 (copilot)", "Claude Sonnet 4.5 (copilot)", "Gemini 2.5 Pro (copilot)"]`, `omitOnDefer: true` |
+| `fast` | `primary: "flash_lite"`, `fallback: ["flash_lite", "flash", "inherit"]` | `primary: "haiku"`, `fallback: ["haiku", "sonnet", "inherit"]` | `primary: "gemini-3-flash"`, `fallback: ["gemini-3-flash", "mai-code-2-flash", "gpt-5-mini", "gpt-4.1", "claude-haiku-4.5"]`, `omitOnDefer: true` |
+| `balanced` | `primary: "flash"`, `fallback: ["flash", "pro", "inherit"]` | `primary: "sonnet"`, `fallback: ["sonnet", "opus", "inherit"]` | `primary: "claude-sonnet-4.6"`, `fallback: ["claude-sonnet-4.6", "gpt-5.4", "mai-code-2", "claude-sonnet-4.5"]`, `omitOnDefer: true` |
+| `reasoning` | `primary: "pro"`, `fallback: ["pro", "flash", "inherit"]` | `primary: "opus"`, `fallback: ["opus", "sonnet", "inherit"]` | `primary: "claude-opus-4.6"`, `fallback: ["claude-opus-4.6", "gpt-5.4", "gemini-3.1-pro", "claude-opus-4.5"]`, `omitOnDefer: true` |
 
 **Seed Catalog Coverage:**
 - **Antigravity:** `inherit`, `flash_lite`, `flash`, `pro`, plus family metadata entries (`gemini-3.5-flash-lite`, `gemini-3.8-flash`, `gemini-4-carbon`, `gemini-4-argon`, `gemini-4-neon`, `gemini-4-hydrogen`).
 - **Claude Code:** `inherit`, `haiku`, `sonnet`, `opus`.
-- **Copilot / VS Code:** Seed picker strings above (`source: "built-in"`), automatically augmented/annotated by live `vscode.lm.selectChatModels()` (`source: "vscode-lm"`).
+- **Copilot / VS Code:** Seed runtime model IDs above (`source: "built-in"`), automatically augmented/annotated by live `vscode.lm.selectChatModels()` (`source: "vscode-lm"`).
 
 ### 2.5 Concurrency & Atomic Persistence (`src/models/store.ts`)
 - Mirror `src/board/store.ts`:

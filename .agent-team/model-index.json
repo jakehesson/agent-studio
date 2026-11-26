@@ -3,10 +3,15 @@
   "updatedAt": "2026-11-25T05:03:33.461Z",
   "updatedBy": "cli",
   "notes": "Workspace Agent Studio model index (.agent-team/model-index.json). Agents and Web Studio may update tier bindings, role recommendations, and catalog metadata deterministically.",
+  "selectionPriority": [
+    "accuracy",
+    "cost",
+    "speed"
+  ],
   "roleRecommendations": {
     "orchestrator": {
-      "tier": "fast",
-      "rationale": "Read-only board triage, dispatch, and QA gate verification (#1 token-savings lever).",
+      "tier": "balanced",
+      "rationale": "Coordination, task-splitting, and board triage require strong judgment without falling back to low-accuracy fast models.",
       "deferToHostOrchestrator": true
     },
     "architect": {
@@ -43,8 +48,8 @@
       "rationale": "Read-only Antigravity validation across plugin compilation, AntigravityAdapter full-file discovery, openToolCalls/pendingSpawns correlation, SSE streaming, and MCP App scoping."
     },
     "qa-validator": {
-      "tier": "fast",
-      "rationale": "Deterministic checkpoint runs, MCP testrun recording, and pass/fail triage (#2 token-savings lever)."
+      "tier": "balanced",
+      "rationale": "Deterministic checkpoint runs, MCP testrun recording, and accurate pass/fail bug triage."
     },
     "team-setup": {
       "tier": "balanced",
@@ -340,34 +345,31 @@
       "mode": "picker-array",
       "tiers": {
         "fast": {
-          "primary": "Claude Haiku 4.5 (copilot)",
+          "primary": "gemini-3-flash",
           "fallback": [
-            "Claude Haiku 4.5 (copilot)",
-            "Gemini 3 Flash (copilot)",
-            "GPT-4.1 (copilot)",
-            "GPT-4o mini (copilot)"
+            "mai-code-2",
+            "gpt-5-mini",
+            "gpt-4.1"
           ],
           "omitOnDefer": true,
           "notes": "Emits model-policy: preferred unless policy is pinned; omitted on defer-to-host for Fusion/Auto."
         },
         "balanced": {
-          "primary": "Claude Sonnet 4.5 (copilot)",
+          "primary": "claude-sonnet-4.6",
           "fallback": [
-            "Claude Sonnet 4.5 (copilot)",
-            "Claude Sonnet 4 (copilot)",
-            "GPT-4.1 (copilot)",
-            "Gemini 2.5 Pro (copilot)"
+            "gpt-5.4",
+            "mai-code-2",
+            "claude-sonnet-4.5"
           ],
           "omitOnDefer": true,
           "notes": "Emits model-policy: preferred unless policy is pinned; omitted on defer-to-host for Fusion/Auto."
         },
         "reasoning": {
-          "primary": "Claude Opus 4.5 (copilot)",
+          "primary": "claude-opus-4.6",
           "fallback": [
-            "Claude Opus 4.5 (copilot)",
-            "Claude Opus 4.1 (copilot)",
-            "Claude Sonnet 4.5 (copilot)",
-            "Gemini 2.5 Pro (copilot)"
+            "gpt-5.4",
+            "gemini-3.1-pro",
+            "claude-opus-4.5"
           ],
           "omitOnDefer": true,
           "notes": "Emits model-policy: preferred unless policy is pinned; omitted on defer-to-host for Fusion/Auto."
@@ -375,117 +377,46 @@
       },
       "catalog": [
         {
-          "id": "Claude Haiku 4.5 (copilot)",
-          "label": "Claude Haiku 4.5",
+          "id": "claude-opus-4.6",
+          "label": "Claude Opus 4.6",
           "vendor": "copilot",
-          "family": "claude-haiku-4.5",
-          "tier": "fast",
-          "capabilities": [
-            "fast",
-            "search",
-            "orchestration"
-          ],
-          "contextWindow": 200000,
-          "premiumMultiplier": 0.33,
-          "available": true,
-          "source": "built-in"
-        },
-        {
-          "id": "Gemini 3 Flash (copilot)",
-          "label": "Gemini 3 Flash",
-          "vendor": "copilot",
-          "family": "gemini-3-flash",
-          "tier": "fast",
-          "capabilities": [
-            "fast",
-            "multimodal",
-            "long-context"
-          ],
-          "contextWindow": 1000000,
-          "premiumMultiplier": 0.33,
-          "available": true,
-          "source": "built-in"
-        },
-        {
-          "id": "GPT-4.1 (copilot)",
-          "label": "GPT-4.1",
-          "vendor": "copilot",
-          "family": "gpt-4.1",
-          "tier": "balanced",
-          "capabilities": [
-            "coding",
-            "fast",
-            "long-context"
-          ],
-          "contextWindow": 128000,
-          "premiumMultiplier": 0,
-          "available": true,
-          "source": "built-in"
-        },
-        {
-          "id": "GPT-4o mini (copilot)",
-          "label": "GPT-4o mini",
-          "vendor": "copilot",
-          "family": "gpt-4o-mini",
-          "tier": "fast",
-          "capabilities": [
-            "fast"
-          ],
-          "contextWindow": 128000,
-          "premiumMultiplier": 0,
-          "available": true,
-          "source": "built-in"
-        },
-        {
-          "id": "Claude Sonnet 4.5 (copilot)",
-          "label": "Claude Sonnet 4.5",
-          "vendor": "copilot",
-          "family": "claude-sonnet-4.5",
-          "tier": "balanced",
-          "capabilities": [
-            "coding",
-            "reasoning",
-            "multimodal"
-          ],
-          "contextWindow": 200000,
-          "premiumMultiplier": 1,
-          "available": true,
-          "source": "built-in"
-        },
-        {
-          "id": "Claude Sonnet 4 (copilot)",
-          "label": "Claude Sonnet 4",
-          "vendor": "copilot",
-          "family": "claude-sonnet-4",
-          "tier": "balanced",
-          "capabilities": [
-            "coding",
-            "reasoning"
-          ],
-          "contextWindow": 200000,
-          "premiumMultiplier": 1,
-          "available": true,
-          "source": "built-in"
-        },
-        {
-          "id": "Gemini 2.5 Pro (copilot)",
-          "label": "Gemini 2.5 Pro",
-          "vendor": "copilot",
-          "family": "gemini-2.5-pro",
+          "family": "claude-opus-4.6",
           "tier": "reasoning",
           "capabilities": [
             "reasoning",
             "coding",
+            "orchestration",
+            "multimodal"
+          ],
+          "contextWindow": 200000,
+          "premiumMultiplier": 3,
+          "accuracyRank": 100,
+          "speedRank": 45,
+          "available": true,
+          "source": "built-in"
+        },
+        {
+          "id": "gpt-5.4",
+          "label": "GPT-5.4",
+          "vendor": "copilot",
+          "family": "gpt-5.4",
+          "tier": "reasoning",
+          "capabilities": [
+            "reasoning",
+            "coding",
+            "orchestration",
             "multimodal",
             "long-context"
           ],
           "contextWindow": 1000000,
           "premiumMultiplier": 1,
+          "accuracyRank": 96,
+          "speedRank": 65,
           "available": true,
           "source": "built-in"
         },
         {
-          "id": "Claude Opus 4.5 (copilot)",
+          "id": "claude-opus-4.5",
           "label": "Claude Opus 4.5",
           "vendor": "copilot",
           "family": "claude-opus-4.5",
@@ -498,11 +429,231 @@
           ],
           "contextWindow": 200000,
           "premiumMultiplier": 3,
+          "accuracyRank": 93,
+          "speedRank": 45,
           "available": true,
           "source": "built-in"
         },
         {
-          "id": "Claude Opus 4.1 (copilot)",
+          "id": "gemini-3.1-pro",
+          "label": "Gemini 3.1 Pro",
+          "vendor": "copilot",
+          "family": "gemini-3.1-pro",
+          "tier": "reasoning",
+          "capabilities": [
+            "reasoning",
+            "coding",
+            "multimodal",
+            "long-context"
+          ],
+          "contextWindow": 1000000,
+          "premiumMultiplier": 1,
+          "accuracyRank": 90,
+          "speedRank": 60,
+          "available": true,
+          "source": "built-in"
+        },
+        {
+          "id": "claude-sonnet-4.6",
+          "label": "Claude Sonnet 4.6",
+          "vendor": "copilot",
+          "family": "claude-sonnet-4.6",
+          "tier": "balanced",
+          "capabilities": [
+            "coding",
+            "reasoning",
+            "multimodal"
+          ],
+          "contextWindow": 200000,
+          "premiumMultiplier": 1,
+          "accuracyRank": 88,
+          "speedRank": 70,
+          "available": true,
+          "source": "built-in"
+        },
+        {
+          "id": "mai-code-2",
+          "label": "Mai Code 2",
+          "vendor": "copilot",
+          "family": "mai-code-2",
+          "tier": "balanced",
+          "capabilities": [
+            "coding",
+            "reasoning",
+            "long-context"
+          ],
+          "contextWindow": 1000000,
+          "premiumMultiplier": 0.33,
+          "accuracyRank": 85,
+          "speedRank": 82,
+          "available": true,
+          "source": "built-in"
+        },
+        {
+          "id": "claude-sonnet-4.5",
+          "label": "Claude Sonnet 4.5",
+          "vendor": "copilot",
+          "family": "claude-sonnet-4.5",
+          "tier": "balanced",
+          "capabilities": [
+            "coding",
+            "reasoning",
+            "multimodal"
+          ],
+          "contextWindow": 200000,
+          "premiumMultiplier": 1,
+          "accuracyRank": 82,
+          "speedRank": 68,
+          "available": true,
+          "source": "built-in"
+        },
+        {
+          "id": "gemini-3-flash",
+          "label": "Gemini 3 Flash",
+          "vendor": "copilot",
+          "family": "gemini-3-flash",
+          "tier": "fast",
+          "capabilities": [
+            "fast",
+            "multimodal",
+            "long-context"
+          ],
+          "contextWindow": 1000000,
+          "premiumMultiplier": 0.33,
+          "accuracyRank": 78,
+          "speedRank": 90,
+          "available": true,
+          "source": "built-in"
+        },
+        {
+          "id": "mai-code-2-flash",
+          "label": "Mai Code 2 Flash",
+          "vendor": "copilot",
+          "family": "mai-code-2-flash",
+          "tier": "fast",
+          "capabilities": [
+            "fast",
+            "coding",
+            "long-context"
+          ],
+          "contextWindow": 1000000,
+          "premiumMultiplier": 0,
+          "accuracyRank": 76,
+          "speedRank": 92,
+          "available": true,
+          "source": "built-in"
+        },
+        {
+          "id": "gpt-5-mini",
+          "label": "GPT-5 mini",
+          "vendor": "copilot",
+          "family": "gpt-5-mini",
+          "tier": "fast",
+          "capabilities": [
+            "fast",
+            "coding"
+          ],
+          "contextWindow": 400000,
+          "premiumMultiplier": 0,
+          "accuracyRank": 72,
+          "speedRank": 88,
+          "available": true,
+          "source": "built-in"
+        },
+        {
+          "id": "gpt-4.1",
+          "label": "GPT-4.1",
+          "vendor": "copilot",
+          "family": "gpt-4.1",
+          "tier": "balanced",
+          "capabilities": [
+            "coding",
+            "fast",
+            "long-context"
+          ],
+          "contextWindow": 1000000,
+          "premiumMultiplier": 0,
+          "accuracyRank": 70,
+          "speedRank": 85,
+          "available": true,
+          "source": "built-in"
+        },
+        {
+          "id": "claude-haiku-4.5",
+          "label": "Claude Haiku 4.5",
+          "vendor": "copilot",
+          "family": "claude-haiku-4.5",
+          "tier": "fast",
+          "capabilities": [
+            "fast",
+            "search",
+            "orchestration"
+          ],
+          "contextWindow": 200000,
+          "premiumMultiplier": 0.33,
+          "accuracyRank": 45,
+          "speedRank": 92,
+          "deprecated": true,
+          "available": true,
+          "source": "built-in"
+        },
+        {
+          "id": "gpt-4o-mini",
+          "label": "GPT-4o mini",
+          "vendor": "copilot",
+          "family": "gpt-4o-mini",
+          "tier": "fast",
+          "capabilities": [
+            "fast"
+          ],
+          "contextWindow": 128000,
+          "premiumMultiplier": 0,
+          "accuracyRank": 35,
+          "speedRank": 95,
+          "deprecated": true,
+          "available": true,
+          "source": "built-in"
+        },
+        {
+          "id": "claude-sonnet-4",
+          "label": "Claude Sonnet 4",
+          "vendor": "copilot",
+          "family": "claude-sonnet-4",
+          "tier": "balanced",
+          "capabilities": [
+            "coding",
+            "reasoning"
+          ],
+          "contextWindow": 200000,
+          "premiumMultiplier": 1,
+          "accuracyRank": 68,
+          "speedRank": 65,
+          "deprecated": true,
+          "available": true,
+          "source": "built-in"
+        },
+        {
+          "id": "gemini-2.5-pro",
+          "label": "Gemini 2.5 Pro",
+          "vendor": "copilot",
+          "family": "gemini-2.5-pro",
+          "tier": "reasoning",
+          "capabilities": [
+            "reasoning",
+            "coding",
+            "multimodal",
+            "long-context"
+          ],
+          "contextWindow": 1000000,
+          "premiumMultiplier": 1,
+          "accuracyRank": 75,
+          "speedRank": 55,
+          "deprecated": true,
+          "available": true,
+          "source": "built-in"
+        },
+        {
+          "id": "claude-opus-4.1",
           "label": "Claude Opus 4.1",
           "vendor": "copilot",
           "family": "claude-opus-4.1",
@@ -514,6 +665,9 @@
           ],
           "contextWindow": 200000,
           "premiumMultiplier": 10,
+          "accuracyRank": 72,
+          "speedRank": 40,
+          "deprecated": true,
           "available": true,
           "source": "built-in"
         }

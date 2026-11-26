@@ -9,14 +9,24 @@
    ========================================================================== */
 
 /* Container Queries for Card / Pane Internals */
+@container pane (inline-size < 680px) {
+  .kpi-strip.has-handoff-kpi {
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+  }
+}
+
 @container pane (inline-size < 430px) {
   .summary-strip {
     grid-template-columns: repeat(2, minmax(0, 1fr));
     gap: 6px;
     padding: 7px 10px;
   }
-  .kpi-strip {
+  .kpi-strip,
+  .kpi-strip.has-handoff-kpi {
     grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+  .kpi-strip.has-handoff-kpi .kpi-card-handoff {
+    grid-column: 1 / -1;
   }
   .card-head {
     padding: 8px 10px;
@@ -137,10 +147,47 @@
     white-space: normal;
     overflow-wrap: anywhere;
   }
+
+  /* Fold Open: right-docked chat drawer */
+  .chat-drawer-dialog {
+    width: min(460px, 55vw);
+    max-width: 100vw;
+    border-radius: 12px 0 0 12px;
+  }
+
+  .chat-drawer-head {
+    padding: max(10px, env(safe-area-inset-top, 0px)) max(14px, env(safe-area-inset-right, 0px))
+      10px 14px;
+  }
+
+  .chat-body {
+    padding: 12px max(14px, env(safe-area-inset-right, 0px)) 18px 14px;
+  }
+
+  .chat-prompt-dock {
+    padding-bottom: env(safe-area-inset-bottom, 0px);
+    padding-right: env(safe-area-inset-right, 0px);
+  }
+
+  .chat-wide-btn {
+    display: none;
+  }
 }
 
 /* Hinge / Crease-Aware Dual-Screen Support (Viewport Segments API) */
 @media (horizontal-viewport-segments: 2) {
+  .chat-drawer-dialog {
+    position: fixed;
+    inset: 0 auto 0 env(viewport-segment-left 1 0);
+    left: env(viewport-segment-left 1 0);
+    width: env(viewport-segment-width 1 0);
+    max-width: env(viewport-segment-width 1 0);
+    margin: 0;
+    border-radius: 0;
+  }
+  .chat-wide-btn {
+    display: none;
+  }
   /* Full-viewport split shells map directly to physical display segments */
   .studio-workspace,
   .board-split,
@@ -297,6 +344,43 @@
 
   .fb-foot-actions > button {
     width: 100%;
+  }
+
+  /* Cover Screen & Narrow IDE Extension: full-bleed 100vw x 100dvh Chat Drawer */
+  .chat-drawer-dialog {
+    width: 100vw;
+    max-width: 100vw;
+    height: 100dvh;
+    max-height: 100dvh;
+    margin: 0;
+    border: 0;
+    border-radius: 0;
+  }
+
+  .chat-wide-btn {
+    display: none;
+  }
+
+  .chat-drawer-head {
+    padding: max(10px, env(safe-area-inset-top, 0px)) max(12px, env(safe-area-inset-right, 0px))
+      10px max(12px, env(safe-area-inset-left, 0px));
+  }
+
+  .chat-body {
+    padding: 10px max(12px, env(safe-area-inset-right, 0px)) 14px
+      max(12px, env(safe-area-inset-left, 0px));
+  }
+
+  .chat-drawer-shell:has(.chat-prompt-dock[hidden]) .chat-body {
+    padding-bottom: max(18px, env(safe-area-inset-bottom, 0px));
+  }
+
+  .chat-prompt-dock {
+    padding-bottom: max(8px, env(safe-area-inset-bottom, 0px));
+  }
+
+  .waiting-alert-pill {
+    padding: 4px 8px;
   }
 
   .insp-sheet-shell {
@@ -522,8 +606,12 @@
     width: 100%;
   }
 
-  .kpi-strip {
+  .kpi-strip,
+  .kpi-strip.has-handoff-kpi {
     grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+  .kpi-strip.has-handoff-kpi .kpi-card-handoff {
+    grid-column: 1 / -1;
   }
 
   .mockups-view {
@@ -664,6 +752,7 @@
   .copy-btn,
   .guide-copy-btn {
     min-height: 44px;
+    min-inline-size: 44px;
     padding: 6px 14px;
   }
   .insp-icon-btn {
@@ -721,9 +810,30 @@
   .cover-back-btn,
   .filter-chip,
   .tool-burst-row,
-  .tool-badge-btn {
+  .tool-badge-btn,
+  .split-parent-btn,
+  .chat-drawer-dialog button,
+  .qc-card button,
+  .qc-option,
+  .card-chat-btn,
+  .needs-input-badge,
+  .waiting-alert-pill,
+  .pending-chat-btn,
+  .usage-open-chat-btn,
+  .insp-chat-btn,
+  .insp-respond-btn,
+  .chat-subagent-chip,
+  .chat-drawer-dialog summary {
     min-block-size: 44px;
     min-inline-size: 44px;
+  }
+  .chat-drawer-dialog summary {
+    display: flex;
+    align-items: center;
+  }
+  .qc-textarea {
+    font-size: max(1rem, 1em);
+    min-block-size: 56px;
   }
   .reader-toc-drawer-nav .reader-toc-link {
     display: flex;
@@ -749,8 +859,34 @@
   .msg-pill,
   .line-msg-pill,
   .ext-lane-card,
-  .kpi-btn {
+  .kpi-btn,
+  .handoff-brief-box,
+  .handoff-continuation,
+  .handoff-issues-list,
+  .split-proposal-card,
+  .handoff-badge,
+  .split-parent-btn,
+  .kpi-card-handoff,
+  .k-card.has-handoff,
+  .smart-zone-track,
+  .ctx-meter-track {
     border: 1px solid CanvasText;
+  }
+  .sz-thresh,
+  .ctx-bound-tick {
+    background: CanvasText;
+  }
+  .sz-peak-fill,
+  .ctx-meter-fill {
+    background: Highlight;
+  }
+  .sz-marker {
+    background: CanvasText;
+    border-color: Canvas;
+  }
+  .sz-marker.is-peak {
+    background: Highlight;
+    border-color: CanvasText;
   }
   .bubble.inbound,
   .bubble.outbound,
@@ -770,7 +906,23 @@
   .filter-chip[aria-selected="true"],
   .filter-chip[aria-pressed="true"],
   .tool-burst-row.selected,
-  .tool-badge-btn.is-expanded {
+  .tool-badge-btn.is-expanded,
+  .qc-option.is-checked,
+  .qc-step-pill.is-active {
     outline: 2px solid Highlight;
+  }
+  .chat-drawer-dialog,
+  .qc-card,
+  .chat-turn,
+  .waiting-alert-pill,
+  .needs-input-badge,
+  .card-chat-btn,
+  .usage-agent-shell,
+  .insp-waiting-callout,
+  .pending-badge,
+  .qc-waiting-badge,
+  .chat-prompt-pill,
+  .chat-question-badge {
+    border: 1px solid CanvasText;
   }
 }

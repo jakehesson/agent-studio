@@ -5,6 +5,53 @@ All notable changes to **Agent Studio** will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.14.0] - 2026-11-26
+
+### Added
+- **VS Code Copilot Harness Conformance (`S1-68`, `S1-69`, `S1-70`):**
+  - Added `workflow.copilotHarness: "copilot" | "legacy-local"` support, portable tool aliases (`read`, `search`, `edit`, `execute`, `agent`), and `user-invocable` / `disable-model-invocation` frontmatter across compiled `.github/agents/*.agent.md` files.
+  - Coalesced root `.mcp.json` across `claude-code` and `copilot-vscode` (`type: "stdio"` + `tools: ["*"]`), expanded `.github/hooks/agent-studio.json` to all 10 canonical camelCase `json-merge` hooks, and added `$COPILOT_HOME` global install, agent/skill definition discovery, and workspace-scoped `$COPILOT_HOME/session-state/*/events.jsonl` passive telemetry discovery.
+- **Durable Customization-Preserving `agent-studio upgrade` (`S1-71`, `S1-72`):**
+  - Added `agent-studio upgrade` (`--dry-run`, `--diff`, `--write-incoming`, `--force`, `--global`) backed by deterministic git-committed `.agent-team/.upgrade-state.json` (`src/schema/upgrade-state.ts`, `src/cli/commands/upgrade.ts`).
+  - Added structured `migrationWarnings` to `agent-studio doctor` and the Web Studio Doctor card with `embed=1` IDE scoping and Galaxy Z Fold 7 three-tier responsive layout.
+
+### Changed
+- **Safe `agent-studio sync` & Legacy Cleanup:**
+  - Updated `agent-studio sync [--force]` to preserve user-modified or unmarked generated Markdown files and perform surgical legacy cleanup (removing `.vscode/mcp.json` `servers["agent-studio"]` and SHA-256-verified `.github/prompts/learn.prompt.md` / `<VSCodeUserDir>/prompts/*`).
+- **Runtime Copilot Model IDs & Hook Output Formats:**
+  - Updated `DEFAULT_MODEL_INDEX`, `extension/src/modelSync.ts`, and Web Studio to runtime Copilot model IDs (`claude-sonnet-4.6`, `claude-opus-4.6`, `gpt-5.4`, etc.) with deterministic compile-time `LEGACY_COPILOT_MODEL_ALIASES` normalization that preserves custom/BYOK IDs.
+  - Set `disable-model-invocation: true` on `skills/learn/SKILL.md` and updated `hook-emit` to emit top-level JSON (`permissionDecision`, `additionalContext`) for camelCase Copilot events while preserving `hookSpecificOutput` for `claude-code` and legacy PascalCase Copilot.
+
+### Fixed
+- **Subagent Correlation, Doctor Deduplication & Upgrade Locking (`S1-73`, `BUG-28`, `BUG-29`, `BUG-30`):**
+  - Fixed label-only `subagentStart` + UUID `subagentStop` correlation and out-of-order label backfill with bounded LRU correlation maps in `PushBus` and `src/telemetry/normalizer.ts`.
+  - Coalesced `doctor` `fileCount` reporting, deduplicated `migrationWarnings`, added atomic `upgrade` locking, eliminated first-run `model-index.json` churn, and fixed a stale-lockfile unlink TOCTOU race in `src/models/store.ts`.
+  - Fixed comma-separated `warning.ide` filtering in `web/src/views/Doctor.ts` for strict `embed=1` IDE isolation.
+
+### Security
+- **Path Containment, Fail-Closed `preToolUse` & Telemetry Symlink Guards:**
+  - Enforced path traversal and symlink containment (`SafeSlugSchema`, `SafeRelativePosixPathSchema`, `UpgradeStateKeySchema`, `assertContainedPath`) across `team.yaml`, `.upgrade-state.json`, `upgrade.ts`, and `src/compiler/{shared,index}.ts`.
+  - Hardened `hook-emit` `preToolUse` (`create`, `str_replace`, `str_replace_editor` with `command === "view"` awareness, `apply_patch`, `multiedit`, `TargetFile`, >256KB & malformed JSON fail-closed, `execute`/`shell`/`terminal` board-write detection, and `"Team Orchestrator"` roster name matching) plus symlink/realpath containment and a 64KB `workspace.yaml` cap in `CopilotVSCodeAdapter.discoverSessions()`.
+
+## [0.13.0] - 2026-11-26
+
+### Added
+- **Agent Chat Slide-Out Drawer & Waiting-for-Human-Choice Flow (`S1-66`):**
+  - Added on-demand full chat extraction (`GET /api/chat`, `GET /api/sessions/:id/chat`, and MCP `app_get_chat`) across Antigravity (`ask_question` / `notify_user`), Claude Code (`AskUserQuestion`), and VS Code / Copilot (`questionCarousel` / `vscode_askQuestions` / elicitation) with `PendingHumanPrompt` correlation and answered/canceled suppression.
+  - Added `AgentChatDrawer` (`<dialog>` slide-out with Galaxy Z Fold 7 three-tier & hinge-aware styling) and interactive `QuestionCard` answer flow (extension `postMessage` reply bridge, MCP App `sendMessage`, and clipboard fallback) alongside waiting-for-response indicators across `TopologySvg`, `ContextBar`, `ActivityFeed`, and Extension Status Bar / Sidebar.
+- **DevOps Item-Driven Context-Threshold Handoff & Task Splitting (`S1-65`):**
+  - Added `ContextHandoffSchema` plus `board op=handoff` and `board op=split` operations (`src/board/engine.ts`, `src/schema/board.ts`, `src/mcp/server.ts`) with cycle/duplicate dependency guards, 3-channel context advisories (`55%` Handoff / `PreCompact` via hooks, telemetry, and MCP board guidance), updated core team rules/prompts across all compiled IDE adapters, and `AgileBoard` / `UsageDashboard` handoff UI.
+
+### Changed
+- **Evidence-Based Model Routing & Orchestrator Prompt (`S1-67`):**
+  - Upgraded `model-routing` skill (`src/templates/skills.ts`, `.agent-team/skills/model-routing/SKILL.md`) and `orchestrator` prompt (`src/templates/prompts.ts`, `.agent-team/agents/orchestrator.md`) with 10 ordered routing rules, the `expected_cost` formula (`initial_cost + retry_probability * retry_cost + review_cost`), 11 rerouting triggers, structured JSON decision contract, anti-over-delegation guardrails, and `ContextHandoffSchema` alignment (`decisions`, `assumptions`, `unresolved_issues`).
+
+### Fixed
+- **Accurate Model Context Windows in VS Code Telemetry (`BUG-26`):**
+  - Implemented 4-tier `contextWindow` resolution across backend telemetry, `model-index.json`, extension live `vscode.lm` catalog sync, and Web Studio Smart Zone calculations, adding `1M` context window parity for MAI (`mai-*`) and GPT-4.1/5.4 models plus Copilot Auto version and subagent propagation.
+- **Model Selection Ranking & Legacy Default Removal (`BUG-27`):**
+  - Enforced `Accuracy -> Cost -> Speed` ranking across built-in model catalogs, role tier assignments (`orchestrator` / `qa-validator` set to `balanced`), live model sync, and cross-IDE `deferToHostOrchestrator` handling so compiled agents no longer default to outdated models such as Claude Haiku 4.5.
+
 ## [0.12.0] - 2026-11-25
 
 ### Added

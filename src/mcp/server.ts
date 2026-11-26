@@ -6,6 +6,7 @@ import { fileURLToPath } from "node:url";
 import {
   boardAdd,
   boardGate,
+  boardHandoff,
   boardMove,
   boardNext,
   boardNote,
@@ -13,6 +14,7 @@ import {
   boardPlan,
   boardReport,
   boardShow,
+  boardSplit,
   boardStatus,
   listProjects,
   readBoard,
@@ -31,6 +33,7 @@ import {
   BOARD_STATES,
   BUG_RESOLUTIONS,
   BUG_SEVERITIES,
+  SplitProposalSchema,
   type BoardItemType,
   type BoardState,
   type BugResolution,
@@ -46,9 +49,13 @@ import {
   type NormalizedEvent,
 } from "../schema/telemetry.js";
 import {
+  DEFAULT_CONTEXT_THRESHOLDS,
   TelemetryAggregator,
   computeDeterministicEventId,
   discoverTeamDetailsCached,
+  formatContextWindowShort,
+  inferContextWindow,
+  lookupModelContextWindow,
   toIsoUtc,
   type EnrichedEvent,
 } from "../telemetry/index.js";
@@ -91,7 +98,7 @@ function resolveServerVersion(): string {
   } catch {
     // Fall through to default version
   }
-  return "0.12.0";
+  return "0.14.0";
 }
 
 export const MCP_PROTOCOL_VERSION = "2024-11-05";
@@ -230,6 +237,8 @@ export const MCP_TOOLS = [
             "move",
             "note",
             "owner",
+            "handoff",
+            "split",
             "plan",
             "gate",
             "report",
@@ -307,6 +316,94 @@ export const MCP_TOOLS = [
             "Audited override reason to bypass QA Gate on test -> done (recorded in item notes).",
         },
         owner: { type: "string", description: "Owner name (for op=owner)." },
+        kind: {
+          type: "string",
+          enum: ["fresh_context", "task_split"],
+          description: "Handoff kind (for op=handoff).",
+        },
+        objective: {
+          type: "string",
+          description: "Task objective for the handoff (for op=handoff).",
+        },
+        summary: { type: "string", description: "Handoff summary (for op=handoff)." },
+        evidenceItems: {
+          type: "array",
+          items: { type: "string" },
+          description: "Evidence items supporting completed work (for op=handoff).",
+        },
+        decisions: {
+          type: "array",
+          items: { type: "string" },
+          description: "Architectural/implementation decisions made (for op=handoff).",
+        },
+        assumptions: {
+          type: "array",
+          items: { type: "string" },
+          description: "Explicit assumptions carried forward (for op=handoff).",
+        },
+        unresolvedIssues: {
+          type: "array",
+          items: { type: "string" },
+          description: "Open issues or risks remaining (for op=handoff).",
+        },
+        modifiedFiles: {
+          type: "array",
+          items: { type: "string" },
+          description: "Modified files list (for op=handoff).",
+        },
+        verifiedChecks: {
+          type: "array",
+          items: { type: "string" },
+          description: "Verified check commands/results (for op=handoff).",
+        },
+        remainingWork: {
+          type: "array",
+          items: { type: "string" },
+          description: "Remaining work items (for op=handoff).",
+        },
+        continuationBrief: {
+          type: "string",
+          description: "Exact brief for the fresh-context successor (for op=handoff).",
+        },
+        splitProposals: {
+          type: "array",
+          items: {
+            type: "object",
+            properties: {
+              title: { type: "string" },
+              role: { type: "string" },
+              ac: { type: "array", items: { type: "string" } },
+              deps: { type: "array", items: { type: "string" } },
+              rationale: { type: "string" },
+            },
+            required: ["title", "role"],
+          },
+          description: "Proposed subtasks with exclusive scopes (for op=handoff kind=task_split).",
+        },
+        contextPercent: { type: "number", description: "Current context utilization % (for op=handoff)." },
+        contextTokens: { type: "number", description: "Current context token count (for op=handoff)." },
+        contextWindow: { type: "number", description: "Active context window size (for op=handoff)." },
+        agentId: { type: "string", description: "Optional caller agent ID (for op=handoff)." },
+        keepOwner: { type: "boolean", description: "Preserve current owner on op=handoff." },
+        subtasks: {
+          type: "array",
+          items: {
+            type: "object",
+            properties: {
+              title: { type: "string" },
+              role: { type: "string" },
+              ac: { type: "array", items: { type: "string" } },
+              deps: { type: "array", items: { type: "string" } },
+              rationale: { type: "string" },
+            },
+            required: ["title", "role"],
+          },
+          description: "Subtasks to split parent item into (for op=split; defaults to handoff.split_proposals).",
+        },
+        blockParent: {
+          type: "boolean",
+          description: "Append child IDs to parent.deps on op=split (default true).",
+        },
         writeFile: {
           type: "boolean",
           description: "Write docs/sprints/<sprint>-review.md (for op=report).",
@@ -485,6 +582,29 @@ export const MCP_TOOLS = [
         workspace: { type: "string" },
       },
       required: ["session", "event"],
+    },
+    _meta: {
+      ui: {
+        visibility: ["app"],
+      },
+    },
+  },
+  {
+    name: "app_get_chat",
+    description:
+      "App-only data bridge returning full paginated per-agent chat transcript and active pending human prompt.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        session: { type: "string" },
+        agent: { type: "string" },
+        ide: { type: "string" },
+        project: { type: "string" },
+        workspace: { type: "string" },
+        limit: { type: "number" },
+        before: { type: "string" },
+      },
+      required: ["session"],
     },
     _meta: {
       ui: {
@@ -726,6 +846,125 @@ async function executeProjectsTool(
   };
 }
 
+async function maybeAppendContextAdvisory(params: {
+  text: string;
+  project?: ResolvedProject;
+  sessionId?: string;
+  agentId?: string;
+  ide?: IdeSource;
+  op?: string;
+  options: McpServerOptions;
+}): Promise<string> {
+  if (params.op === "handoff") {
+    return params.text;
+  }
+
+  const thresholds = params.project?.teamManifest?.workflow?.contextThresholds;
+  const handoffPercent =
+    thresholds?.handoffPercent ?? DEFAULT_CONTEXT_THRESHOLDS.handoffPercent;
+  const aid = params.agentId?.trim() || "root";
+
+  const evaluateNumbers = (info: {
+    contextTokens?: number;
+    contextWindow?: number;
+    model?: string;
+    modelContextWindows?: Record<string, number>;
+  } | null | undefined): string | null => {
+    if (!info || typeof info.contextTokens !== "number" || info.contextTokens <= 0) {
+      return null;
+    }
+    const model = info.model ?? "unknown";
+    const ctxWin =
+      info.contextWindow && info.contextWindow > 0
+        ? info.contextWindow
+        : lookupModelContextWindow(model, info.modelContextWindows) ??
+          inferContextWindow(model, params.ide);
+    if (ctxWin <= 0) return null;
+    const pct = Math.min(100, Math.round((info.contextTokens / ctxWin) * 1000) / 10);
+    if (pct < handoffPercent) return null;
+    const tokLabel = `${Math.round(info.contextTokens / 1000)}k`;
+    const winLabel = formatContextWindowShort(ctxWin);
+    return `${params.text}\n[CONTEXT_ADVISORY] Context at ${Math.round(pct)}% (${tokLabel}/${winLabel}). Pause new exploration and call \`board { op: 'handoff', ... }\` (or \`kind: 'task_split'\`) before reaching Compact (${thresholds?.compactPercent ?? DEFAULT_CONTEXT_THRESHOLDS.compactPercent}%).`;
+  };
+
+  // 1. Check in-process aggregator first (0ms)
+  const localAgg = params.options.aggregator ?? lazyAggregator;
+  if (localAgg && params.sessionId) {
+    const cached = localAgg.getCachedAgentUsage(params.sessionId, aid);
+    const live = localAgg.pushBus.getAgentContextState(params.sessionId, aid);
+    const mergedTokens = Math.max(
+      live?.contextTokens ?? 0,
+      cached?.contextTokens ?? 0,
+    );
+    const advisoryText = evaluateNumbers({
+      contextTokens: mergedTokens,
+      contextWindow: live?.contextWindow ?? cached?.contextWindow,
+      model: live?.model ?? cached?.model,
+      modelContextWindows: cached?.modelContextWindows,
+    });
+    if (advisoryText) return advisoryText;
+  }
+
+  // 2. Fast <= 80ms HTTP probe to active Studio daemon when enabled
+  if (process.env.AGENT_STUDIO_MCP_NO_HTTP !== "1") {
+    const port = process.env.AGENT_STUDIO_PORT ?? "8767";
+    const qs = new URLSearchParams();
+    if (params.sessionId) qs.set("session", params.sessionId);
+    if (params.project?.id) qs.set("project", params.project.id);
+    if (params.project?.root) qs.set("workspace", params.project.root);
+    const stateUrl = `http://127.0.0.1:${port}/api/state${qs.toString() ? `?${qs.toString()}` : ""}`;
+
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    try {
+      const fetchPromise = fetch(stateUrl, {
+        signal: AbortSignal.timeout(70),
+      })
+        .then(async (resp) => {
+          if (!resp.ok) return null;
+          return (await resp.json()) as {
+            agents?: Array<{
+              id?: string;
+              isRoot?: boolean;
+              model?: string;
+              usage?: {
+                contextTokens?: number;
+                contextWindow?: number;
+                model?: string;
+              };
+            }>;
+            modelContextWindows?: Record<string, number>;
+          };
+        })
+        .catch(() => null);
+      const timeoutPromise = new Promise<null>((resolve) => {
+        timer = setTimeout(() => resolve(null), 75);
+      });
+      const data = await Promise.race([fetchPromise, timeoutPromise]);
+      if (data && Array.isArray(data.agents)) {
+        const matched =
+          data.agents.find((a) => a.id === aid) ??
+          data.agents.find((a) => a.isRoot || a.id === "root") ??
+          data.agents[0];
+        const advisoryText = evaluateNumbers({
+          contextTokens: matched?.usage?.contextTokens,
+          contextWindow: matched?.usage?.contextWindow,
+          model: matched?.usage?.model ?? matched?.model,
+          modelContextWindows: data.modelContextWindows,
+        });
+        if (advisoryText) return advisoryText;
+      }
+    } catch {
+      // Offline or timed out within 80ms budget; return original tool text cleanly.
+    } finally {
+      if (timer !== undefined) {
+        clearTimeout(timer);
+      }
+    }
+  }
+
+  return params.text;
+}
+
 async function executeBoardTool(
   args: Record<string, unknown>,
   options: McpServerOptions,
@@ -856,6 +1095,85 @@ async function executeBoardTool(
       eventPayload = { ...eventPayload, itemId, owner };
       break;
     }
+    case "handoff": {
+      if (!itemId) throw new Error("board handoff requires itemId");
+      const rawKind = str(args.kind);
+      const kind =
+        rawKind === "fresh_context" || rawKind === "task_split"
+          ? rawKind
+          : undefined;
+      if (!kind) {
+        throw new Error('board handoff requires kind: "fresh_context" | "task_split"');
+      }
+      const summary = str(args.summary);
+      const continuationBrief = str(args.continuationBrief);
+      if (!summary) throw new Error("board handoff requires summary");
+      if (!continuationBrief) {
+        throw new Error("board handoff requires continuationBrief");
+      }
+      const splitProposals = Array.isArray(args.splitProposals)
+        ? args.splitProposals.map((p) => SplitProposalSchema.parse(p))
+        : undefined;
+      const contextPercent = num(args.contextPercent);
+      const evidenceFallback = Array.isArray(args.evidence)
+        ? strArray(args.evidence)
+        : str(args.evidence)
+          ? [str(args.evidence)!]
+          : undefined;
+      const res = await boardHandoff(ctx, {
+        itemId,
+        kind,
+        actor,
+        objective: str(args.objective),
+        summary,
+        evidence: strArray(args.evidenceItems) ?? evidenceFallback,
+        decisions: strArray(args.decisions),
+        assumptions: strArray(args.assumptions),
+        unresolvedIssues: strArray(args.unresolvedIssues),
+        modifiedFiles: strArray(args.modifiedFiles),
+        verifiedChecks: strArray(args.verifiedChecks),
+        remainingWork: strArray(args.remainingWork),
+        continuationBrief,
+        splitProposals,
+        contextPercent,
+        contextTokens: num(args.contextTokens),
+        contextWindow: num(args.contextWindow),
+        sessionId,
+        agentId: str(args.agentId),
+        keepOwner: bool(args.keepOwner),
+      });
+      text = res.text;
+      isMutation = true;
+      eventPayload = {
+        ...eventPayload,
+        itemId: res.data.id,
+        handoffKind: kind,
+        ...(contextPercent !== undefined ? { contextPercent } : {}),
+      };
+      break;
+    }
+    case "split": {
+      if (!itemId) throw new Error("board split requires itemId");
+      const subtasks = Array.isArray(args.subtasks)
+        ? args.subtasks.map((p) => SplitProposalSchema.parse(p))
+        : undefined;
+      const blockParent =
+        typeof args.blockParent === "boolean" ? args.blockParent : true;
+      const res = await boardSplit(ctx, {
+        itemId,
+        actor,
+        subtasks,
+        blockParent,
+      });
+      text = res.text;
+      isMutation = true;
+      eventPayload = {
+        ...eventPayload,
+        itemId: res.data.parent.id,
+        childIds: res.data.children.map((c) => c.id),
+      };
+      break;
+    }
     case "plan": {
       const sprint = str(args.sprint);
       if (!sprint) throw new Error("board plan requires sprint");
@@ -896,7 +1214,17 @@ async function executeBoardTool(
   });
   await appendProjectTelemetry(project.root, event);
 
-  return { content: [{ type: "text", text }] };
+  const finalText = await maybeAppendContextAdvisory({
+    text,
+    project,
+    sessionId,
+    agentId: str(args.agentId) ?? actor,
+    ide,
+    op,
+    options,
+  });
+
+  return { content: [{ type: "text", text: finalText }] };
 }
 
 async function executeTestrunTool(
@@ -1022,7 +1350,17 @@ async function executeTestrunTool(
   });
   await appendProjectTelemetry(project.root, event);
 
-  return { content: [{ type: "text", text }] };
+  const finalText = await maybeAppendContextAdvisory({
+    text,
+    project,
+    sessionId,
+    agentId: str(args.agentId) ?? actor,
+    ide,
+    op,
+    options,
+  });
+
+  return { content: [{ type: "text", text: finalText }] };
 }
 
 async function executeTelemetryTool(
@@ -1088,11 +1426,21 @@ async function executeTelemetryTool(
   const targetRoot = project?.root ?? options.cwd ?? process.cwd();
   await appendProjectTelemetry(targetRoot, event);
 
+  const finalText = await maybeAppendContextAdvisory({
+    text: `emitted ${event.kind} (${event.id}): ${event.summary}`,
+    project,
+    sessionId,
+    agentId,
+    ide,
+    op,
+    options,
+  });
+
   return {
     content: [
       {
         type: "text",
-        text: `emitted ${event.kind} (${event.id}): ${event.summary}`,
+        text: finalText,
       },
     ],
   };
@@ -1269,6 +1617,58 @@ async function executeAppGetEventBodyTool(
   return {
     content: [{ type: "text", text: JSON.stringify(payload) }],
     structuredContent: payload,
+  };
+}
+
+async function executeAppGetChatTool(
+  args: Record<string, unknown>,
+  options: McpServerOptions,
+): Promise<McpToolCallResult> {
+  const session = str(args.session);
+  if (!session) {
+    const errPayload: Record<string, unknown> = {
+      ok: false,
+      error: "Missing session parameter",
+    };
+    return {
+      isError: true,
+      content: [{ type: "text", text: JSON.stringify(errPayload) }],
+      structuredContent: errPayload,
+    };
+  }
+
+  const aggregator = options.aggregator ?? getMcpAggregator();
+  const chatRes = await aggregator.getAgentChat({
+    sessionId: session,
+    agentId: str(args.agent) ?? "root",
+    ide: str(args.ide),
+    project: str(args.project) ?? options.defaultProject,
+    workspace: str(args.workspace),
+    limit: num(args.limit),
+    before: str(args.before),
+  });
+
+  if (!chatRes) {
+    const errPayload: Record<string, unknown> = {
+      ok: false,
+      error: "Session not found",
+    };
+    return {
+      isError: true,
+      content: [{ type: "text", text: JSON.stringify(errPayload) }],
+      structuredContent: errPayload,
+    };
+  }
+
+  const structuredContent = chatRes as unknown as Record<string, unknown>;
+  return {
+    content: [
+      {
+        type: "text",
+        text: `Loaded ${chatRes.messages.length} chat message(s) for ${chatRes.agentId} in ${chatRes.sessionId}.`,
+      },
+    ],
+    structuredContent,
   };
 }
 
@@ -1482,6 +1882,8 @@ export async function dispatchToolCall(
         return await executeAppGetStateTool(args, options);
       case "app_get_event_body":
         return await executeAppGetEventBodyTool(args, options);
+      case "app_get_chat":
+        return await executeAppGetChatTool(args, options);
       case "app_get_board":
         return await executeAppGetBoardTool(args, options);
       case "app_get_team":

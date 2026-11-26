@@ -2,13 +2,16 @@ import { EventEmitter } from "node:events";
 import fs from "node:fs/promises";
 import path from "node:path";
 import { getAgentStudioHome, listProjects } from "../board/registry.js";
-import { NormalizedEventSchema } from "../schema/telemetry.js";
+import { NormalizedEventSchema, type IdeSource } from "../schema/telemetry.js";
 import { defaultEventBodyStore, type EventBodyStore } from "./body-store.js";
 import {
   cleanHumanSummary,
   computeDeterministicEventId,
   computeMergeKey,
+  inferContextWindow,
   isOpaqueAgentId,
+  lookupModelContextWindow,
+  normalizeSubagentLabel,
   normalizeWsPath,
   parseEpochSeconds,
   prettifyModelName,
@@ -22,6 +25,8 @@ import {
 export const MAX_EVENTS_PER_SESSION = 2000;
 export const MAX_TRANSCRIPT_BYTES = 20 * 1024 * 1024;
 export const MAX_TRANSCRIPT_PATHS_PER_SESSION = 64;
+export const MAX_CONTEXT_TRACKERS = 2000;
+export const MAX_CORRELATION_ENTRIES = 500;
 
 /**
  * Fast syntactic pre-check for transcriptPath / agentTranscriptPath values.
@@ -377,14 +382,108 @@ export interface SubagentParentMapping {
   agentType?: string;
 }
 
+export type ContextBand = "ok" | "warn" | "handoff" | "compact";
+
+export interface ContextThresholdConfig {
+  warnPercent: number;
+  handoffPercent: number;
+  compactPercent: number;
+}
+
+export const DEFAULT_CONTEXT_THRESHOLDS: ContextThresholdConfig = {
+  warnPercent: 45,
+  handoffPercent: 55,
+  compactPercent: 70,
+};
+
+export interface AgentContextTrackerState {
+  contextTokens: number;
+  contextWindow?: number;
+  model?: string;
+  ide?: IdeSource;
+  updatedAtMs: number;
+  lastAdvisedBand: ContextBand;
+  pendingDeferredAdvisory?: boolean;
+}
+
+export interface ContextAdvisory {
+  band: Exclude<ContextBand, "ok">;
+  sessionId: string;
+  agentId: string;
+  contextTokens: number;
+  contextWindow: number;
+  contextPercent: number;
+  model?: string;
+  isPreCompact?: boolean;
+  message: string;
+}
+
+const CONTEXT_BAND_RANK: Record<ContextBand, number> = {
+  ok: 0,
+  warn: 1,
+  handoff: 2,
+  compact: 3,
+};
+
+export function formatContextWindowShort(windowTokens: number): string {
+  if (windowTokens >= 1_000_000) {
+    const m = Math.round((windowTokens / 1_000_000) * 10) / 10;
+    return `${m}`.replace(/\.0$/, "") + "M";
+  }
+  return `${Math.round(windowTokens / 1000)}k`;
+}
+
+export function buildContextAdvisoryMessage(params: {
+  band: Exclude<ContextBand, "ok">;
+  contextPercent: number;
+  contextWindow: number;
+  handoffPercent: number;
+  isPreCompact?: boolean;
+}): string {
+  const pct = Math.round(params.contextPercent);
+  const winLabel = formatContextWindowShort(params.contextWindow);
+  if (params.band === "compact" || params.isPreCompact) {
+    return `[agent-studio context-budget: ${pct}% of ${winLabel}] Compact threshold reached${params.isPreCompact ? " (PreCompact)" : ""}. Pause new exploration and call \`board { op: 'handoff', ... }\` to checkpoint for a fresh context or return split proposals to orchestrator.`;
+  }
+  if (params.band === "handoff") {
+    return `[agent-studio context-budget: ${pct}% of ${winLabel}] Drift/Handoff threshold reached. Pause new exploration and call \`board { op: 'handoff', ... }\` to checkpoint for a fresh context or return split proposals to orchestrator.`;
+  }
+  return `[agent-studio context-budget: ${pct}% of ${winLabel}] Approaching Drift zone (${params.handoffPercent}% handoff threshold). Wrap up active edits cleanly and prepare a \`board { op: 'handoff', ... }\` checkpoint if work continues.`;
+}
+
 export class PushBus extends EventEmitter {
   private readonly sessions = new Map<string, EnrichedEvent[]>();
   private readonly seenIds = new Map<string, Set<string>>();
   private readonly fileOffsets = new Map<string, number>();
   private readonly subagentToParent = new Map<string, SubagentParentMapping>();
+  private readonly openUnlinkedSpawns = new Map<
+    string,
+    Array<{
+      spawnId: string;
+      normLabels: string[];
+      label?: string;
+      epoch: number;
+      linkedUuid?: string;
+    }>
+  >();
+  private readonly pendingUnlinkedUuids = new Map<
+    string,
+    Array<{
+      uuid: string;
+      normLabels: string[];
+      label?: string;
+      epoch: number;
+      hasDone?: boolean;
+    }>
+  >();
+  private readonly copilotUuidToSpawn = new Map<
+    string,
+    Map<string, { spawnId: string; label?: string }>
+  >();
   private readonly sessionTranscriptPaths = new Map<string, Set<string>>();
   private readonly agentTranscriptPaths = new Map<string, Map<string, string>>();
   private readonly agentLabels = new Map<string, Map<string, string>>();
+  private readonly contextTrackers = new Map<string, AgentContextTrackerState>();
   private readonly extraWorkspaces: string[];
   private readonly includeGlobalFile: boolean;
   private readonly bodyStore: EventBodyStore;
@@ -593,6 +692,174 @@ export class PushBus extends EventEmitter {
     this.sessionTranscriptPaths.delete(orphanSessionId);
     this.agentTranscriptPaths.delete(orphanSessionId);
     this.agentLabels.delete(orphanSessionId);
+
+    const orphanPrefix = `${orphanSessionId}\u001f`;
+    const targetKey = this.contextTrackerKey(
+      mapping.parentSessionId,
+      mapping.agentId,
+    );
+    for (const [k, orphanState] of [...this.contextTrackers.entries()]) {
+      if (!k.startsWith(orphanPrefix)) continue;
+      const existing = this.contextTrackers.get(targetKey);
+      if (existing) {
+        existing.contextTokens = Math.max(
+          existing.contextTokens,
+          orphanState.contextTokens,
+        );
+        existing.contextWindow ??= orphanState.contextWindow;
+        existing.model ??= orphanState.model;
+        existing.ide ??= orphanState.ide;
+        if (
+          CONTEXT_BAND_RANK[orphanState.lastAdvisedBand] >
+          CONTEXT_BAND_RANK[existing.lastAdvisedBand]
+        ) {
+          existing.lastAdvisedBand = orphanState.lastAdvisedBand;
+        }
+        existing.updatedAtMs = Math.max(
+          existing.updatedAtMs,
+          orphanState.updatedAtMs,
+        );
+        this.setContextTracker(targetKey, existing);
+      } else {
+        this.setContextTracker(targetKey, { ...orphanState });
+      }
+      this.contextTrackers.delete(k);
+    }
+  }
+
+  private extractCopilotSubagentLabels(ev: EnrichedEvent): {
+    label?: string;
+    normLabels: string[];
+  } {
+    const rawCandidates = [
+      ev.agentLabel,
+      typeof ev.payload?.agentLabel === "string" ? ev.payload.agentLabel : undefined,
+      typeof ev.payload?.agentType === "string" ? ev.payload.agentType : undefined,
+      typeof ev.payload?.agentName === "string" ? ev.payload.agentName : undefined,
+    ];
+    const cleanCandidates: string[] = [];
+    const normLabels: string[] = [];
+    for (const raw of rawCandidates) {
+      const trimmed = raw?.trim();
+      if (!trimmed || isOpaqueAgentId(trimmed)) continue;
+      if (trimmed.toLowerCase() === "subagent") continue;
+      if (!cleanCandidates.includes(trimmed)) cleanCandidates.push(trimmed);
+      const norm = normalizeSubagentLabel(trimmed);
+      if (norm && norm !== "subagent" && !normLabels.includes(norm)) {
+        normLabels.push(norm);
+      }
+    }
+    return {
+      label: cleanCandidates[0],
+      normLabels,
+    };
+  }
+
+  private setBoundedMapEntry<K, V>(
+    map: Map<K, V>,
+    key: K,
+    value: V,
+    maxEntries = MAX_CORRELATION_ENTRIES,
+  ): void {
+    if (map.has(key)) {
+      map.delete(key);
+    }
+    map.set(key, value);
+    while (map.size > maxEntries) {
+      const oldest = map.keys().next().value;
+      if (oldest === undefined) break;
+      map.delete(oldest);
+    }
+  }
+
+  private recordCopilotUuidMapping(
+    sessionId: string,
+    uuid: string,
+    spawnId: string,
+    label?: string,
+  ): void {
+    let byUuid = this.copilotUuidToSpawn.get(sessionId);
+    if (!byUuid) {
+      byUuid = new Map();
+    }
+    this.setBoundedMapEntry(byUuid, uuid, { spawnId, label });
+    this.setBoundedMapEntry(this.copilotUuidToSpawn, sessionId, byUuid);
+    this.setBoundedMapEntry(this.subagentToParent, uuid, {
+      parentSessionId: sessionId,
+      agentId: spawnId,
+      ...(label ? { agentLabel: label, agentType: label } : {}),
+    });
+    if (label) {
+      this.recordAgentLabel(sessionId, spawnId, label);
+    }
+  }
+
+  private migrateCopilotUuidEvents(
+    sessionId: string,
+    uuid: string,
+    spawnId: string,
+    label?: string,
+  ): void {
+    const list = this.sessions.get(sessionId);
+    if (list) {
+      for (const oldEv of list) {
+        let changed = false;
+        if (oldEv.agentId === uuid) {
+          oldEv.agentId = spawnId;
+          oldEv.parentAgentId = oldEv.parentAgentId || "root";
+          if (label && (!oldEv.agentLabel || isOpaqueAgentId(oldEv.agentLabel))) {
+            oldEv.agentLabel = label;
+          }
+          changed = true;
+        }
+        if (oldEv.targetAgentId === uuid) {
+          oldEv.targetAgentId = spawnId;
+          if (label && oldEv.payload && !oldEv.payload.agentLabel) {
+            oldEv.payload = { ...oldEv.payload, agentLabel: label };
+          }
+          changed = true;
+        }
+        if (changed) {
+          oldEv.mergeKey = computeMergeKey({
+            sessionId: oldEv.sessionId,
+            agentId: oldEv.agentId,
+            kind: oldEv.kind,
+            toolCallId: oldEv.toolCallId,
+            toolName: oldEv.toolName,
+            epoch: oldEv.epoch,
+          });
+        }
+      }
+    }
+
+    const byAgentPaths = this.agentTranscriptPaths.get(sessionId);
+    if (byAgentPaths && byAgentPaths.has(uuid)) {
+      const tp = byAgentPaths.get(uuid)!;
+      byAgentPaths.delete(uuid);
+      if (!byAgentPaths.has(spawnId)) {
+        byAgentPaths.set(spawnId, tp);
+      }
+    }
+
+    const oldCtxKey = this.contextTrackerKey(sessionId, uuid);
+    const oldCtx = this.contextTrackers.get(oldCtxKey);
+    if (oldCtx) {
+      const targetKey = this.contextTrackerKey(sessionId, spawnId);
+      const existing = this.contextTrackers.get(targetKey);
+      if (existing) {
+        existing.contextTokens = Math.max(
+          existing.contextTokens,
+          oldCtx.contextTokens,
+        );
+        existing.contextWindow ??= oldCtx.contextWindow;
+        existing.model ??= oldCtx.model;
+        existing.ide ??= oldCtx.ide;
+        this.setContextTracker(targetKey, existing);
+      } else {
+        this.setContextTracker(targetKey, { ...oldCtx });
+      }
+      this.contextTrackers.delete(oldCtxKey);
+    }
   }
 
   ingest(rawItems: unknown[]): IngestResult {
@@ -719,7 +986,7 @@ export class PushBus extends EventEmitter {
             agentLabel: resolvedLabel,
             agentType: resolvedType,
           };
-          this.subagentToParent.set(originalSessionId, memoized);
+          this.setBoundedMapEntry(this.subagentToParent, originalSessionId, memoized);
           this.migrateOrphanSession(originalSessionId, memoized);
         }
       }
@@ -751,6 +1018,307 @@ export class PushBus extends EventEmitter {
         }
       }
 
+      // Correlate Copilot label-only subagentStart (no agentId) with UUID child/subagentStop events
+      if (ev.kind === "subagent_spawn" && ev.targetAgentId) {
+        const hasExplicitPayloadUuid =
+          typeof ev.payload?.agentId === "string" &&
+          Boolean(ev.payload.agentId.trim());
+        if (
+          ev.targetAgentId !== "root" &&
+          ev.targetAgentId !== "subagent" &&
+          !isOpaqueAgentId(ev.targetAgentId) &&
+          !hasExplicitPayloadUuid
+        ) {
+          const { label, normLabels } = this.extractCopilotSubagentLabels(ev);
+          const spawnNorms =
+            normLabels.length > 0
+              ? normLabels
+              : [normalizeSubagentLabel(ev.targetAgentId)].filter(Boolean);
+          const openQueue = this.openUnlinkedSpawns.get(ev.sessionId) ?? [];
+          let spawnId = ev.targetAgentId;
+          if (openQueue.some((e) => e.spawnId === spawnId)) {
+            let suffix = 2;
+            while (openQueue.some((e) => e.spawnId === `${ev.targetAgentId}-${suffix}`)) {
+              suffix++;
+            }
+            spawnId = `${ev.targetAgentId}-${suffix}`;
+            ev.targetAgentId = spawnId;
+            ev.id = computeDeterministicEventId({
+              ide: ev.ide,
+              sessionId: ev.sessionId,
+              agentId: ev.agentId,
+              kind: ev.kind,
+              toolCallId: ev.toolCallId,
+              toolName: ev.toolName,
+              targetAgentId: ev.targetAgentId,
+              epoch: ev.epoch,
+              summary: ev.summary,
+            });
+            ev.mergeKey = computeMergeKey({
+              sessionId: ev.sessionId,
+              agentId: ev.agentId,
+              kind: ev.kind,
+              toolCallId: ev.toolCallId,
+              toolName: ev.toolName,
+              epoch: ev.epoch,
+            });
+          }
+
+          const pendingQueue = this.pendingUnlinkedUuids.get(ev.sessionId);
+          let matchedPendingIdx = -1;
+          if (pendingQueue && pendingQueue.length > 0) {
+            matchedPendingIdx = pendingQueue.findIndex(
+              (p) =>
+                Math.abs(ev.epoch - p.epoch) <= 120 &&
+                (p.normLabels.some((nl) => spawnNorms.includes(nl)) ||
+                  (p.normLabels.length === 0 && pendingQueue.length === 1)),
+            );
+          }
+          if (pendingQueue && matchedPendingIdx >= 0) {
+            const [pending] = pendingQueue.splice(matchedPendingIdx, 1);
+            if (pendingQueue.length === 0) {
+              this.pendingUnlinkedUuids.delete(ev.sessionId);
+            }
+            if (pending) {
+              const resolvedLbl = label || pending.label;
+              this.recordCopilotUuidMapping(
+                ev.sessionId,
+                pending.uuid,
+                spawnId,
+                resolvedLbl,
+              );
+              this.migrateCopilotUuidEvents(
+                ev.sessionId,
+                pending.uuid,
+                spawnId,
+                resolvedLbl,
+              );
+              if (!pending.hasDone) {
+                openQueue.push({
+                  spawnId,
+                  normLabels: spawnNorms,
+                  label: resolvedLbl,
+                  epoch: ev.epoch,
+                  linkedUuid: pending.uuid,
+                });
+                this.setBoundedMapEntry(
+                  this.openUnlinkedSpawns,
+                  ev.sessionId,
+                  openQueue,
+                );
+              }
+            }
+          } else {
+            openQueue.push({
+              spawnId,
+              normLabels: spawnNorms,
+              label,
+              epoch: ev.epoch,
+            });
+            this.setBoundedMapEntry(
+              this.openUnlinkedSpawns,
+              ev.sessionId,
+              openQueue,
+            );
+          }
+        }
+      } else if (
+        ev.agentId !== "root" &&
+        isOpaqueAgentId(ev.agentId) &&
+        ev.ide === "copilot-vscode"
+      ) {
+        const existingMap = this.copilotUuidToSpawn
+          .get(ev.sessionId)
+          ?.get(ev.agentId);
+        if (existingMap) {
+          ev.agentId = existingMap.spawnId;
+          ev.parentAgentId = ev.parentAgentId || "root";
+          if (existingMap.label && (!ev.agentLabel || isOpaqueAgentId(ev.agentLabel))) {
+            ev.agentLabel = existingMap.label;
+          }
+          ev.mergeKey = computeMergeKey({
+            sessionId: ev.sessionId,
+            agentId: ev.agentId,
+            kind: ev.kind,
+            toolCallId: ev.toolCallId,
+            toolName: ev.toolName,
+            epoch: ev.epoch,
+          });
+        } else {
+          const openQueue = this.openUnlinkedSpawns.get(ev.sessionId);
+          const { label, normLabels } = this.extractCopilotSubagentLabels(ev);
+          const match = openQueue?.find(
+            (entry) =>
+              (!entry.linkedUuid || entry.linkedUuid === ev.agentId) &&
+              (normLabels.length > 0
+                ? normLabels.some((nl) => entry.normLabels.includes(nl))
+                : openQueue.length === 1),
+          );
+          if (match) {
+            match.linkedUuid = ev.agentId;
+            const resolvedLbl = match.label || label;
+            this.recordCopilotUuidMapping(
+              ev.sessionId,
+              ev.agentId,
+              match.spawnId,
+              resolvedLbl,
+            );
+            ev.agentId = match.spawnId;
+            ev.parentAgentId = ev.parentAgentId || "root";
+            if (resolvedLbl && (!ev.agentLabel || isOpaqueAgentId(ev.agentLabel))) {
+              ev.agentLabel = resolvedLbl;
+            }
+            ev.mergeKey = computeMergeKey({
+              sessionId: ev.sessionId,
+              agentId: ev.agentId,
+              kind: ev.kind,
+              toolCallId: ev.toolCallId,
+              toolName: ev.toolName,
+              epoch: ev.epoch,
+            });
+          } else {
+            const pQueue = this.pendingUnlinkedUuids.get(ev.sessionId) ?? [];
+            const prevPending = pQueue.find((p) => p.uuid === ev.agentId);
+            if (prevPending) {
+              if (!prevPending.label && label) prevPending.label = label;
+              for (const nl of normLabels) {
+                if (!prevPending.normLabels.includes(nl)) {
+                  prevPending.normLabels.push(nl);
+                }
+              }
+              this.setBoundedMapEntry(
+                this.pendingUnlinkedUuids,
+                ev.sessionId,
+                pQueue,
+              );
+            } else {
+              pQueue.push({
+                uuid: ev.agentId,
+                normLabels,
+                label,
+                epoch: ev.epoch,
+              });
+              this.setBoundedMapEntry(
+                this.pendingUnlinkedUuids,
+                ev.sessionId,
+                pQueue,
+              );
+            }
+          }
+        }
+      } else if (
+        ev.kind === "subagent_done" &&
+        ev.targetAgentId &&
+        ev.targetAgentId !== "root" &&
+        ev.targetAgentId !== "subagent"
+      ) {
+        const openQueue = this.openUnlinkedSpawns.get(ev.sessionId);
+        if (isOpaqueAgentId(ev.targetAgentId)) {
+          const uuid = ev.targetAgentId;
+          const existingMap = this.copilotUuidToSpawn
+            .get(ev.sessionId)
+            ?.get(uuid);
+          if (existingMap) {
+            ev.targetAgentId = existingMap.spawnId;
+            if (existingMap.label && ev.payload && !ev.payload.agentLabel) {
+              ev.payload = { ...ev.payload, agentLabel: existingMap.label };
+            }
+            ev.mergeKey = computeMergeKey({
+              sessionId: ev.sessionId,
+              agentId: ev.agentId,
+              kind: ev.kind,
+              toolCallId: ev.toolCallId,
+              toolName: ev.toolName,
+              epoch: ev.epoch,
+            });
+            if (openQueue) {
+              const qIdx = openQueue.findIndex(
+                (e) => e.spawnId === existingMap.spawnId,
+              );
+              if (qIdx >= 0) openQueue.splice(qIdx, 1);
+              if (openQueue.length === 0) {
+                this.openUnlinkedSpawns.delete(ev.sessionId);
+              }
+            }
+          } else if (openQueue && openQueue.length > 0) {
+            const { label, normLabels } = this.extractCopilotSubagentLabels(ev);
+            const qIdx = openQueue.findIndex(
+              (entry) =>
+                (!entry.linkedUuid || entry.linkedUuid === uuid) &&
+                (normLabels.length > 0
+                  ? normLabels.some((nl) => entry.normLabels.includes(nl))
+                  : openQueue.length === 1),
+            );
+            if (qIdx >= 0) {
+              const [entry] = openQueue.splice(qIdx, 1);
+              if (openQueue.length === 0) {
+                this.openUnlinkedSpawns.delete(ev.sessionId);
+              }
+              if (entry) {
+                const resolvedLbl = entry.label || label;
+                this.recordCopilotUuidMapping(
+                  ev.sessionId,
+                  uuid,
+                  entry.spawnId,
+                  resolvedLbl,
+                );
+                ev.targetAgentId = entry.spawnId;
+                if (resolvedLbl && ev.payload && !ev.payload.agentLabel) {
+                  ev.payload = { ...ev.payload, agentLabel: resolvedLbl };
+                }
+                ev.mergeKey = computeMergeKey({
+                  sessionId: ev.sessionId,
+                  agentId: ev.agentId,
+                  kind: ev.kind,
+                  toolCallId: ev.toolCallId,
+                  toolName: ev.toolName,
+                  epoch: ev.epoch,
+                });
+              }
+            }
+          } else if (ev.ide === "copilot-vscode") {
+            const { label, normLabels } = this.extractCopilotSubagentLabels(ev);
+            const pQueue = this.pendingUnlinkedUuids.get(ev.sessionId) ?? [];
+            const prevPending = pQueue.find((p) => p.uuid === uuid);
+            if (prevPending) {
+              prevPending.hasDone = true;
+              if (!prevPending.label && label) prevPending.label = label;
+              for (const nl of normLabels) {
+                if (!prevPending.normLabels.includes(nl)) {
+                  prevPending.normLabels.push(nl);
+                }
+              }
+              this.setBoundedMapEntry(
+                this.pendingUnlinkedUuids,
+                ev.sessionId,
+                pQueue,
+              );
+            } else {
+              pQueue.push({
+                uuid,
+                normLabels,
+                label,
+                epoch: ev.epoch,
+                hasDone: true,
+              });
+              this.setBoundedMapEntry(
+                this.pendingUnlinkedUuids,
+                ev.sessionId,
+                pQueue,
+              );
+            }
+          }
+        } else if (openQueue && openQueue.length > 0) {
+          const qIdx = openQueue.findIndex((e) => e.spawnId === ev.targetAgentId);
+          if (qIdx >= 0) {
+            openQueue.splice(qIdx, 1);
+            if (openQueue.length === 0) {
+              this.openUnlinkedSpawns.delete(ev.sessionId);
+            }
+          }
+        }
+      }
+
       // Register subagent-to-parent mapping on subagent_spawn and re-home any out-of-order orphan session
       if (ev.kind === "subagent_spawn" && ev.targetAgentId) {
         const rawSubId =
@@ -779,7 +1347,11 @@ export class PushBus extends EventEmitter {
           agentType,
         };
         if (ev.targetAgentId !== "subagent" && ev.targetAgentId !== "root") {
-          this.subagentToParent.set(ev.targetAgentId, mapping);
+          this.setBoundedMapEntry(
+            this.subagentToParent,
+            ev.targetAgentId,
+            mapping,
+          );
           this.recordAgentLabel(ev.sessionId, ev.targetAgentId, agentLabel);
           this.migrateOrphanSession(ev.targetAgentId, mapping);
         }
@@ -789,7 +1361,7 @@ export class PushBus extends EventEmitter {
           rawSubId !== "subagent" &&
           rawSubId !== "root"
         ) {
-          this.subagentToParent.set(rawSubId, mapping);
+          this.setBoundedMapEntry(this.subagentToParent, rawSubId, mapping);
           this.recordAgentLabel(ev.sessionId, rawSubId, agentLabel);
           this.migrateOrphanSession(rawSubId, mapping);
         }
@@ -881,6 +1453,7 @@ export class PushBus extends EventEmitter {
 
       accepted += 1;
       acceptedEvents.push(ev);
+      this.recordEventContextUsage(ev);
     }
 
     if (acceptedEvents.length > 0) {
@@ -896,6 +1469,204 @@ export class PushBus extends EventEmitter {
 
   getAllSessionIds(): string[] {
     return [...this.sessions.keys()];
+  }
+
+  private contextTrackerKey(sessionId: string, agentId: string): string {
+    return `${sessionId}\u001f${agentId || "root"}`;
+  }
+
+  private setContextTracker(key: string, state: AgentContextTrackerState): void {
+    if (this.contextTrackers.has(key)) {
+      this.contextTrackers.delete(key);
+    }
+    this.contextTrackers.set(key, state);
+    while (this.contextTrackers.size > MAX_CONTEXT_TRACKERS) {
+      const oldest = this.contextTrackers.keys().next().value;
+      if (oldest === undefined) break;
+      this.contextTrackers.delete(oldest);
+    }
+  }
+
+  private recordEventContextUsage(ev: EnrichedEvent): void {
+    const key = this.contextTrackerKey(ev.sessionId, ev.agentId);
+    const existing = this.contextTrackers.get(key) ?? {
+      contextTokens: 0,
+      lastAdvisedBand: "ok" as ContextBand,
+      updatedAtMs: Date.now(),
+    };
+
+    const uDelta = ev.usageDelta;
+    const rawModel =
+      uDelta?.model ??
+      (typeof ev.payload?.model === "string" && ev.payload.model.trim()
+        ? prettifyModelName(ev.payload.model) || ev.payload.model.trim()
+        : undefined);
+    if (rawModel) {
+      existing.model = rawModel;
+    }
+    if (ev.ide && ev.ide !== "unknown") {
+      existing.ide = ev.ide;
+    }
+    if (
+      typeof uDelta?.contextWindow === "number" &&
+      Number.isFinite(uDelta.contextWindow) &&
+      uDelta.contextWindow > 0
+    ) {
+      existing.contextWindow = Math.round(uDelta.contextWindow);
+    }
+    if (uDelta) {
+      const ctxTok =
+        typeof uDelta.contextTokens === "number" &&
+        Number.isFinite(uDelta.contextTokens)
+          ? Math.round(uDelta.contextTokens)
+          : typeof uDelta.inputTokens === "number"
+            ? Math.round(
+                uDelta.inputTokens +
+                  (uDelta.cachedTokens ?? 0) +
+                  (uDelta.outputTokens ?? 0),
+              )
+            : undefined;
+      if (ctxTok !== undefined && ctxTok >= 0) {
+        existing.contextTokens = ctxTok;
+      }
+    }
+    existing.updatedAtMs = Date.now();
+    this.setContextTracker(key, existing);
+  }
+
+  getAgentContextState(
+    sessionId: string,
+    agentId = "root",
+  ): AgentContextTrackerState | undefined {
+    const entry = this.contextTrackers.get(
+      this.contextTrackerKey(sessionId, agentId),
+    );
+    return entry ? { ...entry } : undefined;
+  }
+
+  markDeferredPreCompactAdvisory(sessionId: string, agentId = "root"): void {
+    const key = this.contextTrackerKey(sessionId, agentId);
+    const entry = this.contextTrackers.get(key);
+    if (entry) {
+      entry.pendingDeferredAdvisory = true;
+      this.setContextTracker(key, entry);
+    }
+  }
+
+  consumeDeferredPreCompactAdvisory(
+    sessionId: string,
+    agentId = "root",
+  ): boolean {
+    const key = this.contextTrackerKey(sessionId, agentId);
+    const entry = this.contextTrackers.get(key);
+    if (!entry?.pendingDeferredAdvisory) return false;
+    entry.pendingDeferredAdvisory = false;
+    this.setContextTracker(key, entry);
+    return true;
+  }
+
+  evaluateContextAdvisory(params: {
+    sessionId: string;
+    agentId?: string;
+    ide?: IdeSource;
+    model?: string;
+    contextTokens?: number;
+    contextWindow?: number;
+    isPreCompact?: boolean;
+    thresholds?: Partial<ContextThresholdConfig>;
+    modelContextWindows?: Record<string, number>;
+  }): ContextAdvisory | null {
+    const agentId = params.agentId?.trim() || "root";
+    const key = this.contextTrackerKey(params.sessionId, agentId);
+    const tracker = this.contextTrackers.get(key) ?? {
+      contextTokens: 0,
+      lastAdvisedBand: "ok" as ContextBand,
+      updatedAtMs: Date.now(),
+    };
+
+    const warnPercent =
+      params.thresholds?.warnPercent ?? DEFAULT_CONTEXT_THRESHOLDS.warnPercent;
+    const handoffPercent =
+      params.thresholds?.handoffPercent ??
+      DEFAULT_CONTEXT_THRESHOLDS.handoffPercent;
+    const compactPercent =
+      params.thresholds?.compactPercent ??
+      DEFAULT_CONTEXT_THRESHOLDS.compactPercent;
+
+    const model = params.model ?? tracker.model ?? "unknown";
+    const ide = params.ide ?? tracker.ide;
+    const contextTokens = Math.max(
+      0,
+      Math.round(params.contextTokens ?? tracker.contextTokens ?? 0),
+    );
+    const contextWindow =
+      (typeof params.contextWindow === "number" &&
+      Number.isFinite(params.contextWindow) &&
+      params.contextWindow > 0
+        ? Math.round(params.contextWindow)
+        : undefined) ??
+      tracker.contextWindow ??
+      lookupModelContextWindow(model, params.modelContextWindows) ??
+      inferContextWindow(model, ide);
+
+    const rawPct = contextWindow > 0 ? (contextTokens / contextWindow) * 100 : 0;
+    const contextPercent = Math.min(100, Math.round(rawPct * 10) / 10);
+
+    let band: ContextBand = "ok";
+    if (params.isPreCompact || contextPercent >= compactPercent) {
+      band = "compact";
+    } else if (contextPercent >= handoffPercent) {
+      band = "handoff";
+    } else if (contextPercent >= warnPercent) {
+      band = "warn";
+    }
+
+    tracker.contextTokens = Math.max(tracker.contextTokens, contextTokens);
+    tracker.contextWindow = contextWindow;
+    if (model && model !== "unknown") tracker.model = model;
+    if (ide && ide !== "unknown") tracker.ide = ide;
+    tracker.updatedAtMs = Date.now();
+
+    if (band === "ok") {
+      // Allow re-advising if a session genuinely compacted back well below warnPercent.
+      if (contextPercent < Math.max(0, warnPercent - 5)) {
+        tracker.lastAdvisedBand = "ok";
+      }
+      this.setContextTracker(key, tracker);
+      return null;
+    }
+
+    const shouldEmit =
+      Boolean(params.isPreCompact) ||
+      CONTEXT_BAND_RANK[band] > CONTEXT_BAND_RANK[tracker.lastAdvisedBand];
+
+    if (!shouldEmit) {
+      this.setContextTracker(key, tracker);
+      return null;
+    }
+
+    if (CONTEXT_BAND_RANK[band] > CONTEXT_BAND_RANK[tracker.lastAdvisedBand]) {
+      tracker.lastAdvisedBand = band;
+    }
+    this.setContextTracker(key, tracker);
+
+    return {
+      band,
+      sessionId: params.sessionId,
+      agentId,
+      contextTokens,
+      contextWindow,
+      contextPercent,
+      ...(model && model !== "unknown" ? { model } : {}),
+      ...(params.isPreCompact ? { isPreCompact: true } : {}),
+      message: buildContextAdvisoryMessage({
+        band,
+        contextPercent,
+        contextWindow,
+        handoffPercent,
+        isPreCompact: params.isPreCompact,
+      }),
+    };
   }
 
   discoverPushSessions(): DiscoveredSession[] {

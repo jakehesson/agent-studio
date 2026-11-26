@@ -11,8 +11,16 @@ import {
   applyHostStyleVariables,
   type McpUiHostContext,
 } from "@modelcontextprotocol/ext-apps";
-import { setMcpAppTransport, type McpAppClientLike } from "./api.js";
+import {
+  cleanMcpArgs,
+  extractMcpResultPayload,
+  setMcpAppTransport,
+  setMcpChatLoader,
+  withMcpConcurrencySlot,
+  type McpAppClientLike,
+} from "./api.js";
 import { AgentStudioApp, type StudioExternalDirective } from "./app.js";
+import { copyTextSafe } from "./utils.js";
 
 function extractDirective(raw: unknown): StudioExternalDirective {
   if (!raw || typeof raw !== "object" || Array.isArray(raw)) return {};
@@ -41,8 +49,25 @@ async function bootMcpApp(): Promise<void> {
   const mountEl = document.getElementById("app");
   if (!mountEl) return;
 
-  const mcpApp = new App({ name: "Agent Studio", version: "0.12.0" }, {});
+  const mcpApp = new App({ name: "Agent Studio", version: "0.14.0" }, {});
   setMcpAppTransport(mcpApp as unknown as McpAppClientLike);
+  setMcpChatLoader(async (params) =>
+    withMcpConcurrencySlot(async () => {
+      const res = await mcpApp.callServerTool({
+        name: "app_get_chat",
+        arguments: cleanMcpArgs({
+          session: params.session,
+          agent: params.agent,
+          ide: params.ide && params.ide !== "all" ? params.ide : undefined,
+          project: params.project,
+          workspace: params.workspace,
+          limit: params.limit,
+          before: params.before,
+        }),
+      });
+      return extractMcpResultPayload<unknown>(res, "app_get_chat");
+    })
+  );
 
   let studioApp: AgentStudioApp | null = null;
   let pendingDirective: StudioExternalDirective = {};
@@ -129,6 +154,41 @@ async function bootMcpApp(): Promise<void> {
       pendingDirective.view === "studio"
         ? pendingDirective.view
         : "studio",
+    getReplyCapabilities: () => ({
+      canSendMessage: Boolean(mcpApp.getHostCapabilities()?.message),
+      isMcpApp: true,
+      isEmbed: false,
+    }),
+    onReplyToHost: async (req) => {
+      const canSend = Boolean(mcpApp.getHostCapabilities()?.message) && !req.blockingToolCall;
+      if (canSend) {
+        try {
+          const res = await mcpApp.sendMessage({
+            role: "user",
+            content: [{ type: "text", text: req.text }],
+          });
+          if (!res?.isError) {
+            return {
+              ok: true,
+              mode: "sent",
+              message: "Answer sent to chat.",
+            };
+          }
+        } catch {
+          // Fall through to clipboard fallback
+        }
+      }
+      const copied = await copyTextSafe(req.text);
+      return {
+        ok: copied,
+        mode: "copied",
+        message: copied
+          ? req.blockingToolCall
+            ? "Copied answer — paste into your active IDE prompt to respond."
+            : "Copied answer — paste into your chat to respond."
+          : "Could not send or copy answer — please copy manually.",
+      };
+    },
   });
 
   if (pendingDirective.snapshot) {

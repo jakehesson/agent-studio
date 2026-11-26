@@ -15,7 +15,7 @@ function readExtensionVersion(): string {
   } catch {
     // Fall back to current release version if package.json is unavailable
   }
-  return "0.12.0";
+  return "0.14.0";
 }
 
 interface McpProviderLike {
@@ -56,7 +56,7 @@ export function registerMcpProvider(
 
   if (typeof registerFn !== "function" || typeof StdioCtor !== "function") {
     output.appendLine(
-      "[mcp] Host IDE does not expose vscode.lm.registerMcpServerDefinitionProvider; using project .mcp.json / .vscode/mcp.json configs instead.",
+      "[mcp] Host IDE does not expose vscode.lm.registerMcpServerDefinitionProvider; using workspace .mcp.json instead.",
     );
     return new vscode.Disposable(() => undefined);
   }

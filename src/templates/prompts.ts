@@ -79,14 +79,21 @@ export function renderOrchestratorPrompt(manifest: TeamManifest): string {
     "",
     renderRoleTierTable(manifest),
     "",
+    "## Routing, Decomposition & Validation Discipline",
+    "- **Ordered Routing & Expected Cost:** Apply `skills/model-routing` (`Accuracy -> Cost -> Speed`, hard constraints + validated smart zone first, then `expected_cost = initial_cost + retry_probability * retry_cost + review_cost`) when selecting or overriding subagent models without an active host/user override. Consult `skills/model-routing/SKILL.md` whenever producing a structured routing decision JSON or editing `.agent-team/model-index.json`.",
+    "- **Anti-Over-Delegation & Tier Discipline:** Reserve `reasoning` models for planning, integration, architecture/code review, and hard exceptions; prefer a single bounded call over multi-agent fanout whenever cohesive and more economical; keep parallel write scopes disjoint and never duplicate the same large context across redundant workers.",
+    "- **Smart-Zone Decomposition & Complete Handoffs:** Target `<= 40%` smart zone per subagent. When work exceeds the smart zone or returns `HANDOFF_PENDING` / `SPLIT_PENDING`, require complete DevOps handoff fields (`objective`, `summary`/`completed_work`, `evidence`, `decisions`, `assumptions`, `unresolved_issues`, `modified_files`/`artifacts`, `verified_checks`/`validation_results`, `remaining_work` + `continuation_brief`/`next_steps`) via `board { op: \"handoff\" }` or decompose via `board { op: \"split\" }` before dispatching a fresh context.",
+    "- **Rerouting, Validation & Approval Gates:** Keep stable assignments across routine successful phases; consult `skills/model-routing` to re-route only on material triggers (context `> +25%`, drift/compact zone, new modality/tool, model unavailable, 2x validation failure, repeated tool failures, tighter privacy, higher blast radius, scope change, incomplete handoff, stale/conflicting catalog). Require validation (`code-reviewer` / `qa-validator` / check evidence) before accepting worker output, require explicit user approval before consequential or irreversible actions, and stop/escalate when no eligible model meets hard constraints or `confidence < 0.7`.",
+    "",
     "## Dispatch Loop",
     `1. Call \`board\` with \`{ project: "${manifest.project.id}", op: "status" }\` to inspect active sprint progress, open bugs, and ready items.`,
     `2. Call \`board\` with \`{ project: "${manifest.project.id}", op: "next" }\` to identify the highest-priority unblocked item (prioritize S1/S2 bugs).`,
     "3. Move the selected item to `design` or `dev`, assign its owner, and dispatch the right specialist with a concise brief:",
     `   \`PROJECT ${manifest.project.id} | ITEM <ID> | SCOPE <files> | ACCEPTANCE <criteria>\``,
     "4. When parallel specialists work concurrently, enforce **strict non-overlapping write scopes**.",
-    "5. After implementation finishes, verify the item is in `test` and dispatch `code-reviewer` for non-trivial code changes (security, architecture, concurrency, coverage) before or alongside `qa-validator` running verification checkpoints and recording a `testrun`.",
-    "6. Only transition `test -> done` after a closed, passing `testrun` covers the item's required suite.",
+    "5. **Context-Budget Handoff & Task Splitting:** If an item returns `HANDOFF_PENDING` (or `board { op: \"status\" }` shows `[HANDOFF_PENDING]`), spawn a fresh subagent briefed solely with `board { op: \"show\", itemId }`. If it returns `SPLIT_PENDING` (`[SPLIT_PENDING]`), run `board { op: \"split\", itemId }` to atomically create child tasks and dispatch each child to a fresh subagent.",
+    "6. After implementation finishes, verify the item is in `test` and dispatch `code-reviewer` for non-trivial code changes (security, architecture, concurrency, coverage) before or alongside `qa-validator` running verification checkpoints and recording a `testrun`.",
+    "7. Only transition `test -> done` after a closed, passing `testrun` covers the item's required suite.",
     "",
   ].join("\n");
 }
@@ -130,6 +137,7 @@ export function renderBackendEngineerPrompt(manifest: TeamManifest): string {
     "1. Run static checks and unit tests for your modified modules.",
     "2. Summarize changed files and verification results in a board note.",
     "3. Move the item to `test` for `qa-validator` review and report back to `orchestrator`.",
+    "4. **Context-Budget Handoff (`>= 55%` / `PreCompact`):** If context approaches Drift (`55%`) or `PreCompact` fires, pause new exploration, checkpoint via `board { op: \"handoff\", kind: \"fresh_context\" | \"task_split\", ... }`, and return `ITEM <ID> | HANDOFF_PENDING` (or `SPLIT_PENDING`).",
     "",
   ].join("\n");
 }
@@ -150,6 +158,7 @@ export function renderFrontendEngineerPrompt(manifest: TeamManifest): string {
     "1. Verify builds, typechecks, and zero runtime console errors.",
     "2. Summarize UI changes and responsive verification in a board note.",
     "3. Move the item to `test` for `qa-validator` verification and report back to `orchestrator`.",
+    "4. **Context-Budget Handoff (`>= 55%` / `PreCompact`):** If context approaches Drift (`55%`) or `PreCompact` fires, pause new exploration, checkpoint via `board { op: \"handoff\", kind: \"fresh_context\" | \"task_split\", ... }`, and return `ITEM <ID> | HANDOFF_PENDING` (or `SPLIT_PENDING`).",
     "",
   ].join("\n");
 }
@@ -216,7 +225,7 @@ export function renderCodeReviewerPrompt(
     "  3. **Architecture Conformance**",
     "  4. **Performance, Resource & Concurrency Safety**",
     "  5. **Test Coverage & Edge Cases**",
-    "- **Read-Only Sandbox:** Use shell tools (`run_command` / `Bash` / `execute/runInTerminal`) strictly for read-only inspection (`git diff`, `git status`, `rg`/`Select-String`, typecheck, linter, and targeted test execution). **NEVER modify repository source files, tests, docs, or `pipeline/board.json` directly.**",
+    "- **Read-Only Sandbox:** Use shell tools (`run_command` / `Bash` / `execute`) strictly for read-only inspection (`git diff`, `git status`, `rg`/`Select-String`, typecheck, linter, and targeted test execution). **NEVER modify repository source files, tests, docs, or `pipeline/board.json` directly.**",
     "- Do not close QA gate `testrun`s (that belongs exclusively to `qa-validator`).",
     "",
     ...baselineLines,
@@ -314,7 +323,7 @@ export function renderTeamSetupPrompt(manifest?: TeamManifest): string {
     "  ```bash",
     "  agent-studio serve --open",
     "  ```",
-    "- Summarize all generated/updated files and show how to invoke `orchestrator` in each enabled IDE (Antigravity plugin, Claude Code `@orchestrator` / `Agent`, VS Code Copilot Chat agent dropdown with handoff buttons).",
+    "- Summarize all generated/updated files and show how to invoke `orchestrator` in each enabled IDE (Antigravity plugin, Claude Code `@orchestrator` / `Agent`, VS Code Copilot Chat agent dropdown / `agent` tool).",
     "",
   ].join("\n");
 }

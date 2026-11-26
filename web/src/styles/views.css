@@ -99,6 +99,14 @@
   gap: 8px;
 }
 
+.kpi-strip.has-handoff-kpi {
+  grid-template-columns: repeat(5, minmax(0, 1fr));
+}
+
+.kpi-card-handoff {
+  border-color: rgba(245, 158, 11, 0.45);
+}
+
 .kpi-card {
   background: #0a0f1a;
   border: 1px solid var(--border);
@@ -106,6 +114,7 @@
   padding: 8px 11px;
   display: flex;
   flex-direction: column;
+  justify-content: space-between;
   gap: 2px;
 }
 
@@ -267,6 +276,192 @@
 
 .k-card.type-bug {
   border-left: 3px solid var(--rose);
+}
+
+.k-card.has-handoff {
+  border-color: rgba(245, 158, 11, 0.5);
+}
+
+.handoff-badge {
+  display: inline-flex;
+  align-items: center;
+  font-size: 9.5px;
+  font-weight: 800;
+  letter-spacing: 0.04em;
+  padding: 1px 6px;
+  border-radius: 99px;
+  border: 1px solid transparent;
+  white-space: nowrap;
+}
+
+.handoff-badge.handoff-pending {
+  background: rgba(245, 158, 11, 0.22);
+  border-color: rgba(245, 158, 11, 0.5);
+  color: #fde68a;
+}
+
+.handoff-badge.handoff-split {
+  background: rgba(168, 85, 247, 0.22);
+  border-color: rgba(192, 132, 252, 0.5);
+  color: #e9d5ff;
+}
+
+.handoff-badge.handoff-resumed {
+  background: rgba(16, 185, 129, 0.18);
+  border-color: rgba(16, 185, 129, 0.45);
+  color: #6ee7b7;
+}
+
+.handoff-badge.handoff-cleared {
+  background: rgba(148, 163, 184, 0.18);
+  border-color: rgba(148, 163, 184, 0.4);
+  color: #cbd5e1;
+}
+
+.split-parent-btn {
+  cursor: pointer;
+  min-block-size: var(--target-size);
+  display: inline-flex;
+  align-items: center;
+}
+
+.split-parent-btn:hover {
+  border-color: var(--sky);
+  background: rgba(56, 189, 248, 0.22);
+  color: #ffffff;
+}
+
+.split-parent-btn:focus-visible {
+  outline: 2px solid var(--sky);
+  outline-offset: 2px;
+}
+
+.handoff-brief-box {
+  background: #0a0f1a;
+  border: 1px solid rgba(245, 158, 11, 0.36);
+  border-radius: 9px;
+  padding: 9px 11px;
+  display: flex;
+  flex-direction: column;
+  gap: 7px;
+  min-width: 0;
+}
+
+.handoff-brief-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 6px;
+  flex-wrap: wrap;
+}
+
+.handoff-brief-title {
+  margin-top: 0 !important;
+  color: #fde68a !important;
+}
+
+.handoff-brief-badges {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  flex-wrap: wrap;
+}
+
+.handoff-brief-meta {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px 12px;
+  font-size: 11px;
+  color: var(--muted);
+}
+
+.handoff-brief-meta b {
+  color: var(--text-strong);
+}
+
+.handoff-summary {
+  margin: 0;
+  font-size: 12px;
+  line-height: 1.45;
+  color: var(--text);
+  overflow-wrap: anywhere;
+}
+
+.handoff-continuation {
+  background: #070b14;
+  border: 1px solid var(--border);
+  border-radius: 7px;
+  padding: 7px 9px;
+  font-size: 11.5px;
+  line-height: 1.45;
+  color: #dbe6f6;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+.handoff-objective {
+  margin: 0;
+  font-size: 12px;
+  font-weight: 550;
+  line-height: 1.45;
+  color: var(--text-strong);
+  overflow-wrap: anywhere;
+}
+
+.handoff-brief-box .item-list li,
+.handoff-evidence-list li {
+  overflow-wrap: anywhere;
+}
+
+.handoff-issues-hdr {
+  color: #fda4af !important;
+}
+
+.handoff-issues-list {
+  background: rgba(244, 63, 94, 0.08);
+  border: 1px solid rgba(244, 63, 94, 0.28);
+  border-radius: 7px;
+  padding: 7px 10px 7px 26px;
+}
+
+.handoff-file-list code {
+  font-size: 11px;
+  overflow-wrap: anywhere;
+}
+
+.split-proposals-list {
+  display: flex;
+  flex-direction: column;
+  gap: 7px;
+}
+
+.split-proposal-card {
+  background: var(--panel-2);
+  border: 1px solid var(--border);
+  border-radius: 7px;
+  padding: 8px 9px;
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+  min-width: 0;
+}
+
+.split-proposal-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  flex-wrap: wrap;
+  font-size: 12px;
+  color: var(--text-strong);
+}
+
+.split-proposal-rationale {
+  margin: 0;
+  font-size: 11.5px;
+  color: var(--muted);
+  line-height: 1.4;
+  overflow-wrap: anywhere;
 }
 
 .k-card-top {
@@ -502,6 +697,12 @@
   background: rgba(244, 63, 94, 0.12);
   border-color: rgba(244, 63, 94, 0.4);
   color: #fecdd3;
+}
+
+.issue-row.info {
+  background: rgba(56, 189, 248, 0.12);
+  border-color: rgba(56, 189, 248, 0.36);
+  color: #bae6fd;
 }
 
 /* ---------- Mockups View ---------- */
@@ -2421,6 +2622,15 @@
   justify-content: flex-end;
 }
 
+.model-catalog-card.is-deprecated {
+  border-style: dashed;
+}
+
+.mi-deprecated-pill {
+  text-transform: uppercase;
+  letter-spacing: 0.03em;
+}
+
 .mi-cat-meta {
   display: flex;
   align-items: center;
@@ -2596,6 +2806,81 @@
   align-items: center;
   justify-content: space-between;
   gap: 6px;
+}
+
+/* Doctor Migration & Upgrade Advisories */
+.migration-warnings-card {
+  container-type: inline-size;
+  container-name: migration;
+}
+
+.migration-warnings-card .card-head {
+  gap: 10px;
+}
+
+.migration-warnings-intro {
+  margin: 0;
+  font-size: 12px;
+  line-height: 1.45;
+  overflow-wrap: break-word;
+}
+
+.migration-warnings-ul {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.migration-warning-item {
+  min-width: 0;
+}
+
+.migration-warning-body {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.migration-warning-head {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.migration-warning-path,
+.migration-warning-fix code {
+  overflow-wrap: anywhere;
+}
+
+.migration-warning-msg {
+  overflow-wrap: break-word;
+  line-height: 1.45;
+}
+
+.migration-warning-fix {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-top: 2px;
+}
+
+@container migration (inline-size < 430px) {
+  .migration-warning-item {
+    flex-direction: column;
+    gap: 5px;
+  }
+
+  .migration-warnings-card .card-head {
+    flex-wrap: wrap;
+  }
 }
 
 @media (forced-colors: active) {

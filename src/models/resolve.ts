@@ -5,14 +5,18 @@ import {
   type ModelRoutingPolicy,
   type ModelTier,
 } from "../schema/model-index.js";
-import type {
-  IdeModelOverride,
-  IdeTarget,
-  RosterEntry,
-  TeamManifest,
-  WorkflowModelRouting,
+import {
+  resolveCopilotHarness,
+  type IdeModelOverride,
+  type IdeTarget,
+  type RosterEntry,
+  type TeamManifest,
+  type WorkflowModelRouting,
 } from "../schema/team.js";
-import { defaultTierForRoleType } from "./defaults.js";
+import {
+  defaultTierForRoleType,
+  normalizeLegacyCopilotModelId,
+} from "./defaults.js";
 
 const ALL_IDES: IdeTarget[] = ["antigravity", "claude-code", "copilot-vscode"];
 
@@ -226,11 +230,18 @@ export function resolveRoleModel(
     };
   }
 
+  const harness = resolveCopilotHarness(manifest);
+  const normalizeCopilotId = (id: string): string =>
+    ide === "copilot-vscode" && harness === "copilot"
+      ? normalizeLegacyCopilotModelId(id)
+      : id;
+
   // 3. pinned policy
   if (policy === "pinned") {
     if (ide === "copilot-vscode") {
-      const pinnedPrimary =
-        override?.primary ?? override?.fallback?.[0] ?? tierBinding.primary;
+      const pinnedPrimary = normalizeCopilotId(
+        override?.primary ?? override?.fallback?.[0] ?? tierBinding.primary,
+      );
       const copilotPolicy = override?.copilotPolicy ?? "required";
       return {
         ide,
@@ -265,66 +276,88 @@ export function resolveRoleModel(
   }
 
   // 4. prefer-fallback policy (default)
-  if (ide === "copilot-vscode") {
-    const copilotPolicy = override?.copilotPolicy ?? "preferred";
-    if (override?.kind === "string" && override.primary) {
+  const respectBuiltIn =
+    manifest.workflow.modelRouting?.respectBuiltInOrchestrators ?? true;
+  const roleRec = modelIndex.roleRecommendations[role.id];
+  if (!override && respectBuiltIn && roleRec?.deferToHostOrchestrator) {
+    if (ide === "copilot-vscode") {
       return {
         ide,
         roleId: role.id,
         tier,
         policy,
-        frontmatterModel: override.primary,
-        primaryModel: override.primary,
-        fallbackModels: [override.primary],
+        primaryModel: "",
+        fallbackModels: [],
+        omit: true,
+        source: effectiveSource,
+      };
+    }
+    return {
+      ide,
+      roleId: role.id,
+      tier,
+      policy,
+      frontmatterModel: "inherit",
+      primaryModel: "inherit",
+      fallbackModels: ["inherit"],
+      omit: false,
+      source: effectiveSource,
+    };
+  }
+
+  if (ide === "copilot-vscode") {
+    const copilotPolicy = override?.copilotPolicy ?? "preferred";
+    if (override?.kind === "string" && override.primary) {
+      const primary = normalizeCopilotId(override.primary);
+      return {
+        ide,
+        roleId: role.id,
+        tier,
+        policy,
+        frontmatterModel: primary,
+        primaryModel: primary,
+        fallbackModels: [primary],
         copilotPolicy,
         omit: false,
         source: effectiveSource,
       };
     }
-    const orderedList = override
-      ? dedupeStrings([
-          ...(override.primary ? [override.primary] : []),
-          ...(override.fallback ?? []),
-        ])
-      : dedupeStrings([tierBinding.primary, ...tierBinding.fallback]);
+    const unavailableIds = new Set(
+      modelIndex.ides[ide].catalog
+        .filter((entry) => entry.available === false)
+        .map((entry) => normalizeCopilotId(entry.id)),
+    );
+    const orderedList = (
+      override
+        ? dedupeStrings([
+            ...(override.primary ? [override.primary] : []),
+            ...(override.fallback ?? []),
+          ])
+        : dedupeStrings([tierBinding.primary, ...tierBinding.fallback])
+    ).map(normalizeCopilotId);
+    const dedupedOrdered = dedupeStrings(orderedList);
+    const availableOrdered = dedupedOrdered.filter(
+      (id) => !unavailableIds.has(id),
+    );
+    const fallbackPrimary = normalizeCopilotId(tierBinding.primary);
     const finalArray =
-      orderedList.length > 0 ? orderedList : [tierBinding.primary];
+      availableOrdered.length > 0
+        ? availableOrdered
+        : dedupedOrdered.length > 0
+          ? dedupedOrdered
+          : [fallbackPrimary];
     return {
       ide,
       roleId: role.id,
       tier,
       policy,
       frontmatterModel: finalArray,
-      primaryModel: finalArray[0] ?? tierBinding.primary,
+      primaryModel: finalArray[0] ?? fallbackPrimary,
       fallbackModels: finalArray,
       copilotPolicy,
       omit: false,
       source: effectiveSource,
     };
-  }
-
-  // Antigravity & Claude Code under prefer-fallback
-  if (ide === "antigravity") {
-    const respectBuiltIn =
-      manifest.workflow.modelRouting?.respectBuiltInOrchestrators ?? true;
-    const roleRec = modelIndex.roleRecommendations[role.id];
-    if (
-      !override &&
-      respectBuiltIn &&
-      roleRec?.deferToHostOrchestrator
-    ) {
-      return {
-        ide,
-        roleId: role.id,
-        tier,
-        policy,
-        frontmatterModel: "inherit",
-        primaryModel: "inherit",
-        fallbackModels: ["inherit"],
-        omit: false,
-        source: effectiveSource,
-      };
-    }
   }
 
   const resolvedPrimary =

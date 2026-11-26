@@ -7,6 +7,7 @@ import { StatusBarManager } from "./statusBar";
 import {
   StudioPanel,
   StudioSidebarProvider,
+  type StudioPanelOpenOptions,
   type StudioViewName,
 } from "./webviewProvider";
 
@@ -56,22 +57,33 @@ export function activate(context: vscode.ExtensionContext): void {
 
   const openView = async (
     view: StudioViewName,
-    sessionId?: string,
+    opts?: string | StudioPanelOpenOptions,
   ): Promise<void> => {
-    await StudioPanel.createOrShow(manager, view, sessionId);
+    await StudioPanel.createOrShow(manager, view, opts);
     void sidebarProvider.refresh();
     void statusBar.poll();
   };
 
   context.subscriptions.push(
-    vscode.commands.registerCommand("agentStudio.openStudio", (sessionId?: unknown) =>
-      openView(
-        "studio",
-        typeof sessionId === "string" && sessionId.trim()
-          ? sessionId.trim()
-          : undefined,
-      ),
-    ),
+    vscode.commands.registerCommand("agentStudio.openStudio", (arg?: unknown) => {
+      if (typeof arg === "string" && arg.trim()) {
+        return openView("studio", { sessionId: arg.trim() });
+      }
+      if (arg && typeof arg === "object" && !Array.isArray(arg)) {
+        const raw = arg as Record<string, unknown>;
+        const sessionId =
+          typeof raw.sessionId === "string" && raw.sessionId.trim()
+            ? raw.sessionId.trim()
+            : undefined;
+        const openWaiting = raw.openWaiting === true ? true : undefined;
+        const openChatAgentId =
+          typeof raw.openChatAgentId === "string" && raw.openChatAgentId.trim()
+            ? raw.openChatAgentId.trim()
+            : undefined;
+        return openView("studio", { sessionId, openWaiting, openChatAgentId });
+      }
+      return openView("studio");
+    }),
     vscode.commands.registerCommand("agentStudio.openBoard", () =>
       openView("board"),
     ),
@@ -112,7 +124,7 @@ export function activate(context: vscode.ExtensionContext): void {
           },
           {
             label: "GitHub Copilot / VS Code",
-            description: ".github/agents/, .vscode/mcp.json, hooks",
+            description: ".github/agents/, .mcp.json, hooks",
             ide: "copilot-vscode",
             picked: hostIde === "copilot-vscode",
           },

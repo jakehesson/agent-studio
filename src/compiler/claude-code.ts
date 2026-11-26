@@ -4,7 +4,10 @@ import {
   DEFAULT_MODEL_INDEX,
   type ModelIndex,
 } from "../schema/model-index.js";
-import type { TeamManifest } from "../schema/team.js";
+import {
+  resolveCopilotHarness,
+  type TeamManifest,
+} from "../schema/team.js";
 import {
   mapCapabilitiesToClaudeCode,
   resolveEffectiveCapabilities,
@@ -29,6 +32,7 @@ export const CLAUDE_HOOK_EVENTS = [
   "PreToolUse",
   "PostToolUse",
   "PostToolUseFailure",
+  "PreCompact",
   "SubagentStart",
   "SubagentStop",
   "Stop",
@@ -117,13 +121,21 @@ export function compileClaudeCode(
     blockContent: renderSharedTeamRules(manifest, modelIndex),
   });
 
+  const includeCopilotMcpTools =
+    manifest.targets.includes("copilot-vscode") &&
+    resolveCopilotHarness(manifest) === "copilot";
+
   files.push({
     relPath: ".mcp.json",
     ide: "claude-code",
     kind: "json-merge",
     patch: {
       mcpServers: {
-        "agent-studio": buildPortableMcpSpec(),
+        "agent-studio": {
+          type: "stdio",
+          ...buildPortableMcpSpec(),
+          ...(includeCopilotMcpTools ? { tools: ["*"] } : {}),
+        },
       },
     },
   });

@@ -6,7 +6,7 @@ import type {
   RegisteredProject,
   TestrunRecord,
 } from "../types.js";
-import { escHtml, trunc } from "../utils.js";
+import { escHtml, fmtContextWindow, fmtTokens, trunc } from "../utils.js";
 
 const KANBAN_COLUMNS: Array<{ state: BoardState; label: string; accent: string }> = [
   { state: "ready", label: "Ready", accent: "#64748b" },
@@ -139,6 +139,12 @@ export class AgileBoardView {
     const checkpoints = this.collectCheckpoints(board.suites, testruns);
     const projectId = this.data?.project || board.project || this.currentProject;
 
+    const pendingHandoffCount = sprintItems.filter(
+      (it) =>
+        it.handoff?.status === "pending_handoff" ||
+        it.handoff?.status === "pending_split"
+    ).length;
+
     const selectedItem =
       sprintItems.find((i) => i.id === this.selectedItemId) ??
       items.find((i) => i.id === this.selectedItemId) ??
@@ -166,11 +172,16 @@ export class AgileBoardView {
             </div>
           </div>
 
-          <div class="kpi-strip" aria-label="Sprint metrics">
+          <div class="kpi-strip ${pendingHandoffCount > 0 ? "has-handoff-kpi" : ""}" aria-label="Sprint metrics">
             <div class="kpi-card"><span>In Progress</span><b>${(counts.design ?? 0) + (counts.dev ?? 0)}</b></div>
             <div class="kpi-card"><span>In QA / Test</span><b>${counts.test ?? 0}</b></div>
             <div class="kpi-card"><span>Done</span><b class="kpi-ok">${counts.done ?? 0}</b></div>
             <div class="kpi-card"><span>Open Bugs</span><b class="${openBugs.length > 0 ? "kpi-err" : "kpi-ok"}">${openBugs.length}</b></div>
+            ${
+              pendingHandoffCount > 0
+                ? `<div class="kpi-card kpi-card-handoff"><span>Pending Handoff</span><b class="kpi-warn">${pendingHandoffCount}</b></div>`
+                : ""
+            }
           </div>
         </div>
 
@@ -224,7 +235,7 @@ export class AgileBoardView {
           <aside class="board-side-col">
             ${
               selectedItem
-                ? this.renderItemDetail(selectedItem)
+                ? this.renderItemDetail(selectedItem, items)
                 : `<section class="card board-panel">
                     <div class="card-head"><span class="card-title">Item Inspector</span></div>
                     <div class="board-panel-body muted">Click any Kanban card or bug to view acceptance criteria, dependencies, and notes.</div>
@@ -302,22 +313,31 @@ export class AgileBoardView {
 
   private renderKanbanCard(item: BoardItem, selected: boolean): string {
     const deps = item.deps ?? [];
+    const hStatus = item.handoff?.status;
+    const handoffBadgeHtml =
+      hStatus === "pending_handoff"
+        ? `<span class="handoff-badge handoff-pending">HANDOFF</span>`
+        : hStatus === "pending_split"
+          ? `<span class="handoff-badge handoff-split">SPLIT</span>`
+          : "";
     return `
       <button
         type="button"
-        class="k-card ${selected ? "selected" : ""} type-${escHtml(item.type)}"
+        class="k-card ${selected ? "selected" : ""} type-${escHtml(item.type)} ${hStatus === "pending_handoff" || hStatus === "pending_split" ? "has-handoff" : ""}"
         data-item-id="${escHtml(item.id)}"
       >
         <div class="k-card-top">
           <span class="k-id">${escHtml(item.id)}</span>
           ${item.severity ? `<span class="sev-badge sev-${escHtml(item.severity.toLowerCase())}">${escHtml(item.severity)}</span>` : ""}
+          ${handoffBadgeHtml}
           <span class="k-role">${escHtml(item.role)}</span>
         </div>
         <div class="k-title">${escHtml(item.title)}</div>
         ${
-          deps.length > 0 || item.owner
+          deps.length > 0 || item.owner || item.split_from
             ? `<div class="k-meta">
                 ${item.owner ? `<span class="k-owner">@${escHtml(item.owner)}</span>` : ""}
+                ${item.split_from ? `<span class="dep-tag split-origin-tag">↳ split from ${escHtml(item.split_from)}</span>` : ""}
                 ${deps.map((d) => `<span class="dep-tag">↳ ${escHtml(d)}</span>`).join("")}
               </div>`
             : ""
@@ -326,10 +346,14 @@ export class AgileBoardView {
     `;
   }
 
-  private renderItemDetail(item: BoardItem): string {
+  private renderItemDetail(item: BoardItem, allItems: BoardItem[] = []): string {
     const ac = item.ac ?? [];
     const deps = item.deps ?? [];
     const notes = item.notes ?? [];
+    const splitFrom = item.split_from?.trim();
+    const hasParentItem = Boolean(splitFrom && allItems.some((i) => i.id === splitFrom));
+    const handoffHtml = item.handoff ? this.renderHandoffSection(item.handoff) : "";
+
     return `
       <section class="card board-panel">
         <div class="card-head">
@@ -344,10 +368,20 @@ export class AgileBoardView {
             ${item.suite ? `<span>Suite: <b>${escHtml(item.suite)}</b></span>` : ""}
           </div>
           ${
-            deps.length > 0
-              ? `<div class="dep-row">${deps.map((d) => `<span class="dep-tag">Depends on ${escHtml(d)}</span>`).join("")}</div>`
+            splitFrom || deps.length > 0
+              ? `<div class="dep-row">
+                  ${
+                    splitFrom
+                      ? hasParentItem
+                        ? `<button type="button" class="dep-tag split-parent-btn" data-item-id="${escHtml(splitFrom)}">Split from ${escHtml(splitFrom)}</button>`
+                        : `<span class="dep-tag split-origin-tag">Split from ${escHtml(splitFrom)}</span>`
+                      : ""
+                  }
+                  ${deps.map((d) => `<span class="dep-tag">Depends on ${escHtml(d)}</span>`).join("")}
+                </div>`
               : ""
           }
+          ${handoffHtml}
           ${
             ac.length > 0
               ? `<div class="item-sub-hdr">Acceptance Criteria</div>
@@ -361,6 +395,165 @@ export class AgileBoardView {
               : ""
           }
         </div>
+      </section>
+    `;
+  }
+
+  private renderHandoffSection(handoff: NonNullable<BoardItem["handoff"]>): string {
+    const statusLabel =
+      handoff.status === "pending_handoff"
+        ? "PENDING HANDOFF"
+        : handoff.status === "pending_split"
+          ? "PENDING SPLIT"
+          : handoff.status.toUpperCase();
+    const statusCls =
+      handoff.status === "pending_split"
+        ? "handoff-split"
+        : handoff.status === "pending_handoff"
+          ? "handoff-pending"
+          : handoff.status === "resumed"
+            ? "handoff-resumed"
+            : "handoff-cleared";
+    const kindLabel = handoff.kind === "task_split" ? "Task Split" : "Fresh Context";
+
+    const ctxParts: string[] = [];
+    if (typeof handoff.context_percent === "number" && Number.isFinite(handoff.context_percent)) {
+      ctxParts.push(`${handoff.context_percent.toFixed(1)}%`);
+    }
+    if (
+      typeof handoff.context_tokens === "number" &&
+      typeof handoff.context_window === "number"
+    ) {
+      ctxParts.push(
+        `${fmtTokens(handoff.context_tokens)} / ${fmtContextWindow(handoff.context_window)}`
+      );
+    } else if (typeof handoff.context_tokens === "number") {
+      ctxParts.push(`${fmtTokens(handoff.context_tokens)} tokens`);
+    } else if (typeof handoff.context_window === "number") {
+      ctxParts.push(`${fmtContextWindow(handoff.context_window)} window`);
+    }
+
+    const objective = handoff.objective?.trim();
+    const evidence = handoff.evidence ?? [];
+    const decisions = handoff.decisions ?? [];
+    const assumptions = handoff.assumptions ?? [];
+    const unresolvedIssues = handoff.unresolved_issues ?? [];
+    const modifiedFiles = handoff.modified_files ?? [];
+    const verifiedChecks = handoff.verified_checks ?? [];
+    const remainingWork = handoff.remaining_work ?? [];
+    const splitProposals = handoff.split_proposals ?? [];
+
+    return `
+      <section class="handoff-brief-box" aria-label="Context Handoff and Split Brief">
+        <div class="handoff-brief-head">
+          <span class="item-sub-hdr handoff-brief-title">Context Handoff / Split Brief</span>
+          <div class="handoff-brief-badges">
+            <span class="handoff-badge ${statusCls}">${escHtml(statusLabel)}</span>
+            <span class="pill tool">${escHtml(kindLabel)}</span>
+          </div>
+        </div>
+
+        <div class="handoff-brief-meta">
+          <span>Actor: <b>${escHtml(handoff.actor)}</b></span>
+          ${ctxParts.length > 0 ? `<span>Context: <b>${escHtml(ctxParts.join(" · "))}</b></span>` : ""}
+          ${handoff.created_at ? `<span>At: <code>${escHtml(handoff.created_at)}</code></span>` : ""}
+        </div>
+
+        ${
+          objective
+            ? `<div class="item-sub-hdr">Objective</div>
+               <p class="handoff-objective">${escHtml(objective)}</p>`
+            : ""
+        }
+
+        <p class="handoff-summary">${escHtml(handoff.summary)}</p>
+
+        ${
+          handoff.continuation_brief
+            ? `<div class="item-sub-hdr">Continuation Brief</div>
+               <div class="handoff-continuation">${escHtml(handoff.continuation_brief)}</div>`
+            : ""
+        }
+
+        ${
+          decisions.length > 0
+            ? `<div class="item-sub-hdr">Decisions (${decisions.length})</div>
+               <ul class="item-list">${decisions.map((d) => `<li>${escHtml(d)}</li>`).join("")}</ul>`
+            : ""
+        }
+
+        ${
+          assumptions.length > 0
+            ? `<div class="item-sub-hdr">Assumptions (${assumptions.length})</div>
+               <ul class="item-list">${assumptions.map((a) => `<li>${escHtml(a)}</li>`).join("")}</ul>`
+            : ""
+        }
+
+        ${
+          unresolvedIssues.length > 0
+            ? `<div class="item-sub-hdr handoff-issues-hdr">Unresolved Issues (${unresolvedIssues.length})</div>
+               <ul class="item-list handoff-issues-list">${unresolvedIssues.map((u) => `<li>${escHtml(u)}</li>`).join("")}</ul>`
+            : ""
+        }
+
+        ${
+          modifiedFiles.length > 0
+            ? `<div class="item-sub-hdr">Modified Files (${modifiedFiles.length})</div>
+               <ul class="item-list handoff-file-list">${modifiedFiles.map((f) => `<li><code>${escHtml(f)}</code></li>`).join("")}</ul>`
+            : ""
+        }
+
+        ${
+          verifiedChecks.length > 0
+            ? `<div class="item-sub-hdr">Verified Checks (${verifiedChecks.length})</div>
+               <ul class="item-list">${verifiedChecks.map((c) => `<li>${escHtml(c)}</li>`).join("")}</ul>`
+            : ""
+        }
+
+        ${
+          evidence.length > 0
+            ? `<div class="item-sub-hdr">Evidence (${evidence.length})</div>
+               <ul class="item-list handoff-evidence-list">${evidence.map((e) => `<li>${escHtml(e)}</li>`).join("")}</ul>`
+            : ""
+        }
+
+        ${
+          remainingWork.length > 0
+            ? `<div class="item-sub-hdr">Remaining Work (${remainingWork.length})</div>
+               <ul class="item-list">${remainingWork.map((w) => `<li>${escHtml(w)}</li>`).join("")}</ul>`
+            : ""
+        }
+
+        ${
+          splitProposals.length > 0
+            ? `<div class="item-sub-hdr">Split Proposals (${splitProposals.length})</div>
+               <div class="split-proposals-list">
+                 ${splitProposals
+                   .map(
+                     (sp, idx) => `
+                       <article class="split-proposal-card">
+                         <div class="split-proposal-head">
+                           <strong>${idx + 1}. ${escHtml(sp.title)}</strong>
+                           <span class="k-role">${escHtml(sp.role)}</span>
+                         </div>
+                         ${sp.rationale ? `<p class="split-proposal-rationale">${escHtml(sp.rationale)}</p>` : ""}
+                         ${
+                           sp.deps && sp.deps.length > 0
+                             ? `<div class="dep-row">${sp.deps.map((d) => `<span class="dep-tag">↳ ${escHtml(d)}</span>`).join("")}</div>`
+                             : ""
+                         }
+                         ${
+                           sp.ac && sp.ac.length > 0
+                             ? `<ul class="item-list">${sp.ac.map((a) => `<li>${escHtml(a)}</li>`).join("")}</ul>`
+                             : ""
+                         }
+                       </article>
+                     `
+                   )
+                   .join("")}
+               </div>`
+            : ""
+        }
       </section>
     `;
   }

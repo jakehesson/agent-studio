@@ -34,6 +34,7 @@ function loadFileLinkBridge(): typeof FileLinkBridgeModule {
 
 const { getDefaultAllowedRoots, resolveAllowedFileUri } = loadFileLinkBridge();
 import { createStudioServer } from "../../src/server/index.js";
+import { runHookEmit } from "../../src/cli/commands/hook-emit.js";
 import {
   AntigravityAdapter,
   ClaudeCodeAdapter,
@@ -1054,5 +1055,98 @@ describe("S1-45: EventBodyStore, Adapter Full-Body Capture, /api/event-body & fi
     } finally {
       await handle.close();
     }
+  });
+
+  it("S1-70: captures full untruncated response/last_assistant_message on subagentStop/agentStop and hydrates $COPILOT_HOME/session-state/*/events.jsonl bodies", async () => {
+    const wsDir = path.join(tmpDir, "s170-body-ws");
+    const copilotHome = path.join(tmpDir, "s170-copilot-home");
+    await fs.mkdir(wsDir, { recursive: true });
+    const offlineFetch: typeof fetch = () =>
+      Promise.reject(new Error("ECONNREFUSED"));
+
+    const longResponse = "SUBAGENT_RES_START " + "R".repeat(2200) + " SUBAGENT_RES_END";
+    const longFinal = "FINAL_MSG_START " + "F".repeat(2100) + " FINAL_MSG_END";
+
+    const subStop = await runHookEmit(
+      ["--ide", "copilot-vscode", "--event", "subagentStop", "--cwd", wsDir],
+      {
+        stdinText: JSON.stringify({
+          sessionId: "s170-body-1",
+          agentId: "11111111-2222-4333-8444-555555555555",
+          agentName: "explore",
+          response: longResponse,
+        }),
+        stdout: () => undefined,
+        fetchImpl: offlineFetch,
+      },
+    );
+    assert.equal(subStop.event?.bodyLength, longResponse.length);
+    assert.equal(subStop.event?.payload?.body, longResponse);
+
+    const agStop = await runHookEmit(
+      ["--ide", "copilot-vscode", "--event", "agentStop", "--cwd", wsDir],
+      {
+        stdinText: JSON.stringify({
+          sessionId: "s170-body-1",
+          last_assistant_message: longFinal,
+        }),
+        stdout: () => undefined,
+        fetchImpl: offlineFetch,
+      },
+    );
+    assert.equal(agStop.event?.bodyLength, longFinal.length);
+
+    // Session-state events.jsonl full-body hydration via TelemetryAggregator.getEventBody
+    const ssDir = path.join(copilotHome, "session-state", "s170-ss-body");
+    await fs.mkdir(ssDir, { recursive: true });
+    await fs.writeFile(
+      path.join(ssDir, "workspace.yaml"),
+      `id: s170-ss-body\ncwd: ${JSON.stringify(wsDir)}\n`,
+      "utf8",
+    );
+    await fs.writeFile(
+      path.join(ssDir, "events.jsonl"),
+      [
+        {
+          type: "session.start",
+          timestamp: "2026-11-26T11:00:00Z",
+          data: { sessionId: "s170-ss-body" },
+        },
+        {
+          type: "user.message",
+          timestamp: "2026-11-26T11:00:01Z",
+          data: { content: longFinal },
+        },
+      ]
+        .map((r) => JSON.stringify(r))
+        .join("\n") + "\n",
+      "utf8",
+    );
+
+    const aggregator = new TelemetryAggregator({
+      brainDir: path.join(tmpDir, "no-brain"),
+      claudeDir: path.join(tmpDir, "no-claude"),
+      vscodeDir: path.join(tmpDir, "no-vsc"),
+      copilotHomeDir: copilotHome,
+      includeGlobalTelemetryFile: false,
+      bodyStore: new EventBodyStore(),
+    });
+    aggregator.ingest([subStop.event!, agStop.event!]);
+    const storedSubBody = aggregator.bodyStore.get("s170-body-1", subStop.event!.id);
+    assert.equal(storedSubBody?.body, longResponse);
+    assert.equal(storedSubBody?.truncated, false);
+
+    const { snapshot } = await aggregator.getSessionSnapshot("s170-ss-body", {
+      workspace: wsDir,
+    });
+    const userEv = snapshot.events.find((e) => e.kind === "user_input")!;
+    assert.equal(userEv.bodyLength, longFinal.length);
+    assert.equal(userEv.bodyTruncated, true);
+    const hydrated = await aggregator.getEventBody({
+      sessionId: "s170-ss-body",
+      eventId: userEv.id,
+      workspace: wsDir,
+    });
+    assert.equal(hydrated?.body, longFinal);
   });
 });

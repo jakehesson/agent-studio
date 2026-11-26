@@ -1,5 +1,7 @@
 # Spec: VS Code Copilot Feed Parity (`S1-56`) & Usage Accuracy (`BUG-20`)
 
+> **Superseded / Extended by [`vscode-copilot-harness-and-upgrade.md`](vscode-copilot-harness-and-upgrade.md) (`S1-68`):** Copilot runtime hooks now also normalize camelCase events (`preToolUse`/`postToolUse`/`subagentStart`/`subagentStop`/etc.), native runtime tools (`create`, `str_replace`, `str_replace_editor`, `ask_user`, `task`, `web_fetch`), and workspace-scoped `$COPILOT_HOME/session-state/*/events.jsonl` discovery.
+
 ## 1. Canonical Token, Usage & Context Contract
 
 Every `UsageDelta` emitted by adapters or `hook-emit` MUST obey one canonical contract before `normalizer.ts` or `web/src/state/snapshot.ts`:

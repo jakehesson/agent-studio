@@ -25,6 +25,35 @@ function modelSwatchColor(idx: number): string {
   return MODEL_COLORS[idx % MODEL_COLORS.length] ?? "#06b6d4";
 }
 
+function formatWindowDisplay(
+  ctxWin: number,
+  nominalCtxWin?: number
+): { label: string; title: string; isEffBelow1M: boolean } {
+  if (ctxWin === 1_000_000) {
+    return { label: "1M", title: "1,000,000 token context window", isEffBelow1M: false };
+  }
+  if (nominalCtxWin === 1_000_000 && ctxWin >= 850_000) {
+    const effK = `${Math.round(ctxWin / 1_000)}k`;
+    return {
+      label: "1M",
+      title: `${effK} eff. · 1M nominal`,
+      isEffBelow1M: true,
+    };
+  }
+  if (nominalCtxWin && nominalCtxWin > ctxWin) {
+    return {
+      label: fmtContextWindow(ctxWin),
+      title: `${fmtContextWindow(ctxWin)} eff. · ${fmtContextWindow(nominalCtxWin)} nominal`,
+      isEffBelow1M: false,
+    };
+  }
+  return {
+    label: fmtContextWindow(ctxWin),
+    title: ctxWin > 0 ? `${ctxWin.toLocaleString()} token context window` : "Unknown context window",
+    isEffBelow1M: false,
+  };
+}
+
 function usageSourceBadge(src: "exact" | "estimated" | "mixed"): {
   label: string;
   cls: string;
@@ -106,11 +135,19 @@ export class UsageDashboard {
           (b.usage?.contextTokens ?? 0) - (a.usage?.contextTokens ?? 0)
       )[0];
     const peakCtxTok = peakAgent?.usage?.contextTokens ?? 0;
+    const peakModelName = peakAgent?.usage?.model || peakAgent?.model;
     const peakCtxWin =
       peakAgent?.usage?.contextWindow ??
-      (peakAgent
-        ? inferContextWindow(peakAgent.usage?.model || peakAgent.model, peakAgent.ide)
-        : 0);
+      (peakAgent ? inferContextWindow(peakModelName, peakAgent.ide) : 0);
+    const peakNomWin =
+      peakAgent?.usage?.nominalContextWindow ??
+      (peakAgent && peakModelName
+        ? (() => {
+            const inf = inferContextWindow(peakModelName, peakAgent.ide);
+            return inf > peakCtxWin ? inf : undefined;
+          })()
+        : undefined);
+    const peakWinDisp = formatWindowDisplay(peakCtxWin, peakNomWin);
     const peakAgentLabel = summary.peakContextAgentId
       ? formatActorName(summary.peakContextAgentId, opts.labelMap)
       : "—";
@@ -198,7 +235,11 @@ export class UsageDashboard {
         const fresh = input + output;
         const agentCachePct = total > 0 ? Math.round((cached / total) * 100) : 0;
         const ctxTok = u?.contextTokens ?? fresh;
-        const ctxWin = u?.contextWindow ?? inferContextWindow(modelName, a.ide);
+        const inferredWin = inferContextWindow(modelName, a.ide);
+        const ctxWin = u?.contextWindow ?? inferredWin;
+        const nomWin =
+          u?.nominalContextWindow ?? (inferredWin > ctxWin ? inferredWin : undefined);
+        const winDisp = formatWindowDisplay(ctxWin, nomWin);
         const ctxPct = Math.max(
           0,
           Math.min(
@@ -221,6 +262,7 @@ export class UsageDashboard {
             type="button"
             class="usage-agent-card ${isSelected ? "selected" : ""}"
             data-usage-agent-id="${escHtml(a.id)}"
+            aria-pressed="${isSelected ? "true" : "false"}"
           >
             <div class="usage-agent-top">
               <div class="usage-agent-ident">
@@ -263,7 +305,7 @@ export class UsageDashboard {
 
             <div class="ctx-meter-group">
               <div class="ctx-meter-head">
-                <span class="muted">Context ${fmtTokens(ctxTok)} / ${fmtContextWindow(ctxWin)} · <b>${ctxPct.toFixed(1)}%</b></span>
+                <span class="muted" title="${escHtml(winDisp.title)}">Context ${fmtTokens(ctxTok)} / ${escHtml(winDisp.label)}${winDisp.isEffBelow1M ? ` <span class="ctx-eff-hint">(${Math.round(ctxWin / 1_000)}k eff.)</span>` : ""} · <b>${ctxPct.toFixed(1)}%</b></span>
                 <span class="zone-pill zone-${zone.cssClass}">${escHtml(zone.label)}</span>
               </div>
               <div
@@ -273,10 +315,12 @@ export class UsageDashboard {
                 aria-valuemin="0"
                 aria-valuemax="100"
                 aria-valuenow="${Math.round(ctxPct)}"
+                aria-valuetext="${escHtml(`${ctxPct.toFixed(1)}% (${zone.label}; handoff advisory at 55%, compact at 70%)`)}"
               >
                 <span class="ctx-smart-tint" aria-hidden="true"></span>
                 <span class="ctx-meter-fill ctx-${zone.cssClass}" style="width:${ctxPct.toFixed(1)}%"></span>
                 <span class="ctx-bound-tick tick-40" title="Smart Zone limit (40%)" aria-hidden="true"></span>
+                <span class="ctx-bound-tick tick-55" title="Handoff advisory (55%)" aria-hidden="true"></span>
                 <span class="ctx-bound-tick tick-70" title="Compact threshold (70%)" aria-hidden="true"></span>
               </div>
             </div>
@@ -321,9 +365,9 @@ export class UsageDashboard {
             </div>
             <div class="usage-kpi-val">
               <b class="kpi-${peakZone.cssClass}">${summary.peakContextPercent.toFixed(1)}%</b>
-              ${peakCtxWin > 0 ? `<span class="usage-kpi-tot muted">${fmtTokens(peakCtxTok)} / ${fmtContextWindow(peakCtxWin)}</span>` : ""}
+              ${peakCtxWin > 0 ? `<span class="usage-kpi-tot muted" title="${escHtml(peakWinDisp.title)}">${fmtTokens(peakCtxTok)} / ${escHtml(peakWinDisp.label)}</span>` : ""}
             </div>
-            <small class="muted">Peak: ${escHtml(trunc(peakAgentLabel, 22))}</small>
+            <small class="muted" title="${escHtml(peakWinDisp.isEffBelow1M ? peakWinDisp.title : peakAgentLabel)}">Peak: ${escHtml(trunc(peakAgentLabel, 22))}${peakWinDisp.isEffBelow1M ? ` · ${Math.round(peakCtxWin / 1_000)}k eff.` : ""}</small>
           </div>
 
           <div class="usage-kpi">
@@ -359,20 +403,22 @@ export class UsageDashboard {
             <span class="muted">${smartZoneCount}/${sortedAgents.length} in Smart Zone</span>
           </div>
 
-          <div class="smart-zone-track" role="img" aria-label="Context Smart Zone bar: peak ${summary.peakContextPercent.toFixed(1)}%">
+          <div class="smart-zone-track" role="img" aria-label="Context Smart Zone bar: peak ${summary.peakContextPercent.toFixed(1)}%; thresholds at 40% Smart Zone, 55% Handoff, 70% Compact">
             <span class="sz-band sz-band-smart" aria-hidden="true"></span>
             <span class="sz-band sz-band-drift" aria-hidden="true"></span>
             <span class="sz-band sz-band-compact" aria-hidden="true"></span>
             <span class="sz-peak-fill ctx-${peakZone.cssClass}" style="width:${peakPctClamped.toFixed(1)}%" aria-hidden="true"></span>
             <span class="sz-thresh tick-40" aria-hidden="true"><em>40%</em></span>
+            <span class="sz-thresh tick-55" aria-hidden="true"><em>55%</em></span>
             <span class="sz-thresh tick-70" aria-hidden="true"><em>70%</em></span>
             ${agentMarkersHtml}
           </div>
 
           <div class="sz-legend">
-            <span><i class="sw" style="background:#10b981"></i>Smart Zone ≤40%</span>
-            <span><i class="sw" style="background:#f59e0b"></i>Drift 40–70%</span>
-            <span><i class="sw" style="background:#ef4444"></i>Compact &gt;70%</span>
+            <span><i class="sw" style="background:#10b981" aria-hidden="true"></i>Smart Zone ≤40%</span>
+            <span><i class="sw" style="background:#f59e0b" aria-hidden="true"></i>Drift 40–70%</span>
+            <span><i class="sw sw-handoff" aria-hidden="true"></i>Handoff 55%</span>
+            <span><i class="sw" style="background:#ef4444" aria-hidden="true"></i>Compact &gt;70%</span>
           </div>
         </section>
 

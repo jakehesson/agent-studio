@@ -4,6 +4,7 @@ import { resolveEffectiveModelIndex } from "../models/store.js";
 import type { ModelIndex } from "../schema/model-index.js";
 import {
   parseTeamYaml,
+  resolveCopilotHarness,
   type IdeTarget,
   type TeamManifest,
 } from "../schema/team.js";
@@ -11,13 +12,18 @@ import { compileAntigravity } from "./antigravity.js";
 import { compileClaudeCode } from "./claude-code.js";
 import { compileCopilotVsCode } from "./copilot-vscode.js";
 import {
+  coalesceExpectedFiles,
   computeDrift,
+  extractGeneratedHash,
+  extractManagedMarkdownBlock,
   mergeJsonKeyScoped,
   mergeManagedMarkdownBlock,
   normalizeLf,
+  verifyGeneratedMarkdownHash,
   type DriftReport,
   type ExpectedFile,
 } from "./merge.js";
+import { assertContainedPath } from "./shared.js";
 
 export interface CompileOptions {
   ides?: IdeTarget[];
@@ -26,6 +32,16 @@ export interface CompileOptions {
   useGlobalIndex?: boolean;
   /** Optional explicit pre-resolved ModelIndex override. */
   modelIndex?: ModelIndex;
+  /** Overwrite user-modified or unmarked compiled files when true. */
+  force?: boolean;
+  /** Run surgical legacy artifact cleanup (default true when harness === "copilot"). */
+  cleanLegacy?: boolean;
+}
+
+export interface SkippedModifiedEntry {
+  path: string;
+  ide: IdeTarget;
+  reason: string;
 }
 
 export interface CompileResult {
@@ -35,11 +51,19 @@ export interface CompileResult {
   written: string[];
   merged: string[];
   unchanged: string[];
+  skippedModified: SkippedModifiedEntry[];
+  cleanedLegacy: string[];
+  warnings: string[];
   totalFiles: number;
 }
 
 export function loadTeamManifest(projectRoot: string): TeamManifest {
-  const teamYamlPath = path.resolve(projectRoot, ".agent-team", "team.yaml");
+  const root = path.resolve(projectRoot);
+  const teamYamlPath = assertContainedPath(
+    root,
+    ".agent-team/team.yaml",
+    "team.yaml",
+  );
   if (!fs.existsSync(teamYamlPath)) {
     throw new Error(
       `Missing canonical team manifest: ${teamYamlPath}. Run "agent-studio init" first.`,
@@ -81,7 +105,76 @@ export function planCompiledFiles(
     files.push(...compileCopilotVsCode(root, manifest, modelIndex));
   }
 
-  return { manifest, targets, files, modelIndex };
+  return {
+    manifest,
+    targets,
+    files: coalesceExpectedFiles(files),
+    modelIndex,
+  };
+}
+
+function isPlainJsonObject(val: unknown): val is Record<string, unknown> {
+  return Boolean(val) && typeof val === "object" && !Array.isArray(val);
+}
+
+function cleanupLegacyCopilotArtifacts(
+  root: string,
+  cleanedLegacy: string[],
+  warnings: string[],
+): void {
+  const vscodeMcpPath = assertContainedPath(
+    root,
+    ".vscode/mcp.json",
+    "legacy cleanup",
+  );
+  if (fs.existsSync(vscodeMcpPath)) {
+    try {
+      const parsed: unknown = JSON.parse(fs.readFileSync(vscodeMcpPath, "utf8"));
+      if (isPlainJsonObject(parsed) && isPlainJsonObject(parsed.servers)) {
+        const servers = parsed.servers;
+        if (Object.prototype.hasOwnProperty.call(servers, "agent-studio")) {
+          delete servers["agent-studio"];
+          if (Object.keys(servers).length === 0) {
+            delete parsed.servers;
+          }
+          if (Object.keys(parsed).length === 0) {
+            fs.unlinkSync(vscodeMcpPath);
+          } else {
+            fs.writeFileSync(
+              vscodeMcpPath,
+              JSON.stringify(parsed, null, 2) + "\n",
+              "utf8",
+            );
+          }
+          cleanedLegacy.push(".vscode/mcp.json");
+        }
+      }
+    } catch {
+      warnings.push(
+        "[.vscode/mcp.json] Legacy VS Code MCP file is malformed JSON; preserving untouched.",
+      );
+    }
+  }
+
+  const learnPromptPath = assertContainedPath(
+    root,
+    ".github/prompts/learn.prompt.md",
+    "legacy cleanup",
+  );
+  if (fs.existsSync(learnPromptPath)) {
+    const raw = fs.readFileSync(learnPromptPath, "utf8");
+    if (
+      extractGeneratedHash(raw) !== null &&
+      verifyGeneratedMarkdownHash(raw) === true
+    ) {
+      fs.unlinkSync(learnPromptPath);
+      cleanedLegacy.push(".github/prompts/learn.prompt.md");
+    } else {
+      warnings.push(
+        "[.github/prompts/learn.prompt.md] Legacy Copilot prompt file was manually modified or lacks an Agent Studio SHA-256 marker; preserving untouched.",
+      );
+    }
+  }
 }
 
 export function compileTeam(
@@ -90,13 +183,21 @@ export function compileTeam(
 ): CompileResult {
   const root = path.resolve(projectRoot);
   const { manifest, targets, files } = planCompiledFiles(root, options);
+  const force = options?.force === true;
 
   const written: string[] = [];
   const merged: string[] = [];
   const unchanged: string[] = [];
+  const skippedModified: SkippedModifiedEntry[] = [];
+  const cleanedLegacy: string[] = [];
+  const warnings: string[] = [];
 
   for (const expected of files) {
-    const absPath = path.join(root, expected.relPath);
+    const absPath = assertContainedPath(
+      root,
+      expected.relPath,
+      "compiled output",
+    );
     const normRel = expected.relPath.replace(/\\/g, "/");
     const exists = fs.existsSync(absPath);
     const existingRaw = exists ? normalizeLf(fs.readFileSync(absPath, "utf8")) : null;
@@ -106,8 +207,47 @@ export function compileTeam(
 
     if (expected.kind === "generated") {
       nextContent = normalizeLf(expected.content);
+      if (exists && existingRaw !== null && existingRaw !== nextContent && !force) {
+        if (normRel.endsWith(".md")) {
+          const hasMarker = extractGeneratedHash(existingRaw) !== null;
+          const validHash = hasMarker && verifyGeneratedMarkdownHash(existingRaw);
+          if (!validHash) {
+            const reason = hasMarker
+              ? "Generated Markdown file was manually modified (SHA-256 marker mismatch); skipping overwrite (pass --force to replace)."
+              : "Existing Markdown file lacks Agent Studio SHA-256 marker; skipping overwrite (pass --force to replace).";
+            skippedModified.push({ path: normRel, ide: expected.ide, reason });
+            warnings.push(`[${normRel}] ${reason}`);
+            continue;
+          }
+        } else if (normRel.endsWith(".json")) {
+          let validJsonObject = false;
+          try {
+            const parsed: unknown = JSON.parse(existingRaw);
+            validJsonObject = isPlainJsonObject(parsed);
+          } catch {
+            validJsonObject = false;
+          }
+          if (!validJsonObject) {
+            const reason =
+              "Existing JSON file is malformed/unparseable; skipping overwrite (pass --force to replace).";
+            skippedModified.push({ path: normRel, ide: expected.ide, reason });
+            warnings.push(`[${normRel}] ${reason}`);
+            continue;
+          }
+        }
+      }
     } else if (expected.kind === "managed-markdown") {
       isMergeKind = true;
+      if (!force && exists && existingRaw !== null) {
+        const actualBlock = extractManagedMarkdownBlock(existingRaw);
+        if (actualBlock !== null && !verifyGeneratedMarkdownHash(actualBlock)) {
+          const reason =
+            "Managed <!-- agent-studio:begin/end --> block was manually modified; skipping overwrite (pass --force to replace).";
+          skippedModified.push({ path: normRel, ide: expected.ide, reason });
+          warnings.push(`[${normRel}] ${reason}`);
+          continue;
+        }
+      }
       nextContent = normalizeLf(
         mergeManagedMarkdownBlock(existingRaw, expected.blockContent),
       );
@@ -149,6 +289,14 @@ export function compileTeam(
     }
   }
 
+  if (
+    targets.includes("copilot-vscode") &&
+    resolveCopilotHarness(manifest) === "copilot" &&
+    options?.cleanLegacy !== false
+  ) {
+    cleanupLegacyCopilotArtifacts(root, cleanedLegacy, warnings);
+  }
+
   return {
     projectRoot: root,
     projectId: manifest.project.id,
@@ -156,6 +304,9 @@ export function compileTeam(
     written,
     merged,
     unchanged,
+    skippedModified,
+    cleanedLegacy,
+    warnings,
     totalFiles: files.length,
   };
 }
@@ -170,6 +321,7 @@ export function checkTeamDrift(
 }
 
 export * from "./merge.js";
+export * from "./shared.js";
 export * from "./capabilities.js";
 export * from "./antigravity.js";
 export * from "./claude-code.js";

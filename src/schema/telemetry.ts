@@ -80,6 +80,7 @@ export const AgentUsageMetricsSchema = z.object({
   totalTokens: z.number().int().nonnegative(),
   contextTokens: z.number().int().nonnegative(),
   contextWindow: z.number().int().positive(),
+  nominalContextWindow: z.number().int().positive().optional(),
   contextPercent: z.number().min(0).max(100),
   costUsd: z.number().nonnegative().optional(),
 });
@@ -150,6 +151,104 @@ export const SessionTeamRosterEntrySchema = z.object({
 });
 export type SessionTeamRosterEntry = z.infer<typeof SessionTeamRosterEntrySchema>;
 
+export const PendingQuestionOptionSchema = z.object({
+  id: z.string().optional(),
+  label: z.string(),
+  description: z.string().optional(),
+  recommended: z.boolean().optional(),
+});
+export type PendingQuestionOption = z.infer<typeof PendingQuestionOptionSchema>;
+
+export const PendingQuestionTypeSchema = z.enum([
+  "single_select",
+  "multi_select",
+  "text",
+]);
+export type PendingQuestionType = z.infer<typeof PendingQuestionTypeSchema>;
+
+export const PendingQuestionItemSchema = z.object({
+  id: z.string().optional(),
+  header: z.string().optional(),
+  question: z.string(),
+  type: PendingQuestionTypeSchema,
+  options: z.array(PendingQuestionOptionSchema),
+  allowCustomInput: z.boolean().optional(),
+  defaultValue: z.string().optional(),
+});
+export type PendingQuestionItem = z.infer<typeof PendingQuestionItemSchema>;
+
+export const PendingHumanPromptSchema = z.object({
+  id: z.string(),
+  toolCallId: z.string().optional(),
+  toolName: z.string().optional(),
+  agentId: z.string(),
+  agentLabel: z.string(),
+  kind: z.enum(["question", "approval"]),
+  title: z.string(),
+  summary: z.string().optional(),
+  questions: z.array(PendingQuestionItemSchema),
+  options: z
+    .array(
+      z.object({
+        label: z.string(),
+        recommended: z.boolean().optional(),
+      }),
+    )
+    .optional(),
+  ts: z.string().optional(),
+  blockingToolCall: z.boolean(),
+});
+export type PendingHumanPrompt = z.infer<typeof PendingHumanPromptSchema>;
+
+export const ChatMessageRoleSchema = z.enum([
+  "user",
+  "assistant",
+  "thinking",
+  "tool",
+  "question",
+  "subagent",
+]);
+export type ChatMessageRole = z.infer<typeof ChatMessageRoleSchema>;
+
+export const ChatToolCallRefSchema = z.object({
+  toolCallId: z.string().optional(),
+  toolName: z.string(),
+  summary: z.string(),
+  status: z.enum(["running", "ok", "error", "denied"]).optional(),
+  inputPreview: z.string().optional(),
+  output: z.string().optional(),
+});
+export type ChatToolCallRef = z.infer<typeof ChatToolCallRefSchema>;
+
+export const AgentChatMessageSchema = z.object({
+  id: z.string(),
+  ts: z.string(),
+  epoch: z.number(),
+  agentId: z.string(),
+  role: ChatMessageRoleSchema,
+  text: z.string(),
+  thinking: z.string().optional(),
+  tools: z.array(ChatToolCallRefSchema).optional(),
+  pendingPromptId: z.string().optional(),
+  subagentId: z.string().optional(),
+  subagentLabel: z.string().optional(),
+});
+export type AgentChatMessage = z.infer<typeof AgentChatMessageSchema>;
+
+export const AgentChatResponseSchema = z.object({
+  ok: z.literal(true),
+  sessionId: z.string(),
+  agentId: z.string(),
+  agentLabel: z.string(),
+  ide: IdeSourceSchema,
+  messages: z.array(AgentChatMessageSchema),
+  totalMessages: z.number().int().nonnegative(),
+  hasMore: z.boolean(),
+  nextCursor: z.string().optional(),
+  pendingPrompt: PendingHumanPromptSchema.nullable(),
+});
+export type AgentChatResponse = z.infer<typeof AgentChatResponseSchema>;
+
 export const SessionSnapshotSchema = z.object({
   sessionId: z.string().min(1),
   ide: IdeSourceSchema,
@@ -164,6 +263,8 @@ export const SessionSnapshotSchema = z.object({
   counters: SessionCountersSchema,
   usage: SessionUsageSummarySchema.optional(),
   teamRoster: z.array(SessionTeamRosterEntrySchema).optional(),
+  modelContextWindows: z.record(z.string(), z.number().int().positive()).optional(),
+  pendingPrompts: z.array(PendingHumanPromptSchema).optional(),
 });
 export type SessionSnapshot = z.infer<typeof SessionSnapshotSchema>;
 

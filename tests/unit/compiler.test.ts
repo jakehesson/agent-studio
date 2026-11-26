@@ -13,26 +13,35 @@ import {
 import { runInit } from "../../src/cli/commands/init.js";
 import { runSync } from "../../src/cli/commands/sync.js";
 import {
+  buildCopilotHooksConfig,
   buildPortableHookCommand,
   buildPortableMcpSpec,
   checkTeamDrift,
   compileTeam,
   computeDrift,
+  COPILOT_HOOK_EVENTS_CANONICAL,
   extractGeneratedHash,
   formatGeneratedMarker,
   HOOK_TAG_NEEDLE,
   installGlobalSetupAgent,
+  LEGACY_COPILOT_HOOK_EVENTS,
   MANAGED_BEGIN,
   MANAGED_END,
   mapCapabilitiesToAntigravity,
+  mapCapabilitiesToCopilotVsCode,
   mergeJsonKeyScoped,
   mergeManagedMarkdownBlock,
+  planCompiledFiles,
   renderManagedMarkdownBlock,
+  resolveCopilotHomeDir,
   resolveEffectiveCapabilities,
   verifyGeneratedMarkdownHash,
   wrapGeneratedMarkdown,
 } from "../../src/compiler/index.js";
-import { splitFrontmatter } from "../../src/compiler/shared.js";
+import {
+  assertContainedPath,
+  splitFrontmatter,
+} from "../../src/compiler/shared.js";
 import {
   parseTeamYaml,
   serializeTeamYaml,
@@ -47,6 +56,7 @@ import {
 const tempDirs: string[] = [];
 const savedEnv = {
   AGENT_STUDIO_HOME: process.env.AGENT_STUDIO_HOME,
+  COPILOT_HOME: process.env.COPILOT_HOME,
   HOME: process.env.HOME,
   VSCODE_USER_DIR: process.env.VSCODE_USER_DIR,
 };
@@ -58,7 +68,7 @@ function makeTempDir(prefix: string): string {
 }
 
 function restoreEnvVar(
-  key: "AGENT_STUDIO_HOME" | "HOME" | "VSCODE_USER_DIR",
+  key: "AGENT_STUDIO_HOME" | "COPILOT_HOME" | "HOME" | "VSCODE_USER_DIR",
   val: string | undefined,
 ): void {
   if (val === undefined) {
@@ -71,6 +81,7 @@ function restoreEnvVar(
 afterEach(() => {
   process.exitCode = 0;
   restoreEnvVar("AGENT_STUDIO_HOME", savedEnv.AGENT_STUDIO_HOME);
+  restoreEnvVar("COPILOT_HOME", savedEnv.COPILOT_HOME);
   restoreEnvVar("HOME", savedEnv.HOME);
   restoreEnvVar("VSCODE_USER_DIR", savedEnv.VSCODE_USER_DIR);
   while (tempDirs.length > 0) {
@@ -329,9 +340,13 @@ describe("Multi-IDE Compiler (Golden Fixtures & Orchestrator Read-Only)", () => 
     assert.ok(ccQaFm.tools.includes("Bash"));
 
     const ccMcp = JSON.parse(fs.readFileSync(path.join(repo, ".mcp.json"), "utf8")) as {
-      mcpServers: Record<string, { command: string; args: string[] }>;
+      mcpServers: Record<string, { type?: string; command: string; args: string[]; tools?: string[] }>;
     };
-    assert.deepEqual(ccMcp.mcpServers["agent-studio"], expectedMcp);
+    assert.deepEqual(ccMcp.mcpServers["agent-studio"], {
+      type: "stdio",
+      ...expectedMcp,
+      tools: ["*"],
+    });
 
     const ccSettings = JSON.parse(
       fs.readFileSync(path.join(repo, ".claude", "settings.json"), "utf8"),
@@ -340,6 +355,7 @@ describe("Multi-IDE Compiler (Golden Fixtures & Orchestrator Read-Only)", () => 
       "PreToolUse",
       "PostToolUse",
       "PostToolUseFailure",
+      "PreCompact",
       "SubagentStart",
       "SubagentStop",
       "Stop",
@@ -364,24 +380,23 @@ describe("Multi-IDE Compiler (Golden Fixtures & Orchestrator Read-Only)", () => 
     assert.ok(ccBackendFm.tools.includes("Write"));
     assert.ok(!ccBackendFm.tools.includes("MultiEdit"));
 
-    // Verify Copilot hooks include SessionStart, UserPromptSubmit, PreCompact alongside tool/subagent/stop hooks
+    // Verify Copilot hooks use 10 canonical camelCase events, version 1, timeoutSec 5, and NO managedBy
     const vscHooks = JSON.parse(
       fs.readFileSync(path.join(repo, ".github", "hooks", "agent-studio.json"), "utf8"),
-    ) as { hooks: Record<string, Array<{ command: string }>> };
-    for (const ev of [
-      "SessionStart",
-      "UserPromptSubmit",
-      "PreCompact",
-      "PreToolUse",
-      "PostToolUse",
-      "SubagentStart",
-      "SubagentStop",
-      "Stop",
-    ]) {
+    ) as {
+      version?: number;
+      managedBy?: string;
+      hooks: Record<string, Array<{ type?: string; command: string; timeoutSec?: number }>>;
+    };
+    assert.equal(vscHooks.version, 1);
+    assert.equal(vscHooks.managedBy, undefined);
+    for (const ev of COPILOT_HOOK_EVENTS_CANONICAL) {
       assert.ok(
         Array.isArray(vscHooks.hooks[ev]) && vscHooks.hooks[ev]!.length === 1,
         `missing Copilot hook ${ev}`,
       );
+      assert.equal(vscHooks.hooks[ev]![0]?.type, "command");
+      assert.equal(vscHooks.hooks[ev]![0]?.timeoutSec, 5);
       assert.ok(
         vscHooks.hooks[ev]![0]?.command.includes(`--ide copilot-vscode --event ${ev}`),
       );
@@ -395,26 +410,20 @@ describe("Multi-IDE Compiler (Golden Fixtures & Orchestrator Read-Only)", () => 
     assert.ok(verifyGeneratedMarkdownHash(vscOrchRaw));
     const vscOrchFm = parseYaml(splitFrontmatter(vscOrchRaw).frontmatter ?? "") as {
       tools: string[];
-      handoffs: Array<{ label: string; agent: string; prompt: string; send: boolean }>;
+      "user-invocable"?: boolean;
+      "disable-model-invocation"?: boolean;
+      handoffs?: Array<{ label: string; agent: string; prompt: string; send: boolean }>;
     };
-    assert.ok(vscOrchFm.tools.includes("agent/runSubagent"));
+    assert.ok(vscOrchFm.tools.includes("agent"));
     assert.ok(vscOrchFm.tools.includes("agent-studio/*"));
+    assert.ok(!vscOrchFm.tools.includes("edit"));
+    assert.ok(!vscOrchFm.tools.includes("execute"));
     assert.ok(!vscOrchFm.tools.includes("edit/editFiles"));
     assert.ok(!vscOrchFm.tools.includes("edit/createFile"));
     assert.ok(!vscOrchFm.tools.includes("execute/runInTerminal"));
-
-    assert.ok(Array.isArray(vscOrchFm.handoffs) && vscOrchFm.handoffs.length === 6);
-    assert.deepEqual(
-      vscOrchFm.handoffs.map((h) => h.agent),
-      [
-        "architect",
-        "ux-designer",
-        "backend-engineer",
-        "frontend-engineer",
-        "code-reviewer",
-        "qa-validator",
-      ],
-    );
+    assert.equal(vscOrchFm["user-invocable"], true);
+    assert.equal(vscOrchFm["disable-model-invocation"], false);
+    assert.equal(vscOrchFm.handoffs, undefined);
 
     // Verify scaffolded canonical code-reviewer and review skills
     assert.ok(fs.existsSync(path.join(repo, ".agent-team", "agents", "code-reviewer.md")));
@@ -466,13 +475,17 @@ describe("Multi-IDE Compiler (Golden Fixtures & Orchestrator Read-Only)", () => 
     assert.ok(verifyGeneratedMarkdownHash(vscReviewerRaw));
     const vscReviewerFm = parseYaml(splitFrontmatter(vscReviewerRaw).frontmatter ?? "") as {
       tools: string[];
+      "user-invocable"?: boolean;
+      "disable-model-invocation"?: boolean;
     };
-    assert.ok(vscReviewerFm.tools.includes("read/readFile"));
-    assert.ok(vscReviewerFm.tools.includes("search/codebase"));
-    assert.ok(vscReviewerFm.tools.includes("execute/runInTerminal"));
+    assert.ok(vscReviewerFm.tools.includes("read"));
+    assert.ok(vscReviewerFm.tools.includes("search"));
+    assert.ok(vscReviewerFm.tools.includes("execute"));
     assert.ok(vscReviewerFm.tools.includes("agent-studio/*"));
-    assert.ok(!vscReviewerFm.tools.includes("edit/editFiles"));
-    assert.ok(!vscReviewerFm.tools.includes("edit/createFile"));
+    assert.ok(!vscReviewerFm.tools.includes("edit"));
+    assert.ok(!vscReviewerFm.tools.includes("agent-studio/testrun"));
+    assert.equal(vscReviewerFm["user-invocable"], false);
+    assert.equal(vscReviewerFm["disable-model-invocation"], false);
 
     // Verify ux-designer agent, ux-review, code-review, architecture-review, and token-efficiency skills compiled across all 3 IDEs
     assert.ok(fs.existsSync(path.join(agyPluginDir, "agents", "ux-designer.md")));
@@ -493,7 +506,9 @@ describe("Multi-IDE Compiler (Golden Fixtures & Orchestrator Read-Only)", () => 
     assert.ok(fs.existsSync(path.join(repo, ".github", "skills", "architecture-review", "SKILL.md")));
     assert.ok(fs.existsSync(path.join(repo, ".github", "skills", "token-efficiency", "SKILL.md")));
     assert.ok(fs.existsSync(path.join(repo, ".github", "skills", "learn", "SKILL.md")));
-    assert.ok(fs.existsSync(path.join(repo, ".github", "prompts", "learn.prompt.md")));
+    // Default "copilot" harness omits .github/prompts/learn.prompt.md in favor of .github/skills/learn/SKILL.md
+    assert.equal(fs.existsSync(path.join(repo, ".github", "prompts", "learn.prompt.md")), false);
+    assert.equal(fs.existsSync(path.join(repo, ".vscode", "mcp.json")), false);
 
     // Verify per-IDE learn adaptation & frontmatter
     const agyLearnRaw = fs.readFileSync(
@@ -507,6 +522,7 @@ describe("Multi-IDE Compiler (Golden Fixtures & Orchestrator Read-Only)", () => 
     >;
     assert.equal(agyLearnFm.name, "learn");
     assert.equal(agyLearnFm["disable-slash-command"], undefined);
+    assert.equal(agyLearnFm["disable-model-invocation"], true);
 
     const ccLearnRaw = fs.readFileSync(
       path.join(repo, ".claude", "skills", "learn", "SKILL.md"),
@@ -519,24 +535,17 @@ describe("Multi-IDE Compiler (Golden Fixtures & Orchestrator Read-Only)", () => 
     >;
     assert.equal(ccLearnFm.name, "learn");
     assert.equal(ccLearnFm["argument-hint"], "[optional focus]");
+    assert.equal(ccLearnFm["disable-model-invocation"], true);
 
     const vscLearnSkillRaw = fs.readFileSync(
       path.join(repo, ".github", "skills", "learn", "SKILL.md"),
       "utf8",
     );
     assert.ok(verifyGeneratedMarkdownHash(vscLearnSkillRaw));
-
-    const vscLearnPromptRaw = fs.readFileSync(
-      path.join(repo, ".github", "prompts", "learn.prompt.md"),
-      "utf8",
-    );
-    assert.ok(verifyGeneratedMarkdownHash(vscLearnPromptRaw));
-    const vscLearnPromptFm = parseYaml(
-      splitFrontmatter(vscLearnPromptRaw).frontmatter ?? "",
+    const vscLearnSkillFm = parseYaml(
+      splitFrontmatter(vscLearnSkillRaw).frontmatter ?? "",
     ) as Record<string, unknown>;
-    assert.equal(typeof vscLearnPromptFm.description, "string");
-    assert.ok((vscLearnPromptFm.description as string).length > 0);
-    assert.equal(vscLearnPromptFm.agent, "agent");
+    assert.equal(vscLearnSkillFm["disable-model-invocation"], true);
 
     // Verify always-on Token & Context Discipline rules appear in all 3 IDE rules files
     assert.ok(
@@ -553,17 +562,10 @@ describe("Multi-IDE Compiler (Golden Fixtures & Orchestrator Read-Only)", () => 
         .includes("Token & Context Discipline"),
     );
 
-    const vscMcp = JSON.parse(
-      fs.readFileSync(path.join(repo, ".vscode", "mcp.json"), "utf8"),
-    ) as { servers: Record<string, { type: string; command: string; args: string[] }> };
-    assert.equal(vscMcp.servers["agent-studio"]?.type, "stdio");
-    assert.equal(vscMcp.servers["agent-studio"]?.command, expectedMcp.command);
-    assert.deepEqual(vscMcp.servers["agent-studio"]?.args, expectedMcp.args);
-
     const copilotHooks = JSON.parse(
       fs.readFileSync(path.join(repo, ".github", "hooks", "agent-studio.json"), "utf8"),
     ) as { hooks: Record<string, Array<{ command: string }>> };
-    for (const ev of ["PreToolUse", "PostToolUse", "SubagentStart", "SubagentStop", "Stop"]) {
+    for (const ev of COPILOT_HOOK_EVENTS_CANONICAL) {
       const list = copilotHooks.hooks[ev];
       assert.ok(Array.isArray(list) && list.length === 1, `missing Copilot hook ${ev}`);
       assert.ok(
@@ -587,6 +589,45 @@ describe("Multi-IDE Compiler (Golden Fixtures & Orchestrator Read-Only)", () => 
     const drift = checkTeamDrift(repo);
     assert.equal(drift.ok, true);
     assert.equal(drift.entries.length, 0);
+  });
+
+  it("S1-67: compiles self-contained skills/model-routing with 10 rules, expected_cost, 11 triggers, exact JSON contract, and lean orchestrator pointers", () => {
+    const repo = makeTempDir("av-s1-67-");
+    scaffoldAgentTeam(repo, { projectId: "s67-app", projectTitle: "S67 App" });
+    compileTeam(repo);
+
+    for (const skillPath of [
+      path.join(repo, ".agents", "plugins", "s67-app-team", "skills", "model-routing", "SKILL.md"),
+      path.join(repo, ".claude", "skills", "model-routing", "SKILL.md"),
+      path.join(repo, ".github", "skills", "model-routing", "SKILL.md"),
+    ]) {
+      const raw = fs.readFileSync(skillPath, "utf8");
+      const fm = parseYaml(splitFrontmatter(raw).frontmatter ?? "") as Record<string, unknown>;
+      assert.equal(fm.name, "model-routing");
+      assert.equal(fm["disable-model-invocation"], undefined, "skill must remain model-invoked");
+      assert.match(String(fm.description), /10 ordered decision rules/i);
+      assert.match(raw, /expected_cost = initial_cost \+ retry_probability \* retry_cost \+ review_cost/);
+      assert.match(raw, /## 11 Rerouting Triggers & Anti-Churn Rule/);
+      assert.match(raw, /Do not re-run routing after every successful phase/);
+      assert.match(raw, /"strategy": "single_model \| planner_executor \| coordinator_workers \| specialist_pipeline \| planner_workers_reviewer"/);
+      assert.match(raw, /"reasoning_complexity": "low \| medium \| high \| frontier"/);
+      assert.match(raw, /"required_fields": \[/);
+      assert.match(raw, /"catalog_warnings": \[\]/);
+      assert.match(raw, /3-Layer Model Index Architecture/);
+      assert.match(raw, /agent-studio models show/);
+    }
+
+    for (const orchPath of [
+      path.join(repo, ".agents", "plugins", "s67-app-team", "agents", "orchestrator.md"),
+      path.join(repo, ".claude", "agents", "orchestrator.md"),
+      path.join(repo, ".github", "agents", "orchestrator.agent.md"),
+    ]) {
+      const raw = fs.readFileSync(orchPath, "utf8");
+      assert.match(raw, /## Routing, Decomposition & Validation Discipline/);
+      assert.match(raw, /skills\/model-routing\/SKILL\.md/);
+      assert.match(raw, /expected_cost = initial_cost \+ retry_probability \* retry_cost \+ review_cost/);
+      assert.ok(!raw.includes('"estimated_peak_tokens"'), "orchestrator prompt must stay lean without JSON schema bloat");
+    }
   });
 });
 
@@ -714,9 +755,7 @@ describe("Non-Destructive Merges", () => {
         "# My Existing Repo Notes",
         "Keep this top note untouched.",
         "",
-        MANAGED_BEGIN,
-        "stale managed content",
-        MANAGED_END,
+        renderManagedMarkdownBlock("stale managed content"),
         "",
         "## Footer Notes",
         "Keep this footer untouched.",
@@ -793,7 +832,6 @@ describe("Non-Destructive Merges", () => {
     assert.ok(res1.merged.includes("CLAUDE.md"));
     assert.ok(res1.merged.includes(".github/copilot-instructions.md"));
     assert.ok(res1.merged.includes(".mcp.json"));
-    assert.ok(res1.merged.includes(".vscode/mcp.json"));
     assert.ok(res1.merged.includes(".claude/settings.json"));
 
     // Verify CLAUDE.md preserved top & bottom
@@ -809,20 +847,22 @@ describe("Non-Destructive Merges", () => {
     assert.ok(copilotAfter.includes(MANAGED_BEGIN));
     assert.ok(copilotAfter.includes(MANAGED_END));
 
-    // Verify .mcp.json preserved user-postgres AND added agent-studio
+    // Verify .mcp.json preserved user-postgres AND added agent-studio with type: stdio & tools: ["*"]
     const mcpAfter = JSON.parse(fs.readFileSync(path.join(repo, ".mcp.json"), "utf8")) as {
-      mcpServers: Record<string, unknown>;
+      mcpServers: Record<string, { type?: string; tools?: string[] }>;
     };
     assert.ok(mcpAfter.mcpServers["user-postgres"]);
     assert.ok(mcpAfter.mcpServers["agent-studio"]);
+    assert.equal(mcpAfter.mcpServers["agent-studio"]?.type, "stdio");
+    assert.deepEqual(mcpAfter.mcpServers["agent-studio"]?.tools, ["*"]);
 
-    // Verify .vscode/mcp.json preserved inputs + user-github AND added agent-studio
+    // Verify .vscode/mcp.json user servers + inputs were left untouched in copilot harness mode
     const vscMcpAfter = JSON.parse(
       fs.readFileSync(path.join(repo, ".vscode", "mcp.json"), "utf8"),
     ) as { inputs: unknown[]; servers: Record<string, unknown> };
     assert.equal(vscMcpAfter.inputs.length, 1);
     assert.ok(vscMcpAfter.servers["user-github"]);
-    assert.ok(vscMcpAfter.servers["agent-studio"]);
+    assert.equal(vscMcpAfter.servers["agent-studio"], undefined);
 
     // Verify .claude/settings.json preserved permissions + user PreToolUse hook AND added studio hooks
     const ccSettingsAfter = JSON.parse(
@@ -899,42 +939,54 @@ describe("Drift Detection (sync --check)", () => {
     );
     process.exitCode = 0;
 
-    // Re-sync repairs drift while still keeping user header in CLAUDE.md
-    const resync = await runSync(["--project", repo, "--quiet"]);
+    // Safe sync WITHOUT --force skips user-modified generated Markdown and preserves edits
+    const safeSkip = await runSync(["--project", repo, "--quiet"]);
+    assert.equal(safeSkip.ok, true);
+    assert.equal(safeSkip.exitCode, 0);
+    assert.ok(
+      safeSkip.compileResult?.skippedModified.some(
+        (s) => s.path === ".claude/agents/backend-engineer.md",
+      ),
+    );
+    assert.ok(fs.readFileSync(tamperedPath, "utf8").includes("<!-- hand edit -->"));
+    const stillModified = await runSync(["--project", repo, "--check", "--quiet"]);
+    assert.equal(stillModified.ok, false);
+    process.exitCode = 0;
+
+    // Re-sync WITH --force repairs drift while still keeping user header in CLAUDE.md
+    const resync = await runSync(["--project", repo, "--force", "--quiet"]);
     assert.equal(resync.ok, true);
+    assert.equal(resync.compileResult?.skippedModified.length, 0);
     assert.ok(fs.readFileSync(claudeMdPath, "utf8").startsWith("# Custom User Header"));
 
     const afterFix = await runSync(["--project", repo, "--check", "--quiet"]);
     assert.equal(afterFix.ok, true);
     assert.equal(afterFix.exitCode, 0);
 
-    // Tamper with .github/prompts/learn.prompt.md and verify hash/drift detection + repair
-    const learnPromptPath = path.join(repo, ".github", "prompts", "learn.prompt.md");
-    fs.appendFileSync(learnPromptPath, "\n<!-- manual edit -->\n", "utf8");
-    const promptDrift = await runSync(["--project", repo, "--check", "--quiet"]);
-    assert.equal(promptDrift.ok, false);
-    assert.equal(promptDrift.exitCode, 1);
+    // Tamper with managed block inside CLAUDE.md -> skipped without --force, repaired with --force
+    const claudeTampered = fs
+      .readFileSync(claudeMdPath, "utf8")
+      .replace("Drift App — Agent Studio Team Rules", "Tampered Block Title");
+    fs.writeFileSync(claudeMdPath, claudeTampered, "utf8");
+    const safeSkipManaged = compileTeam(repo);
     assert.ok(
-      promptDrift.drift?.entries.some(
-        (e) =>
-          e.path === ".github/prompts/learn.prompt.md" &&
-          e.status === "modified",
-      ),
+      safeSkipManaged.skippedModified.some((s) => s.path === "CLAUDE.md"),
     );
-    process.exitCode = 0;
+    assert.ok(fs.readFileSync(claudeMdPath, "utf8").includes("Tampered Block Title"));
 
-    const promptResync = await runSync(["--project", repo, "--quiet"]);
-    assert.equal(promptResync.ok, true);
-    const promptAfterFix = await runSync(["--project", repo, "--check", "--quiet"]);
-    assert.equal(promptAfterFix.ok, true);
-    assert.equal(promptAfterFix.exitCode, 0);
+    const forceManaged = compileTeam(repo, { force: true });
+    assert.equal(forceManaged.skippedModified.length, 0);
+    assert.ok(fs.readFileSync(claudeMdPath, "utf8").startsWith("# Custom User Header"));
+    assert.ok(fs.readFileSync(claudeMdPath, "utf8").includes("Drift App — Agent Studio Team Rules"));
+    assert.equal(checkTeamDrift(repo).ok, true);
   });
 
-  it("omits .github/prompts/learn.prompt.md when skills/learn is absent from manifest", () => {
+  it("omits .github/prompts/learn.prompt.md in legacy-local mode when skills/learn is absent from manifest", () => {
     const repo = makeTempDir("av-no-learn-");
     scaffoldAgentTeam(repo, { projectId: "no-learn", projectTitle: "No Learn" });
     const teamYamlPath = path.join(repo, ".agent-team", "team.yaml");
     const manifest: TeamManifest = parseTeamYaml(fs.readFileSync(teamYamlPath, "utf8"));
+    manifest.workflow.copilotHarness = "legacy-local";
     manifest.skills = manifest.skills.filter((s) => s !== "skills/learn");
     fs.writeFileSync(teamYamlPath, serializeTeamYaml(manifest), "utf8");
 
@@ -1203,25 +1255,310 @@ describe("CLI Init, Global Install & Doctor", () => {
     assert.ok(fs.existsSync(globalCcLearnPath));
     assert.ok(verifyGeneratedMarkdownHash(fs.readFileSync(globalCcLearnPath, "utf8")));
 
-    // VS Code global prompts/instructions inside sandboxed HOME
-    const directRes = installGlobalSetupAgent({ homeDir: fakeHome });
-    assert.ok(
-      directRes.installedFiles.some((f) => f.endsWith("team-setup.agent.md")),
+    // Copilot global files under $COPILOT_HOME (default ~/.copilot)
+    const copilotAgentPath = path.join(fakeHome, ".copilot", "agents", "team-setup.agent.md");
+    const copilotInstrPath = path.join(
+      fakeHome,
+      ".copilot",
+      "instructions",
+      "team-setup.instructions.md",
     );
-    assert.ok(
-      directRes.installedFiles.some((f) => f.endsWith("team-setup.instructions.md")),
+    const copilotSetupSkillPath = path.join(
+      fakeHome,
+      ".copilot",
+      "skills",
+      "team-setup",
+      "SKILL.md",
     );
-    const globalVscLearnPath = directRes.installedFiles.find((f) =>
-      f.endsWith("learn.prompt.md"),
+    const copilotLearnSkillPath = path.join(
+      fakeHome,
+      ".copilot",
+      "skills",
+      "learn",
+      "SKILL.md",
     );
-    assert.ok(globalVscLearnPath && fs.existsSync(globalVscLearnPath));
-    const globalVscLearnRaw = fs.readFileSync(globalVscLearnPath, "utf8");
-    assert.ok(verifyGeneratedMarkdownHash(globalVscLearnRaw));
-    const globalVscLearnFm = parseYaml(
-      splitFrontmatter(globalVscLearnRaw).frontmatter ?? "",
+    assert.ok(fs.existsSync(copilotAgentPath));
+    assert.ok(fs.existsSync(copilotInstrPath));
+    assert.ok(fs.existsSync(copilotSetupSkillPath));
+    assert.ok(fs.existsSync(copilotLearnSkillPath));
+
+    const copilotAgentFm = parseYaml(
+      splitFrontmatter(fs.readFileSync(copilotAgentPath, "utf8")).frontmatter ?? "",
     ) as Record<string, unknown>;
-    assert.equal(globalVscLearnFm.agent, "agent");
-    assert.equal(typeof globalVscLearnFm.description, "string");
+    assert.deepEqual(copilotAgentFm.tools, ["read", "search", "edit", "execute"]);
+    assert.equal(copilotAgentFm["user-invocable"], true);
+    assert.equal(copilotAgentFm["disable-model-invocation"], false);
+
+    const copilotLearnRaw = fs.readFileSync(copilotLearnSkillPath, "utf8");
+    assert.ok(verifyGeneratedMarkdownHash(copilotLearnRaw));
+    const copilotLearnFm = parseYaml(
+      splitFrontmatter(copilotLearnRaw).frontmatter ?? "",
+    ) as Record<string, unknown>;
+    assert.equal(copilotLearnFm["disable-model-invocation"], true);
+
+    // Test COPILOT_HOME override + surgical cleanup of <VSCodeUserDir>/prompts/*
+    const customCopilotHome = path.join(fakeHome, "custom-copilot-home");
+    const fakeVsCodeUserDir = path.join(fakeHome, "vscode-user-prompts-test");
+    const legacyPromptsDir = path.join(fakeVsCodeUserDir, "prompts");
+    fs.mkdirSync(legacyPromptsDir, { recursive: true });
+    // 1. Unmodified SHA-256-verified legacy files -> unlinked
+    const validLegacyAgent = wrapGeneratedMarkdown("# Setup", "name: Team Setup Agent");
+    const validLegacyLearn = wrapGeneratedMarkdown("# Learn", "agent: agent");
+    fs.writeFileSync(path.join(legacyPromptsDir, "team-setup.agent.md"), validLegacyAgent, "utf8");
+    fs.writeFileSync(path.join(legacyPromptsDir, "learn.prompt.md"), validLegacyLearn, "utf8");
+    // 2. Modified/unmarked legacy file -> preserved with warning
+    fs.writeFileSync(
+      path.join(legacyPromptsDir, "team-setup.instructions.md"),
+      "# Custom user instructions without marker\n",
+      "utf8",
+    );
+
+    process.env.COPILOT_HOME = customCopilotHome;
+    assert.equal(resolveCopilotHomeDir(fakeHome), path.resolve(customCopilotHome));
+    const directRes = installGlobalSetupAgent({
+      homeDir: fakeHome,
+      vscodeUserDir: fakeVsCodeUserDir,
+    });
+    assert.equal(directRes.copilotHomeDir, path.resolve(customCopilotHome));
+    assert.ok(
+      fs.existsSync(path.join(customCopilotHome, "agents", "team-setup.agent.md")),
+    );
+    assert.equal(
+      fs.existsSync(path.join(legacyPromptsDir, "team-setup.agent.md")),
+      false,
+    );
+    assert.equal(
+      fs.existsSync(path.join(legacyPromptsDir, "learn.prompt.md")),
+      false,
+    );
+    assert.equal(
+      fs.existsSync(path.join(legacyPromptsDir, "team-setup.instructions.md")),
+      true,
+    );
+    assert.equal(directRes.cleanedLegacy.length, 2);
+    assert.ok(
+      directRes.warnings.some((w) => w.includes("team-setup.instructions.md")),
+    );
+  });
+});
+
+describe("S1-69: Copilot Harness, Shared .mcp.json Coalescing & Surgical Legacy Cleanup", () => {
+  it("supports workflow.copilotHarness: legacy-local escape hatch while defaulting to copilot harness", () => {
+    const repo = makeTempDir("av-legacy-harness-");
+    scaffoldAgentTeam(repo, { projectId: "legacy-app", projectTitle: "Legacy App" });
+    const teamYamlPath = path.join(repo, ".agent-team", "team.yaml");
+    const manifest: TeamManifest = parseTeamYaml(fs.readFileSync(teamYamlPath, "utf8"));
+    manifest.workflow.copilotHarness = "legacy-local";
+    fs.writeFileSync(teamYamlPath, serializeTeamYaml(manifest), "utf8");
+
+    compileTeam(repo);
+    assert.equal(checkTeamDrift(repo).ok, true);
+
+    assert.deepEqual(
+      mapCapabilitiesToCopilotVsCode(["read", "search", "edit", "shell", "delegate"], {
+        harness: "legacy-local",
+      }),
+      [
+        "read/readFile",
+        "search/codebase",
+        "search/textSearch",
+        "search/fileSearch",
+        "edit/editFiles",
+        "edit/createFile",
+        "execute/runInTerminal",
+        "agent/runSubagent",
+      ],
+    );
+
+    const vscOrchFm = parseYaml(
+      splitFrontmatter(
+        fs.readFileSync(path.join(repo, ".github", "agents", "orchestrator.agent.md"), "utf8"),
+      ).frontmatter ?? "",
+    ) as { tools: string[]; handoffs?: Array<{ agent: string }> };
+    assert.ok(vscOrchFm.tools.includes("agent/runSubagent"));
+    assert.ok(Array.isArray(vscOrchFm.handoffs) && vscOrchFm.handoffs.length === 6);
+
+    assert.ok(fs.existsSync(path.join(repo, ".vscode", "mcp.json")));
+    assert.ok(fs.existsSync(path.join(repo, ".github", "prompts", "learn.prompt.md")));
+
+    const hooksCfg = JSON.parse(
+      fs.readFileSync(path.join(repo, ".github", "hooks", "agent-studio.json"), "utf8"),
+    ) as { managedBy?: string; hooks: Record<string, unknown[]> };
+    assert.equal(hooksCfg.managedBy, "agent-studio");
+    for (const ev of LEGACY_COPILOT_HOOK_EVENTS) {
+      assert.ok(Array.isArray(hooksCfg.hooks[ev]) && hooksCfg.hooks[ev]!.length === 1);
+    }
+    assert.deepEqual(
+      buildCopilotHooksConfig("legacy-local").managedBy,
+      "agent-studio",
+    );
+  });
+
+  it("coalesces shared .mcp.json across claude-code & copilot-vscode with zero drift on filtered --ides claude-code", async () => {
+    const repo = makeTempDir("av-coalesce-mcp-");
+    scaffoldAgentTeam(repo, { projectId: "coalesce-app", projectTitle: "Coalesce App" });
+
+    const planned = planCompiledFiles(repo);
+    const mcpEntries = planned.files.filter((f) => f.relPath === ".mcp.json");
+    assert.equal(mcpEntries.length, 1, ".mcp.json must be coalesced into a single ExpectedFile");
+    assert.deepEqual(mcpEntries[0]?.contributors, ["claude-code", "copilot-vscode"]);
+
+    compileTeam(repo);
+    assert.equal(checkTeamDrift(repo).ok, true);
+
+    // Filtered sync --ides claude-code must still include tools: ["*"] so full sync --check has zero drift
+    fs.rmSync(path.join(repo, ".mcp.json"));
+    const filteredSync = await runSync(["--project", repo, "--ides", "claude-code", "--quiet"]);
+    assert.equal(filteredSync.ok, true);
+    const mcpJson = JSON.parse(fs.readFileSync(path.join(repo, ".mcp.json"), "utf8")) as {
+      mcpServers: Record<string, { type?: string; tools?: string[] }>;
+    };
+    assert.equal(mcpJson.mcpServers["agent-studio"]?.type, "stdio");
+    assert.deepEqual(mcpJson.mcpServers["agent-studio"]?.tools, ["*"]);
+    assert.equal(checkTeamDrift(repo).ok, true);
+  });
+
+  it("migrates legacy PascalCase Copilot hooks to camelCase while preserving user hooks and pruning managedBy", () => {
+    const repo = makeTempDir("av-hooks-migrate-");
+    scaffoldAgentTeam(repo, { projectId: "hooks-app", projectTitle: "Hooks App" });
+
+    const hooksPath = path.join(repo, ".github", "hooks", "agent-studio.json");
+    fs.mkdirSync(path.dirname(hooksPath), { recursive: true });
+    fs.writeFileSync(
+      hooksPath,
+      JSON.stringify(
+        {
+          version: 1,
+          managedBy: "agent-studio",
+          hooks: {
+            SessionStart: [
+              {
+                type: "command",
+                command: buildPortableHookCommand("copilot-vscode", "SessionStart"),
+                timeoutSec: 5,
+              },
+            ],
+            PreToolUse: [
+              { type: "command", command: "echo my-custom-pascal-hook" },
+              {
+                type: "command",
+                command: buildPortableHookCommand("copilot-vscode", "PreToolUse"),
+                timeoutSec: 5,
+              },
+            ],
+            preToolUse: [
+              { type: "command", command: "echo my-custom-camel-hook" },
+            ],
+          },
+        },
+        null,
+        2,
+      ),
+      "utf8",
+    );
+
+    compileTeam(repo);
+    const migrated = JSON.parse(fs.readFileSync(hooksPath, "utf8")) as {
+      version: number;
+      managedBy?: string;
+      hooks: Record<string, Array<{ command: string }>>;
+    };
+    assert.equal(migrated.version, 1);
+    assert.equal(migrated.managedBy, undefined);
+    assert.equal(migrated.hooks.SessionStart, undefined, "empty legacy SessionStart key should be removed");
+    assert.deepEqual(migrated.hooks.PreToolUse, [
+      { type: "command", command: "echo my-custom-pascal-hook" },
+    ]);
+    assert.equal(migrated.hooks.preToolUse?.length, 2);
+    assert.equal(migrated.hooks.preToolUse?.[0]?.command, "echo my-custom-camel-hook");
+    assert.ok(migrated.hooks.preToolUse?.[1]?.command.includes(HOOK_TAG_NEEDLE));
+    assert.equal(checkTeamDrift(repo).ok, true);
+  });
+
+  it("respects explicit RosterEntry userInvocable/disableModelInvocation and performs surgical legacy cleanup", async () => {
+    const repo = makeTempDir("av-cleanup-");
+    scaffoldAgentTeam(repo, { projectId: "cleanup-app", projectTitle: "Cleanup App" });
+    const teamYamlPath = path.join(repo, ".agent-team", "team.yaml");
+    const manifest: TeamManifest = parseTeamYaml(fs.readFileSync(teamYamlPath, "utf8"));
+    const backend = manifest.roster.find((r) => r.id === "backend-engineer")!;
+    backend.userInvocable = true;
+    backend.disableModelInvocation = true;
+    fs.writeFileSync(teamYamlPath, serializeTeamYaml(manifest), "utf8");
+
+    // Case 1: .vscode/mcp.json containing ONLY servers["agent-studio"] -> unlinked; valid learn.prompt.md -> unlinked
+    const vscodeMcpPath = path.join(repo, ".vscode", "mcp.json");
+    fs.mkdirSync(path.dirname(vscodeMcpPath), { recursive: true });
+    fs.writeFileSync(
+      vscodeMcpPath,
+      JSON.stringify({ servers: { "agent-studio": { type: "stdio", command: "node", args: [] } } }),
+      "utf8",
+    );
+    const learnPromptPath = path.join(repo, ".github", "prompts", "learn.prompt.md");
+    fs.mkdirSync(path.dirname(learnPromptPath), { recursive: true });
+    fs.writeFileSync(
+      learnPromptPath,
+      wrapGeneratedMarkdown("# Learn", "agent: agent\ndescription: test"),
+      "utf8",
+    );
+
+    const res1 = compileTeam(repo);
+    assert.equal(fs.existsSync(vscodeMcpPath), false);
+    assert.equal(fs.existsSync(learnPromptPath), false);
+    assert.ok(res1.cleanedLegacy.includes(".vscode/mcp.json"));
+    assert.ok(res1.cleanedLegacy.includes(".github/prompts/learn.prompt.md"));
+
+    const backendFm = parseYaml(
+      splitFrontmatter(
+        fs.readFileSync(path.join(repo, ".github", "agents", "backend-engineer.agent.md"), "utf8"),
+      ).frontmatter ?? "",
+    ) as Record<string, unknown>;
+    assert.equal(backendFm["user-invocable"], true);
+    assert.equal(backendFm["disable-model-invocation"], true);
+
+    // Case 2: .vscode/mcp.json with user servers + inputs, and modified learn.prompt.md -> preserved + warned
+    fs.writeFileSync(
+      vscodeMcpPath,
+      JSON.stringify({
+        inputs: [{ id: "api-key", type: "promptString" }],
+        servers: {
+          "user-server": { type: "stdio", command: "my-mcp", args: [] },
+          "agent-studio": { type: "stdio", command: "node", args: [] },
+        },
+      }),
+      "utf8",
+    );
+    fs.writeFileSync(learnPromptPath, "# Modified user prompt without valid hash\n", "utf8");
+
+    const res2 = compileTeam(repo);
+    assert.equal(fs.existsSync(vscodeMcpPath), true);
+    const vscMcpAfter = JSON.parse(fs.readFileSync(vscodeMcpPath, "utf8")) as {
+      inputs: unknown[];
+      servers: Record<string, unknown>;
+    };
+    assert.equal(vscMcpAfter.inputs.length, 1);
+    assert.ok(vscMcpAfter.servers["user-server"]);
+    assert.equal(vscMcpAfter.servers["agent-studio"], undefined);
+    assert.ok(res2.cleanedLegacy.includes(".vscode/mcp.json"));
+    assert.equal(fs.existsSync(learnPromptPath), true);
+    assert.ok(res2.warnings.some((w) => w.includes(".github/prompts/learn.prompt.md")));
+
+    // Case 3: unmarked .md file & invalid generated JSON skipped unless --force
+    const customAgentPath = path.join(repo, ".github", "agents", "qa-validator.agent.md");
+    fs.writeFileSync(customAgentPath, "# Hand-written unmarked agent\n", "utf8");
+    const agyPluginJsonPath = path.join(repo, ".agents", "plugins", "cleanup-app-team", "plugin.json");
+    fs.writeFileSync(agyPluginJsonPath, "{ broken json", "utf8");
+
+    const resSkip = await runSync(["--project", repo, "--quiet"]);
+    assert.equal(resSkip.ok, true);
+    assert.ok(resSkip.compileResult?.skippedModified.some((s) => s.path.endsWith("qa-validator.agent.md")));
+    assert.ok(resSkip.compileResult?.skippedModified.some((s) => s.path.endsWith("plugin.json")));
+    assert.equal(fs.readFileSync(customAgentPath, "utf8"), "# Hand-written unmarked agent\n");
+
+    const resForce = await runSync(["--project", repo, "--force", "--quiet"]);
+    assert.equal(resForce.ok, true);
+    assert.equal(resForce.compileResult?.skippedModified.length, 0);
+    assert.ok(verifyGeneratedMarkdownHash(fs.readFileSync(customAgentPath, "utf8")));
+    assert.doesNotThrow(() => JSON.parse(fs.readFileSync(agyPluginJsonPath, "utf8")));
   });
 });
 
@@ -1365,5 +1702,110 @@ describe("Portable Hook & MCP Launcher", () => {
     });
     assert.equal(resMissingMcp.status, 1);
     assert.match(resMissingMcp.stderr, /agent-studio CLI not found/);
+  });
+});
+
+describe("BUG-28 & BUG-30: Schema Path Containment, Symlink Guard & sync --force CLI E2E", () => {
+  it("rejects path traversal and unsafe identifiers in team.yaml (project.id, role.id, role.promptFile, skills[])", () => {
+    const repo = makeTempDir("av-team-traversal-");
+    scaffoldAgentTeam(repo, { projectId: "safe-app", projectTitle: "Safe App" });
+    const baseManifest = parseTeamYaml(
+      fs.readFileSync(path.join(repo, ".agent-team", "team.yaml"), "utf8"),
+    );
+
+    for (const badId of ["../evil", "a/b", "a\\b", ".", "..", "-bad", "bad..id", "bad\0id"]) {
+      const badProj = structuredClone(baseManifest);
+      badProj.project.id = badId;
+      assert.throws(
+        () => serializeTeamYaml(badProj),
+        `expected project.id ${JSON.stringify(badId)} to be rejected`,
+      );
+
+      const badRole = structuredClone(baseManifest);
+      badRole.roster[0]!.id = badId;
+      assert.throws(
+        () => serializeTeamYaml(badRole),
+        `expected role.id ${JSON.stringify(badId)} to be rejected`,
+      );
+    }
+
+    for (const badRelPath of [
+      "../outside.md",
+      "agents/../../outside.md",
+      "/etc/passwd",
+      "\\Windows\\System32",
+      "C:/escape.md",
+      "C:escape.md",
+      "agents/./foo.md",
+      "agents\\foo.md",
+      "agents/bad\0.md",
+    ]) {
+      const badPrompt = structuredClone(baseManifest);
+      badPrompt.roster[0]!.promptFile = badRelPath;
+      assert.throws(
+        () => serializeTeamYaml(badPrompt),
+        `expected promptFile ${JSON.stringify(badRelPath)} to be rejected`,
+      );
+
+      const badSkill = structuredClone(baseManifest);
+      badSkill.skills = [badRelPath];
+      assert.throws(
+        () => serializeTeamYaml(badSkill),
+        `expected skill ${JSON.stringify(badRelPath)} to be rejected`,
+      );
+    }
+  });
+
+  it("blocks lexical traversal and symlink/junction escapes via assertContainedPath", () => {
+    const sandbox = makeTempDir("av-symlink-");
+    const baseDir = path.join(sandbox, "workspace", ".agent-team");
+    const outsideDir = path.join(sandbox, "outside");
+    fs.mkdirSync(path.join(baseDir, "agents"), { recursive: true });
+    fs.mkdirSync(outsideDir, { recursive: true });
+    fs.writeFileSync(path.join(outsideDir, "secret.md"), "# Secret\n", "utf8");
+
+    assert.throws(
+      () => assertContainedPath(baseDir, "../outside/secret.md", "test"),
+      /Path traversal blocked/,
+    );
+    assert.throws(
+      () => assertContainedPath(baseDir, "agents/bad\0.md", "test"),
+      /Unsafe control characters/,
+    );
+
+    const escapedLink = path.join(baseDir, "linked-outside");
+    fs.symlinkSync(
+      outsideDir,
+      escapedLink,
+      process.platform === "win32" ? "junction" : "dir",
+    );
+    assert.throws(
+      () => assertContainedPath(baseDir, "linked-outside/secret.md", "test"),
+      /Symlink escape blocked/,
+    );
+    assert.throws(
+      () => assertContainedPath(baseDir, "linked-outside/new-file.md", "test"),
+      /Symlink escape blocked/,
+    );
+  });
+
+  it("supports agent-studio sync --force CLI e2e to overwrite modified compiled files and clear drift", () => {
+    const repo = makeTempDir("av-sync-force-e2e-");
+    scaffoldAgentTeam(repo, { projectId: "force-e2e", projectTitle: "Force E2E" });
+    compileTeam(repo);
+
+    const compiledAgent = path.join(repo, ".github", "agents", "qa-validator.agent.md");
+    fs.appendFileSync(compiledAgent, "\n<!-- manual drift -->\n", "utf8");
+    assert.equal(checkTeamDrift(repo).ok, false);
+
+    const cliPath = path.resolve(process.cwd(), "dist", "cli", "index.js");
+    const res = spawnSync(
+      process.execPath,
+      [cliPath, "sync", "--project", repo, "--force", "--quiet"],
+      { encoding: "utf8", timeout: 15_000 },
+    );
+    assert.equal(res.status, 0, `sync --force failed: ${res.stderr}`);
+    assert.equal(checkTeamDrift(repo).ok, true);
+    assert.ok(verifyGeneratedMarkdownHash(fs.readFileSync(compiledAgent, "utf8")));
   });
 });

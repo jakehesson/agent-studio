@@ -1,6 +1,7 @@
 import type { ResolvedRoleModel } from "../models/resolve.js";
 import type {
   Capability,
+  CopilotHarness,
   RosterEntry,
   WorkflowEnforcement,
 } from "../schema/team.js";
@@ -160,36 +161,54 @@ export function mapCapabilitiesToClaudeCode(
   return dedupe(tools);
 }
 
+export interface CopilotVsCodeMappingOptions {
+  harness?: CopilotHarness;
+}
+
 export function mapCapabilitiesToCopilotVsCode(
   capabilities: Capability[],
+  options?: CopilotVsCodeMappingOptions,
 ): string[] {
+  const harness = options?.harness ?? "copilot";
   const tools: string[] = [];
 
   for (const cap of capabilities) {
     switch (cap) {
       case "read":
-        tools.push("read/readFile");
+        tools.push(harness === "legacy-local" ? "read/readFile" : "read");
         break;
       case "search":
-        tools.push(
-          "search/codebase",
-          "search/textSearch",
-          "search/fileSearch",
-        );
+        if (harness === "legacy-local") {
+          tools.push(
+            "search/codebase",
+            "search/textSearch",
+            "search/fileSearch",
+          );
+        } else {
+          tools.push("search");
+        }
         break;
       case "edit":
       case "write_docs":
       case "edit_tests":
-        tools.push("edit/editFiles", "edit/createFile");
+        if (harness === "legacy-local") {
+          tools.push("edit/editFiles", "edit/createFile");
+        } else {
+          tools.push("edit");
+        }
         break;
       case "shell":
-        tools.push("execute/runInTerminal");
+        tools.push(
+          harness === "legacy-local" ? "execute/runInTerminal" : "execute",
+        );
         break;
       case "delegate":
-        tools.push("agent/runSubagent");
+        tools.push(
+          harness === "legacy-local" ? "agent/runSubagent" : "agent",
+        );
         break;
       case "ask_user":
-        // VS Code Copilot uses native chat confirmation; no explicit tool entry required.
+        // VS Code Copilot uses native runtime ask_user / chat confirmation; no explicit tool entry required.
         break;
       case "mcp_board":
         tools.push("agent-studio/*");

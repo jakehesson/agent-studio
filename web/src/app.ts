@@ -18,11 +18,15 @@ import type {
   IdeFilter,
   PrimaryView,
   RegisteredProject,
+  ReplyCapabilities,
+  ReplyToHostRequest,
+  ReplyToHostResult,
   SessionSnapshot,
   TeamDefinitionEntry,
   TeamRosterEntry,
   TeamRosterRef,
 } from "./types.js";
+import { copyTextSafe } from "./utils.js";
 import { AgileBoardView } from "./views/AgileBoard.js";
 import { DoctorView } from "./views/Doctor.js";
 import { LiveStudioView } from "./views/LiveStudio.js";
@@ -46,6 +50,8 @@ export interface AgentStudioBootOptions {
   initialWorkspace?: string;
   initialSession?: string;
   initialView?: PrimaryView;
+  getReplyCapabilities?: () => ReplyCapabilities;
+  onReplyToHost?: (req: ReplyToHostRequest) => Promise<ReplyToHostResult>;
 }
 
 export interface StudioExternalDirective {
@@ -90,10 +96,16 @@ export class AgentStudioApp {
   private panels: Record<PrimaryView, HTMLElement>;
   private bottomNav: HTMLElement;
   private shellEl: HTMLElement;
+  private pendingOpenChatAgentId: string | null = null;
+  private pendingOpenWaiting = false;
+  private mcpReplyCapabilitiesGetter?: () => ReplyCapabilities;
+  private mcpReplyHandler?: (req: ReplyToHostRequest) => Promise<ReplyToHostResult>;
 
   constructor(mountEl: HTMLElement, opts: AgentStudioBootOptions = {}) {
     this.mcpAppMode = Boolean(opts.mcpAppMode);
     this.hideMockups = Boolean(opts.hideMockups || opts.mcpAppMode);
+    this.mcpReplyCapabilitiesGetter = opts.getReplyCapabilities;
+    this.mcpReplyHandler = opts.onReplyToHost;
     if (opts.lockedIde) {
       this.lockedIde = opts.lockedIde;
       this.ideFilter = opts.lockedIde;
@@ -202,6 +214,12 @@ export class AgentStudioApp {
       onSelectView: (view) => this.setView(view),
       onReconnect: () => this.stream.reconnectNow(),
       onOpenFeedback: () => this.openFeedbackDialog(),
+      onOpenWaitingAgent: (agentId) => {
+        if (this.activeView !== "studio") {
+          this.setView("studio");
+        }
+        this.studioView.openChat(agentId, true);
+      },
     });
 
     this.feedbackDialog = new FeedbackDialog({
@@ -221,6 +239,8 @@ export class AgentStudioApp {
             btn.setAttribute("aria-current", active ? "page" : "false");
           });
       },
+      getReplyCapabilities: () => this.getReplyCapabilities(),
+      onReplyToHost: (req) => this.sendReplyToHost(req),
     });
     this.teamView = new TeamView(this.panels.team);
 
@@ -250,6 +270,7 @@ export class AgentStudioApp {
     });
 
     this.bindCoverNav();
+    this.bindHostFocusMessages();
     if (!this.mcpAppMode) {
       this.restoreFromUrl();
     } else {
@@ -453,6 +474,7 @@ export class AgentStudioApp {
       hideMockups: this.hideMockups,
       lockedIde: this.lockedIde,
       lockedWorkspace: this.lockedWorkspace,
+      pendingPrompts: this.lastSnapshot?.pendingPrompts,
     };
   }
 
@@ -585,6 +607,206 @@ export class AgentStudioApp {
     this.studioView.setSnapshot(snap);
     this.doctorView.notifyLiveSnapshot(snap);
     this.refreshContextBar();
+    this.processPendingOpenActions(snap);
+  }
+
+  private bindHostFocusMessages(): void {
+    if (typeof window === "undefined") return;
+    window.addEventListener("message", (event: MessageEvent) => {
+      if (!this.embedMode || window.parent === window || event.source !== window.parent) {
+        return;
+      }
+      const data = event.data;
+      if (!data || typeof data !== "object" || Array.isArray(data)) return;
+      const rec = data as Record<string, unknown>;
+      if (rec.type !== "agentStudio:focusSession") return;
+
+      const nextSession =
+        typeof rec.sessionId === "string" ? rec.sessionId.trim() : "";
+      const nextChatAgent =
+        typeof rec.openChatAgentId === "string"
+          ? rec.openChatAgentId.trim()
+          : "";
+      const openWaiting = Boolean(rec.openWaiting);
+
+      if (nextChatAgent) {
+        this.pendingOpenChatAgentId = nextChatAgent;
+        this.pendingOpenWaiting = false;
+      } else if (openWaiting) {
+        this.pendingOpenWaiting = true;
+      }
+
+      if (this.activeView !== "studio") {
+        this.setView("studio");
+      }
+
+      const sessionChanged = Boolean(nextSession && nextSession !== this.selectedSessionId);
+      if (sessionChanged) {
+        this.selectedSessionId = nextSession;
+        this.syncUrlState();
+        this.refreshContextBar();
+        this.stream.updateParams({
+          session: this.selectedSessionId,
+          ide: this.ideFilter,
+          project: this.selectedProject,
+          workspace: this.lockedWorkspace || undefined,
+        });
+        void this.loadCurrentSnapshot();
+        return;
+      }
+
+      if (this.lastSnapshot) {
+        this.processPendingOpenActions(this.lastSnapshot);
+      } else {
+        void this.loadCurrentSnapshot();
+      }
+    });
+  }
+
+  private processPendingOpenActions(snap: SessionSnapshot): void {
+    if (this.pendingOpenChatAgentId) {
+      const targetId = this.pendingOpenChatAgentId;
+      this.pendingOpenChatAgentId = null;
+      this.pendingOpenWaiting = false;
+      if (this.activeView !== "studio") {
+        this.setView("studio");
+      }
+      this.studioView.openChat(targetId, true);
+      return;
+    }
+
+    if (this.pendingOpenWaiting) {
+      const hasWaiting =
+        (snap.pendingPrompts?.length ?? 0) > 0 ||
+        snap.agents.some((a) => Boolean(a.pendingPrompt));
+      if (hasWaiting) {
+        this.pendingOpenWaiting = false;
+        if (this.activeView !== "studio") {
+          this.setView("studio");
+        }
+        this.studioView.openFirstWaitingChat();
+      } else if (snap.sessionId && snap.agents.length > 0) {
+        this.pendingOpenWaiting = false;
+      }
+    }
+  }
+
+  public getReplyCapabilities(): ReplyCapabilities {
+    if (this.mcpAppMode && this.mcpReplyCapabilitiesGetter) {
+      return this.mcpReplyCapabilitiesGetter();
+    }
+    return {
+      canSendMessage: false,
+      isMcpApp: this.mcpAppMode,
+      isEmbed: this.embedMode,
+    };
+  }
+
+  public async sendReplyToHost(
+    req: ReplyToHostRequest
+  ): Promise<ReplyToHostResult> {
+    const text = req.text.trim();
+    if (!text) {
+      return {
+        ok: false,
+        mode: "error",
+        message: "Please select an option or enter a reply first.",
+      };
+    }
+
+    if (this.mcpAppMode && this.mcpReplyHandler) {
+      return this.mcpReplyHandler({
+        ...req,
+        sessionId: req.sessionId || this.selectedSessionId || undefined,
+        text,
+      });
+    }
+
+    if (
+      this.embedMode &&
+      typeof window !== "undefined" &&
+      window.parent !== window
+    ) {
+      const requestId = `reply-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+      const bridgeRes = await new Promise<{
+        ok?: boolean;
+        mode?: string;
+        message?: string;
+      } | null>((resolve) => {
+        let settled = false;
+        const cleanup = () => {
+          window.removeEventListener("message", onMessage);
+          window.clearTimeout(timer);
+        };
+        const onMessage = (event: MessageEvent) => {
+          if (event.source !== window.parent) return;
+          const d = event.data;
+          if (!d || typeof d !== "object" || Array.isArray(d)) return;
+          const rec = d as Record<string, unknown>;
+          if (rec.type !== "agentStudio:replyResult" || rec.requestId !== requestId) {
+            return;
+          }
+          if (settled) return;
+          settled = true;
+          cleanup();
+          resolve({
+            ok: Boolean(rec.ok),
+            mode: typeof rec.mode === "string" ? rec.mode : undefined,
+            message: typeof rec.message === "string" ? rec.message : undefined,
+          });
+        };
+        const timer = window.setTimeout(() => {
+          if (settled) return;
+          settled = true;
+          cleanup();
+          resolve(null);
+        }, 4000);
+
+        window.addEventListener("message", onMessage);
+        window.parent.postMessage(
+          {
+            type: "agentStudio:replyToAgent",
+            requestId,
+            sessionId: req.sessionId || this.selectedSessionId || "",
+            agentId: req.agentId,
+            promptId: req.promptId,
+            text,
+            blockingToolCall: req.blockingToolCall,
+          },
+          "*"
+        );
+      });
+
+      if (bridgeRes && bridgeRes.ok) {
+        const mode: ReplyToHostResult["mode"] =
+          bridgeRes.mode === "sent" ||
+          bridgeRes.mode === "prefilled" ||
+          bridgeRes.mode === "copied" ||
+          bridgeRes.mode === "focused_copied"
+            ? bridgeRes.mode
+            : req.blockingToolCall
+              ? "focused_copied"
+              : "prefilled";
+        return {
+          ok: true,
+          mode,
+          message:
+            bridgeRes.message ||
+            (req.blockingToolCall
+              ? "Copied & focused IDE — paste to confirm prompt."
+              : "Prefilled in IDE chat."),
+        };
+      }
+    }
+
+    const copied = await copyTextSafe(text);
+    return {
+      ok: copied,
+      mode: "copied",
+      message: copied
+        ? "Copied answer — paste into your IDE prompt to respond."
+        : "Copy failed — please select and copy your answer manually.",
+    };
   }
 
   private collectFeedbackDiagnostics(): FeedbackDiagnostics {
@@ -746,9 +968,17 @@ export class AgentStudioApp {
     const ws = sp.get("workspace");
     const ide = sp.get("ide") as IdeFilter | null;
     const sess = sp.get("session");
+    const openChat = sp.get("openChat");
+    const openWaiting = sp.get("openWaiting");
 
     if (p) this.selectedProject = p;
     if (ws) this.lockedWorkspace = ws;
+    if (openChat && openChat.trim()) {
+      this.pendingOpenChatAgentId = openChat.trim();
+    }
+    if (openWaiting === "1" || openWaiting === "true") {
+      this.pendingOpenWaiting = true;
+    }
 
     if (ide === "antigravity" || ide === "claude-code" || ide === "copilot-vscode") {
       this.ideFilter = ide;

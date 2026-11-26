@@ -104,6 +104,7 @@ const DiscoverModelsPayloadSchema = z.object({
       label: z.string().optional(),
       vendor: z.string().optional(),
       family: z.string().optional(),
+      version: z.string().optional(),
       maxInputTokens: z.number().int().positive().optional(),
       tierHint: ModelTierSchema.optional(),
       capabilities: z.array(ModelCapabilityTagSchema).optional(),
@@ -711,6 +712,62 @@ export function createStudioServer(
       return;
     }
 
+    // 2c. GET /api/chat and GET /api/sessions/:id/chat
+    const isSessionChatRoute =
+      method === "GET" &&
+      pathname.startsWith("/api/sessions/") &&
+      pathname.endsWith("/chat");
+    if ((method === "GET" && pathname === "/api/chat") || isSessionChatRoute) {
+      let sessionParam = url.searchParams.get("session")?.trim();
+      if (isSessionChatRoute) {
+        const rawId = pathname
+          .slice("/api/sessions/".length, -"/chat".length)
+          .trim();
+        if (
+          !rawId ||
+          rawId.includes("/") ||
+          rawId.includes("\\") ||
+          rawId.includes("..")
+        ) {
+          sendJson(res, 404, {
+            ok: false,
+            error: "Session not found",
+          });
+          return;
+        }
+        sessionParam = rawId;
+      }
+      if (!sessionParam) {
+        sendJson(res, 400, {
+          ok: false,
+          error: "Missing session query parameter",
+        });
+        return;
+      }
+      const rawLimitParam = url.searchParams.get("limit");
+      const parsedLimit = rawLimitParam
+        ? Number.parseInt(rawLimitParam, 10)
+        : 80;
+      const chatRes = await aggregator.getAgentChat({
+        sessionId: sessionParam,
+        agentId: url.searchParams.get("agent")?.trim() || "root",
+        ide: url.searchParams.get("ide") ?? undefined,
+        project: url.searchParams.get("project") ?? undefined,
+        workspace: url.searchParams.get("workspace") ?? undefined,
+        limit: Number.isFinite(parsedLimit) ? parsedLimit : 80,
+        before: url.searchParams.get("before")?.trim() || undefined,
+      });
+      if (!chatRes) {
+        sendJson(res, 404, {
+          ok: false,
+          error: "Session not found",
+        });
+        return;
+      }
+      sendJson(res, 200, chatRes);
+      return;
+    }
+
     // 3. GET /api/stream (SSE)
     if (method === "GET" && pathname === "/api/stream") {
       res.writeHead(200, {
@@ -765,10 +822,12 @@ export function createStudioServer(
 
       try {
         const result = aggregator.ingest(items);
+        const advisory = aggregator.evaluateIngestAdvisory(result.events);
         sendJson(res, 202, {
           ok: true,
           accepted: result.accepted,
           deduped: result.deduped,
+          ...(advisory ? { advisory } : {}),
         });
       } catch (err) {
         sendJson(res, 400, {
@@ -1136,44 +1195,39 @@ export function createStudioServer(
       try {
         await withTeamYamlLock(teamYamlPath, (manifest) => {
           if (input.workflow) {
-            manifest.workflow.modelRouting ??= {
+            const mr = (manifest.workflow.modelRouting ??= {
               policy: "prefer-fallback",
               respectBuiltInOrchestrators: true,
               allowSubagentModelHints: true,
               copilotHandoffModels: false,
-            };
+              selectionPriority: ["accuracy", "cost", "speed"],
+            });
             const wf = input.workflow;
             if (wf.policy !== undefined) {
-              manifest.workflow.modelRouting.policy = wf.policy;
+              mr.policy = wf.policy;
             }
             if (wf.respectBuiltInOrchestrators !== undefined) {
-              manifest.workflow.modelRouting.respectBuiltInOrchestrators =
-                wf.respectBuiltInOrchestrators;
+              mr.respectBuiltInOrchestrators = wf.respectBuiltInOrchestrators;
             }
             if (wf.allowSubagentModelHints !== undefined) {
-              manifest.workflow.modelRouting.allowSubagentModelHints =
-                wf.allowSubagentModelHints;
+              mr.allowSubagentModelHints = wf.allowSubagentModelHints;
             }
             if (wf.copilotHandoffModels !== undefined) {
-              manifest.workflow.modelRouting.copilotHandoffModels =
-                wf.copilotHandoffModels;
+              mr.copilotHandoffModels = wf.copilotHandoffModels;
             }
             if (wf.idePolicies) {
-              manifest.workflow.modelRouting.idePolicies ??= {};
+              mr.idePolicies ??= {};
               for (const ide of ALL_IDES) {
                 const pol = wf.idePolicies[ide];
                 if (pol === undefined) continue;
                 if (pol === null) {
-                  delete manifest.workflow.modelRouting.idePolicies[ide];
+                  delete mr.idePolicies[ide];
                 } else {
-                  manifest.workflow.modelRouting.idePolicies[ide] = pol;
+                  mr.idePolicies[ide] = pol;
                 }
               }
-              if (
-                Object.keys(manifest.workflow.modelRouting.idePolicies)
-                  .length === 0
-              ) {
-                delete manifest.workflow.modelRouting.idePolicies;
+              if (Object.keys(mr.idePolicies).length === 0) {
+                delete mr.idePolicies;
               }
             }
           }

@@ -9,6 +9,7 @@ import type {
   ModelIndexLayersInfo,
   ModelIndexView,
   ModelRoutingPolicy,
+  ModelSelectionCriterion,
   ModelSourceTag,
   ModelTier,
   RoleModelRouting,
@@ -38,6 +39,29 @@ const VALID_CAPS = new Set<ModelCapabilityTag>([
   "search",
   "long-context",
 ]);
+const VALID_CRITERIA = new Set<ModelSelectionCriterion>([
+  "accuracy",
+  "cost",
+  "speed",
+]);
+
+function normalizeSelectionPriority(
+  raw: unknown,
+  fallback: readonly ModelSelectionCriterion[] = ["accuracy", "cost", "speed"]
+): ModelSelectionCriterion[] {
+  if (!Array.isArray(raw)) return [...fallback];
+  const out: ModelSelectionCriterion[] = [];
+  for (const item of raw) {
+    if (
+      typeof item === "string" &&
+      VALID_CRITERIA.has(item as ModelSelectionCriterion) &&
+      !out.includes(item as ModelSelectionCriterion)
+    ) {
+      out.push(item as ModelSelectionCriterion);
+    }
+  }
+  return out.length > 0 ? out : [...fallback];
+}
 
 function asRecord(val: unknown): Record<string, unknown> {
   return val && typeof val === "object" && !Array.isArray(val)
@@ -65,12 +89,13 @@ export function buildDefaultModelIndex(): ModelIndex {
     schemaVersion: 1,
     updatedAt: new Date(0).toISOString(),
     updatedBy: "built-in",
+    selectionPriority: ["accuracy", "cost", "speed"],
     roleRecommendations: {
       orchestrator: {
-        tier: "fast",
+        tier: "balanced",
         deferToHostOrchestrator: true,
         rationale:
-          "Read-only board triage, dispatch, and QA gate verification (#1 token-savings lever).",
+          "Coordination, task-splitting, and board triage require strong judgment without falling back to low-accuracy fast models.",
       },
       architect: {
         tier: "reasoning",
@@ -93,10 +118,15 @@ export function buildDefaultModelIndex(): ModelIndex {
         rationale:
           "Interactive UI, SVG/CSS, and iterative typecheck/build fixes.",
       },
-      "qa-validator": {
-        tier: "fast",
+      "code-reviewer": {
+        tier: "reasoning",
         rationale:
-          "Deterministic checkpoint runs, MCP testrun recording, and pass/fail triage (#2 token-savings lever).",
+          "Deep code review for security vulnerabilities, architecture conformance, concurrency bugs, performance regressions, and test coverage.",
+      },
+      "qa-validator": {
+        tier: "balanced",
+        rationale:
+          "Deterministic checkpoint runs, MCP testrun recording, and accurate pass/fail bug triage.",
       },
       "team-setup": {
         tier: "balanced",
@@ -172,8 +202,9 @@ export function buildDefaultModelIndex(): ModelIndex {
             label: "Gemini 4 Carbon",
             vendor: "google",
             family: "gemini-4",
-            tier: "fast",
-            capabilities: ["fast", "coding"],
+            tier: "balanced",
+            capabilities: ["coding", "reasoning", "multimodal"],
+            contextWindow: 1_000_000,
             available: true,
             source: "built-in",
           },
@@ -182,8 +213,9 @@ export function buildDefaultModelIndex(): ModelIndex {
             label: "Gemini 4 Argon",
             vendor: "google",
             family: "gemini-4",
-            tier: "balanced",
-            capabilities: ["coding", "reasoning", "multimodal"],
+            tier: "reasoning",
+            capabilities: ["reasoning", "coding", "orchestration"],
+            contextWindow: 1_000_000,
             available: true,
             source: "built-in",
           },
@@ -193,7 +225,8 @@ export function buildDefaultModelIndex(): ModelIndex {
             vendor: "google",
             family: "gemini-4",
             tier: "reasoning",
-            capabilities: ["reasoning", "coding", "long-context"],
+            capabilities: ["reasoning", "coding", "multimodal", "long-context"],
+            contextWindow: 1_000_000,
             available: true,
             source: "built-in",
           },
@@ -202,8 +235,9 @@ export function buildDefaultModelIndex(): ModelIndex {
             label: "Gemini 4 Hydrogen",
             vendor: "google",
             family: "gemini-4",
-            tier: "reasoning",
-            capabilities: ["reasoning", "multimodal", "long-context"],
+            tier: "fast",
+            capabilities: ["fast", "search"],
+            contextWindow: 1_000_000,
             available: true,
             source: "built-in",
           },
@@ -264,133 +298,263 @@ export function buildDefaultModelIndex(): ModelIndex {
         syncSource: "built-in",
         tiers: {
           fast: {
-            primary: "Claude Haiku 4.5 (copilot)",
+            primary: "gemini-3-flash",
             fallback: [
-              "Claude Haiku 4.5 (copilot)",
-              "Gemini 3 Flash (copilot)",
-              "GPT-4.1 (copilot)",
-              "GPT-4o mini (copilot)",
+              "gemini-3-flash",
+              "mai-code-2",
+              "gpt-5-mini",
+              "gpt-4.1",
             ],
             omitOnDefer: true,
           },
           balanced: {
-            primary: "Claude Sonnet 4.5 (copilot)",
+            primary: "claude-sonnet-4.6",
             fallback: [
-              "Claude Sonnet 4.5 (copilot)",
-              "Claude Sonnet 4 (copilot)",
-              "GPT-4.1 (copilot)",
-              "Gemini 2.5 Pro (copilot)",
+              "claude-sonnet-4.6",
+              "gpt-5.4",
+              "mai-code-2",
+              "claude-sonnet-4.5",
             ],
             omitOnDefer: true,
           },
           reasoning: {
-            primary: "Claude Opus 4.5 (copilot)",
+            primary: "claude-opus-4.6",
             fallback: [
-              "Claude Opus 4.5 (copilot)",
-              "Claude Opus 4.1 (copilot)",
-              "Claude Sonnet 4.5 (copilot)",
-              "Gemini 2.5 Pro (copilot)",
+              "claude-opus-4.6",
+              "gpt-5.4",
+              "gemini-3.1-pro",
+              "claude-opus-4.5",
             ],
             omitOnDefer: true,
           },
         },
         catalog: [
           {
-            id: "Claude Haiku 4.5 (copilot)",
-            label: "Claude Haiku 4.5",
+            id: "claude-opus-4.6",
+            label: "Claude Opus 4.6",
             vendor: "copilot",
-            family: "claude-haiku-4.5",
-            tier: "fast",
-            capabilities: ["fast", "orchestration", "coding"],
-            premiumMultiplier: 0.33,
+            family: "claude-opus-4.6",
+            tier: "reasoning",
+            capabilities: ["reasoning", "coding", "orchestration", "multimodal"],
+            contextWindow: 200_000,
+            premiumMultiplier: 3,
+            accuracyRank: 100,
+            speedRank: 45,
             available: true,
             source: "built-in",
           },
           {
-            id: "Gemini 3 Flash (copilot)",
-            label: "Gemini 3 Flash",
+            id: "gpt-5.4",
+            label: "GPT-5.4",
             vendor: "copilot",
-            family: "gemini-3-flash",
-            tier: "fast",
-            capabilities: ["fast", "multimodal"],
-            premiumMultiplier: 0.33,
+            family: "gpt-5.4",
+            tier: "reasoning",
+            capabilities: ["reasoning", "coding", "orchestration", "multimodal", "long-context"],
+            contextWindow: 1_000_000,
+            premiumMultiplier: 1,
+            accuracyRank: 96,
+            speedRank: 65,
             available: true,
             source: "built-in",
           },
           {
-            id: "GPT-4.1 (copilot)",
-            label: "GPT-4.1",
+            id: "claude-opus-4.5",
+            label: "Claude Opus 4.5",
             vendor: "copilot",
-            family: "gpt-4.1",
+            family: "claude-opus-4.5",
+            tier: "reasoning",
+            capabilities: ["reasoning", "coding", "orchestration", "multimodal"],
+            contextWindow: 200_000,
+            premiumMultiplier: 3,
+            accuracyRank: 93,
+            speedRank: 45,
+            available: true,
+            source: "built-in",
+          },
+          {
+            id: "gemini-3.1-pro",
+            label: "Gemini 3.1 Pro",
+            vendor: "copilot",
+            family: "gemini-3.1-pro",
+            tier: "reasoning",
+            capabilities: ["reasoning", "coding", "multimodal", "long-context"],
+            contextWindow: 1_000_000,
+            premiumMultiplier: 1,
+            accuracyRank: 90,
+            speedRank: 60,
+            available: true,
+            source: "built-in",
+          },
+          {
+            id: "claude-sonnet-4.6",
+            label: "Claude Sonnet 4.6",
+            vendor: "copilot",
+            family: "claude-sonnet-4.6",
             tier: "balanced",
-            capabilities: ["coding", "fast"],
-            premiumMultiplier: 0,
+            capabilities: ["coding", "reasoning", "multimodal"],
+            contextWindow: 200_000,
+            premiumMultiplier: 1,
+            accuracyRank: 88,
+            speedRank: 70,
             available: true,
             source: "built-in",
           },
           {
-            id: "GPT-4o mini (copilot)",
-            label: "GPT-4o mini",
+            id: "mai-code-2",
+            label: "Mai Code 2",
             vendor: "copilot",
-            family: "gpt-4o-mini",
-            tier: "fast",
-            capabilities: ["fast"],
-            premiumMultiplier: 0,
+            family: "mai-code-2",
+            tier: "balanced",
+            capabilities: ["coding", "reasoning", "long-context"],
+            contextWindow: 1_000_000,
+            premiumMultiplier: 0.33,
+            accuracyRank: 85,
+            speedRank: 82,
             available: true,
             source: "built-in",
           },
           {
-            id: "Claude Sonnet 4.5 (copilot)",
+            id: "claude-sonnet-4.5",
             label: "Claude Sonnet 4.5",
             vendor: "copilot",
             family: "claude-sonnet-4.5",
             tier: "balanced",
             capabilities: ["coding", "reasoning", "multimodal"],
+            contextWindow: 200_000,
             premiumMultiplier: 1,
+            accuracyRank: 82,
+            speedRank: 68,
             available: true,
             source: "built-in",
           },
           {
-            id: "Claude Sonnet 4 (copilot)",
+            id: "gemini-3-flash",
+            label: "Gemini 3 Flash",
+            vendor: "copilot",
+            family: "gemini-3-flash",
+            tier: "fast",
+            capabilities: ["fast", "multimodal", "long-context"],
+            contextWindow: 1_000_000,
+            premiumMultiplier: 0.33,
+            accuracyRank: 78,
+            speedRank: 90,
+            available: true,
+            source: "built-in",
+          },
+          {
+            id: "mai-code-2-flash",
+            label: "Mai Code 2 Flash",
+            vendor: "copilot",
+            family: "mai-code-2-flash",
+            tier: "fast",
+            capabilities: ["fast", "coding", "long-context"],
+            contextWindow: 1_000_000,
+            premiumMultiplier: 0,
+            accuracyRank: 76,
+            speedRank: 92,
+            available: true,
+            source: "built-in",
+          },
+          {
+            id: "gpt-5-mini",
+            label: "GPT-5 mini",
+            vendor: "copilot",
+            family: "gpt-5-mini",
+            tier: "fast",
+            capabilities: ["fast", "coding"],
+            contextWindow: 400_000,
+            premiumMultiplier: 0,
+            accuracyRank: 72,
+            speedRank: 88,
+            available: true,
+            source: "built-in",
+          },
+          {
+            id: "gpt-4.1",
+            label: "GPT-4.1",
+            vendor: "copilot",
+            family: "gpt-4.1",
+            tier: "balanced",
+            capabilities: ["coding", "fast", "long-context"],
+            contextWindow: 1_000_000,
+            premiumMultiplier: 0,
+            accuracyRank: 70,
+            speedRank: 85,
+            available: true,
+            source: "built-in",
+          },
+          {
+            id: "claude-haiku-4.5",
+            label: "Claude Haiku 4.5",
+            vendor: "copilot",
+            family: "claude-haiku-4.5",
+            tier: "fast",
+            capabilities: ["fast", "search", "orchestration"],
+            contextWindow: 200_000,
+            premiumMultiplier: 0.33,
+            accuracyRank: 45,
+            speedRank: 92,
+            deprecated: true,
+            available: true,
+            source: "built-in",
+          },
+          {
+            id: "gpt-4o-mini",
+            label: "GPT-4o mini",
+            vendor: "copilot",
+            family: "gpt-4o-mini",
+            tier: "fast",
+            capabilities: ["fast"],
+            contextWindow: 128_000,
+            premiumMultiplier: 0,
+            accuracyRank: 35,
+            speedRank: 95,
+            deprecated: true,
+            available: true,
+            source: "built-in",
+          },
+          {
+            id: "claude-sonnet-4",
             label: "Claude Sonnet 4",
             vendor: "copilot",
             family: "claude-sonnet-4",
             tier: "balanced",
             capabilities: ["coding", "reasoning"],
+            contextWindow: 200_000,
             premiumMultiplier: 1,
+            accuracyRank: 68,
+            speedRank: 65,
+            deprecated: true,
             available: true,
             source: "built-in",
           },
           {
-            id: "Gemini 2.5 Pro (copilot)",
+            id: "gemini-2.5-pro",
             label: "Gemini 2.5 Pro",
             vendor: "copilot",
             family: "gemini-2.5-pro",
             tier: "reasoning",
             capabilities: ["reasoning", "coding", "multimodal", "long-context"],
+            contextWindow: 1_000_000,
             premiumMultiplier: 1,
+            accuracyRank: 75,
+            speedRank: 55,
+            deprecated: true,
             available: true,
             source: "built-in",
           },
           {
-            id: "Claude Opus 4.5 (copilot)",
-            label: "Claude Opus 4.5",
-            vendor: "copilot",
-            family: "claude-opus-4.5",
-            tier: "reasoning",
-            capabilities: ["reasoning", "coding", "long-context"],
-            premiumMultiplier: 3,
-            available: true,
-            source: "built-in",
-          },
-          {
-            id: "Claude Opus 4.1 (copilot)",
+            id: "claude-opus-4.1",
             label: "Claude Opus 4.1",
             vendor: "copilot",
             family: "claude-opus-4.1",
             tier: "reasoning",
-            capabilities: ["reasoning", "coding"],
+            capabilities: ["reasoning", "coding", "orchestration"],
+            contextWindow: 200_000,
             premiumMultiplier: 10,
+            accuracyRank: 72,
+            speedRank: 40,
+            deprecated: true,
             available: true,
             source: "built-in",
           },
@@ -447,6 +611,15 @@ function normalizeCatalogEntry(raw: unknown): ModelCatalogEntry | null {
       typeof rec.premiumMultiplier === "number" && rec.premiumMultiplier >= 0
         ? rec.premiumMultiplier
         : undefined,
+    accuracyRank:
+      typeof rec.accuracyRank === "number" && Number.isFinite(rec.accuracyRank)
+        ? rec.accuracyRank
+        : undefined,
+    speedRank:
+      typeof rec.speedRank === "number" && Number.isFinite(rec.speedRank)
+        ? rec.speedRank
+        : undefined,
+    deprecated: typeof rec.deprecated === "boolean" ? rec.deprecated : undefined,
     available: typeof rec.available === "boolean" ? rec.available : true,
     source: src,
     discoveredAt: typeof rec.discoveredAt === "string" ? rec.discoveredAt : undefined,
@@ -529,6 +702,10 @@ export function normalizeModelIndex(raw: unknown): ModelIndex {
       typeof rec.updatedAt === "string" && rec.updatedAt ? rec.updatedAt : def.updatedAt,
     updatedBy,
     notes: typeof rec.notes === "string" ? rec.notes : undefined,
+    selectionPriority: normalizeSelectionPriority(
+      rec.selectionPriority,
+      def.selectionPriority ?? ["accuracy", "cost", "speed"]
+    ),
     roleRecommendations,
     ides: {
       antigravity: normalizeIdeConfig(rawIdes.antigravity, def.ides.antigravity),
@@ -555,6 +732,7 @@ export function normalizeWorkflowRouting(raw: unknown): WorkflowModelRouting {
     respectBuiltInOrchestrators: rec.respectBuiltInOrchestrators !== false,
     allowSubagentModelHints: rec.allowSubagentModelHints !== false,
     copilotHandoffModels: rec.copilotHandoffModels === true,
+    selectionPriority: normalizeSelectionPriority(rec.selectionPriority),
     ...(Object.keys(idePolicies).length > 0 ? { idePolicies } : {}),
   };
 }
@@ -643,12 +821,21 @@ export function synthesizeModelIndexViewFromTeam(team: TeamDetailsResponse): Mod
   if (team.modelIndexSummary?.updatedAt) {
     effective.updatedAt = team.modelIndexSummary.updatedAt;
   }
-  const wf = team.modelRouting ?? {
-    policy: "prefer-fallback" as ModelRoutingPolicy,
-    respectBuiltInOrchestrators: true,
-    allowSubagentModelHints: true,
-    copilotHandoffModels: false,
-  };
+  const wf: WorkflowModelRouting = team.modelRouting
+    ? {
+        ...team.modelRouting,
+        selectionPriority: normalizeSelectionPriority(team.modelRouting.selectionPriority),
+      }
+    : {
+        policy: "prefer-fallback" as ModelRoutingPolicy,
+        respectBuiltInOrchestrators: true,
+        allowSubagentModelHints: true,
+        copilotHandoffModels: false,
+        selectionPriority: ["accuracy", "cost", "speed"],
+      };
+  if (wf.selectionPriority) {
+    effective.selectionPriority = wf.selectionPriority;
+  }
 
   const resolvedRoles: Record<string, RoleModelRouting> = {};
   for (const r of team.roster) {

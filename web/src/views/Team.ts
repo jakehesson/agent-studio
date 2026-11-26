@@ -60,7 +60,8 @@ function getDefinitionScope(
   // Global IDE directories outside any workspace root
   if (
     normPath.includes("/.gemini/antigravity/agents/") ||
-    normPath.includes("/.gemini/config/plugins/")
+    normPath.includes("/.gemini/config/plugins/") ||
+    normPath.includes("/.copilot/")
   ) {
     return "global";
   }
@@ -83,7 +84,9 @@ function getDefinitionScope(
 
   if (
     /^([a-z]:)?\/(users|home)\/[^/]+\/\.claude\/agents\//.test(normPath) ||
-    normPath.startsWith("/root/.claude/agents/")
+    normPath.startsWith("/root/.claude/agents/") ||
+    /^([a-z]:)?\/(users|home)\/[^/]+\/\.copilot\//.test(normPath) ||
+    normPath.startsWith("/root/.copilot/")
   ) {
     return "global";
   }
@@ -129,7 +132,9 @@ function renderDefinitionScopeBadges(info: DefinitionClassification): string {
 function describeDefinitionScope(info: DefinitionClassification): string {
   if (info.isProjectCustom) return "Project-local (Custom / non-roster)";
   if (info.scope === "global") {
-    return info.isRoster ? "Global plugin (Team Roster)" : "Global (~/.gemini or ~/.claude)";
+    return info.isRoster
+      ? "Global plugin (Team Roster)"
+      : "Global (~/.gemini, ~/.claude, or ~/.copilot / $COPILOT_HOME)";
   }
   return "Project-local (Team Roster)";
 }
@@ -161,12 +166,12 @@ function getPolicyDescription(
   }
   if (lockedIde === "copilot-vscode") {
     if (policy === "prefer-fallback") {
-      return "Emits ordered VS Code picker fallback arrays with model-policy: preferred — preserves Copilot Fusion / Auto overrides.";
+      return "Emits ordered Copilot runtime model ID fallback arrays with model-policy: preferred — preserves Copilot Fusion / Auto overrides.";
     }
     if (policy === "defer-to-host") {
       return "Omits model and model-policy completely so Copilot Fusion / Auto (and Auto discounts) govern selection.";
     }
-    return "Emits explicit Copilot model strings with model-policy: required (bypasses Copilot Fusion / Auto overrides).";
+    return "Emits explicit Copilot runtime model IDs with model-policy: required (bypasses Copilot Fusion / Auto overrides).";
   }
   if (lockedIde === "claude-code") {
     if (policy === "prefer-fallback") {
@@ -178,7 +183,7 @@ function getPolicyDescription(
     return "Emits pinned concrete Claude model IDs into .claude/agents/<role>.md frontmatter.";
   }
   if (policy === "prefer-fallback") {
-    return "Emits portable tier enums (flash_lite/flash/pro), family aliases (haiku/sonnet/opus), and Copilot model-policy: preferred fallback arrays — compatible with /swarm, Copilot Fusion, and /model.";
+    return "Emits portable tier enums (flash_lite/flash/pro), family aliases (haiku/sonnet/opus), and Copilot model-policy: preferred runtime ID arrays — compatible with /swarm, Copilot Fusion, and /model.";
   }
   if (policy === "defer-to-host") {
     return "Emits model: inherit for Antigravity & Claude Code and omits model/model-policy in VS Code Copilot so /swarm, Copilot Fusion/Auto (10% Auto discount), and /model always govern selection.";
@@ -203,8 +208,8 @@ function getHostCueBadgeText(lockedIde: HostIde | null): string {
 function defaultTierForRole(roleType: string, roleId: string): ModelTier {
   const id = roleId.toLowerCase();
   const rt = roleType.toLowerCase();
-  if (rt === "orchestrator" || id === "orchestrator") return "fast";
-  if (rt === "qa" || id === "qa-validator") return "fast";
+  if (rt === "orchestrator" || id === "orchestrator") return "balanced";
+  if (rt === "qa" || id === "qa-validator") return "balanced";
   if (
     id === "architect" ||
     id === "ux-designer" ||
@@ -216,6 +221,14 @@ function defaultTierForRole(roleType: string, roleId: string): ModelTier {
     return "reasoning";
   }
   return "balanced";
+}
+
+function formatSelectionPriority(priority?: readonly string[]): string {
+  const list = priority && priority.length > 0 ? priority : ["accuracy", "cost", "speed"];
+  return list
+    .map((p) => (p ? p.charAt(0).toUpperCase() + p.slice(1) : ""))
+    .filter(Boolean)
+    .join(" → ");
 }
 
 function sourceBadgeMeta(source: TeamSourceIde): {
@@ -485,6 +498,10 @@ export class TeamView {
         respectBuiltInOrchestrators: this.modelIndex.routing.respectBuiltInOrchestrators,
         allowSubagentModelHints: this.modelIndex.routing.allowSubagentModelHints,
         copilotHandoffModels: this.modelIndex.routing.copilotHandoffModels,
+        selectionPriority:
+          this.modelIndex.routing.selectionPriority ??
+          this.modelIndex.effective.selectionPriority ??
+          ["accuracy", "cost", "speed"],
         idePolicies: this.modelIndex.routing.idePolicies,
       };
     }
@@ -494,6 +511,7 @@ export class TeamView {
         respectBuiltInOrchestrators: true,
         allowSubagentModelHints: true,
         copilotHandoffModels: false,
+        selectionPriority: ["accuracy", "cost", "speed"],
       }
     );
   }
@@ -1209,6 +1227,9 @@ export class TeamView {
     const lockedIde = this.embedScope.lockedIde;
     const policyDesc = getPolicyDescription(wf.policy, lockedIde);
     const respectLabel = getRespectOrchestratorLabel(lockedIde);
+    const priorityLabel = formatSelectionPriority(
+      wf.selectionPriority ?? this.modelIndex?.effective.selectionPriority
+    );
     const cliPolicyCmd = `agent-studio models set-policy ${wf.policy} --respect-host ${wf.respectBuiltInOrchestrators ? "true" : "false"} --sync`;
 
     return `
@@ -1221,6 +1242,7 @@ export class TeamView {
           <div class="mr-title-group">
             <h3 id="modelRoutingHeading">Model Routing &amp; Host Compatibility</h3>
             <span class="pill ${sourceBadgeClass}">${escHtml(sourceBadgeText)}</span>
+            <span class="pill tool" title="Deterministic candidate ranking order">${escHtml(priorityLabel)}</span>
           </div>
           <div class="mr-bar-actions">
             ${
@@ -1795,7 +1817,7 @@ export class TeamView {
         activeFilter === "project-custom"
           ? "No project-specific custom (non-roster) agents found in .agents/agents/, .claude/agents/, or .github/agents/."
           : activeFilter === "global"
-            ? "No global agent definitions found in ~/.gemini/ or ~/.claude/agents/."
+            ? "No global agent definitions found in ~/.gemini/, ~/.claude/agents/, or ~/.copilot/ ($COPILOT_HOME)."
             : "No agent definitions match the selected filter.";
       return `<div class="empty-state">${escHtml(msg)}</div>`;
     }

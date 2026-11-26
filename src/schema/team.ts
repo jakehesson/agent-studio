@@ -3,6 +3,7 @@ import { z } from "zod";
 import {
   ModelRoutingPolicySchema,
   ModelTierSchema,
+  SelectionPriorityMetricSchema,
 } from "./model-index.js";
 
 export const IdeTargetSchema = z.enum([
@@ -19,6 +20,9 @@ export const RoleTypeSchema = z.enum([
   "setup",
 ]);
 export type RoleType = z.infer<typeof RoleTypeSchema>;
+
+export const CopilotHarnessSchema = z.enum(["copilot", "legacy-local"]);
+export type CopilotHarness = z.infer<typeof CopilotHarnessSchema>;
 
 export const CapabilitySchema = z.enum([
   "read",
@@ -68,12 +72,24 @@ export const IdeModelOverrideSchema = z.union([
 ]);
 export type IdeModelOverride = z.infer<typeof IdeModelOverrideSchema>;
 
+export const ContextThresholdsSchema = z
+  .object({
+    warnPercent: z.number().min(1).max(99).default(45),
+    handoffPercent: z.number().min(1).max(99).default(55),
+    compactPercent: z.number().min(1).max(99).default(70),
+  })
+  .passthrough();
+export type ContextThresholds = z.infer<typeof ContextThresholdsSchema>;
+
 export const WorkflowModelRoutingSchema = z
   .object({
     policy: ModelRoutingPolicySchema.default("prefer-fallback"),
     respectBuiltInOrchestrators: z.boolean().default(true),
     allowSubagentModelHints: z.boolean().default(true),
     copilotHandoffModels: z.boolean().default(false),
+    selectionPriority: z
+      .array(SelectionPriorityMetricSchema)
+      .default(["accuracy", "cost", "speed"]),
     idePolicies: z
       .object({
         antigravity: ModelRoutingPolicySchema.optional(),
@@ -102,21 +118,57 @@ export const WorkflowConfigSchema = z
       full: ["CP0", "CP1", "CP2"],
     }),
     checkpoints: z.record(z.string(), CheckpointDefinitionSchema).default({}),
+    copilotHarness: CopilotHarnessSchema.optional(),
     modelRouting: WorkflowModelRoutingSchema.optional(),
+    contextThresholds: ContextThresholdsSchema.optional(),
   })
   .passthrough();
 export type WorkflowConfig = z.infer<typeof WorkflowConfigSchema>;
 
+export const SafeSlugSchema = z
+  .string()
+  .min(1)
+  .regex(/^[a-zA-Z0-9][a-zA-Z0-9._-]*$/, {
+    message:
+      "Identifier must start with an alphanumeric character and contain only letters, digits, '.', '_', or '-'.",
+  })
+  .refine((v) => !v.includes(".."), {
+    message: "Identifier must not contain '..'.",
+  });
+
+export function isSafeRelativePosixPath(value: string): boolean {
+  if (!value || value.length === 0) return false;
+  if (/[\x00-\x1f\x7f]/.test(value)) return false;
+  if (value.includes("\\")) return false;
+  if (value.startsWith("/")) return false;
+  if (/^[A-Za-z]:/.test(value)) return false;
+  const segments = value.split("/");
+  if (segments.some((seg) => seg.length === 0 || seg === "." || seg === "..")) {
+    return false;
+  }
+  return true;
+}
+
+export const SafeRelativePosixPathSchema = z
+  .string()
+  .min(1)
+  .refine(isSafeRelativePosixPath, {
+    message:
+      "Path must be a safe relative POSIX path without leading '/', drive letters, backslashes, '..', '.', or control characters.",
+  });
+
 export const RosterEntrySchema = z
   .object({
-    id: z.string().min(1),
+    id: SafeSlugSchema,
     name: z.string().min(1),
     roleType: RoleTypeSchema,
     boardRole: z.string().min(1),
-    promptFile: z.string().min(1),
+    promptFile: SafeRelativePosixPathSchema,
     capabilities: z.array(CapabilitySchema).default([]),
     handoffs: z.array(z.string().min(1)).optional(),
     description: z.string().optional(),
+    userInvocable: z.boolean().optional(),
+    disableModelInvocation: z.boolean().optional(),
     modelTier: ModelTierSchema.optional(),
     modelPolicy: ModelRoutingPolicySchema.optional(),
     models: z
@@ -133,7 +185,7 @@ export type RosterEntry = z.infer<typeof RosterEntrySchema>;
 
 export const TeamProjectSchema = z
   .object({
-    id: z.string().min(1),
+    id: SafeSlugSchema,
     title: z.string().min(1),
     description: z.string().optional(),
     mockupsDirs: z.array(z.string()).default([]),
@@ -164,10 +216,16 @@ export const TeamManifestSchema = z
       checkpoints: {},
     }),
     roster: z.array(RosterEntrySchema).min(1),
-    skills: z.array(z.string().min(1)).default([]),
+    skills: z.array(SafeRelativePosixPathSchema).default([]),
   })
   .passthrough();
 export type TeamManifest = z.infer<typeof TeamManifestSchema>;
+
+export function resolveCopilotHarness(
+  manifest?: TeamManifest | null,
+): CopilotHarness {
+  return manifest?.workflow.copilotHarness ?? "copilot";
+}
 
 export function parseTeamYaml(yamlText: string): TeamManifest {
   const raw: unknown = parseYaml(yamlText);

@@ -2,6 +2,7 @@
 name: learn
 description: Capture durable session learnings (user corrections, bug root causes, invariants, repeated workflows) into AGENTS.md, .agent-team/ agents, or quickref skills and re-sync IDEs.
 argument-hint: "[optional focus]"
+disable-model-invocation: true
 ---
 
 # Session Learning & Knowledge Capture (`/learn`)
@@ -37,7 +38,7 @@ Route each learning to its single canonical home:
    - **Target:** Exact file path (plus whether `.agent-team/team.yaml` needs a `skills/<name>` entry).
    - **Exact Diff:** Minimal surgical diff showing additions/updates/pruning.
 2. **Wait for user confirmation** (unless the user explicitly authorized auto-apply).
-3. **Apply edits to canonical sources ONLY:** Never hand-edit compiled IDE outputs (`.agents/plugins/`, `.claude/agents/`, `.claude/skills/`, `.github/agents/`, `.github/skills/`, `.github/prompts/`, or inside `<!-- agent-studio:begin/end -->` blocks).
+3. **Apply edits to canonical sources ONLY:** Never hand-edit compiled IDE outputs (`.agents/plugins/`, `.claude/agents/`, `.claude/skills/`, `.github/agents/`, `.github/skills/`, or inside `<!-- agent-studio:begin/end -->` blocks).
 4. **Recompile & verify zero drift:**
    - Run `agent-studio sync` (or `npx agent-studio sync`).
    - Run `agent-studio sync --check` and confirm exit code `0`.

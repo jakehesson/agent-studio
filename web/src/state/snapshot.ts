@@ -6,6 +6,9 @@ import type {
   IdeSource,
   ModelUsageBucket,
   NormalizedEvent,
+  PendingHumanPrompt,
+  PendingQuestionItem,
+  PendingQuestionOption,
   SessionCounters,
   SessionSnapshot,
   SessionUsageSummary,
@@ -58,10 +61,15 @@ export function inferContextWindow(model?: string, ide?: IdeSource): number {
   if (!low || low === "unknown") {
     return ide === "antigravity" ? 1_000_000 : 200_000;
   }
+  if (/\bmai\b/i.test(low) || /^mai[-_]/i.test(low)) {
+    return 1_000_000;
+  }
   if (
     low.includes("gemini") ||
     low.includes("gpt-4.1") ||
-    low.includes("gpt 4.1")
+    low.includes("gpt 4.1") ||
+    low.includes("gpt-5.4") ||
+    low.includes("gpt 5.4")
   ) {
     return 1_000_000;
   }
@@ -179,6 +187,60 @@ function calcContextPercent(contextTokens: number, contextWindow: number): numbe
   );
 }
 
+function normalizeModelContextWindows(raw: unknown): Record<string, number> | undefined {
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return undefined;
+  const out: Record<string, number> = {};
+  for (const [k, v] of Object.entries(raw as Record<string, unknown>)) {
+    const key = k.trim().toLowerCase();
+    if (key && typeof v === "number" && Number.isFinite(v) && v > 0) {
+      out[key] = Math.round(v);
+    }
+  }
+  return Object.keys(out).length > 0 ? out : undefined;
+}
+
+function resolveCatalogContextWindow(
+  model: string | undefined,
+  modelContextWindows?: Record<string, number>
+): number | undefined {
+  if (!model || !modelContextWindows) return undefined;
+  const low = model.trim().toLowerCase();
+  if (!low || low === "unknown") return undefined;
+
+  const lookup = (key: string): number | undefined => {
+    if (!key) return undefined;
+    const val = modelContextWindows[key];
+    return typeof val === "number" && Number.isFinite(val) && val > 0
+      ? Math.round(val)
+      : undefined;
+  };
+
+  const direct = lookup(low);
+  if (direct !== undefined) return direct;
+
+  const noSuffix = low.replace(/\s*\([^)]+\)\s*$/, "").trim();
+  if (noSuffix !== low) {
+    const byNoSuffix = lookup(noSuffix);
+    if (byNoSuffix !== undefined) return byNoSuffix;
+  }
+
+  const noPrefix = low
+    .replace(/^(?:copilot|models|google|anthropic|openai|azure|vertex)\//i, "")
+    .trim();
+  if (noPrefix !== low) {
+    const byNoPrefix = lookup(noPrefix);
+    if (byNoPrefix !== undefined) return byNoPrefix;
+  }
+
+  const noBoth = noPrefix.replace(/\s*\([^)]+\)\s*$/, "").trim();
+  if (noBoth !== low && noBoth !== noPrefix && noBoth !== noSuffix) {
+    const byNoBoth = lookup(noBoth);
+    if (byNoBoth !== undefined) return byNoBoth;
+  }
+
+  return undefined;
+}
+
 export function synthesizeSessionUsage(agents: AgentNodeSnapshot[]): SessionUsageSummary {
   const aiAgents = agents.filter((a) => (a.nodeType ?? "agent") === "agent");
   let totalTokens = 0;
@@ -287,6 +349,7 @@ function isHumanPromptTool(toolName?: string): boolean {
     low === "ask_question" ||
     low === "askuserquestion" ||
     low === "vscode_askquestions" ||
+    low === "questioncarousel" ||
     low === "elicitationserialized"
   );
 }
@@ -351,6 +414,7 @@ export function buildSnapshot(
         messagesReceived: 0,
         summary: "Standby",
         recentActions: [],
+        pendingPrompt: null,
       });
     }
   }
@@ -905,7 +969,20 @@ export function buildSnapshot(
               (!uAcc.model || baseUsage.model === model)
             ? baseUsage.contextWindow
             : undefined;
-      const contextWindow = explicitContextWindow ?? inferContextWindow(model, node.ide);
+      const catalogContextWindow = resolveCatalogContextWindow(
+        model,
+        baseSnapshot?.modelContextWindows
+      );
+      const inferredWin = inferContextWindow(model, node.ide);
+      const contextWindow =
+        explicitContextWindow ?? catalogContextWindow ?? inferredWin;
+      const nominalContextWindow =
+        inferredWin > contextWindow
+          ? inferredWin
+          : baseUsage?.nominalContextWindow &&
+              baseUsage.nominalContextWindow > contextWindow
+            ? baseUsage.nominalContextWindow
+            : undefined;
       const contextTokens = uAcc.contextTokens;
       const contextPercent = calcContextPercent(contextTokens, contextWindow);
       node.usage = {
@@ -923,6 +1000,7 @@ export function buildSnapshot(
         totalTokens,
         contextTokens,
         contextWindow,
+        ...(nominalContextWindow ? { nominalContextWindow } : {}),
         contextPercent,
         ...(uAcc.costUsd !== undefined
           ? { costUsd: Math.round(uAcc.costUsd * 10000) / 10000 }
@@ -950,7 +1028,20 @@ export function buildSnapshot(
               (!uAcc?.model || baseUsage.model === model)
             ? baseUsage.contextWindow
             : undefined;
-      const contextWindow = explicitContextWindow ?? inferContextWindow(model, node.ide);
+      const catalogContextWindow = resolveCatalogContextWindow(
+        model,
+        baseSnapshot?.modelContextWindows
+      );
+      const inferredWin = inferContextWindow(model, node.ide);
+      const contextWindow =
+        explicitContextWindow ?? catalogContextWindow ?? inferredWin;
+      const nominalContextWindow =
+        inferredWin > contextWindow
+          ? inferredWin
+          : baseUsage?.nominalContextWindow &&
+              baseUsage.nominalContextWindow > contextWindow
+            ? baseUsage.nominalContextWindow
+            : undefined;
       const activeContextChars = acc.priorProseChars + acc.currentTurnTotalChars;
       const contextTokens = Math.min(totalTokens, Math.round(activeContextChars / 4));
       const contextPercent = calcContextPercent(contextTokens, contextWindow);
@@ -964,6 +1055,7 @@ export function buildSnapshot(
         totalTokens,
         contextTokens,
         contextWindow,
+        ...(nominalContextWindow ? { nominalContextWindow } : {}),
         contextPercent,
       };
       node.usage = estUsage;
@@ -987,6 +1079,107 @@ export function buildSnapshot(
   };
 }
 
+function normalizePendingOption(raw: unknown): PendingQuestionOption | null {
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) {
+    if (typeof raw === "string" && raw.trim()) {
+      return { label: raw.trim() };
+    }
+    return null;
+  }
+  const r = raw as Record<string, unknown>;
+  const label = typeof r.label === "string" ? r.label : typeof r.value === "string" ? r.value : "";
+  if (!label) return null;
+  return {
+    id: typeof r.id === "string" ? r.id : undefined,
+    label,
+    description: typeof r.description === "string" ? r.description : undefined,
+    recommended: Boolean(r.recommended),
+  };
+}
+
+function normalizePendingQuestionItem(raw: unknown): PendingQuestionItem | null {
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return null;
+  const r = raw as Record<string, unknown>;
+  const options = Array.isArray(r.options)
+    ? r.options.map(normalizePendingOption).filter((o): o is PendingQuestionOption => o !== null)
+    : [];
+  const rawType = r.type;
+  const type: PendingQuestionItem["type"] =
+    rawType === "multi_select" || rawType === "text" || rawType === "single_select"
+      ? rawType
+      : options.length > 0
+        ? "single_select"
+        : "text";
+  const question =
+    typeof r.question === "string"
+      ? r.question
+      : typeof r.title === "string"
+        ? r.title
+        : typeof r.prompt === "string"
+          ? r.prompt
+          : "";
+  if (!question && options.length === 0) return null;
+  return {
+    id: typeof r.id === "string" ? r.id : undefined,
+    header: typeof r.header === "string" ? r.header : undefined,
+    question: question || (typeof r.header === "string" ? r.header : "Select an option"),
+    type,
+    options,
+    allowCustomInput: typeof r.allowCustomInput === "boolean" ? r.allowCustomInput : undefined,
+    defaultValue: typeof r.defaultValue === "string" ? r.defaultValue : undefined,
+  };
+}
+
+export function normalizePendingHumanPrompt(raw: unknown): PendingHumanPrompt | null {
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return null;
+  const r = raw as Record<string, unknown>;
+  const id = typeof r.id === "string" ? r.id : "";
+  const agentId = typeof r.agentId === "string" ? r.agentId : "";
+  const title = typeof r.title === "string" ? r.title : "";
+  if (!id && !agentId && !title) return null;
+
+  const rawOptions = Array.isArray(r.options)
+    ? r.options
+        .map((o): { label: string; recommended?: boolean } | null => {
+          const norm = normalizePendingOption(o);
+          return norm ? { label: norm.label, recommended: norm.recommended } : null;
+        })
+        .filter((o): o is { label: string; recommended?: boolean } => o !== null)
+    : undefined;
+
+  let questions = Array.isArray(r.questions)
+    ? r.questions
+        .map(normalizePendingQuestionItem)
+        .filter((q): q is PendingQuestionItem => q !== null)
+    : [];
+
+  if (questions.length === 0 && rawOptions && rawOptions.length > 0) {
+    questions = [
+      {
+        question: title || "Choose an option",
+        type: "single_select",
+        options: rawOptions.map((o) => ({ label: o.label, recommended: o.recommended })),
+        allowCustomInput: true,
+      },
+    ];
+  }
+
+  return {
+    id: id || `prompt-${agentId || "agent"}`,
+    toolCallId: typeof r.toolCallId === "string" ? r.toolCallId : undefined,
+    toolName: typeof r.toolName === "string" ? r.toolName : undefined,
+    agentId,
+    agentLabel: typeof r.agentLabel === "string" ? r.agentLabel : agentId || "Agent",
+    kind: r.kind === "approval" ? "approval" : "question",
+    title: title || "Waiting for input",
+    summary: typeof r.summary === "string" ? r.summary : undefined,
+    questions,
+    options: rawOptions,
+    ts: typeof r.ts === "string" ? r.ts : undefined,
+    blockingToolCall: Boolean(r.blockingToolCall),
+  };
+}
+
 /**
  * Normalizes a raw `/api/state` or SSE payload so both canonical TS backend responses
  * and transitional payloads map cleanly into `SessionSnapshot`.
@@ -998,21 +1191,43 @@ export function normalizeServerSnapshot(raw: unknown): SessionSnapshot {
     : [];
 
   const events = ensureMonotonicEvents(rawEvents);
+  const normalizedPendingPrompts = Array.isArray(obj.pendingPrompts)
+    ? obj.pendingPrompts
+        .map(normalizePendingHumanPrompt)
+        .filter((p): p is PendingHumanPrompt => p !== null)
+    : undefined;
+
+  const promptByAgent = new Map<string, PendingHumanPrompt>();
+  if (normalizedPendingPrompts) {
+    for (const p of normalizedPendingPrompts) {
+      if (p.agentId && !promptByAgent.has(p.agentId)) {
+        promptByAgent.set(p.agentId, p);
+      }
+    }
+  }
+
   const rawAgents = Array.isArray(obj.agents)
-    ? (obj.agents as AgentNodeSnapshot[]).map((a) => ({
-        ...a,
-        status: normalizeStatus(a.status),
-        nodeType:
-          a.nodeType ??
-          (a.id === "ext:human" || a.id === "human"
-            ? "human"
-            : a.id.startsWith("ext:")
-              ? "external"
-              : "agent"),
-        toolCalls: a.toolCalls ?? 0,
-        messagesSent: a.messagesSent ?? 0,
-        messagesReceived: a.messagesReceived ?? 0,
-      }))
+    ? (obj.agents as AgentNodeSnapshot[]).map((a) => {
+        const normPrompt =
+          a.pendingPrompt !== undefined
+            ? normalizePendingHumanPrompt(a.pendingPrompt)
+            : promptByAgent.get(a.id) ?? null;
+        return {
+          ...a,
+          status: normalizeStatus(a.status),
+          nodeType:
+            a.nodeType ??
+            (a.id === "ext:human" || a.id === "human"
+              ? "human"
+              : a.id.startsWith("ext:")
+                ? "external"
+                : "agent"),
+          toolCalls: a.toolCalls ?? 0,
+          messagesSent: a.messagesSent ?? 0,
+          messagesReceived: a.messagesReceived ?? 0,
+          pendingPrompt: normPrompt,
+        };
+      })
     : [];
 
   const rawEdges = Array.isArray(obj.edges) ? (obj.edges as AgentEdgeSnapshot[]) : [];
@@ -1056,14 +1271,13 @@ export function normalizeServerSnapshot(raw: unknown): SessionSnapshot {
       ? (obj.sessions as SessionSnapshot["sessions"])
       : undefined,
     boardProjects: boardProjects as SessionSnapshot["boardProjects"],
-    pendingPrompts: Array.isArray(obj.pendingPrompts)
-      ? (obj.pendingPrompts as SessionSnapshot["pendingPrompts"])
-      : undefined,
+    pendingPrompts: normalizedPendingPrompts,
     definitions: Array.isArray(obj.definitions)
       ? (obj.definitions as SessionSnapshot["definitions"])
       : undefined,
     teamRoster: Array.isArray(obj.teamRoster)
       ? (obj.teamRoster as SessionSnapshot["teamRoster"])
       : undefined,
+    modelContextWindows: normalizeModelContextWindows(obj.modelContextWindows),
   };
 }

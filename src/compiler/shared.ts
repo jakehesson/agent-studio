@@ -41,11 +41,111 @@ export function serializeFrontmatter(data: Record<string, unknown>): string {
   return stringifyYaml(data, { lineWidth: 0 }).trim();
 }
 
+function lstatSyncSafe(targetPath: string): fs.Stats | null {
+  try {
+    return fs.lstatSync(targetPath);
+  } catch (err) {
+    if (
+      err &&
+      typeof err === "object" &&
+      "code" in err &&
+      (err as { code?: unknown }).code === "ENOENT"
+    ) {
+      return null;
+    }
+    throw err;
+  }
+}
+
+function resolveRealWithMissingTail(targetPath: string): string {
+  let curr = path.resolve(targetPath);
+  const missingTail: string[] = [];
+
+  while (true) {
+    const st = lstatSyncSafe(curr);
+    if (st !== null) {
+      if (st.isSymbolicLink()) {
+        try {
+          const real = fs.realpathSync(curr);
+          return missingTail.length > 0
+            ? path.join(real, ...missingTail.reverse())
+            : real;
+        } catch (err) {
+          throw new Error(
+            `Symlink path cannot be resolved safely: ${curr} (${err instanceof Error ? err.message : String(err)})`,
+          );
+        }
+      }
+      const real = fs.realpathSync(curr);
+      return missingTail.length > 0
+        ? path.join(real, ...missingTail.reverse())
+        : real;
+    }
+    const parent = path.dirname(curr);
+    if (parent === curr) {
+      return path.resolve(targetPath);
+    }
+    missingTail.push(path.basename(curr));
+    curr = parent;
+  }
+}
+
+export function assertContainedPath(
+  baseDir: string,
+  targetPath: string,
+  label = "path",
+): string {
+  if (/[\x00-\x1f\x7f]/.test(targetPath)) {
+    throw new Error(
+      `Unsafe control characters in ${label}: ${JSON.stringify(targetPath)}`,
+    );
+  }
+  const resolvedBase = path.resolve(baseDir);
+  const resolvedTarget = path.resolve(resolvedBase, targetPath);
+
+  const rel = path.relative(resolvedBase, resolvedTarget);
+  if (
+    !rel ||
+    rel === ".." ||
+    rel.startsWith(`..${path.sep}`) ||
+    path.isAbsolute(rel)
+  ) {
+    throw new Error(
+      `Path traversal blocked for ${label}: "${targetPath}" escapes "${resolvedBase}"`,
+    );
+  }
+
+  const realBase = resolveRealWithMissingTail(resolvedBase);
+  const realTarget = resolveRealWithMissingTail(resolvedTarget);
+  const realRel = path.relative(realBase, realTarget);
+  if (
+    !realRel ||
+    realRel === ".." ||
+    realRel.startsWith(`..${path.sep}`) ||
+    path.isAbsolute(realRel)
+  ) {
+    throw new Error(
+      `Symlink escape blocked for ${label}: "${targetPath}" resolves outside "${resolvedBase}"`,
+    );
+  }
+
+  return resolvedTarget;
+}
+
 export function readRolePrompt(
   projectRoot: string,
   role: RosterEntry,
 ): string {
-  const promptPath = path.resolve(projectRoot, ".agent-team", role.promptFile);
+  const agentTeamDir = assertContainedPath(
+    projectRoot,
+    ".agent-team",
+    ".agent-team directory",
+  );
+  const promptPath = assertContainedPath(
+    agentTeamDir,
+    role.promptFile,
+    "role.promptFile",
+  );
   if (fs.existsSync(promptPath)) {
     const raw = fs.readFileSync(promptPath, "utf8");
     const { body } = splitFrontmatter(raw);
@@ -58,14 +158,20 @@ export function loadManifestSkills(
   projectRoot: string,
   manifest: TeamManifest,
 ): LoadedSkill[] {
+  const agentTeamDir = assertContainedPath(
+    projectRoot,
+    ".agent-team",
+    ".agent-team directory",
+  );
   const loaded: LoadedSkill[] = [];
   for (const skillEntry of manifest.skills) {
-    const skillId = path.basename(skillEntry.replace(/\\/g, "/"));
-    const candidateFile = path.resolve(
-      projectRoot,
-      ".agent-team",
-      skillEntry,
-      "SKILL.md",
+    assertContainedPath(agentTeamDir, skillEntry, "skill directory");
+    const normalizedSkill = skillEntry.replace(/\\/g, "/");
+    const skillId = path.basename(normalizedSkill);
+    const candidateFile = assertContainedPath(
+      agentTeamDir,
+      `${normalizedSkill}/SKILL.md`,
+      "skill file",
     );
     if (!fs.existsSync(candidateFile)) {
       continue;
@@ -175,5 +281,6 @@ export function renderSharedTeamRules(
     "8. **Concise replies:** Don't restate tool output or artifact contents; skip ceremony on simple tasks.",
     "9. **Persist learnings:** Record durable verified facts (working commands, quirks, endpoints, fixes) in workspace quickrefs; never store secrets.",
     "10. **Reuse subagent read-only checks:** Pass verified diagnostic/read-only findings forward into follow-on agent briefs instead of re-running redundant checks.",
+    "11. **Context-budget handoff (`>= 55%` / `PreCompact`):** When context hits `55%` (or `PreCompact` fires), pause new exploration and run `board { op: \"handoff\", kind: \"fresh_context\" | \"task_split\", ... }`; `orchestrator` dispatches a fresh subagent via `board { op: \"show\", itemId }` or splits via `board { op: \"split\", itemId }`.",
   ].join("\n");
 }

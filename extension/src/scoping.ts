@@ -25,6 +25,8 @@ export interface BuildScopedViewUrlInput {
   view?: StudioView;
   projectId?: string;
   sessionId?: string;
+  openWaiting?: boolean;
+  openChatAgentId?: string;
   embed?: boolean;
   hostIde?: HostIde;
   workspaceRoot?: string;
@@ -51,8 +53,55 @@ export function buildScopedViewUrl(input: BuildScopedViewUrlInput): string {
   if (input.sessionId) {
     params.set("session", input.sessionId);
   }
+  if (input.openWaiting) {
+    params.set("openWaiting", "1");
+  }
+  if (input.openChatAgentId && input.openChatAgentId.trim()) {
+    params.set("openChat", input.openChatAgentId.trim());
+  }
   const qs = params.toString();
   return `${input.baseUrl.replace(/\/+$/, "")}/${qs ? `?${qs}` : ""}`;
+}
+
+export function appendDeepLinkParams(
+  rawUrl: string,
+  opts?: { openWaiting?: boolean; openChatAgentId?: string },
+): string {
+  const hasWaiting = Boolean(opts?.openWaiting);
+  const chatAgent = opts?.openChatAgentId?.trim();
+  if (!hasWaiting && !chatAgent) {
+    return rawUrl;
+  }
+  const parsed = new URL(rawUrl);
+  if (hasWaiting) {
+    parsed.searchParams.set("openWaiting", "1");
+  }
+  if (chatAgent) {
+    parsed.searchParams.set("openChat", chatAgent);
+  }
+  return parsed.toString();
+}
+
+export interface SessionWaitingInfo {
+  status?: string;
+  waitingOn?: string | null;
+  pendingQuestionCount?: number;
+  waitingSummary?: string;
+}
+
+export function isSessionWaitingForHuman(session: SessionWaitingInfo): boolean {
+  const status = (session.status ?? "").toUpperCase();
+  const pendingCount =
+    typeof session.pendingQuestionCount === "number" &&
+    Number.isFinite(session.pendingQuestionCount)
+      ? session.pendingQuestionCount
+      : 0;
+  return (
+    session.waitingOn === "user" ||
+    session.waitingOn === "tool_approval" ||
+    pendingCount > 0 ||
+    status === "WAITING"
+  );
 }
 
 export interface ScopedSessionsQueryInput {

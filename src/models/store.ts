@@ -32,6 +32,7 @@ import {
   cloneDefaultModelIndex,
   inferModelCapabilities,
   inferModelTier,
+  rankCatalogModelsForTier,
 } from "./defaults.js";
 
 const ALL_IDES: IdeTarget[] = ["antigravity", "claude-code", "copilot-vscode"];
@@ -71,6 +72,7 @@ export interface DiscoverModelInput {
   label?: string;
   vendor?: string;
   family?: string;
+  version?: string;
   maxInputTokens?: number;
   tierHint?: ModelTier;
   capabilities?: ModelCapabilityTag[];
@@ -185,6 +187,7 @@ export async function withFileLock<T>(
 
   await fs.mkdir(path.dirname(filePath), { recursive: true });
 
+  const lockToken = randomBytes(8).toString("hex");
   const deadline = Date.now() + timeoutMs;
   let acquired = false;
 
@@ -197,6 +200,7 @@ export async function withFileLock<T>(
       try {
         const meta = JSON.stringify({
           pid: process.pid,
+          token: lockToken,
           acquiredAt: new Date().toISOString(),
         });
         await fd.writeFile(meta, "utf8");
@@ -205,15 +209,40 @@ export async function withFileLock<T>(
       }
       acquired = true;
     } catch (err) {
-      if (!isErrno(err, "EEXIST")) {
+      const isWinDeletePending =
+        process.platform === "win32" && isErrno(err, "EPERM", "EBUSY");
+      if (!isErrno(err, "EEXIST") && !isWinDeletePending) {
         throw err;
+      }
+
+      if (isWinDeletePending) {
+        // Windows NTFS returns EPERM while an unlinked lockfile is in DELETE_PENDING state
+        if (Date.now() >= deadline) {
+          throw err;
+        }
+        await sleep(retryDelayMs);
+        continue;
       }
 
       try {
         const stat = await fs.stat(lockPath);
         if (Date.now() - stat.mtimeMs > staleMs) {
-          await fs.unlink(lockPath).catch(() => undefined);
-          continue;
+          const stalePath = `${lockPath}.stale.${process.pid}.${Date.now()}.${randomBytes(4).toString("hex")}`;
+          try {
+            // Atomically claim the stale lockfile via rename before unlinking so concurrent
+            // stale-cleaners fail with ENOENT instead of unlinking a fresh winner's lockfile.
+            await fs.rename(lockPath, stalePath);
+            const renamedStat = await fs.stat(stalePath).catch(() => null);
+            if (renamedStat && Date.now() - renamedStat.mtimeMs <= staleMs) {
+              await fs.link(stalePath, lockPath).catch(() => undefined);
+            }
+            await fs.unlink(stalePath).catch(() => undefined);
+            continue;
+          } catch (renameErr) {
+            if (isErrno(renameErr, "ENOENT")) {
+              continue;
+            }
+          }
         }
       } catch (statErr) {
         if (isErrno(statErr, "ENOENT")) {
@@ -235,7 +264,15 @@ export async function withFileLock<T>(
   try {
     return await fn();
   } finally {
-    await fs.unlink(lockPath).catch(() => undefined);
+    try {
+      const raw = await fs.readFile(lockPath, "utf8");
+      const parsed = JSON.parse(raw) as { token?: unknown };
+      if (parsed.token === lockToken) {
+        await fs.unlink(lockPath).catch(() => undefined);
+      }
+    } catch {
+      // Lockfile already absent or unparseable; do not unlink another owner's lockfile
+    }
   }
 }
 
@@ -459,6 +496,9 @@ function applyOverlayLayer(
   if (layer.notes !== undefined) {
     target.notes = layer.notes;
   }
+  if (layer.selectionPriority && layer.selectionPriority.length > 0) {
+    target.selectionPriority = [...layer.selectionPriority];
+  }
   if (layer.roleRecommendations) {
     for (const [roleId, rec] of Object.entries(layer.roleRecommendations)) {
       const prev = target.roleRecommendations[roleId];
@@ -572,6 +612,9 @@ export function mergeOverlayPatch(
     updatedBy: patch.updatedBy ?? updatedBy,
     ...(patch.$schema !== undefined ? { $schema: patch.$schema } : {}),
     ...(patch.notes !== undefined ? { notes: patch.notes } : {}),
+    ...(patch.selectionPriority !== undefined
+      ? { selectionPriority: [...patch.selectionPriority] }
+      : {}),
   };
 
   if (patch.roleRecommendations) {
@@ -728,6 +771,11 @@ export function applyDiscoveredModels(
         : existing?.family
           ? { family: existing.family }
           : {}),
+      ...(raw.version !== undefined
+        ? { version: raw.version.trim() || undefined }
+        : typeof (existing as Record<string, unknown> | undefined)?.version === "string"
+          ? { version: (existing as Record<string, unknown>).version as string }
+          : {}),
       tier,
       capabilities,
       ...(typeof raw.maxInputTokens === "number" && raw.maxInputTokens > 0
@@ -773,11 +821,51 @@ export function applyDiscoveredModels(
     }
   }
 
+  const nextCatalog = order.map((id) => byId.get(id)!);
+  let nextTiers = prevIde.tiers ? { ...prevIde.tiers } : undefined;
+
+  if (source === "vscode-lm" && prevIde.syncSource !== "manual") {
+    const priority =
+      next.selectionPriority ?? DEFAULT_MODEL_INDEX.selectionPriority;
+
+    for (const tier of ALL_TIERS) {
+      const existingTier = prevIde.tiers?.[tier];
+      const hasUserOverride =
+        existingTier !== undefined &&
+        (existingTier as { autoRanked?: boolean }).autoRanked !== true;
+      if (hasUserOverride) {
+        continue;
+      }
+      const tierCandidates = nextCatalog.filter(
+        (entry) => entry.available !== false && entry.tier === tier,
+      );
+      if (tierCandidates.length === 0) {
+        continue;
+      }
+      const ranked = rankCatalogModelsForTier(
+        nextCatalog,
+        tier,
+        priority,
+      ).slice(0, 4);
+      if (ranked.length > 0) {
+        nextTiers ??= {};
+        nextTiers[tier] = {
+          primary: ranked[0]!.id,
+          fallback: ranked.map((r) => r.id),
+          omitOnDefer: opts.ide === "copilot-vscode" ? true : undefined,
+          notes: "Auto-ranked by Accuracy -> Cost -> Speed from live vscode-lm discovery.",
+          autoRanked: true,
+        } as IdeTierBindingPatch;
+      }
+    }
+  }
+
   next.ides[opts.ide] = {
     ...prevIde,
+    ...(nextTiers ? { tiers: nextTiers } : {}),
     lastSyncedAt: nowIso,
     syncSource,
-    catalog: order.map((id) => byId.get(id)!),
+    catalog: nextCatalog,
   };
 
   return {

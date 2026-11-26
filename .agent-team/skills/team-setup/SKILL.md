@@ -24,6 +24,7 @@ Guides the `team-setup` AI agent (or human developer) through safe, deterministi
 > **CLI Fallback:** If `agent-studio` is not yet on `PATH`, the VS Code/Antigravity extension auto-shims it into `~/.agent-studio/bin` (or run `node ~/.agent-studio/bin/studio-cli.mjs ...`).
 - Global bootstrap (`team-setup` in all IDEs): `agent-studio init --global`
 - Project bootstrap: `agent-studio init --ides antigravity,claude-code,copilot-vscode --non-interactive`
+- Safely upgrade stock templates & configs: `agent-studio upgrade`
 - Inspect/update model routing: `agent-studio models show` / `agent-studio models set-policy prefer-fallback --sync`
 - Recompile after `.agent-team/` edits: `agent-studio sync`
 - CI / QA drift check: `agent-studio sync --check`

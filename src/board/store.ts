@@ -125,8 +125,18 @@ export async function withBoardLock<T>(
       }
       acquired = true;
     } catch (err) {
-      if (!isErrno(err, "EEXIST")) {
+      const isWinDeletePending =
+        process.platform === "win32" && isErrno(err, "EPERM", "EBUSY");
+      if (!isErrno(err, "EEXIST") && !isWinDeletePending) {
         throw err;
+      }
+
+      if (isWinDeletePending) {
+        if (Date.now() >= deadline) {
+          throw err;
+        }
+        await sleep(retryDelayMs);
+        continue;
       }
 
       // Check for stale lockfile and recover safely.

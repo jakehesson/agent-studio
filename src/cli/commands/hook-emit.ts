@@ -3,17 +3,26 @@ import path from "node:path";
 import { parseTeamYaml, type TeamManifest } from "../../schema/team.js";
 import type { EventKind, IdeSource } from "../../schema/telemetry.js";
 import {
+  buildContextAdvisoryMessage,
+  DEFAULT_CONTEXT_THRESHOLDS,
+  type ContextAdvisory,
+} from "../../telemetry/push-bus.js";
+import {
   cleanHumanSummary,
   computeDeterministicEventId,
   computeMergeKey,
+  inferContextWindow,
   isBoardMutationToolCall,
   isOpaqueAgentId,
   normalizeCopilotUsage,
+  normalizePendingQuestions,
   normalizeWsPath,
   prettifyModelName,
   summarizeToolCall,
   toIsoUtc,
+  unquoteArg,
   type EnrichedEvent,
+  type PendingQuestionItem,
   type UsageDelta,
 } from "../../telemetry/types.js";
 
@@ -29,6 +38,7 @@ export interface HookEmitResult {
   denied: boolean;
   deliveredVia: "http" | "file" | "none";
   event?: EnrichedEvent;
+  advisory?: ContextAdvisory;
 }
 
 const EDIT_OR_WRITE_TOOLS = new Set([
@@ -39,6 +49,8 @@ const EDIT_OR_WRITE_TOOLS = new Set([
   "edit_file",
   "write_file",
   "apply_patch",
+  "create",
+  "str_replace",
   "edit/editfiles",
   "edit/createfile",
   "copilot_applypatch",
@@ -49,13 +61,30 @@ const EDIT_OR_WRITE_TOOLS = new Set([
   "multi_replace_file_content",
 ]);
 
+function isEditOrWriteToolCall(
+  toolName: string,
+  toolInput: Record<string, unknown>,
+): boolean {
+  const low = toolName.toLowerCase();
+  if (low === "str_replace_editor") {
+    const cmd = strField(toolInput, "command", "Command")?.toLowerCase();
+    return cmd !== "view";
+  }
+  return EDIT_OR_WRITE_TOOLS.has(low);
+}
+
 const SHELL_TOOLS = new Set([
   "bash",
   "powershell",
   "run_command",
   "run_in_terminal",
   "execute/runinterminal",
+  "execute",
+  "shell",
+  "terminal",
 ]);
+
+const MAX_STDIN_BYTES = 256 * 1024;
 
 function parseFlags(args: string[]): Record<string, string> {
   const out: Record<string, string> = {};
@@ -79,14 +108,16 @@ function parseFlags(args: string[]): Record<string, string> {
   return out;
 }
 
-function readStdinWithCap(timeoutMs = 250): Promise<string> {
+function readStdinWithCap(
+  timeoutMs = 250,
+): Promise<{ text: string; truncated: boolean }> {
   if (process.stdin.isTTY) {
-    return Promise.resolve("");
+    return Promise.resolve({ text: "", truncated: false });
   }
   return new Promise((resolve) => {
     const chunks: Buffer[] = [];
     let totalBytes = 0;
-    const MAX_BYTES = 256 * 1024;
+    let truncated = false;
     let settled = false;
 
     const finish = (): void => {
@@ -97,14 +128,16 @@ function readStdinWithCap(timeoutMs = 250): Promise<string> {
       process.stdin.removeListener("end", onEnd);
       process.stdin.removeListener("error", onEnd);
       process.stdin.pause();
-      resolve(Buffer.concat(chunks).toString("utf8"));
+      resolve({ text: Buffer.concat(chunks).toString("utf8"), truncated });
     };
 
     const onData = (buf: Buffer | string): void => {
       const b = typeof buf === "string" ? Buffer.from(buf, "utf8") : buf;
-      if (totalBytes + b.length <= MAX_BYTES) {
+      if (totalBytes + b.length <= MAX_STDIN_BYTES) {
         chunks.push(b);
         totalBytes += b.length;
+      } else {
+        truncated = true;
       }
     };
     const onEnd = (): void => finish();
@@ -127,25 +160,64 @@ function loadTeamManifestBestEffort(cwd: string): TeamManifest | null {
   }
 }
 
-function mapHookEventToKind(hookEvent: string, isSubagent = false): EventKind {
-  switch (hookEvent.toLowerCase()) {
-    case "sessionstart":
+const HOOK_EVENT_CANONICAL_MAP: Readonly<Record<string, string>> = {
+  sessionstart: "sessionStart",
+  sessionend: "sessionEnd",
+  userpromptsubmitted: "userPromptSubmitted",
+  userpromptsubmit: "userPromptSubmitted",
+  userprompttransformed: "userPromptTransformed",
+  pretooluse: "preToolUse",
+  posttooluse: "postToolUse",
+  posttoolusefailure: "postToolUseFailure",
+  precompact: "preCompact",
+  subagentstart: "subagentStart",
+  subagentstop: "subagentStop",
+  agentstop: "agentStop",
+  stop: "agentStop",
+  permissionrequest: "permissionRequest",
+  notification: "notification",
+  erroroccurred: "errorOccurred",
+};
+
+const NEW_COPILOT_ADVISORY_EVENTS = new Set([
+  "sessionStart",
+  "postToolUse",
+  "postToolUseFailure",
+  "subagentStart",
+  "notification",
+]);
+
+export function normalizeHookEventName(raw: string): string {
+  const trimmed = raw.trim();
+  if (!trimmed) return "preToolUse";
+  return HOOK_EVENT_CANONICAL_MAP[trimmed.toLowerCase()] ?? trimmed;
+}
+
+function mapHookEventToKind(hookCanon: string, isSubagent = false): EventKind {
+  switch (hookCanon) {
+    case "sessionStart":
       return "session_start";
-    case "userpromptsubmit":
+    case "userPromptSubmitted":
       return isSubagent ? "thinking_start" : "user_input";
-    case "pretooluse":
+    case "userPromptTransformed":
+      return "thinking_start";
+    case "preToolUse":
       return "tool_start";
-    case "posttooluse":
-    case "posttoolusefailure":
+    case "postToolUse":
+    case "postToolUseFailure":
       return "tool_end";
-    case "subagentstart":
+    case "subagentStart":
       return "subagent_spawn";
-    case "subagentstop":
+    case "subagentStop":
       return "subagent_done";
-    case "precompact":
-      return "message";
-    case "stop":
+    case "agentStop":
+    case "sessionEnd":
       return "assistant_turn_end";
+    case "preCompact":
+    case "permissionRequest":
+    case "notification":
+    case "errorOccurred":
+      return "message";
     default:
       return "message";
   }
@@ -330,52 +402,280 @@ function objField(
   return {};
 }
 
+const PATH_FIELD_KEY_SET = new Set([
+  "file_path",
+  "filepath",
+  "path",
+  "target",
+  "target_file",
+  "targetfile",
+  "uri",
+  "file",
+  "destination",
+  "dest",
+  "new_path",
+  "newpath",
+  "old_path",
+  "oldpath",
+]);
+
+const NESTED_ARRAY_KEY_SET = new Set([
+  "edits",
+  "files",
+  "changes",
+  "operations",
+  "patches",
+  "items",
+]);
+
+const PATCH_TEXT_KEY_SET = new Set([
+  "patch",
+  "input",
+  "diff",
+  "rawpatch",
+  "raw_patch",
+]);
+
+function stripFileUri(raw: string): string {
+  const trimmed = raw.trim().replace(/^["']|["']$/g, "");
+  if (/^file:\/\//i.test(trimmed)) {
+    try {
+      const u = new URL(trimmed);
+      if (u.protocol === "file:") {
+        let p = decodeURIComponent(u.pathname);
+        if (process.platform === "win32" && /^\/[a-zA-Z]:/.test(p)) {
+          p = p.slice(1);
+        }
+        return p;
+      }
+    } catch {
+      // fall through
+    }
+  }
+  return trimmed;
+}
+
+function normalizeForBoardCompare(p: string): string {
+  return path.normalize(p).replace(/\\/g, "/").replace(/\/+$/, "").toLowerCase();
+}
+
+function matchesBoardPath(
+  rawCandidate: string,
+  boardRelPath: string,
+  cwd: string,
+): boolean {
+  const cleaned = stripFileUri(rawCandidate);
+  if (!cleaned) return false;
+  const resolvedBoard = normalizeForBoardCompare(path.resolve(cwd, boardRelPath));
+  const resolvedCandidate = normalizeForBoardCompare(path.resolve(cwd, cleaned));
+  if (resolvedCandidate === resolvedBoard) {
+    return true;
+  }
+  const normRelBoard = boardRelPath
+    .replace(/\\/g, "/")
+    .replace(/^\.\//, "")
+    .replace(/\/+$/, "")
+    .toLowerCase();
+  const normPosixCand = path.posix
+    .normalize(cleaned.replace(/\\/g, "/"))
+    .replace(/^\.\//, "")
+    .replace(/\/+$/, "")
+    .toLowerCase();
+  return normPosixCand === normRelBoard;
+}
+
+function extractPathsFromPatchText(patchText: string): string[] {
+  const out: string[] = [];
+  for (const line of patchText.split(/\r?\n/)) {
+    const codexMatch = /^\s*\*{3}\s*(?:Update File|Add File|Delete File|Move to)\s*:\s*(.+)$/i.exec(
+      line,
+    );
+    if (codexMatch?.[1]) {
+      const p = codexMatch[1].trim();
+      if (p) out.push(p);
+      continue;
+    }
+    const diffMatch = /^\s*(?:\+\+\+|---)\s+(.+)$/.exec(line);
+    if (diffMatch?.[1]) {
+      const raw = diffMatch[1].split("\t")[0]!.trim().replace(/^["']|["']$/g, "");
+      if (!raw || raw === "/dev/null") continue;
+      out.push(raw);
+      if (/^[ab]\//i.test(raw)) {
+        out.push(raw.slice(2));
+      }
+    }
+  }
+  return out;
+}
+
+function collectCandidatePathsFromInput(
+  obj: Record<string, unknown>,
+  lowTool: string,
+  depth = 0,
+): string[] {
+  if (depth > 4) return [];
+  const out: string[] = [];
+  for (const [key, val] of Object.entries(obj)) {
+    const lowKey = key.toLowerCase();
+    if (PATH_FIELD_KEY_SET.has(lowKey)) {
+      if (typeof val === "string" && val.trim()) {
+        out.push(val.trim());
+      } else if (Array.isArray(val)) {
+        for (const item of val) {
+          if (typeof item === "string" && item.trim()) {
+            out.push(item.trim());
+          } else if (item && typeof item === "object" && !Array.isArray(item)) {
+            out.push(
+              ...collectCandidatePathsFromInput(
+                item as Record<string, unknown>,
+                lowTool,
+                depth + 1,
+              ),
+            );
+          }
+        }
+      } else if (val && typeof val === "object") {
+        const uriRec = val as Record<string, unknown>;
+        const uriPath = strField(uriRec, "fsPath", "path", "external");
+        if (uriPath) out.push(uriPath);
+      }
+    } else if (NESTED_ARRAY_KEY_SET.has(lowKey) && Array.isArray(val)) {
+      for (const item of val) {
+        if (typeof item === "string" && item.trim()) {
+          out.push(item.trim());
+        } else if (item && typeof item === "object" && !Array.isArray(item)) {
+          out.push(
+            ...collectCandidatePathsFromInput(
+              item as Record<string, unknown>,
+              lowTool,
+              depth + 1,
+            ),
+          );
+        }
+      }
+    }
+
+    if (
+      (PATCH_TEXT_KEY_SET.has(lowKey) ||
+        ((lowTool === "apply_patch" || lowTool === "copilot_applypatch") &&
+          (lowKey === "content" || lowKey === "text"))) &&
+      typeof val === "string" &&
+      val.trim()
+    ) {
+      out.push(...extractPathsFromPatchText(val));
+    }
+  }
+  return out;
+}
+
+function escapeRegExp(s: string): string {
+  return s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+function looksLikeShellBoardWrite(rawCmd: string, boardRelPath: string): boolean {
+  const cmdNorm = rawCmd.replace(/\\/g, "/").toLowerCase();
+  const normBoard = boardRelPath
+    .replace(/\\/g, "/")
+    .replace(/^\.\//, "")
+    .toLowerCase();
+  const boardBase = path.posix.basename(normBoard);
+  const boardBaseRe = new RegExp(
+    `(?:^|[\\s/"'\`=,(])${escapeRegExp(boardBase)}(?:$|[\\s"'\`,);&|])`,
+    "i",
+  );
+  const mentionsBoard =
+    cmdNorm.includes(normBoard) ||
+    cmdNorm.includes("pipeline/board.json") ||
+    boardBaseRe.test(cmdNorm);
+  if (!mentionsBoard) return false;
+
+  const cmdNoDevNull = cmdNorm
+    .replace(/\b\d*>&\d+\b/g, " ")
+    .replace(/\b\d*>\s*(?:\/dev\/null|nul)\b/g, " ");
+  const hasRedirect = /(?:^|[^=-])>{1,2}/.test(cmdNoDevNull);
+  const hasScriptRuntime =
+    /\b(?:node|nodejs|tsx|ts-node)\s+(?:--eval|-e)\b/.test(cmdNorm) ||
+    /\bpython[23]?\s+-c\b/.test(cmdNorm) ||
+    /\bruby\s+-e\b/.test(cmdNorm) ||
+    /\bperl\s+-[a-z]*e\b/.test(cmdNorm) ||
+    /\b(?:pwsh|powershell)\s+(?:-[a-z]*c|-command|-encodedcommand|-enc)\b/.test(
+      cmdNorm,
+    );
+  const hasFileOp =
+    /\b(?:cp|mv|rm|tee|truncate|install|touch)\b/.test(cmdNorm) ||
+    /\bsed\s+(?:-[a-z]*i|--in-place)\b/.test(cmdNorm) ||
+    /\bdd\b.*\bof=/.test(cmdNorm) ||
+    /\b(?:write_text|writefilesync|writefile)\b/.test(cmdNorm);
+  const hasPowerShellWrite =
+    /\b(?:set-content|out-file|add-content|remove-item|move-item|copy-item|rename-item|clear-content|new-item)\b/.test(
+      cmdNorm,
+    );
+
+  return hasRedirect || hasScriptRuntime || hasFileOp || hasPowerShellWrite;
+}
+
 function targetsBoardFile(
   toolName: string,
   toolInput: Record<string, unknown>,
   boardRelPath: string,
+  cwd: string,
 ): boolean {
   const lowTool = toolName.toLowerCase();
-  const normBoard = boardRelPath.replace(/\\/g, "/").toLowerCase();
-  const boardBase = path.basename(normBoard);
 
-  if (EDIT_OR_WRITE_TOOLS.has(lowTool)) {
-    const filePath = (
-      strField(toolInput, "file_path", "filePath", "path", "Path", "target") ??
-      ""
-    )
-      .replace(/\\/g, "/")
-      .toLowerCase();
-    if (!filePath) return false;
-    return filePath.endsWith(normBoard) || filePath.endsWith("/" + boardBase) || filePath === boardBase;
+  if (isEditOrWriteToolCall(toolName, toolInput)) {
+    const candidates = collectCandidatePathsFromInput(toolInput, lowTool);
+    return candidates.some((cand) => matchesBoardPath(cand, boardRelPath, cwd));
   }
 
   if (SHELL_TOOLS.has(lowTool)) {
-    const cmd = (
-      strField(toolInput, "command", "CommandLine", "cmd") ?? ""
-    )
-      .replace(/\\/g, "/")
-      .toLowerCase();
+    const cmd = strField(
+      toolInput,
+      "command",
+      "Command",
+      "CommandLine",
+      "commandLine",
+      "cmd",
+      "script",
+      "Script",
+    );
     if (!cmd) return false;
-    const mentionsBoard = cmd.includes(normBoard) || cmd.includes("pipeline/board.json");
-    const looksLikeWrite =
-      cmd.includes(">") ||
-      cmd.includes("set-content") ||
-      cmd.includes("out-file") ||
-      cmd.includes("write_text") ||
-      cmd.includes("sed -i") ||
-      cmd.includes("tee ");
-    return mentionsBoard && looksLikeWrite;
+    return looksLikeShellBoardWrite(cmd, boardRelPath);
   }
 
+  return false;
+}
+
+function isOrchestratorRole(
+  roleCandidates: ReadonlyArray<string>,
+  manifest: TeamManifest | null,
+): boolean {
+  const orchestratorKeys = new Set<string>(["orchestrator"]);
+  if (manifest?.roster) {
+    for (const entry of manifest.roster) {
+      if (entry.roleType === "orchestrator") {
+        if (entry.id.trim()) orchestratorKeys.add(entry.id.trim().toLowerCase());
+        if (entry.name.trim()) orchestratorKeys.add(entry.name.trim().toLowerCase());
+        if (entry.boardRole.trim()) {
+          orchestratorKeys.add(entry.boardRole.trim().toLowerCase());
+        }
+      }
+    }
+  }
+  for (const cand of roleCandidates) {
+    const norm = cand.trim().toLowerCase();
+    if (norm && orchestratorKeys.has(norm)) {
+      return true;
+    }
+  }
   return false;
 }
 
 function evaluatePreToolUseGuardrail(params: {
   toolName: string;
   toolInput: Record<string, unknown>;
-  role?: string;
+  roleCandidates: ReadonlyArray<string>;
   manifest: TeamManifest | null;
+  cwd: string;
 }): string | null {
   const blockDirectBoardEdits =
     params.manifest?.workflow.enforcement.blockDirectBoardEdits ?? true;
@@ -386,17 +686,17 @@ function evaluatePreToolUseGuardrail(params: {
 
   if (
     blockDirectBoardEdits &&
-    targetsBoardFile(params.toolName, params.toolInput, boardPath)
+    targetsBoardFile(params.toolName, params.toolInput, boardPath, params.cwd)
   ) {
     return `Direct edits to ${boardPath} are blocked by Agent Studio. Use the agent-studio MCP \`board\` tool instead.`;
   }
 
   if (
     orchestratorReadOnly &&
-    params.role?.toLowerCase() === "orchestrator"
+    isOrchestratorRole(params.roleCandidates, params.manifest)
   ) {
     const lowTool = params.toolName.toLowerCase();
-    if (EDIT_OR_WRITE_TOOLS.has(lowTool) || SHELL_TOOLS.has(lowTool)) {
+    if (isEditOrWriteToolCall(params.toolName, params.toolInput) || SHELL_TOOLS.has(lowTool)) {
       return `Orchestrator is read-only (orchestratorReadOnly=true). Tool "${params.toolName}" is denied; delegate edits and shell commands to a specialist subagent.`;
     }
   }
@@ -424,18 +724,35 @@ export async function runHookEmit(
   const writeStderr = io?.stderr ?? ((s: string) => process.stderr.write(s));
   const fetchFn = io?.fetchImpl ?? fetch;
 
-  const rawStdin =
-    io?.stdinText !== undefined ? io.stdinText : await readStdinWithCap();
+  let rawStdin = "";
+  let stdinTruncated = false;
+  if (io?.stdinText !== undefined) {
+    const rawBuf = Buffer.from(io.stdinText, "utf8");
+    if (rawBuf.length > MAX_STDIN_BYTES) {
+      stdinTruncated = true;
+      rawStdin = rawBuf.subarray(0, MAX_STDIN_BYTES).toString("utf8");
+    } else {
+      rawStdin = io.stdinText;
+    }
+  } else {
+    const capRes = await readStdinWithCap();
+    rawStdin = capRes.text;
+    stdinTruncated = capRes.truncated;
+  }
 
   let payload: Record<string, unknown> = {};
+  let malformedJson = false;
   if (rawStdin.trim()) {
     try {
       const parsed: unknown = JSON.parse(rawStdin);
       if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
         payload = parsed as Record<string, unknown>;
+      } else {
+        malformedJson = true;
       }
     } catch {
-      // Malformed stdin must never crash the IDE hook.
+      // Malformed stdin must never crash the IDE hook; preToolUse fails closed below.
+      malformedJson = true;
     }
   }
 
@@ -449,11 +766,14 @@ export async function runHookEmit(
       ? ideRaw
       : "unknown";
 
-  const hookEvent =
+  const rawHookEvent =
     flags.event ??
-    strField(payload, "hook_event_name", "hookEventName", "event") ??
+    strField(payload, "hook_event_name", "hookEventName", "event", "hookEvent") ??
     "PreToolUse";
-  const hookLow = hookEvent.toLowerCase();
+  const hookCanon = normalizeHookEventName(rawHookEvent);
+  const hookEvent = rawHookEvent;
+  const isNewCopilotFormat =
+    ide === "copilot-vscode" && /^[a-z]/.test(rawHookEvent.trim());
 
   const cwd = path.resolve(
     flags.cwd ?? strField(payload, "cwd", "workspacePath") ?? process.cwd(),
@@ -491,7 +811,7 @@ export async function runHookEmit(
   );
 
   const isSubagentLifecycle =
-    hookLow === "subagentstart" || hookLow === "subagentstop";
+    hookCanon === "subagentStart" || hookCanon === "subagentStop";
   const subagentType = firstNonOpaqueField(
     payload,
     "agent_display_name",
@@ -512,6 +832,12 @@ export async function runHookEmit(
     "agentRole",
     "role",
     ...(isSubagentLifecycle ? ["name"] : []),
+  );
+  const rawAgentName = firstNonOpaqueField(
+    payload,
+    "agent_name",
+    "agentName",
+    "name",
   );
   const rawSubagentId = strField(
     payload,
@@ -558,9 +884,9 @@ export async function runHookEmit(
         : typeSlug || "subagent";
 
   const isToolHook =
-    hookLow === "pretooluse" ||
-    hookLow === "posttooluse" ||
-    hookLow === "posttoolusefailure";
+    hookCanon === "preToolUse" ||
+    hookCanon === "postToolUse" ||
+    hookCanon === "postToolUseFailure";
 
   let agentId: string;
   let targetAgentId: string | undefined;
@@ -579,20 +905,61 @@ export async function runHookEmit(
     agentId = flags.role ?? "root";
   }
 
-  const role =
-    flags.role ??
-    strField(payload, "agent_role", "agentRole", "role", "agent_type", "agentName");
+  const roleCandidates: string[] = [];
+  if (flags.role?.trim()) {
+    roleCandidates.push(flags.role.trim());
+  } else {
+    for (const k of [
+      "agent_role",
+      "agentRole",
+      "role",
+      "agentName",
+      "agent_name",
+      "agentType",
+      "agent_type",
+      "agentDisplayName",
+      "agent_display_name",
+      "customAgent",
+      "custom_agent",
+    ]) {
+      const v = payload[k];
+      if (typeof v === "string" && v.trim()) {
+        roleCandidates.push(v.trim());
+      } else if (v && typeof v === "object" && !Array.isArray(v)) {
+        const rec = v as Record<string, unknown>;
+        const nested = strField(rec, "id", "name", "role", "displayName");
+        if (nested) roleCandidates.push(nested);
+      }
+    }
+  }
 
   const isSubagentContext = Boolean(subagentId && subagentId !== "root");
   const epoch = Date.now() / 1000;
-  let kind = mapHookEventToKind(hookEvent, isSubagentContext);
+  let kind = mapHookEventToKind(hookCanon, isSubagentContext);
   const lowTool = (toolName ?? "").toLowerCase();
   const isMessageTool =
     lowTool === "sendmessage" ||
     lowTool === "send_message" ||
     lowTool === "write_agent" ||
     lowTool === "read_agent";
-  if (hookLow === "pretooluse" && toolName) {
+  const QUESTION_TOOLS = new Set([
+    "askuserquestion",
+    "ask_question",
+    "ask_user",
+    "vscode_askquestions",
+    "ask_questions",
+    "askquestions",
+  ]);
+  const isQuestionTool = QUESTION_TOOLS.has(lowTool);
+  const isBlockedNotifyUser =
+    lowTool === "notify_user" &&
+    (toolInput.BlockedOnUser === true ||
+      unquoteArg(toolInput.BlockedOnUser).toLowerCase() === "true");
+
+  let waitingReason: EnrichedEvent["waitingReason"];
+  let parsedQuestions: PendingQuestionItem[] = [];
+
+  if (hookCanon === "preToolUse" && toolName) {
     if ((lowTool === "agent" || lowTool === "task") && targetAgentId) {
       kind = "subagent_spawn";
     } else if (isMessageTool) {
@@ -616,32 +983,76 @@ export async function runHookEmit(
           targetAgentId = msgTarget;
         }
       }
-    } else if (lowTool === "askuserquestion") {
-      kind = "user_input";
+    } else if (isQuestionTool || isBlockedNotifyUser) {
+      kind = "tool_start";
+      waitingReason = "user";
+      if (!targetAgentId) {
+        targetAgentId = "human";
+      }
+      if (isBlockedNotifyUser) {
+        const msg = unquoteArg(toolInput.Message ?? toolInput.message).trim();
+        if (msg) {
+          parsedQuestions = [
+            {
+              question: msg,
+              type: "text",
+              options: [],
+              allowCustomInput: true,
+            },
+          ];
+        }
+      } else {
+        parsedQuestions = normalizePendingQuestions(toolInput, {
+          defaultAllowCustomInput: true,
+        });
+      }
     } else if (isBoardMutationToolCall(toolName, toolInput)) {
       kind = "board_mutation";
     }
   } else if (
-    (hookLow === "posttooluse" || hookLow === "posttoolusefailure") &&
+    (hookCanon === "postToolUse" || hookCanon === "postToolUseFailure") &&
     (lowTool === "agent" || lowTool === "task") &&
     targetAgentId
   ) {
     kind = "subagent_done";
+  } else if (hookCanon === "permissionRequest") {
+    waitingReason = "tool_approval";
+    if (!targetAgentId) {
+      targetAgentId = "human";
+    }
+  } else if (hookCanon === "notification") {
+    if (!targetAgentId) {
+      targetAgentId = "human";
+    }
   }
 
   // Evaluate PreToolUse guardrails before delivering telemetry
   let denyReason: string | null = null;
-  if (hookLow === "pretooluse" && toolName) {
-    denyReason = evaluatePreToolUseGuardrail({
-      toolName,
-      toolInput,
-      role,
-      manifest,
-    });
+  if (hookCanon === "preToolUse") {
+    if (stdinTruncated || malformedJson) {
+      denyReason =
+        "PreToolUse payload exceeded 256KB limit or was malformed JSON; failing closed.";
+    } else if (toolName) {
+      denyReason = evaluatePreToolUseGuardrail({
+        toolName,
+        toolInput,
+        roleCandidates,
+        manifest,
+        cwd,
+      });
+    }
   }
 
   const promptText =
-    strField(payload, "prompt", "user_prompt", "userPrompt") ??
+    strField(
+      payload,
+      "prompt",
+      "user_prompt",
+      "userPrompt",
+      "transformedPrompt",
+      "transformed_prompt",
+      "transformedContent",
+    ) ??
     (typeof payload.message === "string" && payload.message.trim()
       ? payload.message.trim()
       : payload.message &&
@@ -650,9 +1061,47 @@ export async function runHookEmit(
         ? strField(payload.message as Record<string, unknown>, "text", "content")
         : undefined);
 
+  const isStopLifecycle =
+    hookCanon === "subagentStop" || hookCanon === "agentStop";
+  const stopResponseText = isStopLifecycle
+    ? strField(
+        payload,
+        "response",
+        "last_assistant_message",
+        "lastAssistantMessage",
+      ) ??
+      (payload.response &&
+      typeof payload.response === "object" &&
+      !Array.isArray(payload.response)
+        ? strField(
+            payload.response as Record<string, unknown>,
+            "text",
+            "content",
+            "message",
+          )
+        : undefined)
+    : undefined;
+
+  const errorText =
+    hookCanon === "errorOccurred"
+      ? (typeof payload.error === "string" && payload.error.trim()
+          ? payload.error.trim()
+          : payload.error &&
+              typeof payload.error === "object" &&
+              !Array.isArray(payload.error)
+            ? strField(
+                payload.error as Record<string, unknown>,
+                "message",
+                "error",
+                "reason",
+              )
+            : strField(payload, "errorMessage", "error_message", "reason")) ??
+        promptText
+      : undefined;
+
   let status: EnrichedEvent["status"] = "ok";
   let isError = false;
-  if (hookLow === "pretooluse") {
+  if (hookCanon === "preToolUse") {
     if (denyReason) {
       status = "denied";
       isError = true;
@@ -660,10 +1109,13 @@ export async function runHookEmit(
       status = "running";
       isError = false;
     }
-  } else if (hookLow === "posttoolusefailure") {
+  } else if (
+    hookCanon === "postToolUseFailure" ||
+    hookCanon === "errorOccurred"
+  ) {
     status = "error";
     isError = true;
-  } else if (hookLow === "posttooluse") {
+  } else if (hookCanon === "postToolUse") {
     const respObj =
       toolResultRaw &&
       typeof toolResultRaw === "object" &&
@@ -690,38 +1142,70 @@ export async function runHookEmit(
     subagentType ||
     (isOpaqueAgentId(normalizedSubagentId) ? "Subagent" : normalizedSubagentId);
   const toolSummary = toolName ? summarizeToolCall(toolName, toolInput) : undefined;
+  const notifTitle =
+    hookCanon === "notification"
+      ? promptText ?? strField(payload, "title", "body", "notification")
+      : undefined;
   const summary = denyReason
     ? `DENIED ${toolName ?? "tool"}: ${denyReason}`
     : isSubagentLifecycle
-      ? `${hookLow === "subagentstart" ? "Spawned" : "Completed"} ${readableTarget}`
-      : hookLow === "userpromptsubmit"
+      ? `${hookCanon === "subagentStart" ? "Spawned" : "Completed"} ${readableTarget}`
+      : hookCanon === "userPromptSubmitted"
         ? isSubagentContext
           ? (promptText ? cleanHumanSummary(promptText, 130) : "") || "Starting task…"
           : promptText
             ? `Human: ${cleanHumanSummary(promptText, 130)}`
             : `${hookEvent} (${readableActor})`
-        : toolSummary
-          ? hookLow === "posttooluse" || hookLow === "posttoolusefailure"
-            ? cleanHumanSummary(
-                isError ? `Failed: ${toolSummary}` : `Completed: ${toolSummary}`,
-                140,
-              )
-            : toolSummary
-          : `${hookEvent} (${readableActor})`;
+        : hookCanon === "userPromptTransformed"
+          ? (promptText ? cleanHumanSummary(promptText, 130) : "") || "Prompt transformed"
+          : hookCanon === "errorOccurred"
+            ? errorText
+              ? cleanHumanSummary(`Error: ${errorText}`, 140)
+              : `Error (${readableActor})`
+            : hookCanon === "permissionRequest"
+              ? toolSummary
+                ? `Approve: ${toolSummary}`
+                : promptText
+                  ? cleanHumanSummary(promptText, 140)
+                  : `Permission requested (${readableActor})`
+              : hookCanon === "notification"
+                ? notifTitle
+                  ? cleanHumanSummary(notifTitle, 140)
+                  : `${hookEvent} (${readableActor})`
+                : toolSummary
+                  ? hookCanon === "postToolUse" || hookCanon === "postToolUseFailure"
+                    ? cleanHumanSummary(
+                        isError ? `Failed: ${toolSummary}` : `Completed: ${toolSummary}`,
+                        140,
+                      )
+                    : toolSummary
+                  : hookCanon === "preCompact"
+                    ? `PreCompact (${readableActor})`
+                    : `${hookEvent} (${readableActor})`;
 
   const usageDelta = extractHookUsageDelta(payload, modelRaw, ide);
   const toolMsgBody = isMessageTool
     ? strField(toolInput, "message", "content", "body", "text")
     : undefined;
+  const fullBodyText =
+    promptText ??
+    stopResponseText ??
+    (errorText ? `Error: ${errorText}` : undefined) ??
+    notifTitle ??
+    toolMsgBody;
 
   const eventPayload: Record<string, unknown> = {
     hookEvent,
     toolInput,
+    ...(hookCanon === "preCompact" ? { isPreCompact: true } : {}),
     ...(toolArgsRaw !== undefined ? { toolArgs: toolArgsRaw } : {}),
     ...(toolResultRaw !== undefined ? { toolResult: toolResultRaw } : {}),
     ...(subagentId !== undefined ? { agentId: subagentId } : {}),
     ...(subagentType !== undefined
       ? { agentType: subagentType, agentLabel: subagentType }
+      : {}),
+    ...(rawAgentName && rawAgentName !== subagentType
+      ? { agentName: rawAgentName }
       : {}),
     ...(parentSessionId !== undefined ? { parentSessionId } : {}),
     ...(transcriptPath !== undefined ? { transcriptPath } : {}),
@@ -729,11 +1213,25 @@ export async function runHookEmit(
     ...(modelRaw !== undefined ? { model: modelRaw } : {}),
     ...(promptText !== undefined
       ? { prompt: promptText, body: promptText }
-      : toolMsgBody !== undefined
-        ? { body: toolMsgBody }
+      : fullBodyText !== undefined
+        ? { body: fullBodyText }
         : {}),
     ...(isError ? { isError: true } : {}),
     ...(denyReason ? { denyReason } : {}),
+    ...(hookCanon === "permissionRequest"
+      ? {
+          promptKind: "approval",
+          promptTitle: toolSummary ? `Approve: ${toolSummary}` : summary,
+          blockingToolCall: true,
+        }
+      : {}),
+    ...(parsedQuestions.length > 0
+      ? {
+          questions: parsedQuestions,
+          promptKind: "question",
+          blockingToolCall: true,
+        }
+      : {}),
     ...(usageDelta ? { _usageDelta: usageDelta } : {}),
   };
 
@@ -745,6 +1243,7 @@ export async function runHookEmit(
       kind,
       toolCallId,
       toolName,
+      targetAgentId,
       epoch,
       summary,
     }),
@@ -773,6 +1272,8 @@ export async function runHookEmit(
     summary,
     status,
     isError,
+    ...(fullBodyText !== undefined ? { bodyLength: fullBodyText.length } : {}),
+    ...(waitingReason && !denyReason ? { waitingReason } : {}),
     ...(usageDelta ? { usageDelta } : {}),
     payload: eventPayload,
   };
@@ -781,6 +1282,7 @@ export async function runHookEmit(
   const port = flags.port ?? process.env.AGENT_STUDIO_PORT ?? "8767";
   const ingestUrl = `http://127.0.0.1:${port}/api/ingest`;
   let deliveredVia: "http" | "file" | "none" = "none";
+  let serverAdvisory: ContextAdvisory | undefined;
 
   try {
     const resp = await fetchFn(ingestUrl, {
@@ -791,6 +1293,19 @@ export async function runHookEmit(
     });
     if (resp.ok) {
       deliveredVia = "http";
+      try {
+        const respData = (await resp.json()) as { advisory?: ContextAdvisory };
+        if (
+          respData &&
+          typeof respData.advisory === "object" &&
+          respData.advisory !== null &&
+          typeof respData.advisory.message === "string"
+        ) {
+          serverAdvisory = respData.advisory;
+        }
+      } catch {
+        // Ignore non-JSON ingest responses.
+      }
     } else if (appendTelemetryFallback(cwd, event)) {
       deliveredVia = "file";
     }
@@ -801,6 +1316,15 @@ export async function runHookEmit(
   }
 
   if (denyReason) {
+    if (isNewCopilotFormat) {
+      const denyPayload = {
+        permissionDecision: "deny",
+        permissionDecisionReason: denyReason,
+      };
+      writeStdout(JSON.stringify(denyPayload) + "\n");
+      writeStderr(`[agent-studio guardrail] ${denyReason}\n`);
+      return { exitCode: 0, denied: true, deliveredVia, event };
+    }
     const denyPayload = {
       hookSpecificOutput: {
         hookEventName: "PreToolUse",
@@ -814,5 +1338,91 @@ export async function runHookEmit(
     return { exitCode, denied: true, deliveredVia, event };
   }
 
-  return { exitCode: 0, denied: false, deliveredVia, event };
+  let advisory: ContextAdvisory | undefined = serverAdvisory;
+  if (!advisory && deliveredVia !== "http") {
+    const isPreCompact = hookCanon === "preCompact";
+    const ctxTokens =
+      usageDelta?.contextTokens ??
+      (usageDelta && typeof usageDelta.inputTokens === "number"
+        ? usageDelta.inputTokens +
+          (usageDelta.cachedTokens ?? 0) +
+          (usageDelta.outputTokens ?? 0)
+        : undefined);
+    if (isPreCompact || (typeof ctxTokens === "number" && ctxTokens > 0)) {
+      const resolvedModel = usageDelta?.model ?? modelRaw ?? "unknown";
+      const ctxWindow =
+        usageDelta?.contextWindow ?? inferContextWindow(resolvedModel, ide);
+      const thresholds = manifest?.workflow.contextThresholds;
+      const handoffPercent =
+        thresholds?.handoffPercent ?? DEFAULT_CONTEXT_THRESHOLDS.handoffPercent;
+      const compactPercent =
+        thresholds?.compactPercent ?? DEFAULT_CONTEXT_THRESHOLDS.compactPercent;
+      const safeTokens = typeof ctxTokens === "number" ? ctxTokens : 0;
+      const ctxPercent =
+        ctxWindow > 0
+          ? Math.min(100, Math.round((safeTokens / ctxWindow) * 1000) / 10)
+          : 0;
+      const band =
+        isPreCompact || ctxPercent >= compactPercent
+          ? "compact"
+          : ctxPercent >= handoffPercent
+            ? "handoff"
+            : null;
+      if (band) {
+        advisory = {
+          band,
+          sessionId,
+          agentId,
+          contextTokens: safeTokens,
+          contextWindow: ctxWindow,
+          contextPercent: ctxPercent,
+          ...(resolvedModel !== "unknown" ? { model: resolvedModel } : {}),
+          ...(isPreCompact ? { isPreCompact: true } : {}),
+          message: buildContextAdvisoryMessage({
+            band,
+            contextPercent: ctxPercent,
+            contextWindow: ctxWindow,
+            handoffPercent,
+            isPreCompact,
+          }),
+        };
+      }
+    }
+  }
+
+  if (isNewCopilotFormat) {
+    if (advisory && NEW_COPILOT_ADVISORY_EVENTS.has(hookCanon)) {
+      writeStdout(JSON.stringify({ additionalContext: advisory.message }) + "\n");
+    }
+  } else {
+    const advisoryHookEventName =
+      hookCanon === "preToolUse"
+        ? "PreToolUse"
+        : hookCanon === "postToolUse"
+          ? "PostToolUse"
+          : hookCanon === "userPromptSubmitted"
+            ? "UserPromptSubmit"
+            : hookCanon === "preCompact"
+              ? "PreCompact"
+              : null;
+
+    if (advisory && advisoryHookEventName) {
+      writeStdout(
+        JSON.stringify({
+          hookSpecificOutput: {
+            hookEventName: advisoryHookEventName,
+            additionalContext: advisory.message,
+          },
+        }) + "\n",
+      );
+    }
+  }
+
+  return {
+    exitCode: 0,
+    denied: false,
+    deliveredVia,
+    event,
+    ...(advisory ? { advisory } : {}),
+  };
 }

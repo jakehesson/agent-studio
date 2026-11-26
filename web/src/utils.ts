@@ -288,6 +288,7 @@ export function classifyEventReadable(
     case "tool_end": {
       if (
         tool === "ask_question" ||
+        tool === "ask_user" ||
         tool === "askuserquestion" ||
         tool === "vscode_askquestions" ||
         tool === "questioncarousel" ||
@@ -298,6 +299,21 @@ export function classifyEventReadable(
           cssClass: "human",
           category: "waiting",
           humanTitle: "Waiting for User Input",
+          isLowSignal: false,
+        };
+      }
+      if (
+        tool === "task" ||
+        tool === "agent" ||
+        tool === "runsubagent" ||
+        tool === "agent/runsubagent" ||
+        tool === "invoke_subagent"
+      ) {
+        return {
+          badge: "Handoff",
+          cssClass: "dispatch",
+          category: "handoff",
+          humanTitle: "Subagent Handoff",
           isLowSignal: false,
         };
       }
@@ -337,11 +353,18 @@ export function classifyEventReadable(
           isLowSignal: false,
         };
       }
+      const toolCmd =
+        typeof ev.payload?.command === "string"
+          ? ev.payload.command.toLowerCase()
+          : "";
       if (
         tool === "edit_file" ||
         tool === "write_file" ||
         tool === "edit" ||
         tool === "write" ||
+        tool === "create" ||
+        tool === "str_replace" ||
+        (tool === "str_replace_editor" && toolCmd !== "view") ||
         tool === "multiedit" ||
         tool === "apply_patch" ||
         tool === "replace_file_content" ||
@@ -392,6 +415,7 @@ export function classifyEventReadable(
         tool === "view_file" ||
         tool === "view_file_outline" ||
         tool === "view_code_item" ||
+        (tool === "str_replace_editor" && toolCmd === "view") ||
         tool === "glob" ||
         tool === "grep" ||
         tool === "rg" ||
@@ -427,6 +451,19 @@ export function classifyEventReadable(
               : tool === "manage_todo_list"
                 ? "Updated Todo List"
                 : "Renamed Chat",
+          isLowSignal: true,
+        };
+      }
+      if (
+        tool === "web_fetch" ||
+        tool === "fetch" ||
+        tool.includes("fetchwebpage")
+      ) {
+        return {
+          badge: "Web",
+          cssClass: "tool",
+          category: "tool",
+          humanTitle: "Web Fetch",
           isLowSignal: true,
         };
       }
@@ -749,6 +786,7 @@ export function classifyExternalTarget(toolName?: string): { id: string; label: 
 
   if (
     low === "ask_question" ||
+    low === "ask_user" ||
     low === "askuserquestion" ||
     low === "vscode_askquestions" ||
     low === "questioncarousel" ||
@@ -799,6 +837,9 @@ export function classifyExternalTarget(toolName?: string): { id: string; label: 
     low === "read" ||
     low === "edit" ||
     low === "write" ||
+    low === "create" ||
+    low === "str_replace" ||
+    low === "str_replace_editor" ||
     low === "multiedit" ||
     low === "glob" ||
     low === "grep" ||
@@ -825,6 +866,7 @@ export function classifyExternalTarget(toolName?: string): { id: string; label: 
   }
 
   if (
+    low === "web_fetch" ||
     low === "fetch" ||
     low.includes("fetchwebpage") ||
     low.includes("chrome-devtools") ||

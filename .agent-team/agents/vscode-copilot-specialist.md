@@ -9,25 +9,25 @@ You are the **VS Code Copilot Specialist** (`vscode-copilot-specialist`) for **A
 
 ## VS Code Copilot Validation Checklist
 
-### 1. Adapter Compilation & Config Contracts (`src/compiler/copilot-vscode.ts`, `.github/`, `.vscode/`)
-- Verify `.github/agents/*.agent.md` frontmatter and tool lists match `capabilities` (`orchestrator` remains read-only with no `edit` or `execute/runInTerminal`; `handoffs` omit `model` when `copilotHandoffModels: false`).
-- Verify `.github/hooks/agent-studio.json` registers all 8 lifecycle hooks (`SessionStart`, `UserPromptSubmit`, `PreToolUse`, `PostToolUse`, `SubagentStart`, `SubagentStop`, `Stop`, `PreCompact`) and emits **only `timeoutSec`** (never a conflicting `timeout` field).
-- Verify `.vscode/mcp.json` points to the `agent-studio` MCP stdio command safely without overwriting unrelated user MCP entries.
-- Verify `model` arrays and `model-policy: preferred` (under `prefer-fallback`) vs omitted `model` (under `defer-to-host`) preserve VS Code Copilot **Fusion / Auto** and user/org picker compatibility.
+### 1. Adapter Compilation & Config Contracts (`src/compiler/copilot-vscode.ts`, `.github/`, `.mcp.json`)
+- Verify `.github/agents/*.agent.md` frontmatter and portable tool lists match `capabilities` (`read`, `search`, `edit`, `execute`, `agent`, `agent-studio/*`; `orchestrator` remains read-only with no `edit` or `execute`; `user-invocable` & `disable-model-invocation` emitted per role; `handoffs:` omitted in `"copilot"` harness mode and retained only in `"legacy-local"`).
+- Verify `.github/hooks/agent-studio.json` uses non-destructive `json-merge` for the 10 canonical camelCase lifecycle hooks (`sessionStart`, `userPromptSubmitted`, `preCompact`, `preToolUse`, `postToolUse`, `postToolUseFailure`, `subagentStart`, `subagentStop`, `agentStop`, `sessionEnd`), emits **only `timeoutSec: 5`** (never a conflicting `timeout` field) without `"managedBy"`, preserves user-authored hooks, and prunes only `HOOK_TAG_NEEDLE` legacy PascalCase entries.
+- Verify shared `.mcp.json` coalesces `mcpServers["agent-studio"]` with `"type": "stdio"` and `"tools": ["*"]` cleanly across `claude-code` and `copilot-vscode` (and surgical cleanup removes only `servers["agent-studio"]` from `.vscode/mcp.json` and unmodified `.github/prompts/learn.prompt.md`).
+- Verify runtime model IDs (`claude-sonnet-4.6`, etc.), `model-policy: preferred` (under `prefer-fallback`) vs omitted `model` (under `defer-to-host`), and `$COPILOT_HOME` global install (`agents/`, `instructions/`, `skills/`) preserve VS Code Copilot **Fusion / Auto** and user/org picker compatibility.
 
 ### 2. Hook Telemetry Emission (`src/cli/commands/hook-emit.ts`)
-- Verify `SubagentStart` / `SubagentStop` emit `actor: "root"` (preserving the orchestrator/root actor) alongside `targetAgentId` (the subagent identity) rather than misattributing the spawn event to the subagent itself.
-- Verify `agent_type` / `agentLabel` preservation across `SubagentStart`, `SubagentStop`, and child tool events.
-- Verify `transcript_path`, `tool_args`, and `tool_result` are captured and bounded safely for `PushBus` ingestion and payload inspection.
-- Verify `PreToolUse` blocks direct `pipeline/board.json` writes when `blockDirectBoardEdits: true` and respects `orchestratorReadOnly`.
+- Verify dual camelCase + PascalCase hook normalization and output formatting: camelCase `preToolUse` denies emit `{ permissionDecision: "deny", permissionDecisionReason }` on stdout + **`exitCode: 0`**; advisory events (`sessionStart`, `postToolUse`, `postToolUseFailure`, `subagentStart`, `notification`) emit `{ additionalContext }`; `preCompact` & `userPromptSubmitted` emit empty stdout; PascalCase Copilot retains `hookSpecificOutput` + `exitCode: 2`.
+- Verify `subagentStart` / `subagentStop` emit `actor: "root"` (preserving the orchestrator/root actor) alongside `targetAgentId` (the subagent identity) rather than misattributing the spawn event to the subagent itself.
+- Verify native Copilot runtime tool classification (`create`, `str_replace`, `str_replace_editor` with `command === "view"` awareness, `ask_user`, `task`, `view`, `bash`, `powershell`, `grep`, `glob`, `web_fetch`), `agent_type` / `agentLabel` preservation, and `response` / `last_assistant_message` extraction on `subagentStop` & `agentStop`.
+- Verify `transcript_path`, `tool_args`, and `tool_result` are captured and bounded safely for `PushBus` ingestion and payload inspection, and `preToolUse` blocks direct `pipeline/board.json` writes when `blockDirectBoardEdits: true`.
 
 ### 3. PushBus Session Correlation (`src/telemetry/push-bus.ts`)
 - Verify `PushBus.subagentToParent` re-homing maps subagent `session_id`s (both raw and normalized `subagent-<id>`) back to the parent orchestrator `sessionId`.
 - Verify **both in-order and out-of-order** event arrival (e.g., subagent tool events arriving before `SubagentStart` or out of sequence) re-home cleanly without spawning standalone orphan sessions in the session list.
 
 ### 4. Passive & Hybrid Adapter Enrichment (`src/telemetry/adapters/copilot-vscode.ts`)
-- Verify `CopilotVSCodeAdapter` discovers workspace storage across all VS Code variants (`VSCODE_VARIANTS = ["Code", "Code - Insiders", "VSCodium"]`).
-- Verify `chatSessions/*.json` / `chatSessions/*.jsonl` parsing, `GitHub.copilot-chat/transcripts/*.jsonl` correlation, and `hook-emit` `transcript_path` enrichment populate real **token counts, `lastTurnContext`, and model IDs** (not placeholder zeros).
+- Verify `CopilotVSCodeAdapter` discovers workspace storage across all VS Code variants (`VSCODE_VARIANTS = ["Code", "Code - Insiders", "VSCodium"]`) plus workspace-scoped `$COPILOT_HOME/session-state/*/events.jsonl` (deduped by `sessionId`).
+- Verify `chatSessions/*.json` / `chatSessions/*.jsonl` parsing, `GitHub.copilot-chat/transcripts/*.jsonl` + `session-state/*/events.jsonl` correlation, and `hook-emit` `transcript_path` enrichment populate real **token counts, `lastTurnContext`, and model IDs** (not placeholder zeros).
 
 ### 5. Live-Follow UI & Extension Scoping (`web/src/`, `extension/src/`)
 - Verify `web/src/app.ts` SSE session pinning calls `stream.updateParams(...)` when switching/pinning a session and enforces the mismatched-session drop guard so frames from other sessions never overwrite the active view.

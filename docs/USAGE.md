@@ -54,7 +54,7 @@ Start any work session in **Antigravity**, **Claude Code**, or **VS Code Copilot
 Agent Studio enforces process discipline at three independent layers so no single IDE client quirk can bypass it:
 
 1. **Layer 1 — IDE Tool Allowlists:** Compiled agent frontmatter strips edit/write/shell tools from `orchestrator` when `workflow.enforcement.orchestratorReadOnly: true` is set in `.agent-team/team.yaml`.
-2. **Layer 2 — `PreToolUse` Guardrail Hooks:** In Claude Code (`.claude/settings.json`) and VS Code Copilot (`.github/hooks/agent-studio.json`), `npx agent-studio hook-emit --ide <ide> --event PreToolUse` inspects tool inputs and blocks direct edits to `pipeline/board.json` with exit code `2` and an actionable deny message directing the agent to use the `agent-studio` MCP `board` tool.
+2. **Layer 2 — `PreToolUse` / `preToolUse` Guardrail Hooks:** In Claude Code (`.claude/settings.json`) and VS Code Copilot (`.github/hooks/agent-studio.json`), `npx agent-studio hook-emit --ide <ide> --event <event>` inspects tool inputs and blocks direct edits to `pipeline/board.json` (emitting `hookSpecificOutput` in Claude Code or `{ permissionDecision: "deny", permissionDecisionReason }` in Copilot camelCase mode) and directs the agent to use the `agent-studio` MCP `board` tool.
 3. **Layer 3 — MCP Server QA Gate:** `agent-studio mcp` acquires an atomic lockfile (`board.json.lock` with stale-lock recovery) on every mutation and rejects `board { op: "move", state: "done" }` unless a closed, passing `testrun` covers the item's required suite (or an explicit `overrideReason` is logged for auditability).
 
 ### CLI Board & Testrun Quick Reference
@@ -120,5 +120,6 @@ If your repository already has a `pipeline/board.json` (and optionally a legacy 
 
 1. **Preserve your board automatically:** Running `npx agent-studio init` detects an existing `pipeline/board.json` and leaves it **100% untouched** (never overwriting items, sprints, bugs, or testruns).
 2. **Avoid plugin directory collisions during cutover:** If you want to keep an existing Antigravity plugin (e.g. `.agents/plugins/my-legacy-team/`) active while testing Agent Studio, pass `--id <new-id>` (for example `npx agent-studio init --id my-app-studio`) so compiled Antigravity files land in `.agents/plugins/my-app-studio-team/`.
-3. **Import checkpoints:** Copy your existing `project.json` checkpoint commands (`CP0`, `CP1`, `CP2`) into `.agent-team/team.yaml` under `workflow.checkpoints` and run `npx agent-studio sync`.
-4. **Verify health:** Run `npx agent-studio doctor` and `npx agent-studio board status` to confirm your legacy items, testruns, and QA gates are read cleanly by the new engine.
+3. **Upgrade safely across Agent Studio releases:** Run `npx agent-studio upgrade --dry-run` (then `npx agent-studio upgrade`) to initialize `.agent-team/.upgrade-state.json`, preserve customized `.agent-team/*.md` files, migrate legacy Copilot model IDs / `.vscode/mcp.json`, and compile adapters cleanly.
+4. **Import checkpoints:** Copy your existing `project.json` checkpoint commands (`CP0`, `CP1`, `CP2`) into `.agent-team/team.yaml` under `workflow.checkpoints` and run `npx agent-studio sync`.
+5. **Verify health:** Run `npx agent-studio doctor` and `npx agent-studio board status` to confirm your legacy items, testruns, and QA gates are read cleanly by the new engine.

@@ -33,6 +33,7 @@ function parseSyncArgs(args: string[]): {
   projectRef?: string;
   ides?: IdeTarget[];
   check: boolean;
+  force: boolean;
   useGlobalIndex: boolean;
   json: boolean;
   quiet: boolean;
@@ -40,6 +41,7 @@ function parseSyncArgs(args: string[]): {
   let projectRef: string | undefined;
   let ides: IdeTarget[] | undefined;
   let check = false;
+  let force = false;
   let useGlobalIndex = false;
   let json = false;
   let quiet = false;
@@ -49,6 +51,8 @@ function parseSyncArgs(args: string[]): {
     if (!token) continue;
     if (token === "--check") {
       check = true;
+    } else if (token === "--force") {
+      force = true;
     } else if (token === "--use-global-index") {
       useGlobalIndex = true;
     } else if (token === "--json") {
@@ -66,7 +70,7 @@ function parseSyncArgs(args: string[]): {
     }
   }
 
-  return { projectRef, ides, check, useGlobalIndex, json, quiet };
+  return { projectRef, ides, check, force, useGlobalIndex, json, quiet };
 }
 
 function resolveProjectRootArg(projectRef?: string): string {
@@ -126,6 +130,7 @@ export async function runSync(args: string[]): Promise<SyncCommandResult> {
   const compileResult = compileTeam(projectRoot, {
     ides: parsed.ides,
     useGlobalIndex: parsed.useGlobalIndex,
+    force: parsed.force,
   });
   const result: SyncCommandResult = {
     mode: "sync",
@@ -139,10 +144,21 @@ export async function runSync(args: string[]): Promise<SyncCommandResult> {
     if (parsed.json) {
       process.stdout.write(JSON.stringify(result, null, 2) + "\n");
     } else {
+      const skippedSummary =
+        compileResult.skippedModified.length > 0
+          ? `, ${compileResult.skippedModified.length} skipped (modified)`
+          : "";
+      const cleanedSummary =
+        compileResult.cleanedLegacy.length > 0
+          ? `, ${compileResult.cleanedLegacy.length} legacy cleaned`
+          : "";
       process.stdout.write(
         `[agent-studio] synced ${compileResult.projectId} (${compileResult.targets.join(", ")}): ` +
-          `${compileResult.written.length} written, ${compileResult.merged.length} merged, ${compileResult.unchanged.length} unchanged.\n`,
+          `${compileResult.written.length} written, ${compileResult.merged.length} merged, ${compileResult.unchanged.length} unchanged${skippedSummary}${cleanedSummary}.\n`,
       );
+      for (const warning of compileResult.warnings) {
+        process.stderr.write(`[agent-studio] warning: ${warning}\n`);
+      }
     }
   }
 

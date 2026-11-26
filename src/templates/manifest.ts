@@ -1,5 +1,6 @@
 import fs from "node:fs";
 import path from "node:path";
+import { sha256Hex } from "../compiler/merge.js";
 import { createWorkspaceDefaultModelIndex } from "../models/defaults.js";
 import {
   TeamManifestSchema,
@@ -7,6 +8,12 @@ import {
   type IdeTarget,
   type TeamManifest,
 } from "../schema/team.js";
+import {
+  normalizeUpgradeStateKey,
+  resolveAgentStudioVersion,
+  serializeUpgradeState,
+  type ManagedFileRecord,
+} from "../schema/upgrade-state.js";
 import { detectRepoStack, type DetectedRepoInfo } from "./detect.js";
 import {
   renderArchitectPrompt,
@@ -82,7 +89,7 @@ export function buildDefaultTeamManifest(
         roleType: "orchestrator",
         boardRole: "orchestrator",
         promptFile: "agents/orchestrator.md",
-        modelTier: "fast",
+        modelTier: "balanced",
         description:
           "Strict manager and dispatcher overseeing ready -> design -> dev -> test -> done and enforcing the QA gate via agent-studio MCP.",
         capabilities: ["read", "search", "delegate", "ask_user", "mcp_board"],
@@ -156,7 +163,7 @@ export function buildDefaultTeamManifest(
         roleType: "qa",
         boardRole: "qa",
         promptFile: "agents/qa-validator.md",
-        modelTier: "fast",
+        modelTier: "balanced",
         description:
           "Automated test suites, formal MCP testruns, bug filing, and test -> done QA gate verification.",
         capabilities: [
@@ -264,20 +271,55 @@ export function scaffoldAgentTeam(
     [".agent-team/agents/team-setup.md", renderTeamSetupPrompt(manifest)],
   ];
 
+  const stockMarkdownEntries: Array<[string, string]> = [...agentPrompts];
+
   for (const [relPath, content] of agentPrompts) {
     writeIfAllowed(root, relPath, content, force, created, skipped);
   }
 
   for (const skill of getDefaultSkills(detected)) {
+    const relPath = `.agent-team/${skill.relDir}/SKILL.md`;
+    stockMarkdownEntries.push([relPath, skill.content]);
     writeIfAllowed(
       root,
-      `.agent-team/${skill.relDir}/SKILL.md`,
+      relPath,
       skill.content,
       force,
       created,
       skipped,
     );
   }
+
+  const agentStudioVersion = resolveAgentStudioVersion();
+  const managedFiles: Record<string, ManagedFileRecord> = {};
+  for (const [relPath, stockContent] of stockMarkdownEntries) {
+    const stockHash = sha256Hex(stockContent);
+    const absPath = path.join(root, relPath);
+    const diskContent = fs.existsSync(absPath)
+      ? fs.readFileSync(absPath, "utf8")
+      : stockContent;
+    const localHash = sha256Hex(diskContent);
+    const customized = localHash !== stockHash;
+    managedFiles[normalizeUpgradeStateKey(relPath)] = {
+      stockHash,
+      customized,
+      ...(customized ? { localHash } : {}),
+      templateVersion: agentStudioVersion,
+    };
+  }
+
+  writeIfAllowed(
+    root,
+    ".agent-team/.upgrade-state.json",
+    serializeUpgradeState({
+      schemaVersion: 1,
+      agentStudioVersion,
+      files: managedFiles,
+    }),
+    force,
+    created,
+    skipped,
+  );
 
   return { manifest, detected, created, skipped };
 }

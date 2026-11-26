@@ -8,7 +8,11 @@ import {
   DEFAULT_MODEL_INDEX,
   type ModelIndex,
 } from "../schema/model-index.js";
-import type { TeamManifest } from "../schema/team.js";
+import {
+  resolveCopilotHarness,
+  type CopilotHarness,
+  type TeamManifest,
+} from "../schema/team.js";
 import {
   buildCopilotHandoffs,
   mapCapabilitiesToCopilotVsCode,
@@ -18,7 +22,11 @@ import {
   buildPortableHookCommand,
   buildPortableMcpSpec,
 } from "./launcher.js";
-import { type ExpectedFile, wrapGeneratedMarkdown } from "./merge.js";
+import {
+  type CopilotHookRule,
+  type ExpectedFile,
+  wrapGeneratedMarkdown,
+} from "./merge.js";
 import {
   loadManifestSkills,
   readRolePrompt,
@@ -26,7 +34,20 @@ import {
   serializeFrontmatter,
 } from "./shared.js";
 
-export const COPILOT_HOOK_EVENTS = [
+export const COPILOT_HOOK_EVENTS_CANONICAL = [
+  "sessionStart",
+  "userPromptSubmitted",
+  "preCompact",
+  "preToolUse",
+  "postToolUse",
+  "postToolUseFailure",
+  "subagentStart",
+  "subagentStop",
+  "agentStop",
+  "sessionEnd",
+] as const;
+
+export const LEGACY_COPILOT_HOOK_EVENTS = [
   "SessionStart",
   "UserPromptSubmit",
   "PreCompact",
@@ -37,9 +58,17 @@ export const COPILOT_HOOK_EVENTS = [
   "Stop",
 ] as const;
 
-export function buildCopilotHooksConfig(): Record<string, unknown> {
-  const hooks: Record<string, unknown[]> = {};
-  for (const eventName of COPILOT_HOOK_EVENTS) {
+export const COPILOT_HOOK_EVENTS = COPILOT_HOOK_EVENTS_CANONICAL;
+
+export function buildCopilotHooksMap(
+  harness: CopilotHarness = "copilot",
+): Record<string, CopilotHookRule[]> {
+  const events =
+    harness === "legacy-local"
+      ? LEGACY_COPILOT_HOOK_EVENTS
+      : COPILOT_HOOK_EVENTS_CANONICAL;
+  const hooks: Record<string, CopilotHookRule[]> = {};
+  for (const eventName of events) {
     hooks[eventName] = [
       {
         type: "command",
@@ -48,9 +77,22 @@ export function buildCopilotHooksConfig(): Record<string, unknown> {
       },
     ];
   }
+  return hooks;
+}
+
+export function buildCopilotHooksConfig(
+  harness: CopilotHarness = "copilot",
+): Record<string, unknown> {
+  const hooks = buildCopilotHooksMap(harness);
+  if (harness === "legacy-local") {
+    return {
+      version: 1,
+      managedBy: "agent-studio",
+      hooks,
+    };
+  }
   return {
     version: 1,
-    managedBy: "agent-studio",
     hooks,
   };
 }
@@ -102,6 +144,7 @@ export function compileCopilotVsCode(
   modelIndex: ModelIndex = DEFAULT_MODEL_INDEX,
 ): ExpectedFile[] {
   const root = path.resolve(projectRoot);
+  const harness = resolveCopilotHarness(manifest);
   const files: ExpectedFile[] = [];
 
   const resolvedByRoleId = new Map<string, ResolvedRoleModel>();
@@ -120,26 +163,36 @@ export function compileCopilotVsCode(
       role,
       manifest.workflow.enforcement,
     );
-    const tools = mapCapabilitiesToCopilotVsCode(effectiveCaps);
-    const handoffs = buildCopilotHandoffs(role, manifest.roster, {
-      includeModels: includeHandoffModels,
-      resolvedByRoleId,
-    });
+    const tools = mapCapabilitiesToCopilotVsCode(effectiveCaps, { harness });
     const resolvedModel = resolvedByRoleId.get(role.id)!;
 
     const fmObj: Record<string, unknown> = {
       name: role.name,
       description: role.description ?? `${role.name} (${role.boardRole})`,
-      ...( !resolvedModel.omit && resolvedModel.frontmatterModel !== undefined
+      ...(!resolvedModel.omit && resolvedModel.frontmatterModel !== undefined
         ? { model: resolvedModel.frontmatterModel }
         : {}),
-      ...( !resolvedModel.omit && resolvedModel.copilotPolicy
+      ...(!resolvedModel.omit && resolvedModel.copilotPolicy
         ? { "model-policy": resolvedModel.copilotPolicy }
         : {}),
       tools,
+      ...(harness === "copilot"
+        ? {
+            "user-invocable":
+              role.userInvocable ??
+              (role.roleType === "orchestrator" || role.roleType === "setup"),
+            "disable-model-invocation": role.disableModelInvocation ?? false,
+          }
+        : {}),
     };
-    if (handoffs.length > 0) {
-      fmObj.handoffs = handoffs;
+    if (harness === "legacy-local") {
+      const handoffs = buildCopilotHandoffs(role, manifest.roster, {
+        includeModels: includeHandoffModels,
+        resolvedByRoleId,
+      });
+      if (handoffs.length > 0) {
+        fmObj.handoffs = handoffs;
+      }
     }
 
     const promptBody = readRolePrompt(root, role);
@@ -164,7 +217,7 @@ export function compileCopilotVsCode(
       kind: "generated",
       content: wrapGeneratedMarkdown(skill.body, fm),
     });
-    if (skill.id === "learn") {
+    if (harness === "legacy-local" && skill.id === "learn") {
       files.push({
         relPath: ".github/prompts/learn.prompt.md",
         ide: "copilot-vscode",
@@ -181,25 +234,61 @@ export function compileCopilotVsCode(
     blockContent: renderSharedTeamRules(manifest, modelIndex),
   });
 
-  files.push({
-    relPath: ".vscode/mcp.json",
-    ide: "copilot-vscode",
-    kind: "json-merge",
-    patch: {
-      servers: {
-        "agent-studio": {
-          type: "stdio",
-          ...buildPortableMcpSpec(),
+  if (harness === "legacy-local") {
+    files.push({
+      relPath: ".vscode/mcp.json",
+      ide: "copilot-vscode",
+      kind: "json-merge",
+      patch: {
+        servers: {
+          "agent-studio": {
+            type: "stdio",
+            ...buildPortableMcpSpec(),
+          },
         },
       },
-    },
-  });
+    });
+  } else {
+    files.push({
+      relPath: ".mcp.json",
+      ide: "copilot-vscode",
+      kind: "json-merge",
+      patch: {
+        mcpServers: {
+          "agent-studio": {
+            type: "stdio",
+            ...buildPortableMcpSpec(),
+            tools: ["*"],
+          },
+        },
+      },
+    });
+  }
 
   files.push({
     relPath: ".github/hooks/agent-studio.json",
     ide: "copilot-vscode",
-    kind: "generated",
-    content: JSON.stringify(buildCopilotHooksConfig(), null, 2) + "\n",
+    kind: "json-merge",
+    patch:
+      harness === "legacy-local"
+        ? {
+            topLevelDefaults: {
+              version: 1,
+              managedBy: "agent-studio",
+            },
+            pruneManagedHookEvents: COPILOT_HOOK_EVENTS_CANONICAL,
+            hooks: buildCopilotHooksMap("legacy-local"),
+          }
+        : {
+            topLevelDefaults: {
+              version: 1,
+            },
+            removeTopLevelIfEqual: {
+              managedBy: "agent-studio",
+            },
+            pruneManagedHookEvents: LEGACY_COPILOT_HOOK_EVENTS,
+            hooks: buildCopilotHooksMap("copilot"),
+          },
   });
 
   return files;

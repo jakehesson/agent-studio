@@ -8,6 +8,9 @@ import type {
   AgentNodeSnapshot,
   NormalizedEvent,
   PendingHumanPrompt,
+  ReplyCapabilities,
+  ReplyToHostRequest,
+  ReplyToHostResult,
   SessionUsageSummary,
 } from "../types.js";
 import {
@@ -23,6 +26,7 @@ import {
   truncateWords,
 } from "../utils.js";
 import { renderInlineMarkdown } from "../utils/markdown.js";
+import { QuestionCard } from "./QuestionCard.js";
 import { UsageDashboard } from "./UsageDashboard.js";
 
 export type FeedFilter = "all" | "messages" | "board" | "errors" | "usage";
@@ -44,6 +48,9 @@ export interface ActivityFeedCallbacks {
   onOpenReader?: (event: NormalizedEvent) => void;
   onThreadChange?: (threadKey: string | null) => void;
   onCoverBackToTopology?: () => void;
+  onOpenChat?: (agentId: string) => void;
+  getReplyCapabilities?: () => ReplyCapabilities;
+  onReplyToHost?: (req: ReplyToHostRequest) => Promise<ReplyToHostResult>;
 }
 
 const FILTER_TABS: Array<{ id: FeedFilter; label: string }> = [
@@ -161,7 +168,9 @@ export class ActivityFeed {
   private agents: AgentNodeSnapshot[] = [];
   private clusters: TeamAgentCluster[] = [];
   private sessionUsage: SessionUsageSummary | undefined = undefined;
+  private sessionId: string | undefined = undefined;
   private usageDashboard: UsageDashboard | null = null;
+  private inlineQuestionCards = new Map<string, { wrap: HTMLElement; card: QuestionCard }>();
 
   private activeThread: ThreadSelection = ALL_THREAD;
   private selectedRunId = "all";
@@ -183,6 +192,8 @@ export class ActivityFeed {
   private feedListEl: HTMLElement;
   private smsBodyWrapEl: HTMLElement;
   private smsBodyEl: HTMLElement;
+  private smsStreamItemsEl: HTMLElement;
+  private smsInlinePromptsEl: HTMLElement;
   private jumpLatestBtn: HTMLButtonElement;
 
   constructor(container: HTMLElement, cb: ActivityFeedCallbacks) {
@@ -240,7 +251,10 @@ export class ActivityFeed {
       <div class="run-filter-bar" data-run-filter-bar role="group" aria-label="Filter messages by agent run" hidden></div>
       <div class="feed-list" data-feed-list></div>
       <div class="sms-body-wrap" data-sms-body-wrap hidden>
-        <div class="sms-body" data-sms-body aria-live="polite"></div>
+        <div class="sms-body" data-sms-body aria-live="polite">
+          <div class="sms-stream-items" data-sms-stream-items></div>
+          <div class="sms-inline-prompts" data-sms-inline-prompts hidden></div>
+        </div>
         <button type="button" class="jump-latest-btn" data-jump-latest hidden>↓ Jump to latest</button>
       </div>
     `;
@@ -250,12 +264,29 @@ export class ActivityFeed {
     this.feedListEl = this.container.querySelector("[data-feed-list]") as HTMLElement;
     this.smsBodyWrapEl = this.container.querySelector("[data-sms-body-wrap]") as HTMLElement;
     this.smsBodyEl = this.container.querySelector("[data-sms-body]") as HTMLElement;
+    this.smsStreamItemsEl = this.container.querySelector("[data-sms-stream-items]") as HTMLElement;
+    this.smsInlinePromptsEl = this.container.querySelector("[data-sms-inline-prompts]") as HTMLElement;
     this.jumpLatestBtn = this.container.querySelector("[data-jump-latest]") as HTMLButtonElement;
 
     this.bindEvents();
   }
 
   private bindEvents(): void {
+    this.container.querySelector("[data-pending-bar]")?.addEventListener("click", (e) => {
+      const btn = (e.target as Element | null)?.closest<HTMLButtonElement>("[data-pending-open-chat]");
+      if (!btn) return;
+      const aid = btn.dataset.pendingOpenChat;
+      if (aid) this.cb.onOpenChat?.(aid);
+    });
+
+    this.feedListEl.addEventListener("click", (e) => {
+      const btn = (e.target as Element | null)?.closest<HTMLButtonElement>("[data-usage-open-chat]");
+      if (!btn) return;
+      e.stopPropagation();
+      const aid = btn.dataset.usageOpenChat;
+      if (aid) this.cb.onOpenChat?.(aid);
+    });
+
     this.container
       .querySelector("[data-cover-back]")
       ?.addEventListener("click", () => {
@@ -486,19 +517,28 @@ export class ActivityFeed {
       });
   }
 
+  public dispose(): void {
+    for (const entry of this.inlineQuestionCards.values()) {
+      entry.card.dispose();
+    }
+    this.inlineQuestionCards.clear();
+  }
+
   public update(
     events: NormalizedEvent[],
     pendingPrompts: PendingHumanPrompt[] = [],
     labelMap?: Map<string, string>,
     agents?: AgentNodeSnapshot[],
     sessionUsage?: SessionUsageSummary,
-    clusters?: TeamAgentCluster[]
+    clusters?: TeamAgentCluster[],
+    sessionId?: string
   ): void {
     this.events = events;
     this.pendingPrompts = pendingPrompts;
     if (labelMap) this.labelMap = labelMap;
     if (agents) this.agents = agents;
     if (clusters) this.clusters = clusters;
+    if (sessionId !== undefined) this.sessionId = sessionId;
     this.sessionUsage = sessionUsage;
     this.renderPending();
     this.renderList();
@@ -507,7 +547,7 @@ export class ActivityFeed {
   private renderPending(): void {
     const bar = this.container.querySelector<HTMLElement>("[data-pending-bar]");
     if (!bar) return;
-    if (this.filter === "messages" || this.pendingPrompts.length === 0) {
+    if (this.pendingPrompts.length === 0) {
       if (!bar.hidden || this.lastPendingHtml !== "") {
         bar.hidden = true;
         bar.innerHTML = "";
@@ -520,8 +560,11 @@ export class ActivityFeed {
         (p) => `
           <div class="pending-card ${p.kind === "approval" ? "approval" : ""}">
             <div class="pending-head">
-              <span class="pending-badge">${p.kind === "approval" ? "APPROVAL NEEDED" : "WAITING ON USER"}</span>
-              <span class="pending-agent">${escHtml(formatActorName(p.agentId, this.labelMap, p.agentLabel))}</span>
+              <div class="pending-head-left">
+                <span class="pending-badge"><span aria-hidden="true">?</span> ${p.kind === "approval" ? "APPROVAL NEEDED" : "WAITING ON USER"}</span>
+                <span class="pending-agent">${escHtml(formatActorName(p.agentId, this.labelMap, p.agentLabel))}</span>
+              </div>
+              <button type="button" class="btn-primary btn-sm pending-chat-btn" data-pending-open-chat="${escHtml(p.agentId)}">Open Chat</button>
             </div>
             <div class="pending-q-text">${escHtml(cleanSummaryText(p.title))}</div>
             ${p.summary ? `<div class="pending-summary">${escHtml(cleanSummaryText(p.summary))}</div>` : ""}
@@ -783,10 +826,6 @@ export class ActivityFeed {
     const countEl = this.container.querySelector<HTMLElement>("[data-feed-count]");
     const modeToggle = this.container.querySelector<HTMLElement>(".feed-mode-toggle");
     if (modeToggle) modeToggle.hidden = true;
-    const pendingBar = this.container.querySelector<HTMLElement>("[data-pending-bar]");
-    if (pendingBar && !pendingBar.hidden) {
-      pendingBar.hidden = true;
-    }
 
     this.feedListEl.hidden = true;
     if (this.lastListHtml !== "") {
@@ -895,7 +934,10 @@ export class ActivityFeed {
     `;
 
     const sameContext = contextKey === this.lastSmsContextKey;
-    if (sameContext && html === this.lastSmsHtml) {
+    const streamDirty = !sameContext || html !== this.lastSmsHtml;
+
+    if (!streamDirty) {
+      this.reconcileInlineSmsPrompts(effectiveThread);
       if (forceScrollBottom && !preserveScroll) {
         window.requestAnimationFrame(() => {
           this.smsBodyEl.scrollTop = this.smsBodyEl.scrollHeight;
@@ -911,7 +953,7 @@ export class ActivityFeed {
     const prevWasNearBottom = sameContext ? this.isNearBottom : true;
 
     if (sameContext) {
-      this.smsBodyEl
+      this.smsStreamItemsEl
         .querySelectorAll<HTMLElement>(".bubble-tool-drawer[data-drawer-key]")
         .forEach((drawer) => {
           const key = drawer.dataset.drawerKey;
@@ -929,13 +971,14 @@ export class ActivityFeed {
       this.unseenCount = 0;
     }
 
-    this.smsBodyEl.innerHTML = html;
+    this.smsStreamItemsEl.innerHTML = html;
     this.lastSmsHtml = html;
     this.lastSmsContextKey = contextKey;
     this.lastSmsCount = msgCount;
+    this.reconcileInlineSmsPrompts(effectiveThread);
 
     const activeDrawerKeys = new Set<string>();
-    this.smsBodyEl
+    this.smsStreamItemsEl
       .querySelectorAll<HTMLElement>(".bubble-tool-drawer[data-drawer-key]")
       .forEach((drawer) => {
         const key = drawer.dataset.drawerKey;
@@ -1005,6 +1048,7 @@ export class ActivityFeed {
         selectedAgentId: this.agentFilter,
         onSelectAgent: (aid) => this.cb.onSelectAgent?.(aid),
       });
+      this.decorateUsageCards();
       return;
     }
 
@@ -1117,6 +1161,119 @@ export class ActivityFeed {
 
     if (prevScrollTop > 0) {
       listEl.scrollTop = prevScrollTop;
+    }
+  }
+
+  private matchesThreadPrompt(
+    prompt: PendingHumanPrompt,
+    thread: ThreadSelection
+  ): boolean {
+    if (thread.kind === "all") return true;
+    if (thread.kind === "agent") return prompt.agentId === thread.agentId;
+    if (thread.kind === "cluster") {
+      return thread.runId
+        ? prompt.agentId === thread.runId
+        : thread.agentIds.includes(prompt.agentId);
+    }
+    if (thread.kind === "pair") {
+      return (
+        prompt.agentId === thread.a ||
+        prompt.agentId === thread.b ||
+        Boolean(thread.aIds?.includes(prompt.agentId)) ||
+        Boolean(thread.bIds?.includes(prompt.agentId))
+      );
+    }
+    return true;
+  }
+
+  private reconcileInlineSmsPrompts(thread: ThreadSelection): void {
+    const matching = this.pendingPrompts.filter((p) =>
+      this.matchesThreadPrompt(p, thread)
+    );
+    const activeIds = new Set(matching.map((p) => p.id));
+
+    for (const [id, entry] of this.inlineQuestionCards.entries()) {
+      if (!activeIds.has(id)) {
+        entry.card.dispose();
+        entry.wrap.remove();
+        this.inlineQuestionCards.delete(id);
+      }
+    }
+
+    if (matching.length === 0) {
+      this.smsInlinePromptsEl.hidden = true;
+      return;
+    }
+
+    this.smsInlinePromptsEl.hidden = false;
+    const getCaps =
+      this.cb.getReplyCapabilities ??
+      (() => ({ canSendMessage: false, isMcpApp: false, isEmbed: false }));
+    const onReply =
+      this.cb.onReplyToHost ??
+      (async (req: ReplyToHostRequest): Promise<ReplyToHostResult> => ({
+        ok: false,
+        mode: "error",
+        message: `Reply handler unavailable for ${req.agentId}`,
+      }));
+
+    for (const prompt of matching) {
+      const existing = this.inlineQuestionCards.get(prompt.id);
+      if (existing) {
+        existing.card.update({
+          prompt,
+          sessionId: this.sessionId,
+          compact: false,
+          showHeader: true,
+          getCapabilities: getCaps,
+          onReply,
+          onOpenChat: (aid) => this.cb.onOpenChat?.(aid),
+        });
+      } else {
+        const wrap = document.createElement("div");
+        wrap.className = "sms-inline-prompt-item";
+        this.smsInlinePromptsEl.appendChild(wrap);
+        const card = new QuestionCard(wrap, {
+          prompt,
+          sessionId: this.sessionId,
+          compact: false,
+          showHeader: true,
+          getCapabilities: getCaps,
+          onReply,
+          onOpenChat: (aid) => this.cb.onOpenChat?.(aid),
+        });
+        this.inlineQuestionCards.set(prompt.id, { wrap, card });
+      }
+    }
+  }
+
+  private decorateUsageCards(): void {
+    const agentById = new Map(this.agents.map((a) => [a.id, a]));
+    const cards = Array.from(
+      this.feedListEl.querySelectorAll<HTMLElement>(".usage-agent-card[data-usage-agent-id]")
+    );
+    for (const card of cards) {
+      const aid = card.dataset.usageAgentId;
+      if (!aid || card.parentElement?.classList.contains("usage-agent-shell")) continue;
+      const agent = agentById.get(aid);
+      const hasPending = Boolean(agent?.pendingPrompt);
+
+      const shell = document.createElement("div");
+      shell.className = `usage-agent-shell ${hasPending ? "has-pending-prompt" : ""}`;
+      card.parentNode?.insertBefore(shell, card);
+      shell.appendChild(card);
+
+      const actions = document.createElement("div");
+      actions.className = "usage-agent-actions";
+      actions.innerHTML = `
+        ${
+          hasPending
+            ? `<button type="button" class="needs-input-badge" data-usage-open-chat="${escHtml(aid)}" aria-label="Needs input — open chat with ${escHtml(formatActorName(aid, this.labelMap, agent?.label))}"><span aria-hidden="true">?</span> Needs Input</button>`
+            : ""
+        }
+        <button type="button" class="btn-secondary btn-sm usage-open-chat-btn" data-usage-open-chat="${escHtml(aid)}">Open Chat</button>
+      `;
+      shell.appendChild(actions);
     }
   }
 }

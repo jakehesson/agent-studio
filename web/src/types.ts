@@ -72,6 +72,7 @@ export interface AgentUsageMetrics {
   totalTokens: number;
   contextTokens: number;
   contextWindow: number;
+  nominalContextWindow?: number;
   contextPercent: number;
   costUsd?: number;
 }
@@ -125,6 +126,7 @@ export interface AgentNodeSnapshot {
   summary?: string;
   role?: string;
   recentActions?: AgentRecentAction[];
+  pendingPrompt?: PendingHumanPrompt | null;
 }
 
 export interface AgentEdgeSnapshot {
@@ -169,15 +171,100 @@ export interface RegisteredProject {
   boardPath?: string;
 }
 
+export interface PendingQuestionOption {
+  id?: string;
+  label: string;
+  description?: string;
+  recommended?: boolean;
+}
+
+export interface PendingQuestionItem {
+  id?: string;
+  header?: string;
+  question: string;
+  type: "single_select" | "multi_select" | "text";
+  options: PendingQuestionOption[];
+  allowCustomInput?: boolean;
+  defaultValue?: string;
+}
+
 export interface PendingHumanPrompt {
   id: string;
+  toolCallId?: string;
+  toolName?: string;
   agentId: string;
   agentLabel: string;
   kind: "question" | "approval";
   title: string;
   summary?: string;
+  questions: PendingQuestionItem[];
   options?: Array<{ label: string; recommended?: boolean }>;
   ts?: string;
+  blockingToolCall: boolean;
+}
+
+export type ChatMessageRole =
+  | "user"
+  | "assistant"
+  | "thinking"
+  | "tool"
+  | "question"
+  | "subagent";
+
+export interface ChatToolCallRef {
+  toolCallId?: string;
+  toolName: string;
+  summary: string;
+  status?: "running" | "ok" | "error" | "denied";
+  inputPreview?: string;
+  output?: string;
+}
+
+export interface AgentChatMessage {
+  id: string;
+  ts: string;
+  epoch: number;
+  agentId: string;
+  role: ChatMessageRole;
+  text: string;
+  thinking?: string;
+  tools?: ChatToolCallRef[];
+  pendingPromptId?: string;
+  subagentId?: string;
+  subagentLabel?: string;
+}
+
+export interface AgentChatResponse {
+  ok: true;
+  sessionId: string;
+  agentId: string;
+  agentLabel: string;
+  ide: string;
+  messages: AgentChatMessage[];
+  totalMessages: number;
+  hasMore: boolean;
+  nextCursor?: string;
+  pendingPrompt: PendingHumanPrompt | null;
+}
+
+export interface ReplyToHostRequest {
+  sessionId?: string;
+  agentId: string;
+  promptId?: string;
+  text: string;
+  blockingToolCall: boolean;
+}
+
+export interface ReplyToHostResult {
+  ok: boolean;
+  mode: "sent" | "prefilled" | "copied" | "focused_copied" | "error";
+  message: string;
+}
+
+export interface ReplyCapabilities {
+  canSendMessage: boolean;
+  isMcpApp: boolean;
+  isEmbed: boolean;
 }
 
 export interface TeamRosterRef {
@@ -208,6 +295,7 @@ export interface SessionSnapshot {
   pendingPrompts?: PendingHumanPrompt[];
   definitions?: TeamDefinitionEntry[];
   teamRoster?: TeamRosterRef[];
+  modelContextWindows?: Record<string, number>;
 }
 
 export interface SessionsResponse {
@@ -228,6 +316,45 @@ export type BoardState =
 
 export type BugSeverity = "S1" | "S2" | "S3" | "S4";
 
+export type HandoffStatus =
+  | "pending_handoff"
+  | "pending_split"
+  | "resumed"
+  | "cleared";
+
+export type HandoffKind = "fresh_context" | "task_split";
+
+export interface SplitProposal {
+  title: string;
+  role: string;
+  ac?: string[];
+  deps?: string[];
+  rationale?: string;
+}
+
+export interface ContextHandoffRecord {
+  status: HandoffStatus;
+  kind: HandoffKind;
+  created_at: string;
+  actor: string;
+  session_id?: string;
+  agent_id?: string;
+  context_percent?: number;
+  context_tokens?: number;
+  context_window?: number;
+  objective?: string;
+  summary: string;
+  evidence?: string[];
+  decisions?: string[];
+  assumptions?: string[];
+  unresolved_issues?: string[];
+  modified_files?: string[];
+  verified_checks?: string[];
+  remaining_work?: string[];
+  continuation_brief: string;
+  split_proposals?: SplitProposal[];
+}
+
 export interface BoardItem {
   id: string;
   type: "spike" | "story" | "task" | "bug";
@@ -245,6 +372,8 @@ export interface BoardItem {
   suite?: string;
   required_checkpoints?: string[];
   created_at?: string;
+  handoff?: ContextHandoffRecord | null;
+  split_from?: string | null;
 }
 
 export interface TestrunRecord {
@@ -344,6 +473,16 @@ export interface DoctorCheckItem {
   fixHint?: string;
 }
 
+export interface DoctorMigrationWarning {
+  id?: string;
+  ide?: IdeSource | string;
+  severity?: "warn" | "info" | "error";
+  path?: string;
+  title?: string;
+  message: string;
+  fixHint?: string;
+}
+
 export type ModelTier = "fast" | "balanced" | "reasoning";
 
 export type ModelRoutingPolicy =
@@ -366,6 +505,8 @@ export type ModelSourceTag = "built-in" | "vscode-lm" | "agent" | "user";
 
 export type IdeModelMode = "tier-enum" | "family-alias" | "picker-array";
 
+export type ModelSelectionCriterion = "accuracy" | "cost" | "speed";
+
 export interface ModelCatalogEntry {
   id: string;
   label: string;
@@ -375,6 +516,9 @@ export interface ModelCatalogEntry {
   capabilities: ModelCapabilityTag[];
   contextWindow?: number;
   premiumMultiplier?: number;
+  accuracyRank?: number;
+  speedRank?: number;
+  deprecated?: boolean;
   available: boolean;
   source: ModelSourceTag;
   discoveredAt?: string;
@@ -409,6 +553,7 @@ export interface ModelIndex {
   updatedAt: string;
   updatedBy: "built-in" | "cli" | "api" | "vscode-lm" | "agent" | "user";
   notes?: string;
+  selectionPriority?: ModelSelectionCriterion[];
   roleRecommendations: Record<string, RoleRecommendation>;
   ides: Record<HostIde, IdeModelConfig>;
 }
@@ -418,6 +563,7 @@ export interface ModelIndexOverlay {
   updatedAt?: string;
   updatedBy?: "built-in" | "cli" | "api" | "vscode-lm" | "agent" | "user";
   notes?: string;
+  selectionPriority?: ModelSelectionCriterion[];
   roleRecommendations?: Record<string, Partial<RoleRecommendation>>;
   ides?: Partial<
     Record<
@@ -448,6 +594,7 @@ export interface WorkflowModelRouting {
   respectBuiltInOrchestrators: boolean;
   allowSubagentModelHints: boolean;
   copilotHandoffModels: boolean;
+  selectionPriority?: ModelSelectionCriterion[];
   idePolicies?: Partial<Record<HostIde, ModelRoutingPolicy>>;
 }
 
@@ -519,6 +666,7 @@ export interface DoctorApiResponse {
     blockDirectBoardEdits?: boolean;
   };
   driftFiles?: Array<{ file: string; status: string; ide?: string; reason?: string }>;
+  migrationWarnings?: DoctorMigrationWarning[];
   modelIndex?: ModelIndexHealth;
   timestamp?: string;
 }

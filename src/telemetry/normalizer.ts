@@ -5,6 +5,8 @@ import type {
   IdeSource,
   ModelSource,
   ModelUsageBucket,
+  PendingHumanPrompt,
+  PendingQuestionItem,
   SessionUsageSource,
   SessionUsageSummary,
   UsageSource,
@@ -15,10 +17,15 @@ import {
   classifyMessage,
   cleanHumanSummary,
   computeMergeKey,
+  computePendingPromptId,
   inferContextWindow,
   isOpaqueAgentId,
+  lookupModelContextWindow,
+  normalizePendingQuestions,
+  normalizeSubagentLabel,
   prettifyAgentLabel,
   prettifyModelName,
+  stripSubagentNamespacePrefix,
   toIsoUtc,
   type ActivityItem,
   type EnrichedEvent,
@@ -153,6 +160,9 @@ export function canonicalDedupToolName(toolName?: string): string {
     low === "write" ||
     low === "write_file" ||
     low === "apply_patch" ||
+    low === "create" ||
+    low === "str_replace" ||
+    low === "str_replace_editor" ||
     low === "copilot_applypatch" ||
     low === "copilot_edit" ||
     low === "copilot_replacestring" ||
@@ -164,6 +174,15 @@ export function canonicalDedupToolName(toolName?: string): string {
     low === "edit/createfile"
   ) {
     return "fs_edit";
+  }
+  if (
+    low === "web_fetch" ||
+    low === "webfetch" ||
+    low === "read_url_content" ||
+    low === "copilot_fetchwebpage" ||
+    low === "vscode_fetchwebpage_internal"
+  ) {
+    return "web_fetch";
   }
   if (
     low === "grep" ||
@@ -357,6 +376,7 @@ export interface SnapshotBuildOptions {
     id: string;
     model?: string;
   }>;
+  modelContextWindows?: Record<string, number>;
 }
 
 interface MutableAgentState {
@@ -383,6 +403,7 @@ interface MutableAgentState {
   reportedDone: boolean;
   waitingReason: "user" | "tool_approval" | "subagent" | null;
   waitingDetail: string | null;
+  openPendingPrompt: PendingHumanPrompt | null;
   recentActions: Array<{ ts: string; tool: string; text: string }>;
   convId?: string;
   // Token, context & model usage accumulators
@@ -424,29 +445,158 @@ function formatHms(epochSec: number): string {
   return `${hh}:${mm}:${ss}`;
 }
 
-function stripSubagentNamespacePrefix(raw: string): string {
-  const s = raw.trim();
-  const colonIdx = s.indexOf(":");
-  if (colonIdx > 0 && colonIdx < s.length - 1) {
-    const rest = s.slice(colonIdx + 1).trim();
-    if (rest) return rest;
-  }
-  return s;
-}
-
-function normalizeSubagentLabel(raw?: string): string {
-  if (!raw) return "";
-  const unprefixed = stripSubagentNamespacePrefix(raw);
-  return unprefixed
-    .replace(/([a-z0-9])([A-Z])/g, "$1 $2")
-    .replace(/([A-Z]+)([A-Z][a-z])/g, "$1 $2")
-    .toLowerCase()
-    .replace(/[^a-z0-9]+/g, " ")
-    .trim();
-}
-
 function strVal(v: unknown): string | undefined {
   return typeof v === "string" && v.trim() ? v.trim() : undefined;
+}
+
+function buildPendingPromptForEvent(
+  ag: MutableAgentState,
+  ev: EnrichedEvent,
+): PendingHumanPrompt | null {
+  if (
+    (ev.waitingReason !== "user" && ev.waitingReason !== "tool_approval") ||
+    ev.status === "denied"
+  ) {
+    return null;
+  }
+
+  const kind: "question" | "approval" =
+    ev.payload?.promptKind === "approval" || ev.waitingReason === "tool_approval"
+      ? "approval"
+      : "question";
+
+  let questions: PendingQuestionItem[] = normalizePendingQuestions(
+    ev.payload?.questions,
+    { defaultAllowCustomInput: true },
+  );
+
+  if (questions.length === 0) {
+    const rawArgs =
+      ev.payload?.args ??
+      ev.payload?.input ??
+      ev.payload?.toolInput ??
+      ev.payload?.toolSpecificData;
+    questions = normalizePendingQuestions(rawArgs, {
+      defaultAllowCustomInput: true,
+    });
+  }
+
+  if (questions.length === 0 && typeof ev.payload?.body === "string" && ev.payload.body.trim()) {
+    questions = [
+      {
+        question: ev.payload.body.trim(),
+        type: "text",
+        options: [],
+        allowCustomInput: true,
+      },
+    ];
+  }
+
+  if (questions.length === 0) {
+    if (kind === "approval") {
+      const promptMsg =
+        cleanHumanSummary(
+          String(
+            ev.payload?.promptSummary ??
+              ev.summary ??
+              `Approve ${ev.toolName ?? "tool"}?`,
+          ),
+          300,
+        ) || `Approve ${ev.toolName ?? "tool"}?`;
+      questions = [
+        {
+          question: promptMsg,
+          type: "single_select",
+          options: [
+            { label: "Approve", recommended: true },
+            { label: "Reject" },
+          ],
+          allowCustomInput: true,
+        },
+      ];
+    } else {
+      const fallbackQ =
+        cleanHumanSummary(
+          String(
+            ev.payload?.prompt ??
+              ev.payload?.body ??
+              ev.summary ??
+              "Waiting for user answer",
+          ),
+          300,
+        ) || "Waiting for user answer";
+      questions = [
+        {
+          question: fallbackQ,
+          type: "text",
+          options: [],
+          allowCustomInput: true,
+        },
+      ];
+    }
+  }
+
+  const title =
+    cleanHumanSummary(
+      String(
+        ev.payload?.promptTitle ??
+          questions[0]?.header ??
+          questions[0]?.question ??
+          ev.summary ??
+          (kind === "approval"
+            ? `Approval: ${ev.toolName ?? "tool"}`
+            : "Question for user"),
+      ),
+      140,
+    ) || "Waiting for input";
+
+  const rawSummary =
+    typeof ev.payload?.promptSummary === "string"
+      ? ev.payload.promptSummary
+      : ev.summary;
+  const summary = cleanHumanSummary(rawSummary ?? "", 240) || undefined;
+
+  const firstOpts = questions[0]?.options ?? [];
+  const options =
+    firstOpts.length > 0
+      ? firstOpts.map((o) => ({
+          label: o.label,
+          ...(o.recommended ? { recommended: true } : {}),
+        }))
+      : undefined;
+
+  const blockingToolCall =
+    typeof ev.payload?.blockingToolCall === "boolean"
+      ? ev.payload.blockingToolCall
+      : Boolean(ev.toolName);
+
+  return {
+    id: computePendingPromptId(ag.id, ev.toolCallId, ev.id),
+    ...(ev.toolCallId ? { toolCallId: ev.toolCallId } : {}),
+    ...(ev.toolName ? { toolName: ev.toolName } : {}),
+    agentId: ag.id,
+    agentLabel: ag.label,
+    kind,
+    title,
+    ...(summary ? { summary } : {}),
+    questions,
+    ...(options ? { options } : {}),
+    ts: ev.ts,
+    blockingToolCall,
+  };
+}
+
+function doesToolEndMatchPrompt(
+  prompt: PendingHumanPrompt,
+  ev: EnrichedEvent,
+): boolean {
+  if (prompt.toolCallId && ev.toolCallId) {
+    return prompt.toolCallId === ev.toolCallId;
+  }
+  if (prompt.toolName && ev.toolName) {
+    return prompt.toolName.toLowerCase() === ev.toolName.toLowerCase();
+  }
+  return true;
 }
 
 function isUuidOrOpaqueId(raw?: string): boolean {
@@ -493,8 +643,11 @@ function reconcileCopilotSubagents(rawEvents: EnrichedEvent[]): EnrichedEvent[] 
   interface HookSubCand {
     hId: string;
     spawnEv?: EnrichedEvent;
+    spawnEvs: EnrichedEvent[];
+    hasDoneOrChild: boolean;
     epoch: number;
     normLabel: string;
+    altNormLabels: Set<string>;
     readableLabel?: string;
     isGeneric: boolean;
   }
@@ -588,28 +741,50 @@ function reconcileCopilotSubagents(rawEvents: EnrichedEvent[]): EnrichedEvent[] 
     if (ev.channel === "hook") {
       const registerHookCand = (
         hId: string,
-        readable: string | undefined,
+        readableList: Array<string | undefined>,
         spawnEv?: EnrichedEvent,
+        isDoneOrChild = false,
       ): void => {
-        const cleanReadable =
-          readable && !isGenericSubagentLabel(readable) ? readable : undefined;
+        const cleanList = readableList.filter(
+          (v): v is string => Boolean(v && !isGenericSubagentLabel(v)),
+        );
+        const cleanReadable = cleanList[0];
         const normLabel = normalizeSubagentLabel(cleanReadable || hId);
         const isGen = !cleanReadable;
         const prev = hookByHId.get(hId);
         if (!prev) {
+          const altNormLabels = new Set<string>();
+          for (const lbl of cleanList) {
+            const nl = normalizeSubagentLabel(lbl);
+            if (nl) altNormLabels.add(nl);
+          }
+          if (normLabel) altNormLabels.add(normLabel);
           hookByHId.set(hId, {
             hId,
             ...(spawnEv ? { spawnEv } : {}),
+            spawnEvs: spawnEv ? [spawnEv] : [],
+            hasDoneOrChild: isDoneOrChild,
             epoch: ev.epoch,
             normLabel,
+            altNormLabels,
             readableLabel: cleanReadable,
             isGeneric: isGen,
           });
         } else {
-          if (spawnEv && (!prev.spawnEv || ev.epoch < prev.spawnEv.epoch)) {
-            prev.spawnEv = spawnEv;
+          if (spawnEv) {
+            prev.spawnEvs.push(spawnEv);
+            if (!prev.spawnEv || ev.epoch < prev.spawnEv.epoch) {
+              prev.spawnEv = spawnEv;
+            }
+          }
+          if (isDoneOrChild) {
+            prev.hasDoneOrChild = true;
           }
           prev.epoch = Math.min(prev.epoch, ev.epoch);
+          for (const lbl of cleanList) {
+            const nl = normalizeSubagentLabel(lbl);
+            if (nl) prev.altNormLabels.add(nl);
+          }
           if (cleanReadable && (!prev.readableLabel || prev.isGeneric)) {
             prev.readableLabel = cleanReadable;
             prev.normLabel = normalizeSubagentLabel(cleanReadable);
@@ -623,28 +798,150 @@ function reconcileCopilotSubagents(rawEvents: EnrichedEvent[]): EnrichedEvent[] 
         ev.targetAgentId &&
         ev.targetAgentId !== "root"
       ) {
-        const readable =
-          strVal(ev.payload?.agentLabel) || strVal(ev.payload?.agentType);
-        registerHookCand(ev.targetAgentId, readable, ev);
+        registerHookCand(
+          ev.targetAgentId,
+          [
+            strVal(ev.payload?.agentLabel),
+            strVal(ev.payload?.agentType),
+            strVal(ev.payload?.agentName),
+          ],
+          ev,
+          false,
+        );
       } else if (
         ev.agentId &&
         ev.agentId !== "root" &&
         ev.agentId !== "human" &&
         !ev.agentId.startsWith("ext:")
       ) {
-        const readable =
-          strVal(ev.agentLabel) ||
-          strVal(ev.payload?.agentLabel) ||
-          strVal(ev.payload?.agentType);
-        registerHookCand(ev.agentId, readable);
+        registerHookCand(
+          ev.agentId,
+          [
+            strVal(ev.agentLabel),
+            strVal(ev.payload?.agentLabel),
+            strVal(ev.payload?.agentType),
+            strVal(ev.payload?.agentName),
+          ],
+          undefined,
+          true,
+        );
       } else if (
         ev.kind === "subagent_done" &&
         ev.targetAgentId &&
         ev.targetAgentId !== "root"
       ) {
-        const readable =
-          strVal(ev.payload?.agentLabel) || strVal(ev.payload?.agentType);
-        registerHookCand(ev.targetAgentId, readable);
+        registerHookCand(
+          ev.targetAgentId,
+          [
+            strVal(ev.payload?.agentLabel),
+            strVal(ev.payload?.agentType),
+            strVal(ev.payload?.agentName),
+          ],
+          undefined,
+          true,
+        );
+      }
+    }
+  }
+
+  // Step 0: Correlate label-only hook subagent_spawn (no agentId) with UUID-bearing
+  // hook subagent_done / child tool hooks so they collapse onto one canonical node.
+  const unlinkedHookSpawns: Array<{
+    cand: HookSubCand;
+    spawnEv: EnrichedEvent;
+    normLabels: string[];
+  }> = [];
+  for (const cand of hookByHId.values()) {
+    if (isUuidOrOpaqueId(cand.hId) || cand.hasDoneOrChild) continue;
+    for (const spawnEv of cand.spawnEvs) {
+      if (strVal(spawnEv.payload?.agentId)) continue;
+      const norms = [...cand.altNormLabels].filter(
+        (n) => n && n !== "subagent",
+      );
+      unlinkedHookSpawns.push({
+        cand,
+        spawnEv,
+        normLabels: norms.length > 0 ? norms : [cand.normLabel].filter(Boolean),
+      });
+    }
+  }
+  if (unlinkedHookSpawns.length > 0) {
+    unlinkedHookSpawns.sort((a, b) => a.spawnEv.epoch - b.spawnEv.epoch);
+    const uuidHookTargets = [...hookByHId.values()]
+      .filter((c) => isUuidOrOpaqueId(c.hId) && !c.spawnEv && c.hasDoneOrChild)
+      .sort((a, b) => a.epoch - b.epoch);
+    const matchedUuidSet = new Set<string>();
+    const matchedSpawnEvs = new Set<EnrichedEvent>();
+
+    const linkSpawnToUuid = (
+      sp: { cand: HookSubCand; spawnEv: EnrichedEvent },
+      u: HookSubCand,
+    ): void => {
+      matchedUuidSet.add(u.hId);
+      matchedSpawnEvs.add(sp.spawnEv);
+      sp.spawnEv.targetAgentId = u.hId;
+      const resolvedLbl =
+        (!sp.cand.isGeneric ? sp.cand.readableLabel : undefined) ||
+        (!u.isGeneric ? u.readableLabel : undefined) ||
+        (!isUuidOrOpaqueId(sp.cand.hId) ? sp.cand.hId : undefined);
+      if (resolvedLbl) {
+        u.readableLabel = resolvedLbl;
+        u.normLabel = normalizeSubagentLabel(resolvedLbl);
+        u.isGeneric = false;
+        sp.spawnEv.payload = {
+          ...(sp.spawnEv.payload ?? {}),
+          agentLabel: resolvedLbl,
+        };
+      }
+      sp.spawnEv.mergeKey = computeMergeKey({
+        sessionId: sp.spawnEv.sessionId,
+        agentId: sp.spawnEv.agentId,
+        kind: sp.spawnEv.kind,
+        toolCallId: sp.spawnEv.toolCallId,
+        toolName: sp.spawnEv.toolName,
+        epoch: sp.spawnEv.epoch,
+      });
+      u.spawnEv = sp.spawnEv;
+      u.spawnEvs.push(sp.spawnEv);
+      u.epoch = Math.min(u.epoch, sp.spawnEv.epoch);
+    };
+
+    // Pass 0a: Named label match within <= 300s (chronological FIFO)
+    for (const sp of unlinkedHookSpawns) {
+      if (sp.cand.isGeneric) continue;
+      const match = uuidHookTargets.find(
+        (u) =>
+          !matchedUuidSet.has(u.hId) &&
+          !u.isGeneric &&
+          u.epoch >= sp.spawnEv.epoch - 5 &&
+          u.epoch - sp.spawnEv.epoch <= 300 &&
+          sp.normLabels.some((nl) => u.altNormLabels.has(nl)),
+      );
+      if (match) linkSpawnToUuid(sp, match);
+    }
+
+    // Pass 0b: Unambiguous single remaining generic/label-less UUID target within <= 30s
+    const remSpawns = unlinkedHookSpawns.filter(
+      (sp) => !matchedSpawnEvs.has(sp.spawnEv),
+    );
+    const remUuids = uuidHookTargets.filter((u) => !matchedUuidSet.has(u.hId));
+    if (remSpawns.length === 1 && remUuids.length === 1) {
+      const sp = remSpawns[0]!;
+      const u = remUuids[0]!;
+      if (Math.abs(u.epoch - sp.spawnEv.epoch) <= 30) {
+        linkSpawnToUuid(sp, u);
+      }
+    }
+
+    // Remove exhausted label-only hook candidates that have no remaining unlinked spawns
+    for (const sp of unlinkedHookSpawns) {
+      if (!matchedSpawnEvs.has(sp.spawnEv)) continue;
+      const remaining = sp.cand.spawnEvs.filter((se) => !matchedSpawnEvs.has(se));
+      if (remaining.length === 0) {
+        hookByHId.delete(sp.cand.hId);
+      } else {
+        sp.cand.spawnEvs = remaining;
+        sp.cand.spawnEv = remaining[0];
       }
     }
   }
@@ -666,6 +963,15 @@ function reconcileCopilotSubagents(rawEvents: EnrichedEvent[]): EnrichedEvent[] 
       }
       if (hLbl && ev.summary === `Stop (${ev.agentId})`) {
         ev.summary = `Stop (${hLbl})`;
+      }
+      if (
+        (ev.kind === "subagent_spawn" || ev.kind === "subagent_done") &&
+        ev.targetAgentId
+      ) {
+        const targetLbl = hookByHId.get(ev.targetAgentId)?.readableLabel;
+        if (targetLbl && isGenericSubagentLabel(strVal(ev.payload?.agentLabel))) {
+          ev.payload = { ...(ev.payload ?? {}), agentLabel: targetLbl };
+        }
       }
     }
   };
@@ -1213,6 +1519,7 @@ export function buildSessionSnapshot(
         reportedDone: false,
         waitingReason: null,
         waitingDetail: null,
+        openPendingPrompt: null,
         recentActions: [],
         convId: extra?.convId,
         modelSource: "unknown",
@@ -1471,8 +1778,11 @@ export function buildSessionSnapshot(
     if (
       ev.kind === "subagent_spawn" &&
       ev.targetAgentId &&
-      typeof ev.payload?.childModel === "string" &&
-      ev.payload.childModel.trim()
+      ((typeof ev.payload?.childModel === "string" &&
+        ev.payload.childModel.trim()) ||
+        (typeof ev.payload?.childContextWindow === "number" &&
+          Number.isFinite(ev.payload.childContextWindow) &&
+          ev.payload.childContextWindow > 0))
     ) {
       const childSt = ensureAgent(ev.targetAgentId, {
         label: spawnLabelHint,
@@ -1480,7 +1790,11 @@ export function buildSessionSnapshot(
         ide: ev.ide,
         epoch: ev.epoch,
       });
-      if (!childSt.model) {
+      if (
+        !childSt.model &&
+        typeof ev.payload?.childModel === "string" &&
+        ev.payload.childModel.trim()
+      ) {
         childSt.model =
           prettifyModelName(ev.payload.childModel) || ev.payload.childModel;
         childSt.modelSource =
@@ -1488,6 +1802,14 @@ export function buildSessionSnapshot(
           ev.payload.childModelSource === "inherited"
             ? ev.payload.childModelSource
             : "inherited";
+      }
+      if (
+        !childSt.contextWindow &&
+        typeof ev.payload?.childContextWindow === "number" &&
+        Number.isFinite(ev.payload.childContextWindow) &&
+        ev.payload.childContextWindow > 0
+      ) {
+        childSt.contextWindow = Math.round(ev.payload.childContextWindow);
       }
     }
 
@@ -1505,6 +1827,7 @@ export function buildSessionSnapshot(
         ag.reportedDone = false;
         ag.waitingReason = null;
         ag.waitingDetail = null;
+        ag.openPendingPrompt = null;
         ag.hasBlocker = false;
         ag.isThinking = true;
         ag.thinkingSinceEpoch = ev.epoch;
@@ -1580,8 +1903,14 @@ export function buildSessionSnapshot(
 
         const callKey = ev.toolCallId ?? `${ev.toolName ?? "tool"}:${ev.id}`;
         const toolLabel = ev.toolName?.trim() || "tool";
+        if (!ev.isSelfDaemon) {
+          ag.openPendingPrompt = null;
+        }
         if (ev.status === "denied") {
           ag.hasBlocker = true;
+          ag.waitingReason = null;
+          ag.waitingDetail = null;
+          ag.openPendingPrompt = null;
           ag.action = `Blocked: ${ev.summary}`;
         } else if (ev.waitingReason) {
           ag.waitingReason = ev.waitingReason;
@@ -1589,10 +1918,12 @@ export function buildSessionSnapshot(
             ev.waitingReason === "user"
               ? "Waiting for user answer"
               : "Waiting for tool approval";
+          ag.openPendingPrompt = buildPendingPromptForEvent(ag, ev);
           ag.openTools.set(callKey, toolLabel);
         } else if (!ev.isSelfDaemon) {
           ag.hasBlocker = false;
           ag.waitingReason = null;
+          ag.waitingDetail = null;
           ag.openTools.set(callKey, toolLabel);
         }
 
@@ -1694,9 +2025,14 @@ export function buildSessionSnapshot(
           }
         }
 
-        if (ag.waitingReason === "user" || ag.waitingReason === "tool_approval") {
-          ag.waitingReason = null;
-          ag.waitingDetail = null;
+        const promptMatches =
+          !ag.openPendingPrompt || doesToolEndMatchPrompt(ag.openPendingPrompt, ev);
+        if (promptMatches) {
+          ag.openPendingPrompt = null;
+          if (ag.waitingReason === "user" || ag.waitingReason === "tool_approval") {
+            ag.waitingReason = null;
+            ag.waitingDetail = null;
+          }
         }
 
         if (isErr) {
@@ -1799,6 +2135,7 @@ export function buildSessionSnapshot(
         doneAgent.thinkingSinceEpoch = undefined;
         doneAgent.waitingReason = null;
         doneAgent.waitingDetail = null;
+        doneAgent.openPendingPrompt = null;
         doneAgent.reportedDone = true;
         doneAgent.lastEventEpoch = Math.max(doneAgent.lastEventEpoch, ev.epoch);
         doneAgent.action = cleanHumanSummary(ev.summary || "Completed", 140);
@@ -1834,6 +2171,15 @@ export function buildSessionSnapshot(
             target.reportedDone = false;
           }
           recordEdge(ag.id, targetId, ev.kind, ev.ts);
+        }
+
+        if (ev.waitingReason === "user" || ev.waitingReason === "tool_approval") {
+          ag.waitingReason = ev.waitingReason;
+          ag.waitingDetail =
+            ev.waitingReason === "user"
+              ? "Waiting for user answer"
+              : "Waiting for tool approval";
+          ag.openPendingPrompt = buildPendingPromptForEvent(ag, ev);
         }
 
         if (msgClass === "blocker") {
@@ -1873,6 +2219,18 @@ export function buildSessionSnapshot(
         totalBoardMutations += 1;
         ag.toolCalls += 1;
         totalToolCalls += 1;
+        ag.openPendingPrompt = null;
+        if (ev.waitingReason === "user" || ev.waitingReason === "tool_approval") {
+          ag.waitingReason = ev.waitingReason;
+          ag.waitingDetail =
+            ev.waitingReason === "user"
+              ? "Waiting for user answer"
+              : "Waiting for tool approval";
+          ag.openPendingPrompt = buildPendingPromptForEvent(ag, ev);
+        } else if (!ev.isSelfDaemon) {
+          ag.waitingReason = null;
+          ag.waitingDetail = null;
+        }
         const cleanBoardTitle = cleanHumanSummary(ev.summary, 140);
         ev.summary = cleanBoardTitle;
         ag.action = cleanBoardTitle;
@@ -1922,10 +2280,23 @@ export function buildSessionSnapshot(
         ag.thinkingSinceEpoch = undefined;
         ag.waitingReason = null;
         ag.waitingDetail = null;
+        ag.openPendingPrompt = null;
         ag.reportedDone = true;
         ag.action = ev.summary || "Turn completed";
         if (ev.isError || ev.status === "error") {
           ag.hasBlocker = true;
+        }
+        break;
+      }
+
+      default: {
+        if (ev.waitingReason === "user" || ev.waitingReason === "tool_approval") {
+          ag.waitingReason = ev.waitingReason;
+          ag.waitingDetail =
+            ev.waitingReason === "user"
+              ? "Waiting for user answer"
+              : "Waiting for tool approval";
+          ag.openPendingPrompt = buildPendingPromptForEvent(ag, ev);
         }
         break;
       }
@@ -2120,8 +2491,22 @@ export function buildSessionSnapshot(
       }
       const cachedTokens = ag.hasExplicitUsage ? ag.cachedTokens : 0;
       const totalTokens = inputTokens + outputTokens + cachedTokens;
+      const rootAg = agentMap.get("root");
+      const inheritedRootWindow =
+        !ag.isRoot &&
+        ag.ide === "copilot-vscode" &&
+        resolvedRootModel &&
+        finalModel === resolvedRootModel
+          ? rootAg?.contextWindow
+          : undefined;
       const contextWindow =
-        ag.contextWindow ?? inferContextWindow(finalModel, ag.ide);
+        ag.contextWindow ??
+        inheritedRootWindow ??
+        lookupModelContextWindow(finalModel, opts.modelContextWindows) ??
+        inferContextWindow(finalModel, ag.ide);
+      const inferredNominal = inferContextWindow(finalModel, ag.ide);
+      const nominalContextWindow =
+        inferredNominal > contextWindow ? inferredNominal : undefined;
       const estTurnContext = Math.round(
         (ag.fallbackPriorProseChars + ag.fallbackTurnTotalChars) / 4,
       );
@@ -2155,6 +2540,7 @@ export function buildSessionSnapshot(
         totalTokens,
         contextTokens,
         contextWindow,
+        ...(nominalContextWindow !== undefined ? { nominalContextWindow } : {}),
         contextPercent,
         ...(ag.costUsd !== undefined ? { costUsd: ag.costUsd } : {}),
       };
@@ -2231,7 +2617,7 @@ export function buildSessionSnapshot(
       ageSec,
       convId: ag.convId,
       recentActions: ag.recentActions,
-      pendingPrompt: null,
+      pendingPrompt: ag.openPendingPrompt,
       ...(agentModel ? { model: agentModel } : {}),
       ...(agentUsage ? { usage: agentUsage } : {}),
     });
@@ -2292,6 +2678,9 @@ export function buildSessionSnapshot(
   const realAgentCount = richAgents.filter((a) => a.nodeType === "agent").length;
   const updatedAt =
     events.length > 0 ? events[events.length - 1]!.ts : toIsoUtc(nowSec);
+  const pendingPrompts: PendingHumanPrompt[] = richAgents
+    .filter((a) => a.nodeType === "agent" && a.pendingPrompt != null)
+    .map((a) => a.pendingPrompt!);
 
   return {
     sessionId: opts.sessionId,
@@ -2321,5 +2710,10 @@ export function buildSessionSnapshot(
       completedAgents: completedAgentCount,
     },
     usage: sessionUsage,
+    pendingPrompts,
+    ...(opts.modelContextWindows &&
+    Object.keys(opts.modelContextWindows).length > 0
+      ? { modelContextWindows: opts.modelContextWindows }
+      : {}),
   };
 }

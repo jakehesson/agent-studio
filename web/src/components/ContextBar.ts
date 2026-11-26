@@ -3,6 +3,7 @@ import type {
   DiscoveredSessionSummary,
   HostIde,
   IdeFilter,
+  PendingHumanPrompt,
   PrimaryView,
   RegisteredProject,
 } from "../types.js";
@@ -22,6 +23,7 @@ export interface ContextBarState {
   hideMockups?: boolean;
   lockedIde: HostIde | null;
   lockedWorkspace: string;
+  pendingPrompts?: PendingHumanPrompt[];
 }
 
 export interface ContextBarCallbacks {
@@ -33,6 +35,7 @@ export interface ContextBarCallbacks {
   onSelectView: (view: PrimaryView) => void;
   onReconnect: () => void;
   onOpenFeedback: () => void;
+  onOpenWaitingAgent?: (agentId: string) => void;
 }
 
 const IDE_PILLS: Array<{ id: IdeFilter; label: string }> = [
@@ -61,6 +64,7 @@ export class ContextBar {
   private lastScopeChipHtml = "";
   private lastPopListHtml = "";
   private lastSheetListHtml = "";
+  private seenPromptIds = new Set<string>();
 
   constructor(root: HTMLElement, initial: ContextBarState, cb: ContextBarCallbacks) {
     this.root = root;
@@ -118,6 +122,17 @@ export class ContextBar {
         </nav>
 
         <div class="ctx-status-wrap">
+          <button
+            type="button"
+            class="waiting-alert-pill"
+            data-waiting-pill
+            hidden
+            aria-label="Waiting for user input"
+          >
+            <span class="waiting-q-ico" aria-hidden="true">?</span>
+            <span data-waiting-label>0 waiting</span>
+          </button>
+          <span class="sr-only" aria-live="polite" data-waiting-announcer></span>
           <button
             type="button"
             class="feedback-trigger"
@@ -294,6 +309,14 @@ export class ContextBar {
       this.cb.onOpenFeedback();
     });
 
+    // Waiting prompt pill trigger
+    this.root.querySelector("[data-waiting-pill]")?.addEventListener("click", () => {
+      const first = this.state.pendingPrompts?.[0];
+      if (first?.agentId) {
+        this.cb.onOpenWaitingAgent?.(first.agentId);
+      }
+    });
+
     // SSE reconnect pill
     this.root.querySelector("[data-sse-pill]")?.addEventListener("click", () => {
       this.cb.onReconnect();
@@ -419,6 +442,38 @@ export class ContextBar {
       btn.setAttribute("aria-pressed", pressed ? "true" : "false");
       btn.classList.toggle("active", pressed);
     });
+
+    // Update Waiting Alert Pill & polite announcement
+    const waitingPill = this.root.querySelector<HTMLButtonElement>("[data-waiting-pill]");
+    const waitingLabel = this.root.querySelector<HTMLElement>("[data-waiting-label]");
+    const waitingAnnouncer = this.root.querySelector<HTMLElement>("[data-waiting-announcer]");
+    const pendingList = next.pendingPrompts ?? [];
+    if (waitingPill && waitingLabel) {
+      if (pendingList.length > 0) {
+        waitingPill.hidden = false;
+        waitingLabel.textContent = `${pendingList.length} waiting`;
+        const first = pendingList[0]!;
+        waitingPill.setAttribute(
+          "aria-label",
+          `${pendingList.length} ${pendingList.length === 1 ? "agent" : "agents"} waiting for input — open chat with ${first.agentLabel || first.agentId}`
+        );
+        waitingPill.title = `${first.agentLabel || first.agentId}: ${first.title}`;
+      } else {
+        waitingPill.hidden = true;
+      }
+    }
+    if (waitingAnnouncer) {
+      const newlyAdded = pendingList.filter((p) => p.id && !this.seenPromptIds.has(p.id));
+      for (const p of pendingList) {
+        if (p.id) this.seenPromptIds.add(p.id);
+      }
+      if (pendingList.length === 0) {
+        this.seenPromptIds.clear();
+      } else if (newlyAdded.length > 0) {
+        const firstNew = newlyAdded[0]!;
+        waitingAnnouncer.textContent = `${firstNew.agentLabel || firstNew.agentId} needs input: ${firstNew.title}`;
+      }
+    }
 
     // Update SSE Pill
     const ssePill = this.root.querySelector("[data-sse-pill]");

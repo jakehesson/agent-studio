@@ -59,6 +59,7 @@ export interface TopologyRenderMeta {
 export interface TopologyCallbacks {
   onSelectAgent: (agentId: string | null) => void;
   onSelectThread?: (selection: ThreadSelection) => void;
+  onOpenChat?: (agentId: string) => void;
 }
 
 interface MeshPositionedNode {
@@ -69,8 +70,10 @@ interface MeshPositionedNode {
   y: number;
   color: string;
   isCore?: boolean;
+  isHuman?: boolean;
   isBusy?: boolean;
   isDone?: boolean;
+  hasPendingPrompt?: boolean;
   msgs: number;
   threadSelection: ThreadSelection;
 }
@@ -650,10 +653,15 @@ export class TopologySvg {
       const hSelected = this.selectedId === human.id;
       const hSummary = cleanSummaryText(human.summary) || "Session prompt root";
       rootParts.push(`
-        <div class="node-card user-node ${hSelected ? "is-selected" : ""}" data-agent-id="${escHtml(human.id)}" tabindex="0" role="button" aria-label="Inspect User details">
+        <div class="node-card user-node ${hSelected ? "is-selected" : ""}" data-agent-id="${escHtml(human.id)}">
           <div class="cluster-head">
             <div class="cluster-title-wrap">
-              <div class="cluster-name"><span class="status-dot done detail-only" aria-hidden="true"></span><span>User</span></div>
+              <div class="cluster-name">
+                <button type="button" class="card-select-btn" data-select-agent="${escHtml(human.id)}" aria-label="Inspect User details" aria-pressed="${hSelected ? "true" : "false"}">
+                  <span class="status-dot done detail-only" aria-hidden="true"></span>
+                  <span>User</span>
+                </button>
+              </div>
               <div class="role-meta detail-only">Session Root · ${human.messagesSent} prompts</div>
             </div>
             <div class="run-top-right">
@@ -716,17 +724,27 @@ export class TopologySvg {
         ? `<span class="tele-mono" data-thinking-timer="${escHtml(root.id)}" data-thinking-start="${thinkingStart}">thinking ${fmtDuration(elapsed)} · ${root.toolCalls}t</span>`
         : `<span class="tele-mono">${root.toolCalls}t · ${root.messagesSent}↑ ${root.messagesReceived}↓</span>`;
 
+      const rootHasPending = Boolean(root.pendingPrompt);
+
       rootParts.push(`
-        <div class="node-card root-agent ${rSelected ? "is-selected" : ""}" id="avRootOrchestrator" data-root-orchestrator data-agent-id="${escHtml(root.id)}" data-state="${rState}" tabindex="0" role="button" aria-label="Inspect ${escHtml(root.label || "Orchestrator")} details">
+        <div class="node-card root-agent ${rSelected ? "is-selected" : ""} ${rootHasPending ? "has-pending-prompt" : ""}" id="avRootOrchestrator" data-root-orchestrator data-agent-id="${escHtml(root.id)}" data-state="${rState}">
           <div class="cluster-head">
             <div class="cluster-title-wrap">
               <div class="cluster-name">
-                <span class="status-dot ${rState} detail-only" aria-hidden="true"></span>
-                <span>${escHtml(root.label || "Coordinator")}</span>
+                <button type="button" class="card-select-btn" data-select-agent="${escHtml(root.id)}" aria-label="Inspect ${escHtml(root.label || "Orchestrator")} details" aria-pressed="${rSelected ? "true" : "false"}">
+                  <span class="status-dot ${rState} detail-only" aria-hidden="true"></span>
+                  <span>${escHtml(root.label || "Coordinator")}</span>
+                </button>
               </div>
               <div class="role-meta detail-only">Orchestrator · ${subCount} subagents · ${root.toolCalls} tools</div>
             </div>
             <div class="run-top-right">
+              ${
+                rootHasPending
+                  ? `<button type="button" class="needs-input-badge" data-open-chat="${escHtml(root.id)}" aria-label="Needs input — open chat with ${escHtml(root.label || "Coordinator")}"><span aria-hidden="true">?</span> Needs Input</button>`
+                  : ""
+              }
+              <button type="button" class="card-chat-btn" data-open-chat="${escHtml(root.id)}" aria-label="Open chat for ${escHtml(root.label || "Coordinator")}">Chat</button>
               ${
                 totalMsgs > 0
                   ? `<button type="button" class="card-msg-badge detail-only" data-thread-key="all" aria-label="Open all ${totalMsgs} session messages">
@@ -862,10 +880,13 @@ export class TopologySvg {
     const isSelected =
       this.selectedId !== null && c.agentIds.includes(this.selectedId);
     const ideMeta = getIdeMeta(c.ide);
+    const pendingRun = c.runs.find((r) => Boolean(r.agent.pendingPrompt));
+    const hasPending = Boolean(pendingRun);
+    const chatTargetId = pendingRun?.id ?? c.leadAgentId;
 
     return `
       <article
-        class="cluster-card ${isSelected ? "is-selected" : ""}"
+        class="cluster-card ${isSelected ? "is-selected" : ""} ${hasPending ? "has-pending-prompt" : ""}"
         data-cluster-id="${escHtml(c.id)}"
         data-agent-id="${escHtml(c.leadAgentId)}"
         data-cluster-thread-key="${escHtml(c.threadKey)}"
@@ -873,20 +894,25 @@ export class TopologySvg {
         data-role-label="${escHtml(c.teamRole)}"
         data-state="${c.state}"
         style="--rail-color:${c.railColor}"
-        tabindex="0"
-        role="button"
-        aria-label="Inspect ${escHtml(c.teamRole)} details"
       >
         <div class="cluster-head">
           <div class="cluster-title-wrap">
             <div class="cluster-name">
-              <span class="status-dot ${c.state} detail-only" aria-hidden="true"></span>
-              <span>${escHtml(c.teamRole)}</span>
+              <button type="button" class="card-select-btn" data-select-agent="${escHtml(c.leadAgentId)}" aria-label="Inspect ${escHtml(c.teamRole)} details" aria-pressed="${isSelected ? "true" : "false"}">
+                <span class="status-dot ${c.state} detail-only" aria-hidden="true"></span>
+                <span>${escHtml(c.teamRole)}</span>
+              </button>
               ${c.runs.length > 1 ? `<span class="count-badge">×${c.runs.length}</span>` : ""}
             </div>
             <div class="role-meta detail-only">${escHtml(c.subtitle)}${countLabels.length ? ` · ${countLabels.join(", ")}` : ""} · ${c.totalTools} tools</div>
           </div>
           <div class="run-top-right">
+            ${
+              pendingRun
+                ? `<button type="button" class="needs-input-badge" data-open-chat="${escHtml(pendingRun.id)}" aria-label="Needs input — open chat with ${escHtml(pendingRun.displayId)}"><span aria-hidden="true">?</span> Needs Input</button>`
+                : ""
+            }
+            <button type="button" class="card-chat-btn" data-open-chat="${escHtml(chatTargetId)}" aria-label="Open chat for ${escHtml(c.teamRole)}">Chat</button>
             ${
               c.msgCount > 0 && c.runs.length <= 1
                 ? `<button type="button" class="card-msg-badge detail-only" data-thread-key="${escHtml(c.threadKey)}" aria-label="Open ${c.msgCount} messages for ${escHtml(c.teamRole)}">
@@ -907,11 +933,18 @@ export class TopologySvg {
                 ${visibleRuns
                   .map((r) => {
                     const rSelected = this.selectedId === r.id;
+                    const rHasPending = Boolean(r.agent.pendingPrompt);
                     return `
-                      <div class="run-item ${r.state === "done" ? "is-done" : ""} ${rSelected ? "is-selected" : ""}" data-run-agent-id="${escHtml(r.id)}" data-run-state="${r.state}">
+                      <div class="run-item ${r.state === "done" ? "is-done" : ""} ${rSelected ? "is-selected" : ""} ${rHasPending ? "has-pending-prompt" : ""}" data-run-agent-id="${escHtml(r.id)}" data-run-state="${r.state}">
                         <div class="run-top">
-                          <span class="run-id">${escHtml(r.displayId)}</span>
+                          <button type="button" class="run-id card-select-btn" data-select-agent="${escHtml(r.id)}" aria-label="Inspect ${escHtml(r.displayId)} details" aria-pressed="${rSelected ? "true" : "false"}">${escHtml(r.displayId)}</button>
                           <div class="run-top-right">
+                            ${
+                              rHasPending
+                                ? `<button type="button" class="needs-input-badge" data-open-chat="${escHtml(r.id)}" aria-label="Needs input — open chat with ${escHtml(r.displayId)}"><span aria-hidden="true">?</span> Needs Input</button>`
+                                : ""
+                            }
+                            <button type="button" class="card-chat-btn" data-open-chat="${escHtml(r.id)}" aria-label="Open chat for ${escHtml(r.displayId)}">Chat</button>
                             ${
                               r.msgs > 0
                                 ? `<button type="button" class="card-msg-badge" data-thread-key="${escHtml(c.threadKey)}" data-run-id="${escHtml(r.id)}" aria-label="Open ${r.msgs} messages for ${escHtml(r.displayId)}">
@@ -1138,6 +1171,7 @@ export class TopologySvg {
         y: CY,
         color: "#f59e0b",
         isCore: true,
+        isHuman: true,
         msgs: model.humanRootMsgCount,
         threadSelection: this.threadLookup.get(humanRootKey) ?? {
           key: "all",
@@ -1158,6 +1192,7 @@ export class TopologySvg {
         color: "#c084fc",
         isCore: true,
         isBusy: rootBusy,
+        hasPendingPrompt: Boolean(root.pendingPrompt),
         msgs: this.lastCounters?.messages ?? 0,
         threadSelection: this.threadLookup.get("all")!,
       });
@@ -1173,6 +1208,7 @@ export class TopologySvg {
         color: "#c084fc",
         isCore: true,
         isBusy: rootBusy,
+        hasPendingPrompt: Boolean(root.pendingPrompt),
         msgs: this.lastCounters?.messages ?? 0,
         threadSelection: this.threadLookup.get("all")!,
       });
@@ -1208,6 +1244,7 @@ export class TopologySvg {
         y,
         color,
         isBusy: run.state === "working",
+        hasPendingPrompt: Boolean(run.agent.pendingPrompt),
         msgs: run.msgs,
         threadSelection: sel,
       });
@@ -1237,6 +1274,7 @@ export class TopologySvg {
         y,
         color: "#10b981",
         isDone: true,
+        hasPendingPrompt: Boolean(run.agent.pendingPrompt),
         msgs: run.msgs,
         threadSelection: sel,
       });
@@ -1398,11 +1436,37 @@ export class TopologySvg {
       const sel = this.selectedId === n.agentId;
       const r = n.isCore ? 15 : n.isDone ? 9.5 : 12.5;
       const lblY = n.isCore ? n.y + 26 : n.y >= CY ? n.y + 20 : n.y - 17;
+      const chatPillY = n.isCore ? n.y + 39 : n.y >= CY ? n.y + 33 : n.y - 31;
+      const waitingPillTop =
+        !n.isCore && n.y < CY
+          ? Math.min(chatPillY - 26, n.y - r - 24)
+          : n.y - r - 21;
+      const waitingPillHtml = n.hasPendingPrompt
+        ? `
+          <g class="mesh-needs-input-badge" style="cursor:pointer" data-open-chat="${escHtml(n.agentId)}" role="button" tabindex="0" aria-label="Needs input — open chat with ${escHtml(n.label)}">
+            <rect x="${(n.x - 40).toFixed(1)}" y="${waitingPillTop.toFixed(1)}" width="80" height="16" rx="8" fill="#f59e0b" stroke="#0b1120" stroke-width="1.2" />
+            <text x="${n.x.toFixed(1)}" y="${(waitingPillTop + 11).toFixed(1)}" fill="#06101d" font-size="8.2" font-weight="800" text-anchor="middle">? Needs Input</text>
+          </g>
+        `
+        : "";
+      const chatPillHtml = !n.isHuman
+        ? `
+          <g class="mesh-chat-btn" style="cursor:pointer" data-open-chat="${escHtml(n.agentId)}" role="button" tabindex="0" aria-label="Open chat for ${escHtml(n.label)}">
+            <rect x="${(n.x - 18).toFixed(1)}" y="${(chatPillY - 7).toFixed(1)}" width="36" height="13" rx="6.5" fill="#0d1424" stroke="#38bdf8" stroke-width="1" />
+            <text x="${n.x.toFixed(1)}" y="${(chatPillY + 2.5).toFixed(1)}" fill="#7dd3fc" font-size="7.8" font-weight="700" text-anchor="middle">Chat</text>
+          </g>
+        `
+        : "";
       return `
-        <g class="agent-card mesh-node" style="cursor:pointer" data-agent-id="${escHtml(n.agentId)}" role="button" tabindex="0" aria-label="Inspect ${escHtml(n.label)}">
-          ${n.isCore || n.isBusy ? `<circle cx="${n.x.toFixed(1)}" cy="${n.y.toFixed(1)}" r="${r + 4}" fill="none" stroke="${n.color}" stroke-opacity="0.34" stroke-width="2" class="work-halo" />` : ""}
-          <circle cx="${n.x.toFixed(1)}" cy="${n.y.toFixed(1)}" r="${r}" fill="#141c2e" stroke="${sel ? "#ffffff" : n.color}" stroke-width="${sel ? 2.8 : 2}" />
-          <text x="${n.x.toFixed(1)}" y="${lblY.toFixed(1)}" fill="${sel ? "#f8fafc" : n.isCore ? "#e2e8f0" : "#94a3b8"}" font-size="${n.isCore ? "10.5" : "8.8"}" font-weight="${n.isCore ? "700" : "600"}" text-anchor="middle">${escHtml(n.label)}</text>
+        <g class="agent-card mesh-node">
+          <g class="mesh-node-hit" style="cursor:pointer" data-agent-id="${escHtml(n.agentId)}" role="button" tabindex="0" aria-label="Inspect ${escHtml(n.label)}">
+            ${n.hasPendingPrompt ? `<circle cx="${n.x.toFixed(1)}" cy="${n.y.toFixed(1)}" r="${r + 7}" fill="none" stroke="#f59e0b" stroke-width="2" class="needs-input-ring" />` : ""}
+            ${n.isCore || n.isBusy ? `<circle cx="${n.x.toFixed(1)}" cy="${n.y.toFixed(1)}" r="${r + 4}" fill="none" stroke="${n.color}" stroke-opacity="0.34" stroke-width="2" class="work-halo" />` : ""}
+            <circle cx="${n.x.toFixed(1)}" cy="${n.y.toFixed(1)}" r="${r}" fill="#141c2e" stroke="${sel ? "#ffffff" : n.hasPendingPrompt ? "#f59e0b" : n.color}" stroke-width="${sel ? 2.8 : 2}" />
+            <text x="${n.x.toFixed(1)}" y="${lblY.toFixed(1)}" fill="${sel ? "#f8fafc" : n.isCore ? "#e2e8f0" : "#94a3b8"}" font-size="${n.isCore ? "10.5" : "8.8"}" font-weight="${n.isCore ? "700" : "600"}" text-anchor="middle">${escHtml(n.label)}</text>
+          </g>
+          ${waitingPillHtml}
+          ${chatPillHtml}
         </g>
       `;
     });
@@ -1643,6 +1707,24 @@ export class TopologySvg {
         return;
       }
 
+      // 9.5 Open Agent Chat trigger (card button, Needs Input badge, or mesh pill)
+      const openChatEl = target.closest<Element>("[data-open-chat]");
+      if (openChatEl) {
+        e.stopPropagation();
+        const aid = openChatEl.getAttribute("data-open-chat");
+        if (aid) this.cb.onOpenChat?.(aid);
+        return;
+      }
+
+      // 9.6 Explicit card/run title select button
+      const selectAgentBtn = target.closest<HTMLButtonElement>("[data-select-agent]");
+      if (selectAgentBtn) {
+        e.stopPropagation();
+        const aid = selectAgentBtn.dataset.selectAgent;
+        if (aid) this.toggleAgentSelection(aid);
+        return;
+      }
+
       // 10. Specific run item inside a cluster card
       const runEl = target.closest<HTMLElement>("[data-run-agent-id]");
       if (runEl) {
@@ -1661,6 +1743,13 @@ export class TopologySvg {
     });
 
     const activateKeyTarget = (target: Element) => {
+      const openChatEl = target.closest<Element>("[data-open-chat]");
+      if (openChatEl && openChatEl.tagName !== "BUTTON") {
+        const aid = openChatEl.getAttribute("data-open-chat");
+        if (aid) this.cb.onOpenChat?.(aid);
+        return;
+      }
+
       const threadEl = target.closest<Element>("[data-thread-key]");
       if (threadEl && threadEl.tagName !== "BUTTON") {
         const tkey = threadEl.getAttribute("data-thread-key");

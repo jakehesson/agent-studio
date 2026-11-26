@@ -10,7 +10,7 @@ description: Agent Studio architecture profile, module boundaries, state/concurr
 - **API & IPC Boundaries:**
   - Stdio & HTTP/SSE MCP server (`src/mcp/server.ts`) exposing `projects`, `board`, `testrun`, `telemetry`, and `open_studio`.
   - Live monitoring REST & SSE server (`src/server/`) consumed by `web/` and `extension/`.
-  - Multi-IDE compiler (`src/compiler/`) compiling `.agent-team/` into `.agents/plugins/`, `.claude/`, `.github/`, `CLAUDE.md`, `.mcp.json`, and `.vscode/mcp.json`.
+  - Multi-IDE compiler (`src/compiler/`) compiling `.agent-team/` into `.agents/plugins/`, `.claude/`, `.github/`, `CLAUDE.md`, and shared `.mcp.json` (with `.vscode/mcp.json` reserved only for `workflow.copilotHarness: "legacy-local"`).
 
 ## 2. Module Boundaries & Dependency Direction
 - `src/schema/` defines Zod schemas and Layer 0 static constants (`TeamManifestSchema`, `BoardSchema`, `ModelIndexSchema`); it must remain free of CLI/server side effects.

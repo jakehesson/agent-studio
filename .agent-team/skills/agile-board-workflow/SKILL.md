@@ -17,5 +17,7 @@ description: Manage sprints, backlog items, bugs, and QA-gated lifecycle transit
 - Inspect item details: `board { op: "show", itemId: "<ID>" }`
 - Add work or bug: `board { op: "add", type: "task|story|bug", title: "...", role: "..." }`
 - Record progress note: `board { op: "note", itemId: "<ID>", text: "..." }`
+- Checkpoint context handoff: `board { op: "handoff", itemId: "<ID>", kind: "fresh_context|task_split", summary: "...", modifiedFiles: [...], remainingWork: [...], continuationBrief: "..." }`
+- Execute orchestrator split: `board { op: "split", itemId: "<ID>" }` (creates child tasks from `split_proposals` and sets `split_from`)
 - Transition state: `board { op: "move", itemId: "<ID>", state: "design|dev|test|done" }`
 - Check release gate: `board { op: "gate" }`

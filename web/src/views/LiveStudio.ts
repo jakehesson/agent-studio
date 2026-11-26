@@ -1,4 +1,5 @@
 import { ActivityFeed } from "../components/ActivityFeed.js";
+import { AgentChatDrawer } from "../components/AgentChatDrawer.js";
 import { CommReaderModal } from "../components/CommReaderModal.js";
 import { PayloadInspector } from "../components/PayloadInspector.js";
 import { TimelineScrubber } from "../components/TimelineScrubber.js";
@@ -8,6 +9,9 @@ import { buildTopologyModel } from "../state/topologyGrouping.js";
 import type {
   AgentNodeSnapshot,
   NormalizedEvent,
+  ReplyCapabilities,
+  ReplyToHostRequest,
+  ReplyToHostResult,
   SessionSnapshot,
   TeamDefinitionEntry,
   TeamRosterRef,
@@ -15,6 +19,8 @@ import type {
 
 export interface LiveStudioCallbacks {
   onCoverSubPaneChange?: (pane: "topology" | "feed") => void;
+  getReplyCapabilities?: () => ReplyCapabilities;
+  onReplyToHost?: (req: ReplyToHostRequest) => Promise<ReplyToHostResult>;
 }
 
 export class LiveStudioView {
@@ -25,6 +31,7 @@ export class LiveStudioView {
   private inspector: PayloadInspector;
   private scrubber: TimelineScrubber;
   private readerModal: CommReaderModal;
+  private chatDrawer: AgentChatDrawer;
 
   private snapshot: SessionSnapshot | null = null;
   private fallbackTeamRoster: TeamRosterRef[] | undefined = undefined;
@@ -73,6 +80,9 @@ export class LiveStudioView {
           this.cb.onCoverSubPaneChange?.("feed");
         }
       },
+      onOpenChat: (agentId) => {
+        this.openChat(agentId);
+      },
     });
 
     const embedMode = (() => {
@@ -84,21 +94,59 @@ export class LiveStudioView {
       }
     })();
 
+    const getSessionContext = () => {
+      let sp: URLSearchParams | null = null;
+      try {
+        sp = new URLSearchParams(window.location.search);
+      } catch {
+        sp = null;
+      }
+      const snapIde =
+        this.snapshot?.ide && this.snapshot.ide !== "unknown"
+          ? this.snapshot.ide
+          : undefined;
+      return {
+        sessionId: this.snapshot?.sessionId || sp?.get("session") || undefined,
+        ide: snapIde || sp?.get("ide") || undefined,
+        project: this.snapshot?.projectId || sp?.get("project") || undefined,
+        workspace: this.snapshot?.workspacePath || sp?.get("workspace") || undefined,
+      };
+    };
+
     this.readerModal = new CommReaderModal({
       embedMode,
-      getSessionContext: () => {
-        let sp: URLSearchParams | null = null;
-        try {
-          sp = new URLSearchParams(window.location.search);
-        } catch {
-          sp = null;
-        }
-        return {
-          sessionId: this.snapshot?.sessionId || sp?.get("session") || undefined,
-          ide: this.snapshot?.ide || sp?.get("ide") || undefined,
-          project: this.snapshot?.projectId || sp?.get("project") || undefined,
-          workspace: this.snapshot?.workspacePath || sp?.get("workspace") || undefined,
-        };
+      getSessionContext,
+    });
+
+    const getReplyCapabilities =
+      this.cb.getReplyCapabilities ??
+      (() => ({
+        canSendMessage: false,
+        isMcpApp: false,
+        isEmbed: embedMode,
+      }));
+    const onReplyToHost =
+      this.cb.onReplyToHost ??
+      (async (req: ReplyToHostRequest): Promise<ReplyToHostResult> => ({
+        ok: false,
+        mode: "error",
+        message: `Reply handler unavailable for ${req.agentId}`,
+      }));
+
+    this.chatDrawer = new AgentChatDrawer({
+      getSessionContext,
+      getReplyCapabilities,
+      onReplyToHost,
+      onOpenInspector: (agentId) => {
+        this.selectedAgentId = agentId;
+        this.selectedEventId = null;
+        this.topology.setSelectedAgent(agentId);
+        this.feed.setAgentFilter(agentId);
+        this.feed.setSelectedEvent(null);
+        this.inspectCurrentAgent(agentId, this.isCoverScreen());
+      },
+      onSwitchAgent: (agentId) => {
+        this.openChat(agentId);
       },
     });
 
@@ -130,6 +178,11 @@ export class LiveStudioView {
         this.setCoverSubPane("topology");
         this.cb.onCoverSubPaneChange?.("topology");
       },
+      onOpenChat: (agentId) => {
+        this.openChat(agentId);
+      },
+      getReplyCapabilities,
+      onReplyToHost,
     });
 
     this.inspector = new PayloadInspector(inspEl, {
@@ -145,6 +198,9 @@ export class LiveStudioView {
       onOpenReader: (ev) => {
         this.readerModal.open(ev, { labelMap: this.agentLabelMap });
       },
+      onOpenChat: (agentId) => {
+        this.openChat(agentId);
+      },
     });
 
     this.scrubber = new TimelineScrubber(tlEl, {
@@ -155,10 +211,48 @@ export class LiveStudioView {
   }
 
   public dispose(): void {
+    this.chatDrawer.dispose();
+    this.feed.dispose();
     this.readerModal.dispose();
     this.topology.dispose();
     this.inspector.dispose();
     this.scrubber.dispose();
+  }
+
+  public openChat(agentId: string, focusQuestion = false): boolean {
+    const snap = this.snapshot;
+    if (!snap) return false;
+    const found = this.resolveLiveAgent(agentId) ?? {
+      id: agentId,
+      label: agentId,
+      ide: snap.ide,
+      status: "IDLE",
+      toolCalls: 0,
+      messagesSent: 0,
+      messagesReceived: 0,
+    };
+    const effectiveDefinitions =
+      snap.definitions && snap.definitions.length > 0
+        ? snap.definitions
+        : this.fallbackDefinitions;
+    const definition = this.findMatchingDefinition(found, effectiveDefinitions);
+    this.chatDrawer.open({
+      agent: found,
+      labelMap: this.agentLabelMap,
+      definition,
+      focusQuestion,
+    });
+    return true;
+  }
+
+  public openFirstWaitingChat(): boolean {
+    const snap = this.snapshot;
+    if (!snap) return false;
+    const firstAgentId =
+      snap.pendingPrompts?.[0]?.agentId ??
+      snap.agents.find((a) => Boolean(a.pendingPrompt))?.id;
+    if (!firstAgentId) return false;
+    return this.openChat(firstAgentId, true);
   }
 
   private isCoverScreen(): boolean {
@@ -202,6 +296,7 @@ export class LiveStudioView {
       this.selectedAgentId = null;
       this.selectedEventId = null;
       this.lastAnimatedEventId = null;
+      this.chatDrawer.close();
       this.topology.resetSessionState();
       this.feed.setAgentFilter(null);
       this.feed.setSelectedEvent(null);
@@ -283,8 +378,10 @@ export class LiveStudioView {
         this.agentLabelMap,
         mergedAgents,
         snap.usage ?? reconstructed.usage,
-        model.clusters
+        model.clusters,
+        snap.sessionId
       );
+      this.chatDrawer.notifySnapshot(snap, mergedAgents, this.agentLabelMap);
     } else {
       const idx = events.length > 0 ? Math.max(0, Math.min(cursor, events.length - 1)) : -1;
       const reconstructed = buildSnapshot(events, idx, snap);
@@ -313,7 +410,8 @@ export class LiveStudioView {
         this.agentLabelMap,
         reconstructed.agents,
         reconstructed.usage,
-        model.clusters
+        model.clusters,
+        snap.sessionId
       );
       if (animateHead && reconstructed.activeEvent) {
         this.topology.animatePacket(reconstructed.activeEvent);
@@ -347,27 +445,32 @@ export class LiveStudioView {
     return map;
   }
 
-  private inspectCurrentAgent(agentId: string, openSheet = false): void {
+  private resolveLiveAgent(agentId: string): AgentNodeSnapshot | undefined {
     const snap = this.snapshot;
-    if (!snap) return;
+    if (!snap) return undefined;
     const { cursor, liveTail } = this.scrubber.getState();
     const isHistory = snap.events.length > 0 && (!liveTail || cursor < snap.events.length - 1);
     const reconstructed = buildSnapshot(snap.events, cursor, snap);
     const recAgent = reconstructed.agents.find((a) => a.id === agentId);
     const srvAgent = snap.agents.find((a) => a.id === agentId);
-    const found =
-      !isHistory && snap.agents.length > 0
-        ? srvAgent && recAgent
-          ? {
-              ...recAgent,
-              ...srvAgent,
-              recentActions: recAgent.recentActions?.length
-                ? recAgent.recentActions
-                : srvAgent.recentActions,
-              thinkingEpoch: recAgent.thinkingEpoch,
-            }
-          : srvAgent
-        : recAgent ?? srvAgent;
+    return !isHistory && snap.agents.length > 0
+      ? srvAgent && recAgent
+        ? {
+            ...recAgent,
+            ...srvAgent,
+            recentActions: recAgent.recentActions?.length
+              ? recAgent.recentActions
+              : srvAgent.recentActions,
+            thinkingEpoch: recAgent.thinkingEpoch,
+          }
+        : srvAgent
+      : recAgent ?? srvAgent;
+  }
+
+  private inspectCurrentAgent(agentId: string, openSheet = false): void {
+    const snap = this.snapshot;
+    if (!snap) return;
+    const found = this.resolveLiveAgent(agentId);
     if (found) {
       const effectiveDefinitions =
         snap.definitions && snap.definitions.length > 0

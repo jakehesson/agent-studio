@@ -2,6 +2,7 @@
 import {
   boardAdd,
   boardGate,
+  boardHandoff,
   boardMove,
   boardNext,
   boardNote,
@@ -9,6 +10,7 @@ import {
   boardPlan,
   boardReport,
   boardShow,
+  boardSplit,
   boardStatus,
   listProjects,
   registerProject,
@@ -32,6 +34,7 @@ import { runInit } from "./commands/init.js";
 import { runModelsCli } from "./commands/models.js";
 import { runServe } from "./commands/serve.js";
 import { runSync } from "./commands/sync.js";
+import { runUpgrade } from "./commands/upgrade.js";
 
 interface ParsedFlags {
   positionals: string[];
@@ -131,13 +134,14 @@ function printHelp(): void {
       "",
       "Commands:",
       "  init [--ides ...] [--global] [--project <dir>]   Scaffold .agent-team/, board.json, and compile IDE adapters",
-      "  sync [--check] [--use-global-index] [--ides ...] Compile .agent-team/ into Antigravity, Claude Code & VS Code",
+      "  sync [--check] [--force] [--use-global-index]    Compile .agent-team/ into Antigravity, Claude Code & VS Code",
+      "  upgrade [--dry-run] [--diff] [--force] [--global] Safely upgrade .agent-team/, models & IDE adapters",
       "  models <op> [options]                            Manage Model Index & routing (show|set-tier|set-role|set-policy|upsert|discover|adopt|reset)",
       "  doctor [--project <id|dir>] [--json]             Validate schemas, drift hashes, MCP configs & IDE hooks",
       "  serve [--port 8767] [--host 127.0.0.1] [--open]  Launch unified single-port Web Studio (Live, Board, Mockups, Doctor)",
       "  mcp [--project <id|path>]                        Run stdio MCP server (JSON-RPC 2.0)",
       "  hook-emit --ide <ide> --event <type> [--port N]  Fast IDE hook telemetry & PreToolUse guardrail bridge",
-      "  board <op> [--project <id|path>] [...]           Agile Board (status|next|show|add|move|note|owner|plan|gate|report)",
+      "  board <op> [--project <id|path>] [...]           Agile Board (status|next|show|add|move|note|owner|handoff|split|plan|gate|report)",
       "  testrun <op> [--project <id|path>] [...]         QA Testruns (start|record|step|close|list)",
       "  projects <list|register|info> [options]          Manage ~/.agent-studio/projects.json",
       "",
@@ -307,6 +311,118 @@ async function runBoardCli(args: string[]): Promise<void> {
       res = await boardOwner(ctx, { itemId, owner });
       break;
     }
+    case "handoff": {
+      const itemId = positionals[1] ?? flagStr(flags, "id", "item", "itemId");
+      const kind = (flagStr(flags, "kind") ?? "fresh_context") as
+        | "fresh_context"
+        | "task_split";
+      const summary = flagStr(flags, "summary");
+      const continuationBrief = flagStr(
+        flags,
+        "continuation-brief",
+        "continuationBrief",
+        "brief",
+      );
+      if (!itemId || !summary || !continuationBrief) {
+        throw new Error(
+          "Usage: agent-studio board handoff <itemId> --kind <fresh_context|task_split> --summary <text> --brief <text>",
+        );
+      }
+      const splitRaw = flagStr(flags, "split-proposals", "splitProposals");
+      let splitProposals:
+        | Array<{
+            title: string;
+            role: string;
+            ac: string[];
+            deps?: string[];
+            rationale?: string;
+          }>
+        | undefined;
+      if (splitRaw) {
+        const parsed: unknown = JSON.parse(splitRaw);
+        if (!Array.isArray(parsed)) {
+          throw new Error("--split-proposals must be a JSON array of split proposal objects");
+        }
+        splitProposals = (
+          parsed as Array<{
+            title: string;
+            role: string;
+            ac?: string[];
+            deps?: string[];
+            rationale?: string;
+          }>
+        ).map((p) => ({ ...p, ac: p.ac ?? [] }));
+      }
+      res = await boardHandoff(ctx, {
+        itemId,
+        kind,
+        actor,
+        objective: flagStr(flags, "objective"),
+        summary,
+        evidence: flagList(flags, "evidence"),
+        decisions: flagList(flags, "decisions"),
+        assumptions: flagList(flags, "assumptions"),
+        unresolvedIssues: flagList(flags, "unresolved-issues", "unresolvedIssues"),
+        modifiedFiles: flagList(flags, "modified-files", "modifiedFiles"),
+        verifiedChecks: flagList(flags, "verified-checks", "verifiedChecks"),
+        remainingWork: flagList(flags, "remaining-work", "remainingWork"),
+        continuationBrief,
+        splitProposals,
+        contextPercent: flagStr(flags, "context-percent", "contextPercent")
+          ? Number.parseFloat(flagStr(flags, "context-percent", "contextPercent")!)
+          : undefined,
+        contextTokens: flagStr(flags, "context-tokens", "contextTokens")
+          ? Number.parseInt(flagStr(flags, "context-tokens", "contextTokens")!, 10)
+          : undefined,
+        contextWindow: flagStr(flags, "context-window", "contextWindow")
+          ? Number.parseInt(flagStr(flags, "context-window", "contextWindow")!, 10)
+          : undefined,
+        sessionId: flagStr(flags, "session-id", "sessionId"),
+        agentId: flagStr(flags, "agent-id", "agentId"),
+        keepOwner: flagBool(flags, "keep-owner", "keepOwner"),
+      });
+      break;
+    }
+    case "split": {
+      const itemId = positionals[1] ?? flagStr(flags, "id", "item", "itemId");
+      if (!itemId) {
+        throw new Error("Usage: agent-studio board split <itemId> [--subtasks <json>]");
+      }
+      const subtasksRaw = flagStr(flags, "subtasks");
+      let subtasks:
+        | Array<{
+            title: string;
+            role: string;
+            ac: string[];
+            deps?: string[];
+            rationale?: string;
+          }>
+        | undefined;
+      if (subtasksRaw) {
+        const parsed: unknown = JSON.parse(subtasksRaw);
+        if (!Array.isArray(parsed)) {
+          throw new Error("--subtasks must be a JSON array of subtask proposal objects");
+        }
+        subtasks = (
+          parsed as Array<{
+            title: string;
+            role: string;
+            ac?: string[];
+            deps?: string[];
+            rationale?: string;
+          }>
+        ).map((p) => ({ ...p, ac: p.ac ?? [] }));
+      }
+      res = await boardSplit(ctx, {
+        itemId,
+        actor,
+        subtasks,
+        blockParent: flags["block-parent"] !== undefined || flags.blockParent !== undefined
+          ? flagBool(flags, "block-parent", "blockParent")
+          : true,
+      });
+      break;
+    }
     case "plan": {
       const sprint = positionals[1] ?? flagStr(flags, "sprint");
       if (!sprint) {
@@ -445,6 +561,11 @@ async function main(): Promise<void> {
 
   if (cmd === "sync") {
     await runSync(rest);
+    return;
+  }
+
+  if (cmd === "upgrade") {
+    await runUpgrade(rest);
     return;
   }
 

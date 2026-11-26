@@ -68,6 +68,14 @@ workflow:
     respectBuiltInOrchestrators: true
     allowSubagentModelHints: true
     copilotHandoffModels: false
+    selectionPriority:
+      - accuracy
+      - cost
+      - speed
+  contextThresholds:
+    warnPercent: 45
+    handoffPercent: 55
+    compactPercent: 70
 roster:
   - id: orchestrator
     name: Team Orchestrator
@@ -93,7 +101,7 @@ roster:
       - release-engineer
     description: Strict manager and dispatcher overseeing ready -> design -> dev ->
       test -> done and enforcing the QA gate via agent-studio MCP.
-    modelTier: fast
+    modelTier: balanced
   - id: architect
     name: System Architect
     roleType: specialist
@@ -219,7 +227,7 @@ roster:
       - mcp_testrun
     description: Automated test suites, formal MCP testruns, bug filing, and test ->
       done QA gate verification.
-    modelTier: fast
+    modelTier: balanced
   - id: release-engineer
     name: CI/CD & Release Engineer
     roleType: specialist

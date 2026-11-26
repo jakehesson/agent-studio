@@ -89,6 +89,95 @@ body {
   color: #5b21b6;
 }
 
+:root[data-theme="light"] .sz-thresh.tick-55 em {
+  color: #c2410c;
+}
+
+:root[data-theme="light"] .handoff-brief-box,
+:root[data-theme="light"] .split-proposal-card {
+  background: var(--panel-2);
+  border-color: var(--border-strong);
+  color: var(--text);
+}
+
+:root[data-theme="light"] .handoff-brief-title {
+  color: #92400e !important;
+}
+
+:root[data-theme="light"] .kpi-warn,
+:root[data-theme="light"] .kpi-card-handoff b,
+:root[data-theme="light"] .kpi-card-handoff .kpi-val {
+  color: #9a3412 !important;
+}
+
+:root[data-theme="light"] .handoff-brief-box .item-list,
+:root[data-theme="light"] .split-proposal-card .item-list,
+:root[data-theme="light"] .item-detail-body .item-list {
+  color: var(--text);
+}
+
+:root[data-theme="light"] .handoff-continuation {
+  background: var(--panel);
+  border-color: var(--border-strong);
+  color: var(--text);
+}
+
+:root[data-theme="light"] .handoff-objective {
+  color: var(--text-strong);
+}
+
+:root[data-theme="light"] .handoff-issues-hdr {
+  color: #9f1239 !important;
+}
+
+:root[data-theme="light"] .handoff-issues-list {
+  background: rgba(244, 63, 94, 0.08);
+  border-color: rgba(190, 18, 60, 0.36);
+  color: var(--text);
+}
+
+:root[data-theme="light"] .handoff-badge.handoff-pending {
+  background: rgba(245, 158, 11, 0.16);
+  border-color: rgba(180, 83, 9, 0.45);
+  color: #92400e;
+}
+
+:root[data-theme="light"] .handoff-badge.handoff-split {
+  background: rgba(168, 85, 247, 0.14);
+  border-color: rgba(107, 33, 168, 0.42);
+  color: #6b21a8;
+}
+
+:root[data-theme="light"] .handoff-badge.handoff-resumed {
+  background: rgba(16, 185, 129, 0.14);
+  border-color: rgba(4, 120, 87, 0.42);
+  color: #065f46;
+}
+
+:root[data-theme="light"] .handoff-badge.handoff-cleared {
+  background: #e2e8f0;
+  border-color: #94a3b8;
+  color: #334155;
+}
+
+:root[data-theme="light"] .dep-tag,
+:root[data-theme="light"] .split-origin-tag,
+:root[data-theme="light"] .split-parent-btn {
+  background: rgba(2, 132, 199, 0.1);
+  border-color: rgba(2, 132, 199, 0.38);
+  color: #0369a1;
+}
+
+:root[data-theme="light"] .split-parent-btn:hover {
+  background: rgba(2, 132, 199, 0.2);
+  border-color: #0284c7;
+  color: #0f172a;
+}
+
+:root[data-theme="light"] .k-card.has-handoff {
+  border-color: rgba(180, 83, 9, 0.48);
+}
+
 :root[data-theme="light"] .zone-ok {
   background: rgba(16, 185, 129, 0.14);
   color: #047857;
@@ -335,6 +424,12 @@ body {
   background: rgba(244, 63, 94, 0.12);
   border-color: rgba(190, 18, 60, 0.45);
   color: #881337;
+}
+
+:root[data-theme="light"] .issue-row.info {
+  background: rgba(2, 132, 199, 0.12);
+  border-color: rgba(2, 132, 199, 0.42);
+  color: #0c4a6e;
 }
 
 :root[data-theme="light"] .guide-copy-btn,
@@ -640,4 +735,202 @@ body {
 :root[data-theme="light"] .tool-badge-btn.has-error.is-expanded {
   background: rgba(225, 29, 72, 0.2);
   color: #881337;
+}
+
+/* Light theme adaptation for AgentChatDrawer, QuestionCard & Waiting Indicators */
+:root[data-theme="light"] .chat-drawer-dialog {
+  background: var(--panel);
+  color: var(--text);
+  border-left-color: var(--border-strong);
+}
+
+:root[data-theme="light"] .chat-drawer-head,
+:root[data-theme="light"] .chat-prompt-dock,
+:root[data-theme="light"] .usage-agent-actions {
+  background: var(--panel-2);
+  color: var(--text);
+  border-color: var(--border);
+}
+
+:root[data-theme="light"] .chat-body {
+  background: var(--bg);
+}
+
+:root[data-theme="light"] .chat-turn {
+  background: var(--panel);
+  color: var(--text);
+  border-color: var(--border-strong);
+}
+
+:root[data-theme="light"] .chat-turn.role-user {
+  background: #dbeafe;
+  border-color: #60a5fa;
+  color: #0f172a;
+}
+
+:root[data-theme="light"] .chat-turn.role-thinking,
+:root[data-theme="light"] .chat-turn.role-tool,
+:root[data-theme="light"] .chat-tool-chip {
+  background: var(--panel-2);
+  color: var(--text);
+}
+
+:root[data-theme="light"] .chat-turn.role-question,
+:root[data-theme="light"] .qc-card,
+:root[data-theme="light"] .pending-card,
+:root[data-theme="light"] .insp-waiting-callout {
+  background: rgba(245, 158, 11, 0.1);
+  border-color: rgba(180, 83, 9, 0.48);
+  color: var(--text);
+}
+
+:root[data-theme="light"] .qc-card.is-approval,
+:root[data-theme="light"] .pending-card.approval {
+  background: rgba(168, 85, 247, 0.08);
+  border-color: rgba(107, 33, 168, 0.45);
+}
+
+:root[data-theme="light"] .qc-option {
+  background: var(--panel);
+  border-color: var(--border-strong);
+}
+
+:root[data-theme="light"] .qc-option:hover {
+  background: var(--panel-2);
+}
+
+:root[data-theme="light"] .qc-option.is-checked {
+  background: #dbeafe;
+  border-color: #0284c7;
+}
+
+:root[data-theme="light"] .qc-textarea,
+:root[data-theme="light"] .chat-tool-pre,
+:root[data-theme="light"] .chat-turn-prose pre,
+:root[data-theme="light"] .chat-turn-prose code {
+  background: var(--panel);
+  color: var(--text);
+  border-color: var(--border-strong);
+}
+
+:root[data-theme="light"] .chat-thinking-body {
+  background: rgba(168, 85, 247, 0.08);
+  border-color: rgba(107, 33, 168, 0.35);
+  color: #4c1d95;
+}
+
+:root[data-theme="light"] .waiting-alert-pill,
+:root[data-theme="light"] .needs-input-badge,
+:root[data-theme="light"] .needs-input-pill,
+:root[data-theme="light"] .qc-waiting-badge,
+:root[data-theme="light"] .chat-prompt-pill,
+:root[data-theme="light"] .chat-jump-q-btn,
+:root[data-theme="light"] .pending-badge {
+  background: rgba(245, 158, 11, 0.18);
+  border-color: rgba(180, 83, 9, 0.55);
+  color: #78350f;
+}
+
+:root[data-theme="light"] .card-chat-btn,
+:root[data-theme="light"] .qc-custom-toggle {
+  background: rgba(2, 132, 199, 0.1);
+  border-color: rgba(2, 132, 199, 0.35);
+  color: #0369a1;
+}
+
+:root[data-theme="light"] .usage-agent-shell {
+  background: var(--panel);
+  border-color: var(--border-strong);
+}
+
+:root[data-theme="light"] .grouped-tree .node-card.has-pending-prompt,
+:root[data-theme="light"] .grouped-tree .cluster-card.has-pending-prompt,
+:root[data-theme="light"] .run-item.has-pending-prompt,
+:root[data-theme="light"] .usage-agent-shell.has-pending-prompt {
+  border-color: #d97706;
+  box-shadow: 0 0 0 1px rgba(217, 119, 6, 0.35);
+}
+
+:root[data-theme="light"] .pending-summary {
+  color: var(--text);
+}
+
+:root[data-theme="light"] .state-tag.waiting {
+  background: rgba(14, 116, 144, 0.14);
+  border-color: rgba(14, 116, 144, 0.45);
+  color: #0e7490;
+}
+
+:root[data-theme="light"] .qc-step-pill {
+  background: var(--panel);
+  border-color: var(--border-strong);
+  color: var(--text);
+}
+
+:root[data-theme="light"] .qc-step-pill.is-active {
+  background: #dbeafe;
+  border-color: #2563eb;
+  color: #1e3a8a;
+}
+
+:root[data-theme="light"] .qc-step-pill.is-answered {
+  border-color: #047857;
+}
+
+:root[data-theme="light"] .qc-step-check {
+  color: #047857;
+}
+
+:root[data-theme="light"] .qc-q-num {
+  color: #b45309;
+}
+
+:root[data-theme="light"] .qc-rec-pill {
+  background: rgba(16, 185, 129, 0.16);
+  border-color: rgba(4, 120, 87, 0.48);
+  color: #065f46;
+}
+
+:root[data-theme="light"] .qc-blocking-note {
+  background: rgba(245, 158, 11, 0.16);
+  border-color: rgba(180, 83, 9, 0.48);
+  color: #78350f;
+}
+
+:root[data-theme="light"] .qc-ready-chip {
+  color: #047857;
+}
+
+:root[data-theme="light"] .qc-status.is-ok {
+  background: rgba(16, 185, 129, 0.14);
+  border-color: rgba(4, 120, 87, 0.42);
+  color: #065f46;
+}
+
+:root[data-theme="light"] .qc-status.is-warn {
+  background: rgba(245, 158, 11, 0.16);
+  border-color: rgba(180, 83, 9, 0.48);
+  color: #78350f;
+}
+
+:root[data-theme="light"] .qc-status.is-err {
+  background: rgba(244, 63, 94, 0.14);
+  border-color: rgba(190, 18, 60, 0.45);
+  color: #9f1239;
+}
+
+:root[data-theme="light"] .chat-thinking-details summary {
+  color: #6d28d9;
+}
+
+:root[data-theme="light"] .chat-subagent-chip {
+  background: rgba(79, 70, 229, 0.12);
+  border-color: rgba(67, 56, 202, 0.42);
+  color: #3730a3;
+}
+
+:root[data-theme="light"] .chat-subagent-chip:hover {
+  background: rgba(79, 70, 229, 0.22);
+  border-color: #4338ca;
+  color: #1e1b4b;
 }

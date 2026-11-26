@@ -4,12 +4,15 @@ import {
   BOARD_STATES,
   BUG_RESOLUTIONS,
   BUG_SEVERITIES,
+  SplitProposalSchema,
   type Board,
   type BoardItem,
   type BoardItemType,
   type BoardState,
   type BugResolution,
   type BugSeverity,
+  type ContextHandoff,
+  type SplitProposal,
   type TestrunRecord,
 } from "../schema/board.js";
 import type { ResolvedProject } from "./registry.js";
@@ -88,7 +91,13 @@ function formatItemLine(board: Board, item: BoardItem): string {
   const sev = item.severity ? ` ${item.severity}` : "";
   const missing = unfinishedDeps(board, item);
   const depText = missing.length > 0 ? ` (deps:${missing.join(",")})` : "";
-  return `${item.id} [${item.state}] ${item.type}/${item.role}${sev}: ${item.title}${depText}`;
+  const handoffTag =
+    item.handoff?.status === "pending_handoff"
+      ? " [HANDOFF_PENDING]"
+      : item.handoff?.status === "pending_split"
+        ? " [SPLIT_PENDING]"
+        : "";
+  return `${item.id} [${item.state}] ${item.type}/${item.role}${sev}: ${item.title}${depText}${handoffTag}`;
 }
 
 function appendNote(item: BoardItem, actor: string, text: string): void {
@@ -324,6 +333,7 @@ export async function boardShow(
   const scalarKeys = [
     "points",
     "deps",
+    "split_from",
     "found_in",
     "fixed_in",
     "verified_build",
@@ -335,6 +345,69 @@ export async function boardShow(
     const val = item[key];
     if (val !== undefined && val !== null && (!Array.isArray(val) || val.length > 0)) {
       out.push(`${key}: ${Array.isArray(val) ? val.join(", ") : String(val)}`);
+    }
+  }
+  if (item.handoff) {
+    const h = item.handoff;
+    out.push("handoff:");
+    out.push(`  status: ${h.status}`);
+    out.push(`  kind: ${h.kind}`);
+    out.push(`  actor: ${h.actor} (${h.created_at})`);
+    if (h.objective) {
+      out.push(`  objective: ${h.objective}`);
+    }
+    if (h.context_percent !== undefined) {
+      const tokPart =
+        h.context_tokens !== undefined && h.context_window !== undefined
+          ? ` (${h.context_tokens}/${h.context_window})`
+          : "";
+      out.push(`  context: ${h.context_percent}%${tokPart}`);
+    }
+    out.push(`  summary: ${h.summary}`);
+    if (h.evidence && h.evidence.length > 0) {
+      out.push("  evidence:");
+      for (const ev of h.evidence) {
+        out.push(`    - ${ev}`);
+      }
+    }
+    if (h.decisions && h.decisions.length > 0) {
+      out.push("  decisions:");
+      for (const dec of h.decisions) {
+        out.push(`    - ${dec}`);
+      }
+    }
+    if (h.assumptions && h.assumptions.length > 0) {
+      out.push("  assumptions:");
+      for (const asmp of h.assumptions) {
+        out.push(`    - ${asmp}`);
+      }
+    }
+    if (h.unresolved_issues && h.unresolved_issues.length > 0) {
+      out.push("  unresolved_issues:");
+      for (const issue of h.unresolved_issues) {
+        out.push(`    - ${issue}`);
+      }
+    }
+    if (h.modified_files && h.modified_files.length > 0) {
+      out.push(`  modified_files: ${h.modified_files.join(", ")}`);
+    }
+    if (h.verified_checks && h.verified_checks.length > 0) {
+      out.push(`  verified_checks: ${h.verified_checks.join(", ")}`);
+    }
+    if (h.remaining_work && h.remaining_work.length > 0) {
+      out.push("  remaining_work:");
+      for (const rw of h.remaining_work) {
+        out.push(`    - ${rw}`);
+      }
+    }
+    out.push(`  continuation_brief: ${h.continuation_brief}`);
+    if (h.split_proposals && h.split_proposals.length > 0) {
+      out.push("  split_proposals:");
+      for (const sp of h.split_proposals) {
+        out.push(
+          `    - [${sp.role}] ${sp.title}${sp.ac.length > 0 ? ` (ac: ${sp.ac.join("; ")})` : ""}`,
+        );
+      }
     }
   }
   if (item.ac && item.ac.length > 0) {
@@ -584,6 +657,19 @@ export async function boardMove(
       }
 
       item.state = target;
+      if (
+        item.handoff?.status === "pending_handoff" &&
+        (target === "design" || target === "dev" || target === "test")
+      ) {
+        item.handoff.status = "resumed";
+      } else if (
+        target === "done" &&
+        (item.handoff?.status === "pending_handoff" ||
+          item.handoff?.status === "pending_split" ||
+          item.handoff?.status === "resumed")
+      ) {
+        item.handoff.status = "cleared";
+      }
       const transitionNote = `${cur}->${target}${opts.note?.trim() ? ` | ${opts.note.trim()}` : ""}${coveringTestrunId ? ` (${coveringTestrunId})` : ""}`;
       appendNote(item, actor, transitionNote);
 
@@ -631,9 +717,246 @@ export async function boardOwner(
     (board) => {
       const item = findItem(board, opts.itemId);
       item.owner = opts.owner.trim();
+      if (item.handoff?.status === "pending_handoff") {
+        item.handoff.status = "resumed";
+      }
       return {
         text: `owner ${item.id}=${item.owner}`,
         data: item,
+      };
+    },
+    ctx.lockOptions,
+  );
+}
+
+export interface HandoffItemInput {
+  itemId: string;
+  kind: "fresh_context" | "task_split";
+  actor: string;
+  objective?: string;
+  summary: string;
+  evidence?: string[];
+  decisions?: string[];
+  assumptions?: string[];
+  unresolvedIssues?: string[];
+  modifiedFiles?: string[];
+  verifiedChecks?: string[];
+  remainingWork?: string[];
+  continuationBrief: string;
+  splitProposals?: SplitProposal[];
+  contextPercent?: number;
+  contextTokens?: number;
+  contextWindow?: number;
+  sessionId?: string;
+  agentId?: string;
+  keepOwner?: boolean;
+}
+
+function cleanOptionalStringList(items?: string[]): string[] | undefined {
+  if (!items || items.length === 0) return undefined;
+  const cleaned = items.map((s) => s.trim()).filter(Boolean);
+  return cleaned.length > 0 ? cleaned : undefined;
+}
+
+export async function boardHandoff(
+  ctx: BoardEngineContext,
+  opts: HandoffItemInput,
+): Promise<EngineResult<BoardItem>> {
+  const actor = opts.actor?.trim() || "orchestrator";
+  const objective = opts.objective?.trim() || undefined;
+  const summary = opts.summary?.trim();
+  const continuationBrief = opts.continuationBrief?.trim();
+  const evidence = cleanOptionalStringList(opts.evidence);
+  const decisions = cleanOptionalStringList(opts.decisions);
+  const assumptions = cleanOptionalStringList(opts.assumptions);
+  const unresolvedIssues = cleanOptionalStringList(opts.unresolvedIssues);
+  if (!summary) {
+    throw new Error("board handoff requires non-empty summary");
+  }
+  if (!continuationBrief) {
+    throw new Error("board handoff requires non-empty continuationBrief");
+  }
+  if (opts.kind !== "fresh_context" && opts.kind !== "task_split") {
+    throw new Error('board handoff kind must be "fresh_context" or "task_split"');
+  }
+  const validatedProposals = opts.splitProposals?.map((p) =>
+    SplitProposalSchema.parse(p),
+  );
+
+  return withBoardLock(
+    ctx.project.boardPath,
+    (board) => {
+      const item = findItem(board, opts.itemId);
+      const status =
+        opts.kind === "task_split" ? "pending_split" : "pending_handoff";
+      const handoff: ContextHandoff = {
+        status,
+        kind: opts.kind,
+        created_at: nowIso(),
+        actor,
+        ...(opts.sessionId?.trim() ? { session_id: opts.sessionId.trim() } : {}),
+        ...(opts.agentId?.trim() ? { agent_id: opts.agentId.trim() } : {}),
+        ...(typeof opts.contextPercent === "number" &&
+        Number.isFinite(opts.contextPercent)
+          ? { context_percent: Math.min(100, Math.max(0, opts.contextPercent)) }
+          : {}),
+        ...(typeof opts.contextTokens === "number" &&
+        Number.isFinite(opts.contextTokens) &&
+        opts.contextTokens >= 0
+          ? { context_tokens: Math.round(opts.contextTokens) }
+          : {}),
+        ...(typeof opts.contextWindow === "number" &&
+        Number.isFinite(opts.contextWindow) &&
+        opts.contextWindow > 0
+          ? { context_window: Math.round(opts.contextWindow) }
+          : {}),
+        ...(objective ? { objective } : {}),
+        summary,
+        ...(evidence ? { evidence } : {}),
+        ...(decisions ? { decisions } : {}),
+        ...(assumptions ? { assumptions } : {}),
+        ...(unresolvedIssues ? { unresolved_issues: unresolvedIssues } : {}),
+        modified_files: [...(opts.modifiedFiles ?? [])],
+        ...(opts.verifiedChecks && opts.verifiedChecks.length > 0
+          ? { verified_checks: [...opts.verifiedChecks] }
+          : {}),
+        remaining_work: [...(opts.remainingWork ?? [])],
+        continuation_brief: continuationBrief,
+        ...(validatedProposals && validatedProposals.length > 0
+          ? { split_proposals: validatedProposals }
+          : {}),
+      };
+
+      item.handoff = handoff;
+      if (opts.keepOwner !== true) {
+        item.owner = null;
+      }
+      appendNote(item, actor, `[HANDOFF:${opts.kind}] ${summary}`);
+
+      return {
+        text: `${item.id} ${status.toUpperCase()} (${opts.kind}): ${summary}`,
+        data: item,
+      };
+    },
+    ctx.lockOptions,
+  );
+}
+
+export interface SplitItemInput {
+  itemId: string;
+  actor: string;
+  subtasks?: SplitProposal[];
+  blockParent?: boolean;
+}
+
+export async function boardSplit(
+  ctx: BoardEngineContext,
+  opts: SplitItemInput,
+): Promise<EngineResult<{ parent: BoardItem; children: BoardItem[] }>> {
+  const actor = opts.actor?.trim() || "orchestrator";
+  const blockParent = opts.blockParent ?? true;
+
+  return withBoardLock(
+    ctx.project.boardPath,
+    (board) => {
+      const parent = findItem(board, opts.itemId);
+      const rawProposals =
+        opts.subtasks && opts.subtasks.length > 0
+          ? opts.subtasks
+          : parent.handoff?.split_proposals;
+      if (!rawProposals || rawProposals.length === 0) {
+        throw new Error(
+          `board split requires subtasks or existing handoff.split_proposals on ${parent.id}`,
+        );
+      }
+      const proposals = rawProposals.map((p) => SplitProposalSchema.parse(p));
+
+      const sp = parent.sprint ?? board.active_sprint ?? "S1";
+      const prefix = sp;
+      const prefixRe = new RegExp(
+        `^${prefix.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}-(\\d+)$`,
+        "i",
+      );
+      let maxNum = 0;
+      for (const existing of board.items) {
+        const match = prefixRe.exec(existing.id);
+        if (match?.[1]) {
+          const num = Number.parseInt(match[1], 10);
+          if (num > maxNum) maxNum = num;
+        }
+      }
+
+      const createdAt = nowIso();
+      const children: BoardItem[] = [];
+      const parentLow = parent.id.toLowerCase();
+      for (const prop of proposals) {
+        maxNum += 1;
+        const childId = `${prefix}-${String(maxNum).padStart(2, "0")}`;
+        const childLow = childId.toLowerCase();
+        const dedupedDeps: string[] = [];
+        const seenDeps = new Set<string>();
+        for (const rawDep of prop.deps ?? []) {
+          const cleanDep = rawDep.trim();
+          if (!cleanDep) continue;
+          const lowDep = cleanDep.toLowerCase();
+          if (lowDep === childLow) {
+            throw new Error(
+              `Circular dependency in split proposal "${prop.title}": child ${childId} cannot depend on itself`,
+            );
+          }
+          if (blockParent && lowDep === parentLow) {
+            throw new Error(
+              `Circular dependency in split proposal "${prop.title}": child ${childId} cannot depend on parent ${parent.id} when blockParent is enabled`,
+            );
+          }
+          if (!seenDeps.has(lowDep)) {
+            seenDeps.add(lowDep);
+            dedupedDeps.push(cleanDep);
+          }
+        }
+        const child: BoardItem = {
+          id: childId,
+          type: "task",
+          title: prop.title.trim(),
+          role: prop.role.trim(),
+          sprint: sp,
+          state: parent.state === "backlog" ? "backlog" : "ready",
+          ac: [...(prop.ac ?? [])],
+          deps: dedupedDeps,
+          notes: [],
+          created_at: createdAt,
+          split_from: parent.id,
+        };
+        appendNote(
+          child,
+          actor,
+          prop.rationale?.trim()
+            ? `split from ${parent.id}: ${prop.rationale.trim()}`
+            : `split from ${parent.id}`,
+        );
+        children.push(child);
+      }
+      board.items.push(...children);
+
+      const childIds = children.map((c) => c.id);
+      if (blockParent) {
+        const existingDeps = new Set((parent.deps ?? []).map((d) => d.toLowerCase()));
+        parent.deps = [...(parent.deps ?? [])];
+        for (const cid of childIds) {
+          if (!existingDeps.has(cid.toLowerCase())) {
+            parent.deps.push(cid);
+            existingDeps.add(cid.toLowerCase());
+          }
+        }
+      }
+      if (parent.handoff) {
+        parent.handoff.status = "resumed";
+      }
+      appendNote(parent, actor, `[SPLIT] created ${childIds.join(", ")}`);
+
+      return {
+        text: `split ${parent.id} -> ${childIds.join(", ")}`,
+        data: { parent, children },
       };
     },
     ctx.lockOptions,

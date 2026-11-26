@@ -30,6 +30,52 @@ export const BUG_RESOLUTIONS = [
 export const BugResolutionSchema = z.enum(BUG_RESOLUTIONS);
 export type BugResolution = z.infer<typeof BugResolutionSchema>;
 
+export const HANDOFF_STATUSES = [
+  "pending_handoff",
+  "pending_split",
+  "resumed",
+  "cleared",
+] as const;
+export const HandoffStatusSchema = z.enum(HANDOFF_STATUSES);
+export type HandoffStatus = z.infer<typeof HandoffStatusSchema>;
+
+export const SplitProposalSchema = z
+  .object({
+    title: z.string().min(1),
+    role: z.string().min(1),
+    ac: z.array(z.string()).default([]),
+    deps: z.array(z.string()).optional(),
+    rationale: z.string().optional(),
+  })
+  .passthrough();
+export type SplitProposal = z.infer<typeof SplitProposalSchema>;
+
+export const ContextHandoffSchema = z
+  .object({
+    status: HandoffStatusSchema,
+    kind: z.enum(["fresh_context", "task_split"]),
+    created_at: z.string().min(1),
+    actor: z.string().min(1),
+    session_id: z.string().optional(),
+    agent_id: z.string().optional(),
+    context_percent: z.number().min(0).max(100).optional(),
+    context_tokens: z.number().int().nonnegative().optional(),
+    context_window: z.number().int().positive().optional(),
+    objective: z.string().min(1).optional(),
+    summary: z.string().min(1),
+    evidence: z.array(z.string()).optional(),
+    decisions: z.array(z.string()).optional(),
+    assumptions: z.array(z.string()).optional(),
+    unresolved_issues: z.array(z.string()).optional(),
+    modified_files: z.array(z.string()).default([]),
+    verified_checks: z.array(z.string()).optional(),
+    remaining_work: z.array(z.string()).default([]),
+    continuation_brief: z.string().min(1),
+    split_proposals: z.array(SplitProposalSchema).optional(),
+  })
+  .passthrough();
+export type ContextHandoff = z.infer<typeof ContextHandoffSchema>;
+
 export const MilestoneSchema = z
   .object({
     id: z.string().min(1),
@@ -75,6 +121,8 @@ export const BoardItemSchema = z
     required_checkpoints: z.array(z.string()).optional(),
     created_at: z.string().optional(),
     reopened_at: z.string().optional(),
+    handoff: ContextHandoffSchema.nullable().optional(),
+    split_from: z.string().min(1).nullable().optional(),
   })
   .passthrough();
 export type BoardItem = z.infer<typeof BoardItemSchema>;

@@ -397,6 +397,7 @@ export function isCommunicationEvent(ev: NormalizedEvent): boolean {
     const tool = (ev.toolName ?? "").toLowerCase();
     return (
       tool === "ask_question" ||
+      tool === "ask_user" ||
       tool === "askuserquestion" ||
       tool === "vscode_askquestions" ||
       tool === "questioncarousel" ||
@@ -412,6 +413,7 @@ function isHumanPromptToolName(toolName?: string): boolean {
   const low = (toolName ?? "").toLowerCase();
   return (
     low === "ask_question" ||
+    low === "ask_user" ||
     low === "askuserquestion" ||
     low === "vscode_askquestions" ||
     low === "questioncarousel" ||

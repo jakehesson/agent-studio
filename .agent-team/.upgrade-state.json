@@ -1,0 +1,102 @@
+{
+  "schemaVersion": 1,
+  "agentStudioVersion": "0.14.0",
+  "files": {
+    "agents/architect.md": {
+      "stockHash": "767cb9bd453c7b61f7c32018e37265b0a593a234b835466146140d2c72859523",
+      "customized": false,
+      "templateVersion": "0.14.0"
+    },
+    "agents/backend-engineer.md": {
+      "stockHash": "c2a5c2c1efc676e5caf6b1930d04a9b0f4f15b964109f114f8d167481a7a907d",
+      "customized": true,
+      "localHash": "84681853efa766137df014a78355937b87bcb5ed9e665d5b976ec0f8c3424b22",
+      "templateVersion": "0.14.0"
+    },
+    "agents/code-reviewer.md": {
+      "stockHash": "18e5dfcbc7b7dfa02d61ac2de1c10197393496849ab6ca5d9d9b230287e7157a",
+      "customized": true,
+      "localHash": "0661f8fe4fe7a31b62653c4efd08778033794decf3407c316451e15b667048d9",
+      "templateVersion": "0.14.0"
+    },
+    "agents/frontend-engineer.md": {
+      "stockHash": "9272e6ccc1665ad1f0e5c3008ba253521dd97c766f2d649c4b8d6ad137e7eb55",
+      "customized": false,
+      "templateVersion": "0.14.0"
+    },
+    "agents/orchestrator.md": {
+      "stockHash": "f0020421c1ac68745e526d49337196eba682c58c431508873e92e81558fc6682",
+      "customized": true,
+      "localHash": "07e15564cbe0f64f9f9d48142deaeff1bff348c15cdd371ad9706e9c4a985b06",
+      "templateVersion": "0.14.0"
+    },
+    "agents/qa-validator.md": {
+      "stockHash": "3e1298883a7c58e162098e37b3abcce5cde65d2316ad41eff256045a8181413c",
+      "customized": true,
+      "localHash": "b76de14f81ddf7b901b421d3067a24f0b68c801ecd5614178731d8ea1ea5e059",
+      "templateVersion": "0.14.0"
+    },
+    "agents/team-setup.md": {
+      "stockHash": "e6a494e5495fc54261dc55fe6a3d4eb6afec0636bc2ac5e350ad03d88cdfb97a",
+      "customized": false,
+      "templateVersion": "0.14.0"
+    },
+    "agents/ux-designer.md": {
+      "stockHash": "dd61e8919d1ec2eb664a298d408a97c1655edc2b11645e4f258da6ee2ac6d2ba",
+      "customized": false,
+      "templateVersion": "0.14.0"
+    },
+    "skills/agile-board-workflow/SKILL.md": {
+      "stockHash": "c726e3d776caa58f0de08803c0d79d747cc6da2b38b73ac3d05a9ffbd6c05ef2",
+      "customized": false,
+      "templateVersion": "0.14.0"
+    },
+    "skills/architecture-review/SKILL.md": {
+      "stockHash": "3de1e69ac1ffbc5e4379c08bd91011fec9f2428734d57e2d3b53f0b7916ab023",
+      "customized": true,
+      "localHash": "c49cb4021311524883f895b6c77c39a19dc5a1efa179e4afbbb9cd70a2ac4b0d",
+      "templateVersion": "0.14.0"
+    },
+    "skills/architecture-spec/SKILL.md": {
+      "stockHash": "790b1faaac9532098f85288d287824aab2977ee1133bb2ab295c7cf73d1cac97",
+      "customized": false,
+      "templateVersion": "0.14.0"
+    },
+    "skills/code-review/SKILL.md": {
+      "stockHash": "9f860f89048f559de65ab84cf1d46f3c110ee541c6f8bd5af76974086d9a2dad",
+      "customized": false,
+      "templateVersion": "0.14.0"
+    },
+    "skills/learn/SKILL.md": {
+      "stockHash": "04e1140bcff901d173f201f2fb5dfec9b935ef4e7f242892016fb4644af565fe",
+      "customized": false,
+      "templateVersion": "0.14.0"
+    },
+    "skills/model-routing/SKILL.md": {
+      "stockHash": "b7a36129e556ba0f59227605cfb4c0ff5b0de84587124ba8660d5e645f03e4a1",
+      "customized": true,
+      "localHash": "20e962a8baf37372711736541c6481d2bae7b0f812f6bd9971dc2dc5cab17004",
+      "templateVersion": "0.14.0"
+    },
+    "skills/qa-validation/SKILL.md": {
+      "stockHash": "dff8831cd166b84cfb438d25b2531a619d3c45d30440982d73a3aadaa850bc24",
+      "customized": false,
+      "templateVersion": "0.14.0"
+    },
+    "skills/team-setup/SKILL.md": {
+      "stockHash": "692477610f6eab6074e5230a938df3856dd3bea3a69d7236428f9ee44a7b17ab",
+      "customized": false,
+      "templateVersion": "0.14.0"
+    },
+    "skills/token-efficiency/SKILL.md": {
+      "stockHash": "00dff1a1bc7cfedfdb3025a07f6839e5ff7c0ba2eadf6a6fb826f3eadbc93a05",
+      "customized": false,
+      "templateVersion": "0.14.0"
+    },
+    "skills/ux-review/SKILL.md": {
+      "stockHash": "3491c29e7a5c69ddb3adc132182199645236b8b9a3e52bab641e5ae923c22c70",
+      "customized": false,
+      "templateVersion": "0.14.0"
+    }
+  }
+}

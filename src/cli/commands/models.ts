@@ -204,6 +204,7 @@ function parseDiscoverInputs(rawJson: string): DiscoverModelInput[] {
       label: typeof rec.label === "string" ? rec.label : undefined,
       vendor: typeof rec.vendor === "string" ? rec.vendor : undefined,
       family: typeof rec.family === "string" ? rec.family : undefined,
+      version: typeof rec.version === "string" ? rec.version : undefined,
       maxInputTokens:
         typeof rec.maxInputTokens === "number" ? rec.maxInputTokens : undefined,
       tierHint,
@@ -393,6 +394,8 @@ export async function runModelsCli(
                     primary,
                     fallback: nextFallback,
                     ...(omitOnDefer !== undefined ? { omitOnDefer } : {}),
+                    notes: "User/CLI tier override.",
+                    autoRanked: false,
                   },
                 },
               },
@@ -524,28 +527,29 @@ export async function runModelsCli(
 
       const teamYamlPath = getTeamYamlPath(projectRoot);
       const updatedRouting = await withTeamYamlLock(teamYamlPath, (manifest) => {
-        manifest.workflow.modelRouting ??= {
+        const mr = (manifest.workflow.modelRouting ??= {
           policy: "prefer-fallback",
           respectBuiltInOrchestrators: true,
           allowSubagentModelHints: true,
           copilotHandoffModels: false,
-        };
+          selectionPriority: ["accuracy", "cost", "speed"],
+        });
         if (ide) {
-          manifest.workflow.modelRouting.idePolicies ??= {};
-          manifest.workflow.modelRouting.idePolicies[ide] = policy;
+          mr.idePolicies ??= {};
+          mr.idePolicies[ide] = policy;
         } else {
-          manifest.workflow.modelRouting.policy = policy;
+          mr.policy = policy;
         }
         if (respectHost !== undefined) {
-          manifest.workflow.modelRouting.respectBuiltInOrchestrators = respectHost;
+          mr.respectBuiltInOrchestrators = respectHost;
         }
         if (handoffModels !== undefined) {
-          manifest.workflow.modelRouting.copilotHandoffModels = handoffModels;
+          mr.copilotHandoffModels = handoffModels;
         }
         if (allowHints !== undefined) {
-          manifest.workflow.modelRouting.allowSubagentModelHints = allowHints;
+          mr.allowSubagentModelHints = allowHints;
         }
-        return manifest.workflow.modelRouting;
+        return mr;
       });
 
       const compileResult = maybeSync(projectRoot, syncFlag);

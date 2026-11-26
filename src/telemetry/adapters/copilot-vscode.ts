@@ -1,32 +1,44 @@
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
+import { parse as parseYaml } from "yaml";
 import { listProjects } from "../../board/registry.js";
 import { MAX_TRANSCRIPT_BYTES, validateTranscriptPath } from "../push-bus.js";
 import {
+  capChatText,
   cleanHumanSummary,
   computeDeterministicEventId,
   computeMergeKey,
+  computePendingPromptId,
+  formatQuestionsPreview,
   isBoardMutationToolCall,
   isOpaqueAgentId,
   isSelfDaemonCommand,
   normalizeCopilotUsage,
+  normalizePendingQuestions,
   normalizeWsPath,
   parseEpochSeconds,
   prettifyAgentLabel,
   prettifyModelName,
+  resolveEmptyFileLinks,
   summarizeToolCall,
   toIsoUtc,
   type AdapterHealth,
+  type AgentChatMessage,
+  type AgentStatus,
+  type ChatToolCallRef,
   type DiscoveredSession,
   type EnrichedEvent,
+  type ParseChatOptions,
   type ParseSessionOptions,
   type PassiveIdeAdapter,
+  type PendingQuestionItem,
   type UsageDelta,
 } from "../types.js";
 import {
   getKnownProjects,
   matchProjectIdForWorkspaces,
+  pathMatchesRoot,
 } from "./project-match.js";
 
 interface VSCodeUsageObject {
@@ -69,6 +81,14 @@ interface VSCodeResponseItem {
   toolCallId?: string;
   isComplete?: boolean;
   isConfirmed?: boolean;
+  isUsed?: boolean;
+  data?: unknown;
+  questions?: unknown[];
+  title?: string;
+  subtitle?: string;
+  message?: string | { value?: string };
+  state?: string;
+  requestedSchema?: Record<string, unknown>;
   invocationMessage?: string | { value?: string };
   pastTenseMessage?: string | { value?: string };
   generatedTitle?: string;
@@ -119,7 +139,16 @@ interface VSCodeChatSessionState {
           identifier?: string;
           id?: string;
           name?: string;
-          metadata?: { id?: string; name?: string; maxInputTokens?: number };
+          family?: string;
+          version?: string;
+          maxInputTokens?: number;
+          metadata?: {
+            id?: string;
+            name?: string;
+            family?: string;
+            version?: string;
+            maxInputTokens?: number;
+          };
         };
   };
   requests?: VSCodeRequest[];
@@ -134,6 +163,18 @@ interface DeltaRow {
 
 export interface CopilotVSCodeAdapterOptions {
   storageDir?: string;
+  copilotHomeDir?: string;
+}
+
+export function resolveCopilotHomeDir(
+  homeDir: string = os.homedir(),
+  explicitCopilotHome?: string,
+): string {
+  const explicit = explicitCopilotHome?.trim();
+  if (explicit) return path.resolve(explicit);
+  const envVal = process.env.COPILOT_HOME?.trim();
+  if (envVal) return path.resolve(envVal);
+  return path.resolve(path.join(homeDir, ".copilot"));
 }
 
 export interface CopilotTranscriptParseOptions extends ParseSessionOptions {
@@ -150,9 +191,240 @@ interface CachedTranscriptDiscoveryMeta {
   sizeBytes: number;
   sessionId: string;
   title: string;
+  workspacePath?: string;
+  workspaces: string[];
   isMultiAgent: boolean;
   isSubagentTranscript: boolean;
   distinctAgentsCount: number;
+  waitingOn: "user" | "tool_approval" | "subagent" | null;
+  pendingQuestionCount: number;
+  waitingSummary?: string;
+}
+
+function isCopilotAskTool(lowTool: string): boolean {
+  return (
+    lowTool === "vscode_askquestions" ||
+    lowTool === "ask_questions" ||
+    lowTool === "askquestions" ||
+    lowTool === "ask_question" ||
+    lowTool === "ask_user"
+  );
+}
+
+function extractCopilotItemQuestions(
+  item: VSCodeResponseItem,
+): PendingQuestionItem[] {
+  const rkind = item.kind ?? "";
+  if (rkind === "questionCarousel") {
+    return normalizePendingQuestions(item.questions ?? [], {
+      defaultAllowCustomInput: true,
+    });
+  }
+  if (rkind === "elicitationSerialized") {
+    if (Array.isArray(item.questions) && item.questions.length > 0) {
+      return normalizePendingQuestions(item.questions, {
+        defaultAllowCustomInput: true,
+      });
+    }
+    const msgText =
+      extractMessageText(item.message) ||
+      item.title ||
+      item.subtitle ||
+      "Confirmation requested";
+    return [
+      {
+        ...(item.title ? { header: item.title } : {}),
+        question: msgText,
+        type: "single_select",
+        options: [{ label: "Allow" }, { label: "Decline" }],
+        allowCustomInput: true,
+      },
+    ];
+  }
+  const tsd = item.toolSpecificData;
+  if (tsd?.questions !== undefined) {
+    return normalizePendingQuestions(tsd.questions, {
+      defaultAllowCustomInput: true,
+    });
+  }
+  if (tsd) {
+    const qs = normalizePendingQuestions(tsd, {
+      defaultAllowCustomInput: true,
+    });
+    if (qs.length > 0) return qs;
+  }
+  const invMsg = extractMessageText(item.invocationMessage).trim();
+  if (invMsg) {
+    return [
+      {
+        question: invMsg,
+        type: "text",
+        options: [],
+        allowCustomInput: true,
+      },
+    ];
+  }
+  return [];
+}
+
+interface CopilotRequestQuestionAnalysis {
+  mergedCarouselToAskIdx: Map<number, number>;
+  mergedAskQuestions: Map<number, PendingQuestionItem[]>;
+  suppressedCarouselIndices: Set<number>;
+  suppressedAskIndices: Set<number>;
+  waitingOn: "user" | "tool_approval" | null;
+  pendingQuestionCount: number;
+  waitingSummary?: string;
+}
+
+function analyzeCopilotRequestQuestions(
+  req: VSCodeRequest,
+): CopilotRequestQuestionAnalysis {
+  const responses = Array.isArray(req.response) ? req.response : [];
+  const mergedCarouselToAskIdx = new Map<number, number>();
+  const mergedAskQuestions = new Map<number, PendingQuestionItem[]>();
+  const suppressedCarouselIndices = new Set<number>();
+  const suppressedAskIndices = new Set<number>();
+  const reqCompleted = Boolean(
+    req.isCanceled || req.modelState?.completedAt || req.result,
+  );
+
+  const askIndicesByCallId = new Map<string, number>();
+  for (let i = 0; i < responses.length; i++) {
+    const item = responses[i]!;
+    if (
+      item.kind === "toolInvocationSerialized" &&
+      isCopilotAskTool((item.toolId ?? item.toolName ?? "").toLowerCase())
+    ) {
+      if (item.toolCallId) {
+        askIndicesByCallId.set(item.toolCallId, i);
+      }
+      if (item.isComplete === true || reqCompleted) {
+        suppressedAskIndices.add(i);
+      }
+    }
+  }
+
+  for (let i = 0; i < responses.length; i++) {
+    const item = responses[i]!;
+    const rkind = item.kind ?? "";
+    if (rkind !== "questionCarousel" && rkind !== "elicitationSerialized") {
+      continue;
+    }
+
+    const prevItem = i > 0 ? responses[i - 1] : undefined;
+    const prevIsAsk =
+      prevItem?.kind === "toolInvocationSerialized" &&
+      isCopilotAskTool(
+        (prevItem.toolId ?? prevItem.toolName ?? "").toLowerCase(),
+      );
+    const matchingAskIdx =
+      (item.toolCallId ? askIndicesByCallId.get(item.toolCallId) : undefined) ??
+      (prevIsAsk ? i - 1 : undefined);
+    const matchingAsk =
+      matchingAskIdx !== undefined ? responses[matchingAskIdx] : undefined;
+
+    const isElicitationDone =
+      rkind === "elicitationSerialized" &&
+      (item.isComplete === true ||
+        (typeof item.state === "string" &&
+          item.state.toLowerCase() !== "pending"));
+    const isAnswered =
+      Boolean(item.isUsed) ||
+      (item.data !== undefined && item.data !== null) ||
+      isElicitationDone;
+    const precededByCompleteAsk = Boolean(
+      matchingAsk && matchingAsk.isComplete === true,
+    );
+    const followedByMoreItems = i < responses.length - 1;
+    const isSuppressed =
+      isAnswered || precededByCompleteAsk || followedByMoreItems || reqCompleted;
+
+    if (isSuppressed) {
+      suppressedCarouselIndices.add(i);
+    }
+
+    if (
+      rkind === "questionCarousel" &&
+      matchingAskIdx !== undefined &&
+      matchingAsk
+    ) {
+      mergedCarouselToAskIdx.set(i, matchingAskIdx);
+      const carouselQs = extractCopilotItemQuestions(item);
+      if (carouselQs.length > 0) {
+        mergedAskQuestions.set(matchingAskIdx, carouselQs);
+      }
+      if (isSuppressed || matchingAsk.isComplete === true) {
+        suppressedAskIndices.add(matchingAskIdx);
+      }
+    }
+  }
+
+  let waitingOn: "user" | "tool_approval" | null = null;
+  let pendingQuestionCount = 0;
+  let waitingSummary: string | undefined;
+
+  if (!reqCompleted) {
+    for (let i = responses.length - 1; i >= 0; i--) {
+      const item = responses[i]!;
+      const rkind = item.kind ?? "";
+      if (rkind === "questionCarousel" || rkind === "elicitationSerialized") {
+        if (
+          suppressedCarouselIndices.has(i) ||
+          mergedCarouselToAskIdx.has(i)
+        ) {
+          continue;
+        }
+        const qs = extractCopilotItemQuestions(item);
+        waitingOn = "user";
+        pendingQuestionCount = Math.max(1, qs.length);
+        waitingSummary =
+          cleanHumanSummary(
+            qs[0]?.header ?? qs[0]?.question ?? "Waiting for user answer",
+            80,
+          ) || "Waiting for user answer";
+        break;
+      }
+      if (rkind === "toolInvocationSerialized") {
+        const lowTool = (item.toolId ?? item.toolName ?? "").toLowerCase();
+        if (isCopilotAskTool(lowTool)) {
+          if (suppressedAskIndices.has(i) || item.isComplete === true) continue;
+          const qs =
+            mergedAskQuestions.get(i) ?? extractCopilotItemQuestions(item);
+          waitingOn = "user";
+          pendingQuestionCount = Math.max(1, qs.length);
+          waitingSummary =
+            cleanHumanSummary(
+              qs[0]?.header ?? qs[0]?.question ?? "Waiting for user answer",
+              80,
+            ) || "Waiting for user answer";
+          break;
+        }
+        if (item.isComplete === false && item.isConfirmed === false) {
+          const msg =
+            extractMessageText(item.invocationMessage) ||
+            item.generatedTitle ||
+            item.toolId ||
+            item.toolName ||
+            "Tool approval";
+          waitingOn = "tool_approval";
+          pendingQuestionCount = 1;
+          waitingSummary = cleanHumanSummary(msg, 80) || "Waiting for approval";
+          break;
+        }
+      }
+    }
+  }
+
+  return {
+    mergedCarouselToAskIdx,
+    mergedAskQuestions,
+    suppressedCarouselIndices,
+    suppressedAskIndices,
+    waitingOn,
+    pendingQuestionCount,
+    waitingSummary,
+  };
 }
 
 const VSCODE_VARIANTS = ["Code", "Code - Insiders", "VSCodium"] as const;
@@ -185,6 +457,7 @@ function defaultVSCodeStorageDirs(): string[] {
 function isSubagentToolName(lowTool: string): boolean {
   return (
     lowTool === "agent" ||
+    lowTool === "task" ||
     lowTool === "runsubagent" ||
     lowTool === "agent/runsubagent" ||
     lowTool.includes("subagent")
@@ -198,12 +471,33 @@ function extractSelectedModel(
   if (typeof selectedModel === "string") {
     return selectedModel.trim() || undefined;
   }
-  return (
+  const rawId =
     selectedModel.metadata?.id?.trim() ||
     selectedModel.id?.trim() ||
-    selectedModel.identifier?.trim() ||
+    selectedModel.identifier?.trim();
+  const isAuto =
+    Boolean(rawId) &&
+    (rawId!.toLowerCase() === "auto" || rawId!.toLowerCase().endsWith("/auto"));
+  if (isAuto) {
+    const resolved =
+      selectedModel.metadata?.version?.trim() ||
+      selectedModel.version?.trim() ||
+      selectedModel.metadata?.family?.trim() ||
+      selectedModel.family?.trim();
+    if (resolved) return resolved;
+    const rawName =
+      selectedModel.metadata?.name?.trim() || selectedModel.name?.trim();
+    if (rawName && rawName.toLowerCase() !== "auto") return rawName;
+    return rawId;
+  }
+  return (
+    rawId ||
     selectedModel.metadata?.name?.trim() ||
     selectedModel.name?.trim() ||
+    selectedModel.metadata?.version?.trim() ||
+    selectedModel.version?.trim() ||
+    selectedModel.metadata?.family?.trim() ||
+    selectedModel.family?.trim() ||
     undefined
   );
 }
@@ -212,7 +506,8 @@ function extractSelectedModelContextWindow(
   selectedModel: NonNullable<VSCodeChatSessionState["inputState"]>["selectedModel"],
 ): number | undefined {
   if (!selectedModel || typeof selectedModel === "string") return undefined;
-  const maxIn = selectedModel.metadata?.maxInputTokens;
+  const maxIn =
+    selectedModel.metadata?.maxInputTokens ?? selectedModel.maxInputTokens;
   if (typeof maxIn === "number" && Number.isFinite(maxIn) && maxIn > 0) {
     return Math.round(maxIn);
   }
@@ -562,6 +857,79 @@ async function readWorkspaceJsonFolder(
   return undefined;
 }
 
+const MAX_WORKSPACE_YAML_BYTES = 64 * 1024;
+
+function isRealPathInsideRoot(realRoot: string, realTarget: string): boolean {
+  const parsedRoot = path.parse(realRoot);
+  if (parsedRoot.root === realRoot) return false;
+  const normRoot =
+    process.platform === "win32" ? realRoot.toLowerCase() : realRoot;
+  const normTarget =
+    process.platform === "win32" ? realTarget.toLowerCase() : realTarget;
+  const rel = path.relative(normRoot, normTarget);
+  if (!rel || rel === "." || rel === "..") return false;
+  if (rel.startsWith(".." + path.sep)) return false;
+  if (path.isAbsolute(rel)) return false;
+  return true;
+}
+
+async function readSessionStateWorkspaceYaml(
+  sessionDir: string,
+  allowedRootDir?: string,
+): Promise<{
+  workspacePath?: string;
+  workspaces: string[];
+  sessionId?: string;
+  title?: string;
+}> {
+  const workspaces: string[] = [];
+  const pushWs = (raw: unknown): void => {
+    if (typeof raw !== "string" || !raw.trim()) return;
+    const norm = normalizeWsPath(raw);
+    if (norm && !workspaces.includes(norm)) {
+      workspaces.push(norm);
+    }
+  };
+  try {
+    const yamlPath = path.join(sessionDir, "workspace.yaml");
+    const lst = await fs.lstat(yamlPath);
+    if (!lst.isFile() && !lst.isSymbolicLink()) {
+      return { workspaces };
+    }
+    const realYaml = await fs.realpath(yamlPath);
+    const realRoot = await fs.realpath(allowedRootDir ?? sessionDir);
+    if (!isRealPathInsideRoot(realRoot, realYaml)) {
+      return { workspaces };
+    }
+    const st = await fs.stat(realYaml);
+    if (!st.isFile() || st.size === 0 || st.size > MAX_WORKSPACE_YAML_BYTES) {
+      return { workspaces };
+    }
+    const raw = await fs.readFile(realYaml, "utf8");
+    const parsed: unknown = parseYaml(raw);
+    if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+      const rec = parsed as Record<string, unknown>;
+      pushWs(rec.cwd);
+      pushWs(rec.git_root ?? rec.gitRoot);
+      const id =
+        typeof rec.id === "string" && rec.id.trim() ? rec.id.trim() : undefined;
+      const summary =
+        typeof rec.summary === "string" && rec.summary.trim()
+          ? rec.summary.trim().replace(/\s+/g, " ").slice(0, 80)
+          : undefined;
+      return {
+        workspacePath: workspaces[0],
+        workspaces,
+        sessionId: id,
+        title: summary,
+      };
+    }
+  } catch {
+    // workspace.yaml absent or unreadable
+  }
+  return { workspaces };
+}
+
 interface TranscriptRow {
   type?: string;
   event?: string;
@@ -582,7 +950,10 @@ interface TranscriptRow {
 
 function isTranscriptJsonlPath(filePath: string): boolean {
   const norm = filePath.replace(/\\/g, "/").toLowerCase();
-  return norm.includes("/transcripts/") && norm.endsWith(".jsonl");
+  return (
+    (norm.includes("/transcripts/") && norm.endsWith(".jsonl")) ||
+    (norm.includes("/session-state/") && norm.endsWith("/events.jsonl"))
+  );
 }
 
 function parseJsonlRows(raw: string): TranscriptRow[] {
@@ -606,6 +977,8 @@ export class CopilotVSCodeAdapter implements PassiveIdeAdapter {
   readonly ide = "copilot-vscode" as const;
   private readonly storageDir: string;
   private readonly storageDirs: string[];
+  private readonly hasExplicitStorageDir: boolean;
+  private readonly explicitCopilotHomeDir?: string;
   private readonly stateCache = new Map<
     string,
     { mtimeMs: number; sizeBytes: number; state: VSCodeChatSessionState }
@@ -618,6 +991,7 @@ export class CopilotVSCodeAdapter implements PassiveIdeAdapter {
   constructor(options?: CopilotVSCodeAdapterOptions) {
     const explicit =
       options?.storageDir?.trim() || process.env.VSCODE_STORAGE_DIR?.trim();
+    this.hasExplicitStorageDir = Boolean(explicit);
     if (explicit) {
       this.storageDir = explicit;
       this.storageDirs = [explicit];
@@ -625,15 +999,29 @@ export class CopilotVSCodeAdapter implements PassiveIdeAdapter {
       this.storageDirs = defaultVSCodeStorageDirs();
       this.storageDir = this.storageDirs[0]!;
     }
+    this.explicitCopilotHomeDir = options?.copilotHomeDir?.trim() || undefined;
   }
 
   getStorageDirs(): string[] {
     return [...this.storageDirs];
   }
 
+  getCopilotHomeDir(): string {
+    return resolveCopilotHomeDir(os.homedir(), this.explicitCopilotHomeDir);
+  }
+
+  private shouldDiscoverSessionState(): boolean {
+    return Boolean(
+      this.explicitCopilotHomeDir ||
+        process.env.COPILOT_HOME?.trim() ||
+        !this.hasExplicitStorageDir,
+    );
+  }
+
   private getDefaultAllowedTranscriptRoots(workspacePath?: string): string[] {
     const roots = new Set<string>(this.storageDirs);
     const home = os.homedir();
+    roots.add(this.getCopilotHomeDir());
     roots.add(path.join(home, ".copilot"));
     roots.add(path.join(home, ".claude"));
     roots.add(path.join(home, ".gemini"));
@@ -697,6 +1085,26 @@ export class CopilotVSCodeAdapter implements PassiveIdeAdapter {
       }
     }
     if (existingDirs.length === 0) {
+      if (this.shouldDiscoverSessionState()) {
+        const sessionStateDir = path.join(
+          this.getCopilotHomeDir(),
+          "session-state",
+        );
+        try {
+          const sst = await fs.stat(sessionStateDir);
+          if (sst.isDirectory()) {
+            const sessions = await this.discoverSessions({ limit: 50 });
+            return {
+              ide: this.ide,
+              status: "ok",
+              rootDir: sessionStateDir,
+              sessionsFound: sessions.length,
+            };
+          }
+        } catch {
+          // session-state not present
+        }
+      }
       return {
         ide: this.ide,
         status: "degraded",
@@ -725,9 +1133,12 @@ export class CopilotVSCodeAdapter implements PassiveIdeAdapter {
     interface TranscriptCandidate {
       filePath: string;
       fname: string;
+      sessionIdHint?: string;
+      titleHint?: string;
       mtimeMs: number;
       sizeBytes: number;
       workspacePath?: string;
+      workspaces?: string[];
       projectId?: string;
     }
     const transcriptCandidates: TranscriptCandidate[] = [];
@@ -799,6 +1210,11 @@ export class CopilotVSCodeAdapter implements PassiveIdeAdapter {
             if (hasSubagent) break;
           }
 
+          const lastReq = requests[requests.length - 1];
+          const lastAnalysis = lastReq
+            ? analyzeCopilotRequestQuestions(lastReq)
+            : undefined;
+
           const candidate: DiscoveredSession = {
             ide: this.ide,
             sessionId,
@@ -810,6 +1226,16 @@ export class CopilotVSCodeAdapter implements PassiveIdeAdapter {
             mtimeMs: fst.mtimeMs,
             sizeBytes: fst.size,
             isMultiAgent: hasSubagent,
+            waitingOn: lastAnalysis?.waitingOn ?? null,
+            pendingQuestionCount: lastAnalysis?.pendingQuestionCount ?? 0,
+            ...(lastAnalysis?.waitingSummary
+              ? { waitingSummary: lastAnalysis.waitingSummary }
+              : {}),
+            ...(lastAnalysis?.waitingOn
+              ? { status: "WAITING" as AgentStatus, isWaiting: true }
+              : lastReq?.modelState?.completedAt || lastReq?.result
+                ? { status: "DONE" as AgentStatus, isCompleted: true }
+                : {}),
           };
           const prev = byId.get(sessionId);
           if (!prev || candidate.mtimeMs > prev.mtimeMs) {
@@ -832,10 +1258,16 @@ export class CopilotVSCodeAdapter implements PassiveIdeAdapter {
 
         for (const fname of transcriptFiles) {
           if (!fname.endsWith(".jsonl")) continue;
-          const filePath = path.join(transcriptsDir, fname);
+          const rawFilePath = path.resolve(path.join(transcriptsDir, fname));
+          const validPath = await validateTranscriptPath(
+            rawFilePath,
+            [baseStorageDir],
+            { maxBytes: MAX_TRANSCRIPT_BYTES },
+          );
+          if (!validPath) continue;
           let fst;
           try {
-            fst = await fs.stat(filePath);
+            fst = await fs.stat(validPath);
             if (!fst.isFile() || fst.size === 0 || fst.size > MAX_TRANSCRIPT_BYTES) {
               continue;
             }
@@ -843,14 +1275,65 @@ export class CopilotVSCodeAdapter implements PassiveIdeAdapter {
             continue;
           }
           transcriptCandidates.push({
-            filePath,
+            filePath: validPath,
             fname,
             mtimeMs: fst.mtimeMs,
             sizeBytes: fst.size,
             workspacePath,
+            workspaces,
             projectId,
           });
         }
+      }
+    }
+
+    // 3. Collect $COPILOT_HOME/session-state/*/events.jsonl
+    if (this.shouldDiscoverSessionState()) {
+      const copilotHome = this.getCopilotHomeDir();
+      const sessionStateDir = path.join(copilotHome, "session-state");
+      let stateEntries: string[] = [];
+      try {
+        const realCopilotHome = await fs.realpath(copilotHome);
+        const realSessionState = await fs.realpath(sessionStateDir);
+        if (isRealPathInsideRoot(realCopilotHome, realSessionState)) {
+          stateEntries = await fs.readdir(realSessionState);
+        }
+      } catch {
+        stateEntries = [];
+      }
+      for (const sdir of stateEntries) {
+        const dirPath = path.join(sessionStateDir, sdir);
+        const eventsPath = path.resolve(path.join(dirPath, "events.jsonl"));
+        const validEventsPath = await validateTranscriptPath(
+          eventsPath,
+          [sessionStateDir],
+          { maxBytes: MAX_TRANSCRIPT_BYTES },
+        );
+        if (!validEventsPath) continue;
+        let fst;
+        try {
+          fst = await fs.stat(validEventsPath);
+          if (!fst.isFile() || fst.size === 0 || fst.size > MAX_TRANSCRIPT_BYTES) {
+            continue;
+          }
+        } catch {
+          continue;
+        }
+        const wsMeta = await readSessionStateWorkspaceYaml(dirPath, sessionStateDir);
+        const projectId =
+          matchProjectIdForWorkspaces(wsMeta.workspaces, knownProjects) ??
+          (wsMeta.workspacePath ? path.basename(wsMeta.workspacePath) : undefined);
+        transcriptCandidates.push({
+          filePath: validEventsPath,
+          fname: "events.jsonl",
+          sessionIdHint: wsMeta.sessionId ?? sdir,
+          titleHint: wsMeta.title,
+          mtimeMs: fst.mtimeMs,
+          sizeBytes: fst.size,
+          workspacePath: wsMeta.workspacePath,
+          workspaces: wsMeta.workspaces,
+          projectId,
+        });
       }
     }
 
@@ -872,11 +1355,15 @@ export class CopilotVSCodeAdapter implements PassiveIdeAdapter {
         const rows = parseJsonlRows(raw);
         if (rows.length === 0) continue;
 
-        let sessionId = cand.fname.replace(/\.jsonl$/i, "");
-        let title = `Copilot ${sessionId.slice(0, 8)}`;
+        let sessionId = cand.sessionIdHint || cand.fname.replace(/\.jsonl$/i, "");
+        let title = cand.titleHint || `Copilot ${sessionId.slice(0, 8)}`;
+        const extractedWorkspaces: string[] = [];
         let isMultiAgent = false;
         let isSubagentTranscript = false;
         const distinctAgents = new Set<string>();
+        let openAskCallId: string | null = null;
+        let pendingQuestionCount = 0;
+        let waitingSummary: string | undefined;
 
         for (const row of rows) {
           const rtype = (row.type ?? row.event ?? "").toLowerCase();
@@ -895,17 +1382,101 @@ export class CopilotVSCodeAdapter implements PassiveIdeAdapter {
             ) {
               isSubagentTranscript = true;
             }
+            const ctxObj =
+              d?.context &&
+              typeof d.context === "object" &&
+              !Array.isArray(d.context)
+                ? (d.context as Record<string, unknown>)
+                : undefined;
+            for (const rawWs of [
+              ctxObj?.cwd,
+              ctxObj?.gitRoot,
+              ctxObj?.git_root,
+              d?.cwd,
+              d?.workspacePath,
+              (row as Record<string, unknown>).cwd,
+            ]) {
+              if (typeof rawWs === "string" && rawWs.trim()) {
+                const norm = normalizeWsPath(rawWs);
+                if (norm && !extractedWorkspaces.includes(norm)) {
+                  extractedWorkspaces.push(norm);
+                }
+              }
+            }
           }
-          if (rtype === "user.message" && title.startsWith("Copilot ")) {
-            const txt =
-              (typeof d?.content === "string" && d.content) ||
-              (typeof d?.transformedContent === "string" &&
-                d.transformedContent) ||
-              (typeof row.content === "string" && row.content) ||
-              (typeof row.prompt === "string" && row.prompt) ||
-              "";
-            const clean = txt.replace(/\s+/g, " ").trim();
-            if (clean) title = clean.slice(0, 80);
+          if (rtype === "user.message") {
+            openAskCallId = null;
+            pendingQuestionCount = 0;
+            waitingSummary = undefined;
+            if (title.startsWith("Copilot ")) {
+              const txt =
+                (typeof d?.content === "string" && d.content) ||
+                (typeof d?.transformedContent === "string" &&
+                  d.transformedContent) ||
+                (typeof row.content === "string" && row.content) ||
+                (typeof row.prompt === "string" && row.prompt) ||
+                "";
+              const clean = txt.replace(/\s+/g, " ").trim();
+              if (clean) title = clean.slice(0, 80);
+            }
+          }
+          if (rtype === "assistant.message" && Array.isArray(d?.toolRequests)) {
+            for (const tr of d.toolRequests as Array<Record<string, unknown>>) {
+              const tname = String(tr.name ?? tr.toolName ?? "").toLowerCase();
+              if (isCopilotAskTool(tname)) {
+                const args =
+                  tr.arguments && typeof tr.arguments === "object"
+                    ? (tr.arguments as Record<string, unknown>)
+                    : {};
+                const qs = normalizePendingQuestions(args, {
+                  defaultAllowCustomInput: true,
+                });
+                openAskCallId =
+                  typeof tr.toolCallId === "string" ? tr.toolCallId : "__ask__";
+                pendingQuestionCount = Math.max(1, qs.length);
+                waitingSummary =
+                  cleanHumanSummary(
+                    qs[0]?.header ?? qs[0]?.question ?? "Waiting for user answer",
+                    80,
+                  ) || "Waiting for user answer";
+              }
+            }
+          }
+          if (rtype === "tool.execution_start") {
+            const tname = String(
+              d?.mcpToolName ?? d?.toolName ?? "",
+            ).toLowerCase();
+            if (isCopilotAskTool(tname)) {
+              const args =
+                d?.arguments && typeof d.arguments === "object"
+                  ? (d.arguments as Record<string, unknown>)
+                  : {};
+              const qs = normalizePendingQuestions(args, {
+                defaultAllowCustomInput: true,
+              });
+              openAskCallId =
+                typeof d?.toolCallId === "string" ? d.toolCallId : "__ask__";
+              pendingQuestionCount = Math.max(1, qs.length);
+              waitingSummary =
+                cleanHumanSummary(
+                  qs[0]?.header ?? qs[0]?.question ?? "Waiting for user answer",
+                  80,
+                ) || "Waiting for user answer";
+            }
+          }
+          if (rtype === "tool.execution_complete") {
+            const callId =
+              typeof d?.toolCallId === "string" ? d.toolCallId : undefined;
+            if (openAskCallId && (!callId || callId === openAskCallId)) {
+              openAskCallId = null;
+              pendingQuestionCount = 0;
+              waitingSummary = undefined;
+            }
+          }
+          if (rtype === "assistant.turn_end") {
+            openAskCallId = null;
+            pendingQuestionCount = 0;
+            waitingSummary = undefined;
           }
           if (rtype.startsWith("subagent.")) {
             isMultiAgent = true;
@@ -922,14 +1493,33 @@ export class CopilotVSCodeAdapter implements PassiveIdeAdapter {
           sizeBytes: cand.sizeBytes,
           sessionId,
           title,
+          workspacePath: extractedWorkspaces[0],
+          workspaces: extractedWorkspaces,
           isMultiAgent,
           isSubagentTranscript,
           distinctAgentsCount: distinctAgents.size,
+          waitingOn: openAskCallId ? "user" : null,
+          pendingQuestionCount,
+          waitingSummary,
         };
         this.transcriptDiscoveryCache.set(cand.filePath, meta);
       }
 
       if (meta.isSubagentTranscript) continue;
+
+      const mergedWorkspaces: string[] = [];
+      for (const ws of [...(cand.workspaces ?? []), ...meta.workspaces]) {
+        if (ws && !mergedWorkspaces.includes(ws)) {
+          mergedWorkspaces.push(ws);
+        }
+      }
+      const resolvedWs = cand.workspacePath ?? meta.workspacePath ?? mergedWorkspaces[0];
+      const resolvedProj =
+        cand.projectId ??
+        (mergedWorkspaces.length > 0
+          ? matchProjectIdForWorkspaces(mergedWorkspaces, knownProjects) ??
+            (resolvedWs ? path.basename(resolvedWs) : undefined)
+          : undefined);
 
       const prev = byId.get(meta.sessionId);
       if (prev) {
@@ -938,26 +1528,62 @@ export class CopilotVSCodeAdapter implements PassiveIdeAdapter {
           prev.isMultiAgent ||
           meta.isMultiAgent ||
           meta.distinctAgentsCount > 1;
+        if (!prev.workspacePath && resolvedWs) {
+          prev.workspacePath = resolvedWs;
+        }
+        for (const ws of mergedWorkspaces) {
+          if (ws && !prev.workspaces.includes(ws)) {
+            prev.workspaces.push(ws);
+          }
+        }
+        if (!prev.projectId && resolvedProj) {
+          prev.projectId = resolvedProj;
+        }
         if (prev.title?.startsWith("Copilot ") && !meta.title.startsWith("Copilot ")) {
           prev.title = meta.title;
+        }
+        if (!prev.waitingOn && meta.waitingOn) {
+          prev.waitingOn = meta.waitingOn;
+          prev.pendingQuestionCount = meta.pendingQuestionCount;
+          prev.waitingSummary = meta.waitingSummary;
+          prev.status = "WAITING";
+          prev.isWaiting = true;
         }
       } else {
         byId.set(meta.sessionId, {
           ide: this.ide,
           sessionId: meta.sessionId,
           filePath: cand.filePath,
-          workspacePath: cand.workspacePath,
-          workspaces: cand.workspacePath ? [cand.workspacePath] : [],
-          projectId: cand.projectId,
+          workspacePath: resolvedWs,
+          workspaces: mergedWorkspaces.length > 0 ? mergedWorkspaces : resolvedWs ? [resolvedWs] : [],
+          projectId: resolvedProj,
           title: meta.title,
           mtimeMs: cand.mtimeMs,
           sizeBytes: cand.sizeBytes,
           isMultiAgent: meta.isMultiAgent || meta.distinctAgentsCount > 1,
+          waitingOn: meta.waitingOn,
+          pendingQuestionCount: meta.pendingQuestionCount,
+          ...(meta.waitingSummary ? { waitingSummary: meta.waitingSummary } : {}),
+          ...(meta.waitingOn ? { status: "WAITING", isWaiting: true } : {}),
         });
       }
     }
 
-    const sessions = [...byId.values()];
+    const scopeRoots = (opts?.workspaceRoots ?? []).filter(
+      (r) => typeof r === "string" && r.trim().length > 0,
+    );
+    let sessions = [...byId.values()];
+    if (scopeRoots.length > 0) {
+      sessions = sessions.filter((s) => {
+        const wsList = [
+          ...(s.workspacePath ? [s.workspacePath] : []),
+          ...s.workspaces,
+        ].filter(Boolean);
+        return wsList.some((w) =>
+          scopeRoots.some((root) => pathMatchesRoot(w, root)),
+        );
+      });
+    }
     sessions.sort((a, b) => b.mtimeMs - a.mtimeMs);
     return sessions.slice(0, limit);
   }
@@ -1422,7 +2048,16 @@ export class CopilotVSCodeAdapter implements PassiveIdeAdapter {
             const lowTool = tname.toLowerCase();
             const isBoardMut = isBoardMutationToolCall(tname, args);
             const isMsgTool = isMessageToolName(lowTool);
-            const sum = summarizeToolCall(tname, args);
+            const isAskTool = isCopilotAskTool(lowTool);
+            const parsedQuestions = isAskTool
+              ? normalizePendingQuestions(args, { defaultAllowCustomInput: true })
+              : [];
+            const sum = isAskTool
+              ? cleanHumanSummary(
+                  parsedQuestions[0]?.question ?? "Waiting for user answer",
+                  120,
+                ) || "Waiting for user answer"
+              : summarizeToolCall(tname, args);
             acc.currTurnChars += sum.length;
             toolSummaryMap.set(callId, { toolName: tname, summary: sum, agentId });
             const msgInfo = isMsgTool ? extractMessagePayload(args) : undefined;
@@ -1435,12 +2070,23 @@ export class CopilotVSCodeAdapter implements PassiveIdeAdapter {
                   : "tool_start",
               toolName: tname,
               toolCallId: callId,
-              ...(msgInfo?.msgTarget ? { targetAgentId: msgInfo.msgTarget } : {}),
+              ...(isAskTool
+                ? { targetAgentId: "human", waitingReason: "user" as const }
+                : msgInfo?.msgTarget
+                  ? { targetAgentId: msgInfo.msgTarget }
+                  : {}),
               summary: sum,
               status: isMsgTool ? "ok" : "running",
               payload: {
                 args: msgInfo?.compactArgs ?? args,
                 ...(msgInfo?.inlineBody ? { body: msgInfo.inlineBody } : {}),
+                ...(isAskTool
+                  ? {
+                      questions: parsedQuestions,
+                      promptKind: "question",
+                      blockingToolCall: true,
+                    }
+                  : {}),
               },
               ...(msgInfo?.msgBody
                 ? { fullBody: msgInfo.msgBody, inlineBody: msgInfo.inlineBody }
@@ -1487,7 +2133,16 @@ export class CopilotVSCodeAdapter implements PassiveIdeAdapter {
         const lowTool = tname.toLowerCase();
         const isBoardMut = isBoardMutationToolCall(tname, args);
         const isMsgTool = isMessageToolName(lowTool);
-        const sum = summarizeToolCall(tname, args);
+        const isAskTool = isCopilotAskTool(lowTool);
+        const parsedQuestions = isAskTool
+          ? normalizePendingQuestions(args, { defaultAllowCustomInput: true })
+          : [];
+        const sum = isAskTool
+          ? cleanHumanSummary(
+              parsedQuestions[0]?.question ?? "Waiting for user answer",
+              120,
+            ) || "Waiting for user answer"
+          : summarizeToolCall(tname, args);
         acc.currTurnChars += sum.length;
         const selfDaemon = isSelfDaemonCommand(
           sum + " " + JSON.stringify(args),
@@ -1502,13 +2157,24 @@ export class CopilotVSCodeAdapter implements PassiveIdeAdapter {
               : "tool_start",
           toolName: tname,
           toolCallId: callId,
-          ...(msgInfo?.msgTarget ? { targetAgentId: msgInfo.msgTarget } : {}),
+          ...(isAskTool
+            ? { targetAgentId: "human", waitingReason: "user" as const }
+            : msgInfo?.msgTarget
+              ? { targetAgentId: msgInfo.msgTarget }
+              : {}),
           summary: sum,
           status: isMsgTool ? "ok" : "running",
           isSelfDaemon: selfDaemon,
           payload: {
             args: msgInfo?.compactArgs ?? args,
             ...(msgInfo?.inlineBody ? { body: msgInfo.inlineBody } : {}),
+            ...(isAskTool
+              ? {
+                  questions: parsedQuestions,
+                  promptKind: "question",
+                  blockingToolCall: true,
+                }
+              : {}),
           },
           ...(msgInfo?.msgBody
             ? { fullBody: msgInfo.msgBody, inlineBody: msgInfo.inlineBody }
@@ -1596,14 +2262,27 @@ export class CopilotVSCodeAdapter implements PassiveIdeAdapter {
         if (callId) {
           subagentIdByCallId.set(callId, { subId: rawSubId, subLabel });
         }
-        const subModel =
+        const subModelRaw =
           typeof d.model === "string" && d.model.trim()
-            ? prettifyModelName(d.model) || d.model.trim()
+            ? d.model.trim()
             : undefined;
+        const subModel = subModelRaw
+          ? prettifyModelName(subModelRaw) || subModelRaw
+          : undefined;
+        const parentAcc = usageAccByAgent.get(defaultAgentId);
+        const childContextWindow =
+          subModel && parentAcc?.model && subModel === parentAcc.model
+            ? parentAcc.contextWindow
+            : !subModel
+              ? parentAcc?.contextWindow
+              : undefined;
         if (subModel) {
           const subAcc = ensureAcc(rawSubId);
           subAcc.model = subModel;
           subAcc.agentLabel = subLabel;
+          if (childContextWindow !== undefined) {
+            subAcc.contextWindow = childContextWindow;
+          }
         }
         const subPrompt =
           typeof d.prompt === "string" ? d.prompt.trim() : "";
@@ -1632,6 +2311,9 @@ export class CopilotVSCodeAdapter implements PassiveIdeAdapter {
             _passiveSource: "transcript",
             ...(subModel
               ? { childModel: subModel, childModelSource: "exact" }
+              : {}),
+            ...(childContextWindow !== undefined
+              ? { childContextWindow }
               : {}),
             ...(inlinePrompt ? { prompt: inlinePrompt } : {}),
           },
@@ -1808,6 +2490,28 @@ export class CopilotVSCodeAdapter implements PassiveIdeAdapter {
     const selectedModelContextWindow = extractSelectedModelContextWindow(
       state.inputState?.selectedModel,
     );
+    const modelWindowMap = new Map<string, number>();
+    const recordModelWindow = (rawOrPretty: string | undefined, win: number | undefined): void => {
+      if (!rawOrPretty || typeof win !== "number" || !Number.isFinite(win) || win <= 0) {
+        return;
+      }
+      const rounded = Math.round(win);
+      const low = rawOrPretty.trim().toLowerCase();
+      if (low) modelWindowMap.set(low, rounded);
+      const pretty = prettifyModelName(rawOrPretty);
+      if (pretty) modelWindowMap.set(pretty.toLowerCase(), rounded);
+    };
+    const lookupSessionModelWindow = (rawOrPretty: string | undefined): number | undefined => {
+      if (!rawOrPretty) return undefined;
+      const low = rawOrPretty.trim().toLowerCase();
+      if (low && modelWindowMap.has(low)) return modelWindowMap.get(low);
+      const pretty = prettifyModelName(rawOrPretty);
+      if (pretty && modelWindowMap.has(pretty.toLowerCase())) {
+        return modelWindowMap.get(pretty.toLowerCase());
+      }
+      return undefined;
+    };
+    recordModelWindow(selectedModelFallback, selectedModelContextWindow);
 
     const requests = Array.isArray(state.requests) ? state.requests : [];
     const events: EnrichedEvent[] = [];
@@ -1863,9 +2567,15 @@ export class CopilotVSCodeAdapter implements PassiveIdeAdapter {
       const agentLabel = "Copilot Agent";
 
       const acc = ensureAcc(agentId);
+      const reqModelRaw =
+        typeof req.modelId === "string" && req.modelId.trim()
+          ? req.modelId.trim()
+          : undefined;
       const rawModel =
-        (typeof req.modelId === "string" && req.modelId.trim()
-          ? req.modelId
+        (reqModelRaw &&
+        reqModelRaw.toLowerCase() !== "auto" &&
+        !reqModelRaw.toLowerCase().endsWith("/auto")
+          ? reqModelRaw
           : undefined) ?? selectedModelFallback;
       if (rawModel) {
         const pretty = prettifyModelName(rawModel);
@@ -1889,6 +2599,7 @@ export class CopilotVSCodeAdapter implements PassiveIdeAdapter {
         directUsage.contextWindow ?? metaFields.contextWindow;
       if (reqContextWindow !== undefined && reqContextWindow > 0) {
         acc.contextWindow = reqContextWindow;
+        recordModelWindow(rawModel ?? acc.model, reqContextWindow);
       }
 
       const hasDirectPromptOrContext =
@@ -2097,6 +2808,10 @@ export class CopilotVSCodeAdapter implements PassiveIdeAdapter {
 
       // 2. Response items
       const responses = Array.isArray(req.response) ? req.response : [];
+      const reqCompleted = Boolean(
+        req.isCanceled || req.modelState?.completedAt || req.result,
+      );
+      const reqQuestionAnalysis = analyzeCopilotRequestQuestions(req);
       for (let i = 0; i < responses.length; i++) {
         const item = responses[i]!;
         const stepEpoch = reqEpoch + (i + 1) * 0.01;
@@ -2145,6 +2860,9 @@ export class CopilotVSCodeAdapter implements PassiveIdeAdapter {
               tsd?.subAgentName ??
                 tsd?.agentName ??
                 tsd?.agentType ??
+                tsd?.agent_type ??
+                tsd?.subagent_type ??
+                tsd?.name ??
                 tsd?.description ??
                 item.generatedTitle ??
                 "Subagent",
@@ -2187,6 +2905,13 @@ export class CopilotVSCodeAdapter implements PassiveIdeAdapter {
             const subModel = subModelRaw
               ? prettifyModelName(subModelRaw) || subModelRaw
               : undefined;
+            const childContextWindow = subModel
+              ? lookupSessionModelWindow(subModelRaw) ??
+                lookupSessionModelWindow(subModel) ??
+                (acc.model && subModel === acc.model ? acc.contextWindow : undefined)
+              : lookupSessionModelWindow(acc.model) ??
+                acc.contextWindow ??
+                selectedModelContextWindow;
             const rawSubPrompt =
               typeof tsd?.prompt === "string"
                 ? tsd.prompt
@@ -2222,6 +2947,9 @@ export class CopilotVSCodeAdapter implements PassiveIdeAdapter {
                 ...(subModel
                   ? { childModel: subModel, childModelSource: "exact" }
                   : {}),
+                ...(childContextWindow !== undefined
+                  ? { childContextWindow }
+                  : {}),
                 toolSpecificData: compactSpecificData,
                 ...(inlinePrompt ? { prompt: inlinePrompt } : {}),
               },
@@ -2248,28 +2976,49 @@ export class CopilotVSCodeAdapter implements PassiveIdeAdapter {
                   : {}),
               });
             }
-          } else if (lowTool === "vscode_askquestions") {
+          } else if (isCopilotAskTool(lowTool)) {
+            const mergedQs = reqQuestionAnalysis.mergedAskQuestions.get(i);
+            const askQs =
+              mergedQs && mergedQs.length > 0
+                ? mergedQs
+                : extractCopilotItemQuestions(item);
+            const isAskSuppressed =
+              Boolean(item.isComplete) ||
+              reqQuestionAnalysis.suppressedAskIndices.has(i);
+            const qTitle =
+              cleanHumanSummary(
+                askQs[0]?.header ?? askQs[0]?.question ?? msg,
+                90,
+              ) || "Waiting for user answer";
             emit({
               epoch: stepEpoch,
               kind: "tool_start",
               toolName: tname,
               toolCallId: callId,
               targetAgentId: "human",
-              summary: msg.slice(0, 90),
-              waitingReason: item.isComplete ? undefined : "user",
+              summary: qTitle,
+              waitingReason: isAskSuppressed ? undefined : "user",
+              payload: {
+                questions: askQs,
+                promptTitle: qTitle,
+                promptKind: "question",
+                blockingToolCall: true,
+              },
             });
-            if (item.isComplete) {
+            if (isAskSuppressed) {
               emit({
                 epoch: stepEpoch + 0.005,
                 kind: "tool_end",
                 toolName: tname,
                 toolCallId: callId,
-                summary: `Answered: ${msg.slice(0, 80)}`,
+                summary: `Answered: ${qTitle.slice(0, 80)}`,
               });
             }
           } else {
             const needsApproval =
-              item.isComplete === false && item.isConfirmed === false;
+              !reqCompleted &&
+              item.isComplete === false &&
+              item.isConfirmed === false;
             const specificArgs = item.toolSpecificData ?? {};
             const isBoardMut = isBoardMutationToolCall(tname, specificArgs);
             const isMsgTool = isMessageToolName(lowTool);
@@ -2310,6 +3059,15 @@ export class CopilotVSCodeAdapter implements PassiveIdeAdapter {
                 payload: {
                   isConfirmed: item.isConfirmed,
                   toolSpecificData: item.toolSpecificData,
+                  ...(needsApproval
+                    ? {
+                        promptKind: "approval",
+                        promptTitle: cleanMsg || `Approve ${tname}`,
+                        promptSummary:
+                          extractMessageText(item.invocationMessage) || cleanMsg,
+                        blockingToolCall: true,
+                      }
+                    : {}),
                 },
               });
               if (item.isComplete) {
@@ -2332,15 +3090,45 @@ export class CopilotVSCodeAdapter implements PassiveIdeAdapter {
           rkind === "questionCarousel" ||
           rkind === "elicitationSerialized"
         ) {
+          if (reqQuestionAnalysis.mergedCarouselToAskIdx.has(i)) {
+            continue;
+          }
+          const isSuppressed =
+            reqQuestionAnalysis.suppressedCarouselIndices.has(i);
+          const carouselQs = extractCopilotItemQuestions(item);
+          const qTitle =
+            cleanHumanSummary(
+              carouselQs[0]?.header ??
+                carouselQs[0]?.question ??
+                "Waiting for user answer",
+              90,
+            ) || "Waiting for user answer";
+          const callId = item.toolCallId || `${req.requestId ?? rIdx}:${i}:${rkind}`;
           emit({
             epoch: stepEpoch,
             kind: "tool_start",
             toolName: rkind,
-            toolCallId: `${req.requestId ?? rIdx}:${i}:${rkind}`,
+            toolCallId: callId,
             targetAgentId: "human",
-            summary: "Waiting for user answer",
-            waitingReason: "user",
+            summary: qTitle,
+            waitingReason: isSuppressed ? undefined : "user",
+            payload: {
+              questions: carouselQs,
+              promptTitle: qTitle,
+              promptKind: "question",
+              blockingToolCall: true,
+              ...(item.isUsed !== undefined ? { isUsed: item.isUsed } : {}),
+            },
           });
+          if (isSuppressed) {
+            emit({
+              epoch: stepEpoch + 0.005,
+              kind: "tool_end",
+              toolName: rkind,
+              toolCallId: callId,
+              summary: `Answered: ${qTitle.slice(0, 80)}`,
+            });
+          }
         } else if (rkind === "textEditGroup") {
           const callId = `${req.requestId ?? rIdx}:${i}:edit`;
           const fileBase = extractUriBasename(item.uri);
@@ -2365,7 +3153,14 @@ export class CopilotVSCodeAdapter implements PassiveIdeAdapter {
 
       // 3. Turn completion
       const completedAtMs = req.modelState?.completedAt;
-      if ((completedAtMs || req.result) && !req.isCanceled) {
+      if (req.isCanceled) {
+        emit({
+          epoch: reqEpoch + (responses.length + 1) * 0.01,
+          kind: "assistant_turn_end",
+          summary: "Turn canceled",
+          status: "ok",
+        });
+      } else if (completedAtMs || req.result) {
         const endEpoch = parseEpochSeconds(
           completedAtMs,
           reqEpoch + (responses.length + 1) * 0.01,
@@ -2446,5 +3241,895 @@ export class CopilotVSCodeAdapter implements PassiveIdeAdapter {
     }
 
     return events;
+  }
+
+  async parseTranscriptChat(
+    filePath: string,
+    sessionId: string,
+    opts?: CopilotTranscriptParseOptions,
+  ): Promise<AgentChatMessage[]> {
+    const allowedRoots =
+      opts?.allowedRoots ??
+      this.getDefaultAllowedTranscriptRoots(opts?.workspacePath);
+    const validPath = await validateTranscriptPath(filePath, allowedRoots, {
+      maxBytes: MAX_TRANSCRIPT_BYTES,
+    });
+    if (!validPath) return [];
+
+    let raw: string;
+    let mtimeMs = Date.now();
+    try {
+      const fst = await fs.stat(validPath);
+      if (!fst.isFile() || fst.size > MAX_TRANSCRIPT_BYTES) {
+        return [];
+      }
+      mtimeMs = fst.mtimeMs;
+      raw = await fs.readFile(validPath, "utf8");
+    } catch {
+      return [];
+    }
+
+    const rows = parseJsonlRows(raw);
+    if (rows.length === 0) return [];
+
+    const messages: AgentChatMessage[] = [];
+    const defaultAgentId = opts?.agentIdOverride?.trim() || "root";
+    const toolRefByCallId = new Map<string, ChatToolCallRef>();
+    const seenAskCallIds = new Set<string>();
+    const askMsgByCallId = new Map<string, AgentChatMessage>();
+    const subagentIdByCallId = new Map<
+      string,
+      { subId: string; subLabel: string }
+    >();
+    const usedSubagentSlugs = new Set<string>();
+    let fallbackEpoch = mtimeMs / 1000 - Math.max(rows.length, 1);
+
+    const formatToolOutput = (val: unknown): string => {
+      if (val === undefined || val === null) return "";
+      if (typeof val === "string") return val;
+      if (typeof val === "object") {
+        const rec = val as Record<string, unknown>;
+        if (typeof rec.content === "string") return rec.content;
+        try {
+          return JSON.stringify(val, null, 2);
+        } catch {
+          return String(val);
+        }
+      }
+      return String(val);
+    };
+
+    for (let idx = 0; idx < rows.length; idx++) {
+      const row = rows[idx]!;
+      const rtype = (row.type ?? row.event ?? "").toLowerCase();
+      const d =
+        row.data && typeof row.data === "object" && !Array.isArray(row.data)
+          ? row.data
+          : (row as Record<string, unknown>);
+      const epoch = parseEpochSeconds(
+        (d.timestamp as string | number | undefined) ?? row.timestamp,
+        fallbackEpoch + idx,
+      );
+      fallbackEpoch = epoch;
+
+      const rowAgentRaw =
+        (typeof d.agentId === "string" && d.agentId.trim()) ||
+        (typeof row.agentId === "string" && row.agentId.trim()) ||
+        undefined;
+      const agentId = opts?.agentIdOverride
+        ? defaultAgentId
+        : rowAgentRaw && rowAgentRaw !== "root"
+          ? rowAgentRaw
+          : defaultAgentId;
+
+      if (rtype === "user.message") {
+        const txt = (
+          (typeof d.content === "string" && d.content) ||
+          (typeof d.transformedContent === "string" && d.transformedContent) ||
+          (typeof row.content === "string" && row.content) ||
+          (typeof row.prompt === "string" && row.prompt) ||
+          ""
+        ).trim();
+        if (txt) {
+          messages.push({
+            id: `chat:vsc-tr:${sessionId}:${agentId}:${idx}:user`,
+            ts: toIsoUtc(epoch),
+            epoch,
+            agentId,
+            role: "user",
+            text: capChatText(resolveEmptyFileLinks(txt)),
+          });
+        }
+      } else if (rtype === "assistant.message") {
+        const msgText =
+          (typeof d.content === "string" && d.content.trim()) || "";
+        const reasoning =
+          (typeof d.reasoningText === "string" && d.reasoningText.trim()) || "";
+        const toolReqs = Array.isArray(d.toolRequests) ? d.toolRequests : [];
+        const turnTools: ChatToolCallRef[] = [];
+        const specialMsgs: AgentChatMessage[] = [];
+
+        for (let ti = 0; ti < toolReqs.length; ti++) {
+          const tr = toolReqs[ti] as Record<string, unknown>;
+          const tname =
+            (typeof tr.name === "string" && tr.name) ||
+            (typeof tr.toolName === "string" && tr.toolName) ||
+            "tool";
+          const callId =
+            (typeof tr.toolCallId === "string" && tr.toolCallId) ||
+            `${idx}:${ti}:${tname}`;
+          const args =
+            tr.arguments &&
+            typeof tr.arguments === "object" &&
+            !Array.isArray(tr.arguments)
+              ? (tr.arguments as Record<string, unknown>)
+              : {};
+          const lowTool = tname.toLowerCase();
+          if (isCopilotAskTool(lowTool)) {
+            if (!seenAskCallIds.has(callId)) {
+              seenAskCallIds.add(callId);
+              const qs = normalizePendingQuestions(args, {
+                defaultAllowCustomInput: true,
+              });
+              const qMsg: AgentChatMessage = {
+                id: `chat:vsc-tr:${sessionId}:${agentId}:${idx}:ask:${ti}`,
+                ts: toIsoUtc(epoch + (ti + 1) * 0.0001),
+                epoch: epoch + (ti + 1) * 0.0001,
+                agentId,
+                role: "question",
+                text: capChatText(
+                  formatQuestionsPreview(qs, "Waiting for user answer"),
+                ),
+                pendingPromptId: computePendingPromptId(agentId, callId),
+              };
+              askMsgByCallId.set(callId, qMsg);
+              specialMsgs.push(qMsg);
+            }
+          } else if (isMessageToolName(lowTool)) {
+            const msgInfo = extractMessagePayload(args);
+            specialMsgs.push({
+              id: `chat:vsc-tr:${sessionId}:${agentId}:${idx}:msg:${ti}`,
+              ts: toIsoUtc(epoch + (ti + 1) * 0.0001),
+              epoch: epoch + (ti + 1) * 0.0001,
+              agentId,
+              role: "subagent",
+              text: capChatText(
+                msgInfo.msgBody || summarizeToolCall(tname, args),
+              ),
+              ...(msgInfo.msgTarget ? { subagentId: msgInfo.msgTarget } : {}),
+            });
+          } else {
+            const ref: ChatToolCallRef = {
+              toolCallId: callId,
+              toolName: tname,
+              summary: summarizeToolCall(tname, args),
+              status: "running",
+              inputPreview: capChatText(JSON.stringify(args), 4096),
+            };
+            turnTools.push(ref);
+            toolRefByCallId.set(callId, ref);
+          }
+        }
+
+        if (msgText || turnTools.length > 0) {
+          messages.push({
+            id: `chat:vsc-tr:${sessionId}:${agentId}:${idx}:ast`,
+            ts: toIsoUtc(epoch),
+            epoch,
+            agentId,
+            role: "assistant",
+            text: capChatText(
+              resolveEmptyFileLinks(msgText) ||
+                (turnTools.length === 1
+                  ? turnTools[0]!.summary
+                  : `Ran ${turnTools.length} tools`),
+            ),
+            ...(reasoning ? { thinking: capChatText(reasoning) } : {}),
+            ...(turnTools.length > 0 ? { tools: turnTools } : {}),
+          });
+        } else if (reasoning) {
+          messages.push({
+            id: `chat:vsc-tr:${sessionId}:${agentId}:${idx}:thk`,
+            ts: toIsoUtc(epoch),
+            epoch,
+            agentId,
+            role: "thinking",
+            text: capChatText(reasoning),
+            thinking: capChatText(reasoning),
+          });
+        }
+        messages.push(...specialMsgs);
+      } else if (rtype === "tool.execution_start") {
+        const tname =
+          (typeof d.mcpToolName === "string" && d.mcpToolName) ||
+          (typeof d.toolName === "string" && d.toolName) ||
+          "tool";
+        const callId =
+          (typeof d.toolCallId === "string" && d.toolCallId) ||
+          `${idx}:${tname}`;
+        const args =
+          d.arguments &&
+          typeof d.arguments === "object" &&
+          !Array.isArray(d.arguments)
+            ? (d.arguments as Record<string, unknown>)
+            : {};
+        const lowTool = tname.toLowerCase();
+        if (toolRefByCallId.has(callId)) {
+          const existingRef = toolRefByCallId.get(callId)!;
+          if (!existingRef.inputPreview && Object.keys(args).length > 0) {
+            existingRef.inputPreview = capChatText(JSON.stringify(args), 4096);
+          }
+        } else if (isCopilotAskTool(lowTool)) {
+          if (!seenAskCallIds.has(callId)) {
+            seenAskCallIds.add(callId);
+            const qs = normalizePendingQuestions(args, {
+              defaultAllowCustomInput: true,
+            });
+            const qMsg: AgentChatMessage = {
+              id: `chat:vsc-tr:${sessionId}:${agentId}:${idx}:ask`,
+              ts: toIsoUtc(epoch),
+              epoch,
+              agentId,
+              role: "question",
+              text: capChatText(
+                formatQuestionsPreview(qs, "Waiting for user answer"),
+              ),
+              pendingPromptId: computePendingPromptId(agentId, callId),
+            };
+            askMsgByCallId.set(callId, qMsg);
+            messages.push(qMsg);
+          }
+        } else if (isMessageToolName(lowTool)) {
+          const msgInfo = extractMessagePayload(args);
+          messages.push({
+            id: `chat:vsc-tr:${sessionId}:${agentId}:${idx}:msg`,
+            ts: toIsoUtc(epoch),
+            epoch,
+            agentId,
+            role: "subagent",
+            text: capChatText(
+              msgInfo.msgBody || summarizeToolCall(tname, args),
+            ),
+            ...(msgInfo.msgTarget ? { subagentId: msgInfo.msgTarget } : {}),
+          });
+        } else {
+          const ref: ChatToolCallRef = {
+            toolCallId: callId,
+            toolName: tname,
+            summary: summarizeToolCall(tname, args),
+            status: "running",
+            inputPreview: capChatText(JSON.stringify(args), 4096),
+          };
+          toolRefByCallId.set(callId, ref);
+          messages.push({
+            id: `chat:vsc-tr:${sessionId}:${agentId}:${idx}:tool`,
+            ts: toIsoUtc(epoch),
+            epoch,
+            agentId,
+            role: "tool",
+            text: ref.summary,
+            tools: [ref],
+          });
+        }
+      } else if (rtype === "tool.execution_complete") {
+        const callId =
+          (typeof d.toolCallId === "string" && d.toolCallId) || undefined;
+        const isErr =
+          d.success === false || d.isError === true || Boolean(d.error);
+        const outRaw = formatToolOutput(d.error ?? d.result).trim();
+        const ref = callId ? toolRefByCallId.get(callId) : undefined;
+        if (ref) {
+          ref.status = isErr ? "error" : "ok";
+          if (outRaw) ref.output = capChatText(outRaw);
+        }
+        const askMsg = callId ? askMsgByCallId.get(callId) : undefined;
+        if (askMsg) {
+          delete askMsg.pendingPromptId;
+        }
+      } else if (
+        rtype === "subagent.started" ||
+        rtype === "subagent.start"
+      ) {
+        const callId =
+          (typeof d.toolCallId === "string" && d.toolCallId) || undefined;
+        const subLabel =
+          [
+            d.agentDisplayName,
+            d.subAgentName,
+            d.subagentName,
+            d.agentName,
+            d.agentType,
+            d.subagentType,
+            d.description,
+          ]
+            .find(
+              (v): v is string =>
+                typeof v === "string" &&
+                Boolean(v.trim()) &&
+                !isOpaqueAgentId(v),
+            )
+            ?.trim() || "Subagent";
+        const explicitSubId =
+          (typeof d.subAgentInvocationId === "string" &&
+            d.subAgentInvocationId.trim() &&
+            d.subAgentInvocationId.trim() !== "root" &&
+            d.subAgentInvocationId.trim()) ||
+          (typeof d.agentId === "string" &&
+            d.agentId.trim() &&
+            d.agentId.trim() !== "root" &&
+            d.agentId.trim()) ||
+          (typeof d.subagentId === "string" &&
+            d.subagentId.trim() &&
+            d.subagentId.trim() !== "root" &&
+            d.subagentId.trim()) ||
+          undefined;
+        const baseSlug =
+          subLabel
+            .toLowerCase()
+            .replace(/[^a-z0-9_-]+/g, "-")
+            .replace(/^-+|-+$/g, "") || "subagent";
+        let rawSubId: string;
+        if (explicitSubId) {
+          rawSubId = explicitSubId;
+          usedSubagentSlugs.add(rawSubId);
+        } else {
+          rawSubId = baseSlug;
+          let suffix = 2;
+          while (usedSubagentSlugs.has(rawSubId)) {
+            rawSubId = `${baseSlug}-${suffix++}`;
+          }
+          usedSubagentSlugs.add(rawSubId);
+        }
+        if (callId) {
+          subagentIdByCallId.set(callId, { subId: rawSubId, subLabel });
+        }
+        const subPrompt =
+          typeof d.prompt === "string" ? d.prompt.trim() : "";
+        messages.push({
+          id: `chat:vsc-tr:${sessionId}:${agentId}:${idx}:substart`,
+          ts: toIsoUtc(epoch),
+          epoch,
+          agentId,
+          role: "subagent",
+          text: capChatText(subPrompt || `Spawned ${subLabel}`),
+          subagentId: rawSubId,
+          subagentLabel: subLabel,
+        });
+      } else if (
+        rtype === "subagent.completed" ||
+        rtype === "subagent.stop" ||
+        rtype === "subagent.failed"
+      ) {
+        const callId =
+          (typeof d.toolCallId === "string" && d.toolCallId) || undefined;
+        const prevSub = callId ? subagentIdByCallId.get(callId) : undefined;
+        const subLabel =
+          prevSub?.subLabel ||
+          [
+            d.agentDisplayName,
+            d.subAgentName,
+            d.subagentName,
+            d.agentName,
+            d.agentType,
+            d.subagentType,
+          ]
+            .find(
+              (v): v is string =>
+                typeof v === "string" &&
+                Boolean(v.trim()) &&
+                !isOpaqueAgentId(v),
+            )
+            ?.trim() ||
+          "Subagent";
+        const rawSubId =
+          prevSub?.subId ||
+          (typeof d.agentId === "string" && d.agentId.trim()) ||
+          (typeof d.subagentId === "string" && d.subagentId.trim()) ||
+          subLabel.toLowerCase().replace(/[^a-z0-9_-]+/g, "-") ||
+          "subagent";
+        const isErr = rtype === "subagent.failed" || Boolean(d.error);
+        const doneText =
+          typeof d.result === "string"
+            ? d.result.trim()
+            : typeof d.error === "string"
+              ? d.error.trim()
+              : "";
+        messages.push({
+          id: `chat:vsc-tr:${sessionId}:${agentId}:${idx}:subdone`,
+          ts: toIsoUtc(epoch),
+          epoch,
+          agentId,
+          role: "subagent",
+          text: capChatText(
+            doneText ||
+              (isErr
+                ? `Subagent failed: ${subLabel}`
+                : `Subagent finished: ${subLabel}`),
+          ),
+          subagentId: rawSubId,
+          subagentLabel: subLabel,
+        });
+      }
+    }
+
+    return messages;
+  }
+
+  async parseChat(
+    session: DiscoveredSession,
+    opts?: ParseChatOptions,
+  ): Promise<AgentChatMessage[]> {
+    if (
+      !session.filePath ||
+      path.basename(session.filePath).toLowerCase() === "telemetry.jsonl"
+    ) {
+      return [];
+    }
+
+    const reqAgent = opts?.agentId?.trim();
+    const normAlias = (v: string): string =>
+      v.trim().toLowerCase().replace(/[^a-z0-9_-]+/g, "-").replace(/^-+|-+$/g, "");
+    const targetAliases = new Set<string>();
+    if (reqAgent) {
+      targetAliases.add(reqAgent);
+      targetAliases.add(reqAgent.toLowerCase());
+      const ns = normAlias(reqAgent);
+      if (ns) targetAliases.add(ns);
+      for (const al of opts?.agentAliases ?? []) {
+        const t = al.trim();
+        if (!t) continue;
+        targetAliases.add(t);
+        targetAliases.add(t.toLowerCase());
+        const nas = normAlias(t);
+        if (nas) targetAliases.add(nas);
+      }
+    }
+    const msgExtraAliases = new Map<AgentChatMessage, string[]>();
+    const filterByAgent = (msgs: AgentChatMessage[]): AgentChatMessage[] => {
+      const out = reqAgent
+        ? msgs
+            .filter((m) => {
+              const candidates = [m.agentId, ...(msgExtraAliases.get(m) ?? [])];
+              return candidates.some((c) => {
+                const low = c.toLowerCase();
+                const slugged = normAlias(c);
+                return (
+                  targetAliases.has(c) ||
+                  targetAliases.has(low) ||
+                  (slugged.length > 0 && targetAliases.has(slugged))
+                );
+              });
+            })
+            .map((m) => (m.agentId === reqAgent ? m : { ...m, agentId: reqAgent }))
+        : msgs;
+      out.sort((a, b) => a.epoch - b.epoch);
+      return out;
+    };
+
+    if (isTranscriptJsonlPath(session.filePath)) {
+      const msgs = await this.parseTranscriptChat(
+        session.filePath,
+        session.sessionId,
+        {
+          workspacePath: session.workspacePath,
+          projectId: session.projectId,
+        },
+      );
+      return filterByAgent(msgs);
+    }
+
+    let fst;
+    try {
+      fst = await fs.stat(session.filePath);
+    } catch {
+      return [];
+    }
+    const state = await this.loadChatSessionState(
+      session.filePath,
+      fst.mtimeMs,
+      fst.size,
+    );
+    if (!state) return [];
+
+    const messages: AgentChatMessage[] = [];
+    const requests = Array.isArray(state.requests) ? state.requests : [];
+    const usedSubagentSlugs = new Set<string>();
+
+    for (let rIdx = 0; rIdx < requests.length; rIdx++) {
+      const req = requests[rIdx]!;
+      const reqEpoch = parseEpochSeconds(
+        req.timestamp,
+        (state.creationDate ? state.creationDate / 1000 : session.mtimeMs / 1000) +
+          rIdx,
+      );
+      const agentId = "root";
+
+      const promptText = req.message?.text?.trim() ?? "";
+      if (promptText) {
+        messages.push({
+          id: `chat:vsc:${session.sessionId}:${rIdx}:user`,
+          ts: toIsoUtc(reqEpoch),
+          epoch: reqEpoch,
+          agentId,
+          role: "user",
+          text: capChatText(resolveEmptyFileLinks(promptText)),
+        });
+      }
+
+      const responses = Array.isArray(req.response) ? req.response : [];
+      const reqQuestionAnalysis = analyzeCopilotRequestQuestions(req);
+
+      for (let i = 0; i < responses.length; i++) {
+        const item = responses[i]!;
+        const stepEpoch = reqEpoch + (i + 1) * 0.01;
+        const rkind = item.kind ?? "";
+
+        if (rkind === "thinking") {
+          const thinkText = extractMessageText(item.value).trim();
+          const genTitle =
+            typeof item.generatedTitle === "string"
+              ? item.generatedTitle.trim()
+              : "";
+          const body = thinkText || genTitle;
+          if (body) {
+            messages.push({
+              id: `chat:vsc:${session.sessionId}:${rIdx}:${i}:thk`,
+              ts: toIsoUtc(stepEpoch),
+              epoch: stepEpoch,
+              agentId,
+              role: "thinking",
+              text: capChatText(resolveEmptyFileLinks(body)),
+              thinking: capChatText(resolveEmptyFileLinks(body)),
+            });
+          }
+        } else if (!rkind || rkind === "markdownContent" || rkind === "text") {
+          const txt = (
+            extractMessageText(item.value) || extractMessageText(item.content)
+          ).trim();
+          if (txt) {
+            messages.push({
+              id: `chat:vsc:${session.sessionId}:${rIdx}:${i}:ast`,
+              ts: toIsoUtc(stepEpoch),
+              epoch: stepEpoch,
+              agentId,
+              role: "assistant",
+              text: capChatText(resolveEmptyFileLinks(txt)),
+            });
+          }
+        } else if (rkind === "toolInvocationSerialized") {
+          const tname = item.toolId || item.toolName || "tool";
+          const callId =
+            item.toolCallId || `${req.requestId ?? rIdx}:${i}:${tname}`;
+          const msg =
+            extractMessageText(item.pastTenseMessage) ||
+            extractMessageText(item.invocationMessage) ||
+            item.generatedTitle ||
+            tname;
+          const lowTool = tname.toLowerCase();
+
+          if (isSubagentToolName(lowTool)) {
+            const tsd = item.toolSpecificData;
+            const subLabel = String(
+              tsd?.subAgentName ??
+                tsd?.agentName ??
+                tsd?.agentType ??
+                tsd?.agent_type ??
+                tsd?.subagent_type ??
+                tsd?.name ??
+                tsd?.description ??
+                item.generatedTitle ??
+                "Subagent",
+            ).trim();
+            const explicitSubId =
+              (typeof tsd?.subAgentInvocationId === "string" &&
+                tsd.subAgentInvocationId.trim() &&
+                tsd.subAgentInvocationId.trim() !== "root" &&
+                tsd.subAgentInvocationId.trim()) ||
+              (typeof tsd?.agentId === "string" &&
+                tsd.agentId.trim() &&
+                tsd.agentId.trim() !== "root" &&
+                tsd.agentId.trim()) ||
+              (typeof tsd?.subagentId === "string" &&
+                tsd.subagentId.trim() &&
+                tsd.subagentId.trim() !== "root" &&
+                tsd.subagentId.trim()) ||
+              undefined;
+            const baseSlug =
+              subLabel
+                .toLowerCase()
+                .replace(/[^a-z0-9_-]+/g, "-")
+                .replace(/^-+|-+$/g, "") || "subagent";
+            let subId: string;
+            if (explicitSubId) {
+              subId = explicitSubId;
+              usedSubagentSlugs.add(subId);
+            } else {
+              subId = baseSlug;
+              let suffix = 2;
+              while (usedSubagentSlugs.has(subId)) {
+                subId = `${baseSlug}-${suffix++}`;
+              }
+              usedSubagentSlugs.add(subId);
+            }
+            const rawSubPrompt =
+              typeof tsd?.prompt === "string"
+                ? tsd.prompt
+                : typeof tsd?.instructions === "string"
+                  ? tsd.instructions
+                  : typeof tsd?.description === "string"
+                    ? tsd.description
+                    : extractMessageText(item.invocationMessage);
+            const doneText = item.isComplete
+              ? (
+                  extractMessageText(item.pastTenseMessage) ||
+                  (typeof item.resultDetails === "string"
+                    ? item.resultDetails
+                    : "")
+                ).trim()
+              : "";
+            const subText = [rawSubPrompt.trim(), doneText]
+              .filter(Boolean)
+              .join("\n\n");
+            messages.push({
+              id: `chat:vsc:${session.sessionId}:${rIdx}:${i}:sub`,
+              ts: toIsoUtc(stepEpoch),
+              epoch: stepEpoch,
+              agentId,
+              role: "subagent",
+              text: capChatText(
+                resolveEmptyFileLinks(subText || `Spawned ${subLabel}`),
+              ),
+              subagentId: subId,
+              subagentLabel: subLabel,
+            });
+          } else if (isCopilotAskTool(lowTool)) {
+            const mergedQs = reqQuestionAnalysis.mergedAskQuestions.get(i);
+            const askQs =
+              mergedQs && mergedQs.length > 0
+                ? mergedQs
+                : extractCopilotItemQuestions(item);
+            const isAskSuppressed =
+              Boolean(item.isComplete) ||
+              reqQuestionAnalysis.suppressedAskIndices.has(i);
+            const qText = formatQuestionsPreview(
+              askQs,
+              cleanHumanSummary(msg, 120) || "Waiting for user answer",
+            );
+            messages.push({
+              id: `chat:vsc:${session.sessionId}:${rIdx}:${i}:ask`,
+              ts: toIsoUtc(stepEpoch),
+              epoch: stepEpoch,
+              agentId,
+              role: "question",
+              text: capChatText(resolveEmptyFileLinks(qText)),
+              ...(!isAskSuppressed
+                ? { pendingPromptId: computePendingPromptId(agentId, callId) }
+                : {}),
+            });
+          } else {
+            const specificArgs = item.toolSpecificData ?? {};
+            const isMsgTool = isMessageToolName(lowTool);
+            if (isMsgTool) {
+              const msgInfo = extractMessagePayload(specificArgs);
+              messages.push({
+                id: `chat:vsc:${session.sessionId}:${rIdx}:${i}:msg`,
+                ts: toIsoUtc(stepEpoch),
+                epoch: stepEpoch,
+                agentId,
+                role: "subagent",
+                text: capChatText(
+                  resolveEmptyFileLinks(
+                    msgInfo.msgBody || summarizeToolCall(tname, specificArgs),
+                  ),
+                ),
+                ...(msgInfo.msgTarget ? { subagentId: msgInfo.msgTarget } : {}),
+              });
+            } else {
+              const cleanMsg =
+                cleanHumanSummary(msg, 140) ||
+                summarizeToolCall(tname, specificArgs);
+              const outStr =
+                typeof item.resultDetails === "string"
+                  ? item.resultDetails
+                  : item.resultDetails !== undefined
+                    ? JSON.stringify(item.resultDetails, null, 2)
+                    : "";
+              const ref: ChatToolCallRef = {
+                toolCallId: callId,
+                toolName: tname,
+                summary: cleanMsg,
+                status: item.isComplete ? "ok" : "running",
+                ...(Object.keys(specificArgs).length > 0
+                  ? {
+                      inputPreview: capChatText(
+                        JSON.stringify(specificArgs),
+                        4096,
+                      ),
+                    }
+                  : {}),
+                ...(outStr ? { output: capChatText(outStr) } : {}),
+              };
+              messages.push({
+                id: `chat:vsc:${session.sessionId}:${rIdx}:${i}:tool`,
+                ts: toIsoUtc(stepEpoch),
+                epoch: stepEpoch,
+                agentId,
+                role: "tool",
+                text: cleanMsg,
+                tools: [ref],
+              });
+            }
+          }
+        } else if (
+          rkind === "questionCarousel" ||
+          rkind === "elicitationSerialized"
+        ) {
+          if (reqQuestionAnalysis.mergedCarouselToAskIdx.has(i)) {
+            continue;
+          }
+          const isSuppressed =
+            reqQuestionAnalysis.suppressedCarouselIndices.has(i);
+          const carouselQs = extractCopilotItemQuestions(item);
+          const qText = formatQuestionsPreview(
+            carouselQs,
+            "Waiting for user answer",
+          );
+          const callId =
+            item.toolCallId || `${req.requestId ?? rIdx}:${i}:${rkind}`;
+          messages.push({
+            id: `chat:vsc:${session.sessionId}:${rIdx}:${i}:car`,
+            ts: toIsoUtc(stepEpoch),
+            epoch: stepEpoch,
+            agentId,
+            role: "question",
+            text: capChatText(resolveEmptyFileLinks(qText)),
+            ...(!isSuppressed
+              ? { pendingPromptId: computePendingPromptId(agentId, callId) }
+              : {}),
+          });
+        } else if (rkind === "textEditGroup") {
+          const callId = `${req.requestId ?? rIdx}:${i}:edit`;
+          const fileBase = extractUriBasename(item.uri);
+          const summary = fileBase ? `Edit ${fileBase}` : "Edit workspace files";
+          messages.push({
+            id: `chat:vsc:${session.sessionId}:${rIdx}:${i}:edit`,
+            ts: toIsoUtc(stepEpoch),
+            epoch: stepEpoch,
+            agentId,
+            role: "tool",
+            text: summary,
+            tools: [
+              {
+                toolCallId: callId,
+                toolName: "copilot_edit",
+                summary,
+                status: "ok",
+              },
+            ],
+          });
+        }
+      }
+    }
+
+    // Check sibling GitHub.copilot-chat/transcripts/*.jsonl for matching session/subagent transcripts
+    const wsHashDir = path.resolve(path.dirname(session.filePath), "..");
+    const transcriptsDir = path.join(
+      wsHashDir,
+      "GitHub.copilot-chat",
+      "transcripts",
+    );
+    const allowedRoots = this.getDefaultAllowedTranscriptRoots(
+      session.workspacePath,
+    );
+    try {
+      const tFiles = (await fs.readdir(transcriptsDir)).sort();
+      const usedChildTranscriptSlugs = new Set<string>();
+      for (const fname of tFiles) {
+        if (!fname.endsWith(".jsonl")) continue;
+        const tp = path.join(transcriptsDir, fname);
+        const validPath = await validateTranscriptPath(tp, allowedRoots, {
+          maxBytes: MAX_TRANSCRIPT_BYTES,
+        });
+        if (!validPath) continue;
+        const raw = await fs.readFile(validPath, "utf8").catch(() => "");
+        if (!raw) continue;
+        const rows = parseJsonlRows(raw);
+        const startRow = rows.find(
+          (r) => (r.type ?? r.event ?? "").toLowerCase() === "session.start",
+        );
+        const d =
+          startRow?.data && typeof startRow.data === "object"
+            ? startRow.data
+            : undefined;
+        const trSid =
+          (typeof d?.sessionId === "string" && d.sessionId.trim()) ||
+          (typeof startRow?.sessionId === "string" &&
+            startRow.sessionId.trim()) ||
+          fname.replace(/\.jsonl$/i, "");
+        const trParentSid =
+          (typeof d?.parentSessionId === "string" &&
+            d.parentSessionId.trim()) ||
+          (typeof startRow?.parentSessionId === "string" &&
+            startRow.parentSessionId.trim()) ||
+          undefined;
+        const isChildTranscript = trParentSid === session.sessionId;
+        const isMatchingRootTranscript =
+          !isChildTranscript &&
+          trSid === session.sessionId &&
+          messages.length === 0;
+        if (isChildTranscript || isMatchingRootTranscript) {
+          let agentOverride: string | undefined;
+          const childAliases: string[] = [];
+          if (isChildTranscript) {
+            const rawChildName = [
+              d?.agentDisplayName,
+              d?.agentName,
+              d?.agentType,
+              d?.subAgentName,
+              d?.subagentName,
+              startRow?.agentName,
+              startRow?.agentType,
+            ]
+              .find(
+                (v): v is string =>
+                  typeof v === "string" &&
+                  Boolean(v.trim()) &&
+                  !isOpaqueAgentId(v),
+              )
+              ?.trim();
+            const explicitChildId = [
+              d?.subAgentInvocationId,
+              d?.agentId,
+              d?.subagentId,
+              startRow?.agentId,
+            ]
+              .find(
+                (v): v is string =>
+                  typeof v === "string" &&
+                  Boolean(v.trim()) &&
+                  v.trim() !== "root",
+              )
+              ?.trim();
+            if (explicitChildId) {
+              agentOverride = explicitChildId;
+              usedChildTranscriptSlugs.add(agentOverride);
+            } else if (rawChildName) {
+              const baseSlug = normAlias(rawChildName) || "subagent";
+              let slugId = baseSlug;
+              let suffix = 2;
+              while (usedChildTranscriptSlugs.has(slugId)) {
+                slugId = `${baseSlug}-${suffix++}`;
+              }
+              usedChildTranscriptSlugs.add(slugId);
+              agentOverride = slugId;
+            } else {
+              agentOverride = trSid;
+            }
+            if (rawChildName) childAliases.push(rawChildName);
+            childAliases.push(trSid);
+          }
+          const trMsgs = await this.parseTranscriptChat(
+            validPath,
+            session.sessionId,
+            {
+              ...(agentOverride ? { agentIdOverride: agentOverride } : {}),
+              workspacePath: session.workspacePath,
+              projectId: session.projectId,
+              allowedRoots,
+            },
+          );
+          if (childAliases.length > 0) {
+            for (const tm of trMsgs) {
+              msgExtraAliases.set(tm, childAliases);
+            }
+          }
+          messages.push(...trMsgs);
+        }
+      }
+    } catch {
+      // No sibling transcripts directory
+    }
+
+    return filterByAgent(messages);
   }
 }

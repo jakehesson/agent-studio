@@ -15,12 +15,18 @@ import {
 import { splitFrontmatter } from "../../src/compiler/shared.js";
 import {
   DEFAULT_MODEL_INDEX,
+  LEGACY_COPILOT_MODEL_ALIASES,
+  accuracyScore,
   defaultTierForRoleType,
   getFileLockPath,
   getGlobalModelIndexPath,
   getTeamYamlPath,
   getWorkspaceModelIndexPath,
   inferModelTier,
+  isLegacyCopilotPickerId,
+  normalizeCopilotModelId,
+  normalizeLegacyCopilotModelId,
+  rankCatalogModelsForTier,
   resolveEffectiveModelIndex,
   resolveRoleModel,
   updateModelIndexOverlay,
@@ -64,7 +70,8 @@ describe("Per-Role Model Routing, 3-Layer Model Index & Compilers", () => {
 
   it("validates DEFAULT_MODEL_INDEX and enforces 3-layer overlay merge & vscode-lm availability propagation", async () => {
     const validated = ModelIndexSchema.parse(DEFAULT_MODEL_INDEX);
-    assert.equal(validated.roleRecommendations.orchestrator?.tier, "fast");
+    assert.equal(validated.roleRecommendations.orchestrator?.tier, "balanced");
+    assert.equal(validated.roleRecommendations["qa-validator"]?.tier, "balanced");
     assert.equal(validated.roleRecommendations.architect?.tier, "reasoning");
     assert.equal(
       validated.roleRecommendations["code-reviewer"]?.tier,
@@ -296,7 +303,7 @@ describe("Per-Role Model Routing, 3-Layer Model Index & Compilers", () => {
     ) as { model?: unknown };
     assert.equal(agyOrchFm.model, "inherit");
 
-    // When respectBuiltInOrchestrators is false, Antigravity orchestrator falls back to tier binding (flash_lite)
+    // When respectBuiltInOrchestrators is false, Antigravity orchestrator falls back to balanced tier binding (flash)
     const policyManifest = parseTeamYaml(fs.readFileSync(getTeamYamlPath(repo), "utf8"));
     const policyOrch = policyManifest.roster.find((r) => r.id === "orchestrator")!;
     policyManifest.workflow.modelRouting = {
@@ -305,6 +312,7 @@ describe("Per-Role Model Routing, 3-Layer Model Index & Compilers", () => {
       respectBuiltInOrchestrators: false,
       allowSubagentModelHints: true,
       copilotHandoffModels: false,
+      selectionPriority: ["accuracy", "cost", "speed"],
     };
     const agyOrchOptOut = resolveRoleModel(
       policyManifest,
@@ -312,7 +320,28 @@ describe("Per-Role Model Routing, 3-Layer Model Index & Compilers", () => {
       "antigravity",
       DEFAULT_MODEL_INDEX,
     );
-    assert.equal(agyOrchOptOut.frontmatterModel, "flash_lite");
+    assert.equal(agyOrchOptOut.frontmatterModel, "flash");
+
+    // Cross-IDE deferToHostOrchestrator: Copilot omits orchestrator model under respectBuiltInOrchestrators: true,
+    // while emitting balanced array under respectBuiltInOrchestrators: false.
+    const vscOrchDefault = parseYaml(
+      splitFrontmatter(
+        fs.readFileSync(
+          path.join(repo, ".github", "agents", "orchestrator.agent.md"),
+          "utf8",
+        ),
+      ).frontmatter ?? "",
+    ) as { model?: unknown; "model-policy"?: string; handoffs?: Array<{ agent: string; model?: string }> };
+    assert.equal(vscOrchDefault.model, undefined);
+    assert.equal(vscOrchDefault["model-policy"], undefined);
+    const vscOrchOptOut = resolveRoleModel(
+      policyManifest,
+      policyOrch,
+      "copilot-vscode",
+      DEFAULT_MODEL_INDEX,
+    );
+    assert.equal(vscOrchOptOut.omit, false);
+    assert.equal(vscOrchOptOut.primaryModel, "claude-sonnet-4.6");
 
     // Check Claude Code architect -> opus
     const ccArchFm = parseYaml(
@@ -322,7 +351,7 @@ describe("Per-Role Model Routing, 3-Layer Model Index & Compilers", () => {
     ) as { model?: unknown };
     assert.equal(ccArchFm.model, "opus");
 
-    // Check code-reviewer across all 3 IDEs -> pro / opus / Claude Opus 4.5 (copilot) fallback array
+    // Check code-reviewer across all 3 IDEs -> pro / opus / claude-opus-4.6 fallback array
     const agyRevFm = parseYaml(
       splitFrontmatter(
         fs.readFileSync(
@@ -349,10 +378,10 @@ describe("Per-Role Model Routing, 3-Layer Model Index & Compilers", () => {
       ).frontmatter ?? "",
     ) as { model?: unknown; "model-policy"?: string };
     assert.ok(Array.isArray(vscRevFm.model));
-    assert.equal((vscRevFm.model as string[])[0], "Claude Opus 4.5 (copilot)");
+    assert.equal((vscRevFm.model as string[])[0], "claude-opus-4.6");
     assert.equal(vscRevFm["model-policy"], "preferred");
 
-    // Check Copilot backend-engineer -> picker array + model-policy: preferred; orchestrator handoffs omit model by default
+    // Check Copilot backend-engineer -> picker array + model-policy: preferred; orchestrator handoffs omitted in copilot mode
     const vscBackendFm = parseYaml(
       splitFrontmatter(
         fs.readFileSync(
@@ -362,20 +391,13 @@ describe("Per-Role Model Routing, 3-Layer Model Index & Compilers", () => {
       ).frontmatter ?? "",
     ) as { model?: unknown; "model-policy"?: string };
     assert.ok(Array.isArray(vscBackendFm.model));
-    assert.equal((vscBackendFm.model as string[])[0], "Claude Sonnet 4.5 (copilot)");
+    assert.equal((vscBackendFm.model as string[])[0], "claude-sonnet-4.6");
     assert.equal(vscBackendFm["model-policy"], "preferred");
 
-    const vscOrchFm = parseYaml(
-      splitFrontmatter(
-        fs.readFileSync(
-          path.join(repo, ".github", "agents", "orchestrator.agent.md"),
-          "utf8",
-        ),
-      ).frontmatter ?? "",
-    ) as { handoffs?: Array<{ agent: string; model?: string }> };
-    assert.ok(
-      vscOrchFm.handoffs?.every((h) => h.model === undefined),
-      "handoffs[].model must be omitted by default",
+    assert.equal(
+      vscOrchDefault.handoffs,
+      undefined,
+      "handoffs must be omitted in copilot harness mode",
     );
 
     // Shared rules include Model Routing & Host Compatibility section
@@ -394,7 +416,7 @@ describe("Per-Role Model Routing, 3-Layer Model Index & Compilers", () => {
     });
     compileTeam(repo);
     await runModelsCli(
-      ["set-tier", "copilot-vscode", "balanced", "GPT-4.1 (copilot)", "--scope", "global", "--quiet"],
+      ["set-tier", "copilot-vscode", "balanced", "gpt-4.1", "--scope", "global", "--quiet"],
     );
     const deterministicDrift = checkTeamDrift(repo);
     assert.equal(deterministicDrift.ok, true, "Layer 1 global change must not break CI sync --check");
@@ -409,7 +431,7 @@ describe("Per-Role Model Routing, 3-Layer Model Index & Compilers", () => {
         ),
       ).frontmatter ?? "",
     ) as { model?: string[] };
-    assert.equal(vscBackendGlobal.model?.[0], "GPT-4.1 (copilot)");
+    assert.equal(vscBackendGlobal.model?.[0], "gpt-4.1");
     // Restore workspace default seed before continuing policy assertions
     await runModelsCli(["reset", "--scope", "workspace", "--project", repo, "--sync", "--quiet"]);
 
@@ -460,9 +482,14 @@ describe("Per-Role Model Routing, 3-Layer Model Index & Compilers", () => {
         ),
       ).frontmatter ?? "",
     ) as { model?: unknown; "model-policy"?: unknown };
-    assert.equal(vscPinned.model, "Claude Sonnet 4.5 (copilot)");
+    assert.equal(vscPinned.model, "claude-sonnet-4.6");
     assert.equal(vscPinned["model-policy"], "required");
 
+    // In legacy-local harness mode, copilotHandoffModels: true emits model on handoffs
+    await withTeamYamlLock(getTeamYamlPath(repo), (m) => {
+      m.workflow.copilotHarness = "legacy-local";
+    });
+    compileTeam(repo);
     const vscOrchPinned = parseYaml(
       splitFrontmatter(
         fs.readFileSync(
@@ -473,7 +500,7 @@ describe("Per-Role Model Routing, 3-Layer Model Index & Compilers", () => {
     ) as { handoffs?: Array<{ agent: string; model?: string }> };
     assert.ok(
       vscOrchPinned.handoffs?.some((h) => h.agent === "backend-engineer" && Boolean(h.model)),
-      "handoffs[].model emitted when copilotHandoffModels is true",
+      "handoffs[].model emitted in legacy-local mode when copilotHandoffModels is true",
     );
 
     // 4. Direct resolveRoleModel precedence check (override { omit: true } and per-IDE policy)
@@ -484,7 +511,7 @@ describe("Per-Role Model Routing, 3-Layer Model Index & Compilers", () => {
     assert.equal(omitted.omit, true);
     assert.equal(omitted.frontmatterModel, undefined);
 
-    // 5. Global install emits model: inherit for AGY & CC and omits for Copilot
+    // 5. Global install emits model: inherit for AGY & CC and omits for Copilot (in $COPILOT_HOME)
     installGlobalSetupAgent({ homeDir: tmpDir });
     const globalAgyFm = parseYaml(
       splitFrontmatter(
@@ -502,7 +529,7 @@ describe("Per-Role Model Routing, 3-Layer Model Index & Compilers", () => {
     const globalVscFm = parseYaml(
       splitFrontmatter(
         fs.readFileSync(
-          path.join(tmpDir, "vscode-user", "prompts", "team-setup.agent.md"),
+          path.join(tmpDir, ".copilot", "agents", "team-setup.agent.md"),
           "utf8",
         ),
       ).frontmatter ?? "",
@@ -527,7 +554,7 @@ describe("Per-Role Model Routing, 3-Layer Model Index & Compilers", () => {
       (d) => d.source_ide === "copilot-vscode" && d.id === "backend-engineer",
     );
     assert.ok(vscBackend);
-    assert.equal(vscBackend.model, "Claude Sonnet 4.5 (copilot)");
+    assert.equal(vscBackend.model, "claude-sonnet-4.6");
     assert.ok(
       Array.isArray(vscBackend.modelFallbacks) && vscBackend.modelFallbacks.length >= 2,
     );
@@ -651,5 +678,260 @@ describe("Per-Role Model Routing, 3-Layer Model Index & Compilers", () => {
     await runModelsCli(["reset", "--scope", "workspace", "--project", repo, "--sync", "--quiet"]);
     const docRepaired = buildDoctorReport(repo);
     assert.equal(docRepaired.modelIndex.valid, true);
+  });
+
+  it("ranks models deterministically by Accuracy -> Cost -> Speed, filters unavailable/deprecated entries, and auto-ranks untouched tiers on vscode-lm discovery", async () => {
+    // 1. Accuracy -> Cost -> Speed + deprecated exclusion
+    const rankedFast = rankCatalogModelsForTier(
+      DEFAULT_MODEL_INDEX.ides["copilot-vscode"].catalog,
+      "fast",
+    );
+    assert.equal(rankedFast[0]?.id, "gemini-3-flash");
+    assert.ok(
+      rankedFast.findIndex((m) => m.id === "claude-haiku-4.5") >
+        rankedFast.findIndex((m) => m.id === "gpt-5-mini"),
+      "deprecated claude-haiku-4.5 must rank below modern fast models",
+    );
+    assert.equal(
+      DEFAULT_MODEL_INDEX.ides["copilot-vscode"].catalog.find(
+        (m) => m.id === "gpt-4.1",
+      )?.contextWindow,
+      1_000_000,
+    );
+
+    // 2. Cost tie-breaker when accuracyRank is identical
+    const tieRanked = rankCatalogModelsForTier(
+      [
+        {
+          id: "Expensive-A",
+          label: "Expensive A",
+          tier: "balanced",
+          capabilities: ["coding"],
+          accuracyRank: 85,
+          premiumMultiplier: 3,
+          speedRank: 90,
+          available: true,
+          source: "built-in",
+        },
+        {
+          id: "Cheaper-B",
+          label: "Cheaper B",
+          tier: "balanced",
+          capabilities: ["coding"],
+          accuracyRank: 85,
+          premiumMultiplier: 0.33,
+          speedRank: 70,
+          available: true,
+          source: "built-in",
+        },
+      ],
+      "balanced",
+    );
+    assert.equal(tieRanked[0]?.id, "Cheaper-B");
+
+    // 3. resolveRoleModel filters out catalog entries marked available: false
+    const repo = path.join(tmpDir, "repo-avail-filter");
+    scaffoldAgentTeam(repo, { projectId: "avail-app", projectTitle: "Avail App" });
+    const manifest = parseTeamYaml(fs.readFileSync(getTeamYamlPath(repo), "utf8"));
+    const backend = manifest.roster.find((r) => r.id === "backend-engineer")!;
+    const filteredIdx = resolveEffectiveModelIndex({
+      projectRoot: repo,
+      useGlobal: true,
+      globalOverlay: {
+        schemaVersion: 1,
+        ides: {
+          "copilot-vscode": {
+            catalog: [
+              {
+                id: "claude-sonnet-4.6",
+                label: "Claude Sonnet 4.6",
+                tier: "balanced",
+                capabilities: ["coding"],
+                available: false,
+                source: "vscode-lm",
+              },
+            ],
+          },
+        },
+      },
+    });
+    const resolvedBackend = resolveRoleModel(
+      manifest,
+      backend,
+      "copilot-vscode",
+      filteredIdx,
+    );
+    assert.equal(resolvedBackend.primaryModel, "gpt-5.4");
+    assert.ok(
+      !resolvedBackend.fallbackModels.includes("claude-sonnet-4.6"),
+    );
+
+    // 4. applyDiscoveredModels auto-ranks untouched tiers and preserves explicit user overrides
+    await runModelsCli(
+      ["discover", "--ide", "copilot-vscode", "--scope", "global", "--project", repo, "--quiet"],
+      {
+        stdinText: JSON.stringify([
+          {
+            id: "mai-code-2",
+            label: "Mai Code 2",
+            vendor: "copilot",
+            family: "mai-code-2",
+            version: "mai-code-2",
+            maxInputTokens: 921_805,
+          },
+          {
+            id: "claude-sonnet-4.6",
+            label: "Claude Sonnet 4.6",
+            vendor: "copilot",
+            family: "claude-sonnet-4.6",
+            maxInputTokens: 200_000,
+          },
+        ]),
+      },
+    );
+    const afterDiscover = resolveEffectiveModelIndex({
+      projectRoot: repo,
+      useGlobal: true,
+    });
+    assert.equal(
+      afterDiscover.ides["copilot-vscode"].tiers.balanced.primary,
+      "claude-sonnet-4.6",
+    );
+
+    // Explicit user override via set-tier must NOT be overwritten by subsequent discovery
+    await writeModelIndexAtomic(getWorkspaceModelIndexPath(repo), {
+      schemaVersion: 1,
+      updatedAt: "2026-11-26T00:00:00Z",
+      updatedBy: "cli",
+    });
+    await runModelsCli([
+      "set-tier",
+      "copilot-vscode",
+      "balanced",
+      "mai-code-2",
+      "--scope",
+      "global",
+      "--quiet",
+    ]);
+    await runModelsCli(
+      ["discover", "--ide", "copilot-vscode", "--scope", "global", "--project", repo, "--quiet"],
+      {
+        stdinText: JSON.stringify([
+          {
+            id: "mai-code-2",
+            label: "Mai Code 2",
+            vendor: "copilot",
+            family: "mai-code-2",
+            maxInputTokens: 921_805,
+          },
+          {
+            id: "claude-sonnet-4.6",
+            label: "Claude Sonnet 4.6",
+            vendor: "copilot",
+            family: "claude-sonnet-4.6",
+            maxInputTokens: 200_000,
+          },
+        ]),
+      },
+    );
+    const afterManual = resolveEffectiveModelIndex({
+      projectRoot: repo,
+      useGlobal: true,
+    });
+    assert.equal(
+      afterManual.ides["copilot-vscode"].tiers.balanced.primary,
+      "mai-code-2",
+    );
+
+    // 5. Hyphenated version matching in accuracyScore
+    assert.equal(
+      accuracyScore({
+        id: "claude-opus-4-6",
+        label: "Claude Opus 4.6",
+        tier: "reasoning",
+        capabilities: ["reasoning"],
+        available: true,
+        source: "built-in",
+      }),
+      100,
+    );
+    assert.equal(
+      accuracyScore({
+        id: "claude-sonnet-4-6",
+        label: "Claude Sonnet 4.6",
+        tier: "balanced",
+        capabilities: ["coding"],
+        available: true,
+        source: "built-in",
+      }),
+      88,
+    );
+  });
+
+  it("maps legacy built-in Copilot picker IDs deterministically while preserving custom/BYOK IDs", () => {
+    assert.equal(Object.keys(LEGACY_COPILOT_MODEL_ALIASES).length, 16);
+    assert.equal(
+      normalizeLegacyCopilotModelId("Claude Sonnet 4.6 (copilot)"),
+      "claude-sonnet-4.6",
+    );
+    assert.equal(
+      normalizeCopilotModelId("  claude   opus 4.6 (COPILOT)  "),
+      "claude-opus-4.6",
+    );
+    assert.equal(normalizeLegacyCopilotModelId("GPT-5.4 (copilot)"), "gpt-5.4");
+    assert.equal(
+      isLegacyCopilotPickerId("Claude Sonnet 4.6 (copilot)"),
+      true,
+    );
+    assert.equal(isLegacyCopilotPickerId("claude-sonnet-4.6"), false);
+
+    // Custom / BYOK IDs must NEVER be rewritten
+    assert.equal(
+      normalizeLegacyCopilotModelId("custom/enterprise-byok-model"),
+      "custom/enterprise-byok-model",
+    );
+    assert.equal(
+      normalizeLegacyCopilotModelId("My Custom Org Model (copilot)"),
+      "My Custom Org Model (copilot)",
+    );
+
+    // resolveRoleModel normalizes legacy pins in "copilot" mode, preserves in "legacy-local"
+    const repo = path.join(tmpDir, "repo-alias-resolve");
+    scaffoldAgentTeam(repo, { projectId: "alias-app", projectTitle: "Alias App" });
+    const manifest = parseTeamYaml(fs.readFileSync(getTeamYamlPath(repo), "utf8"));
+    const backend = manifest.roster.find((r) => r.id === "backend-engineer")!;
+    backend.models = {
+      "copilot-vscode": [
+        "Claude Sonnet 4.6 (copilot)",
+        "GPT-5.4 (copilot)",
+        "custom/byok-fallback",
+      ],
+    };
+
+    const resolvedCopilot = resolveRoleModel(
+      manifest,
+      backend,
+      "copilot-vscode",
+      DEFAULT_MODEL_INDEX,
+    );
+    assert.deepEqual(resolvedCopilot.frontmatterModel, [
+      "claude-sonnet-4.6",
+      "gpt-5.4",
+      "custom/byok-fallback",
+    ]);
+    assert.equal(resolvedCopilot.primaryModel, "claude-sonnet-4.6");
+
+    manifest.workflow.copilotHarness = "legacy-local";
+    const resolvedLegacy = resolveRoleModel(
+      manifest,
+      backend,
+      "copilot-vscode",
+      DEFAULT_MODEL_INDEX,
+    );
+    assert.deepEqual(resolvedLegacy.frontmatterModel, [
+      "Claude Sonnet 4.6 (copilot)",
+      "GPT-5.4 (copilot)",
+      "custom/byok-fallback",
+    ]);
   });
 });

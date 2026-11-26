@@ -7,6 +7,7 @@ import {
   QaGateError,
   boardAdd,
   boardGate,
+  boardHandoff,
   boardMove,
   boardNext,
   boardNote,
@@ -14,6 +15,7 @@ import {
   boardPlan,
   boardReport,
   boardShow,
+  boardSplit,
   boardStatus,
   getBoardLockPath,
   initBoardFile,
@@ -419,5 +421,164 @@ describe("Board registry, atomic locking, and QA Gate engine", () => {
         }),
       QaGateError,
     );
+  });
+
+  it("supports S1-65 context handoff, task splitting, structured show output, and auto-resume", async () => {
+    const projDir = path.join(tmpRoot, "handoff-app");
+    const boardPath = path.join(projDir, "pipeline", "board.json");
+    await initBoardFile(boardPath, {
+      projectId: "handoff-app",
+      sprintId: "S1",
+      suites: { smoke: ["CP0"] },
+    });
+    registerProject({ root: projDir, id: "handoff-app" });
+    const ctx = { project: resolveProject("handoff-app") };
+
+    const added = await boardAdd(ctx, {
+      type: "story",
+      title: "Large feature requiring fresh-context handoff and split",
+      role: "backend",
+      actor: "orchestrator",
+    });
+    const parentId = added.data.id;
+    await boardOwner(ctx, { itemId: parentId, owner: "backend-engineer" });
+    await boardMove(ctx, { itemId: parentId, state: "dev", actor: "backend-engineer" });
+
+    // 1. Fresh-context handoff clears owner, sets pending_handoff, and appears in status & show
+    const ho1 = await boardHandoff(ctx, {
+      itemId: parentId,
+      kind: "fresh_context",
+      actor: "backend-engineer",
+      summary: "Schema & model layer complete; server routes remain",
+      modifiedFiles: ["src/schema/board.ts"],
+      verifiedChecks: ["npm run check PASS"],
+      remainingWork: ["Implement HTTP ingest advisory"],
+      continuationBrief: "Pick up at src/server/http-server.ts",
+      contextPercent: 58.4,
+      contextTokens: 584_000,
+      contextWindow: 1_000_000,
+    });
+    assert.equal(ho1.data.handoff?.status, "pending_handoff");
+    assert.equal(ho1.data.owner, null);
+
+    const st1 = await boardStatus(ctx);
+    assert.match(st1.text, /\[HANDOFF_PENDING\]/);
+
+    const shown1 = await boardShow(ctx, { itemId: parentId });
+    assert.match(shown1.text, /handoff:/);
+    assert.match(shown1.text, /status: pending_handoff/);
+    assert.match(shown1.text, /continuation_brief: Pick up at src\/server\/http-server\.ts/);
+
+    // Assigning new owner auto-transitions pending_handoff -> resumed
+    const reowned = await boardOwner(ctx, { itemId: parentId, owner: "backend-engineer-2" });
+    assert.equal(reowned.data.handoff?.status, "resumed");
+
+    // 2. Task-split handoff + atomic boardSplit
+    const ho2 = await boardHandoff(ctx, {
+      itemId: parentId,
+      kind: "task_split",
+      actor: "backend-engineer-2",
+      summary: "Work spans backend and frontend modules",
+      modifiedFiles: ["src/server/http-server.ts"],
+      remainingWork: ["Wire UI cards", "Add unit tests"],
+      continuationBrief: "Split into frontend + QA tasks",
+      splitProposals: [
+        {
+          title: "Wire UI handoff pill",
+          role: "frontend",
+          ac: ["Render HANDOFF pill"],
+          rationale: "Exclusive web/ scope",
+        },
+        {
+          title: "Add unit tests for handoff",
+          role: "qa",
+          ac: ["Tests pass"],
+        },
+      ],
+      contextPercent: 61,
+    });
+    assert.equal(ho2.data.handoff?.status, "pending_split");
+    assert.match((await boardStatus(ctx)).text, /\[SPLIT_PENDING\]/);
+
+    const splitRes = await boardSplit(ctx, {
+      itemId: parentId,
+      actor: "orchestrator",
+    });
+    assert.equal(splitRes.data.children.length, 2);
+    const [c1, c2] = splitRes.data.children;
+    assert.equal(c1?.split_from, parentId);
+    assert.equal(c2?.split_from, parentId);
+    assert.equal(c1?.sprint, "S1");
+    assert.ok(splitRes.data.parent.deps?.includes(c1!.id));
+    assert.ok(splitRes.data.parent.deps?.includes(c2!.id));
+    assert.equal(splitRes.data.parent.handoff?.status, "resumed");
+
+    // Parent cannot move dev -> test while split child tasks are unfinished
+    await assert.rejects(
+      () =>
+        boardMove(ctx, {
+          itemId: parentId,
+          state: "test",
+          actor: "orchestrator",
+          note: "Attempt premature test transition",
+        }),
+      /unfinished deps/,
+    );
+
+    // 3. S1-67 additive ContextHandoff fields round-trip cleanly via boardHandoff & boardShow
+    const hoFull = await boardHandoff(ctx, {
+      itemId: parentId,
+      kind: "fresh_context",
+      actor: "backend-engineer",
+      objective: "Complete S1-67 handoff fields",
+      summary: "All schema fields wired",
+      evidence: ["unit test verified"],
+      decisions: ["Use optional arrays"],
+      assumptions: ["Backwards-compatible board.json"],
+      unresolvedIssues: ["Verify Web Studio view"],
+      modifiedFiles: ["src/schema/board.ts"],
+      remainingWork: ["Finish QA"],
+      continuationBrief: "Run CP0",
+    });
+    assert.equal(hoFull.data.handoff?.objective, "Complete S1-67 handoff fields");
+    assert.deepEqual(hoFull.data.handoff?.decisions, ["Use optional arrays"]);
+    const shownFull = await boardShow(ctx, { itemId: parentId });
+    assert.match(shownFull.text, /objective: Complete S1-67 handoff fields/);
+    assert.match(shownFull.text, /unresolved_issues:\s*\n\s*- Verify Web Studio view/);
+
+    // 4. boardSplit deduplicates deps, rejects circular parent.id dep when blockParent=true, and allows blockParent=false
+    await assert.rejects(
+      () =>
+        boardSplit(ctx, {
+          itemId: parentId,
+          actor: "orchestrator",
+          subtasks: [
+            {
+              title: "Circular child",
+              role: "backend",
+              ac: ["Should fail"],
+              deps: [parentId],
+            },
+          ],
+        }),
+      /Circular dependency/,
+    );
+
+    const noBlockSplit = await boardSplit(ctx, {
+      itemId: parentId,
+      actor: "orchestrator",
+      blockParent: false,
+      subtasks: [
+        {
+          title: "Deduped follow-up",
+          role: "backend",
+          ac: ["Works"],
+          deps: [c1!.id, c1!.id, parentId],
+        },
+      ],
+    });
+    const followUp = noBlockSplit.data.children[0]!;
+    assert.deepEqual(followUp.deps, [c1!.id, parentId]);
+    assert.ok(!noBlockSplit.data.parent.deps?.includes(followUp.id));
   });
 });

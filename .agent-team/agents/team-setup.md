@@ -49,4 +49,4 @@ Your mission is to onboard or upgrade a repository to the IDE-agnostic Agent Stu
   ```bash
   agent-studio serve --open
   ```
-- Summarize all generated/updated files and show how to invoke `orchestrator` in each enabled IDE (Antigravity plugin, Claude Code `@orchestrator` / `Agent`, VS Code Copilot Chat agent dropdown with handoff buttons).
+- Summarize all generated/updated files and show how to invoke `orchestrator` in each enabled IDE (Antigravity plugin, Claude Code `@orchestrator` / `Agent`, VS Code Copilot Chat agent dropdown / `agent` tool).

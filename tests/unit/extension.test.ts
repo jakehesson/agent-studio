@@ -59,6 +59,293 @@ function loadExtensionCliShimModule(): typeof CliShimModule {
   return mod.exports as typeof CliShimModule;
 }
 
+function transpileTsFile(
+  filePath: string,
+  customRequire: (id: string) => unknown,
+): Record<string, unknown> {
+  const source = fs.readFileSync(filePath, "utf8");
+  const { outputText } = ts.transpileModule(source, {
+    compilerOptions: {
+      module: ts.ModuleKind.CommonJS,
+      target: ts.ScriptTarget.ES2022,
+      esModuleInterop: true,
+    },
+  });
+  const mod = { exports: {} as Record<string, unknown> };
+  const fn = new Function("exports", "module", "require", outputText);
+  fn(mod.exports, mod, customRequire);
+  return mod.exports;
+}
+
+function createVscodeMock() {
+  const createdStatusItems: Array<{
+    command?: string;
+    text: string;
+    tooltip: unknown;
+    backgroundColor: unknown;
+    show(): void;
+    dispose(): void;
+  }> = [];
+  const createdPanels: Array<{
+    viewType: string;
+    title: string;
+    webview: {
+      html: string;
+      postedMessages: unknown[];
+      postMessage(msg: unknown): Promise<boolean>;
+      onDidReceiveMessage(cb: (msg: unknown) => void): { dispose(): void };
+      emitMessage(msg: unknown): Promise<void>;
+    };
+    revealedColumns: number[];
+    reveal(col: number): void;
+    onDidDispose(cb: () => void): { dispose(): void };
+    dispose(): void;
+  }> = [];
+  const executedCommands: Array<{ command: string; args: unknown[] }> = [];
+  const clipboardWrites: string[] = [];
+  let availableCommands: string[] = ["workbench.action.chat.open"];
+  let executeCommandImpl:
+    | ((command: string, ...args: unknown[]) => Promise<unknown>)
+    | undefined;
+  let clipboardError: Error | undefined;
+
+  class MockThemeColor {
+    constructor(public readonly id: string) {}
+  }
+  class MockMarkdownString {
+    constructor(public readonly value: string) {}
+  }
+
+  const vscodeMock = {
+    StatusBarAlignment: { Left: 1, Right: 2 },
+    ViewColumn: { One: 1, Beside: 2 },
+    ThemeColor: MockThemeColor,
+    MarkdownString: MockMarkdownString,
+    Uri: {
+      parse: (v: string) => ({ toString: () => v }),
+      file: (v: string) => ({ fsPath: v, toString: () => `file://${v}` }),
+    },
+    Range: class {
+      constructor(
+        public startLine: number,
+        public startChar: number,
+        public endLine: number,
+        public endChar: number,
+      ) {}
+    },
+    workspace: {
+      workspaceFolders: [{ uri: { fsPath: REPO_ROOT }, name: "AgentVisualizer" }],
+    },
+    extensions: {
+      getExtension: () => ({ packageJSON: { version: EXPECTED_VERSION } }),
+    },
+    env: {
+      asExternalUri: async (uri: { toString(skip?: boolean): string }) => uri,
+      openExternal: async () => true,
+      clipboard: {
+        writeText: async (text: string) => {
+          if (clipboardError) throw clipboardError;
+          clipboardWrites.push(text);
+        },
+      },
+    },
+    commands: {
+      getCommands: async () => availableCommands,
+      executeCommand: async (command: string, ...args: unknown[]) => {
+        executedCommands.push({ command, args });
+        if (executeCommandImpl) {
+          return await executeCommandImpl(command, ...args);
+        }
+        return undefined;
+      },
+    },
+    window: {
+      showWarningMessage: async () => undefined,
+      createStatusBarItem: () => {
+        const item = {
+          command: undefined as string | undefined,
+          text: "",
+          tooltip: undefined as unknown,
+          backgroundColor: undefined as unknown,
+          show() {},
+          dispose() {},
+        };
+        createdStatusItems.push(item);
+        return item;
+      },
+      createWebviewPanel: (viewType: string, title: string) => {
+        let msgHandler: ((msg: unknown) => unknown) | undefined;
+        let disposeHandler: (() => void) | undefined;
+        let disposed = false;
+        const postedMessages: unknown[] = [];
+        const revealedColumns: number[] = [];
+        const panel = {
+          viewType,
+          title,
+          revealedColumns,
+          webview: {
+            html: "",
+            postedMessages,
+            postMessage: async (msg: unknown) => {
+              postedMessages.push(msg);
+              return true;
+            },
+            onDidReceiveMessage: (cb: (msg: unknown) => unknown) => {
+              msgHandler = cb;
+              return { dispose() {} };
+            },
+            emitMessage: async (msg: unknown) => {
+              if (msgHandler) {
+                await msgHandler(msg);
+              }
+            },
+          },
+          reveal(col: number) {
+            revealedColumns.push(col);
+          },
+          onDidDispose(cb: () => void) {
+            disposeHandler = cb;
+            return { dispose() {} };
+          },
+          dispose() {
+            if (disposed) return;
+            disposed = true;
+            disposeHandler?.();
+          },
+        };
+        createdPanels.push(panel);
+        return panel;
+      },
+    },
+  };
+
+  return {
+    vscodeMock,
+    createdStatusItems,
+    createdPanels,
+    executedCommands,
+    clipboardWrites,
+    setAvailableCommands: (cmds: string[]) => {
+      availableCommands = cmds;
+    },
+    setExecuteCommandImpl: (
+      fn: ((command: string, ...args: unknown[]) => Promise<unknown>) | undefined,
+    ) => {
+      executeCommandImpl = fn;
+    },
+    setClipboardError: (err: Error | undefined) => {
+      clipboardError = err;
+    },
+  };
+}
+
+function loadExtensionStatusBarModule(vscodeMock: unknown) {
+  const srcPath = path.join(EXT_ROOT, "src", "statusBar.ts");
+  const localRequire = createRequire(srcPath);
+  const scopingExports = loadExtensionScopingModule();
+  return transpileTsFile(srcPath, (id) => {
+    if (id === "vscode") return vscodeMock;
+    if (id === "./scoping") return scopingExports;
+    return localRequire(id);
+  }) as {
+    buildStatusBarPresentation: (input: {
+      sessions: Array<{
+        sessionId: string;
+        title?: string;
+        status?: string;
+        ide?: string;
+        waitingOn?: string | null;
+        pendingQuestionCount?: number;
+        waitingSummary?: string;
+      }>;
+      openItemsCount: number;
+      openBugsCount: number;
+      sprint: string;
+      hostIdeName: string;
+      workspaceLabel: string;
+      mode: string;
+      port: number;
+    }) => {
+      text: string;
+      isWarning: boolean;
+      tooltipLines: string[];
+      waitingCount: number;
+      activeCount: number;
+    };
+    StatusBarManager: new (serverManager: unknown) => {
+      poll(): Promise<void>;
+      dispose(): void;
+    };
+  };
+}
+
+function loadExtensionWebviewProviderModule(vscodeMock: unknown) {
+  const srcPath = path.join(EXT_ROOT, "src", "webviewProvider.ts");
+  const localRequire = createRequire(srcPath);
+  const scopingExports = loadExtensionScopingModule();
+  const fileLinkExports = transpileTsFile(
+    path.join(EXT_ROOT, "src", "fileLinkBridge.ts"),
+    (id) => localRequire(id),
+  );
+  const feedbackExports = transpileTsFile(
+    path.join(EXT_ROOT, "src", "feedback.ts"),
+    (id) => localRequire(id),
+  );
+  return transpileTsFile(srcPath, (id) => {
+    if (id === "vscode") return vscodeMock;
+    if (id === "./scoping") return scopingExports;
+    if (id === "./fileLinkBridge") return fileLinkExports;
+    if (id === "./feedback") return feedbackExports;
+    return localRequire(id);
+  }) as {
+    REPLY_MAX_TEXT_BYTES: number;
+    validateReplyToAgentMessage: (raw: unknown) =>
+      | { ok: true; requestId: string; text: string; blockingToolCall: boolean }
+      | { ok: false; requestId: string; reason: string };
+    handleReplyToAgent: (
+      raw: unknown,
+      deps: {
+        writeClipboard(text: string): Promise<void>;
+        getCommands(filterInternal?: boolean): Promise<string[]>;
+        executeCommand(command: string, ...rest: unknown[]): Promise<unknown>;
+      },
+    ) => Promise<{
+      type: "agentStudio:replyResult";
+      requestId: string;
+      ok: boolean;
+      mode: "prefilled" | "focused_copied" | "copied" | "error";
+      message: string;
+    }>;
+    renderSidebarSessionsHtml: (
+      sessions: Array<{
+        sessionId: string;
+        ide?: string;
+        title?: string;
+        status?: string;
+        waitingOn?: string | null;
+        pendingQuestionCount?: number;
+        waitingSummary?: string;
+      }>,
+      limit?: number,
+    ) => string;
+    StudioPanel: {
+      currentPanel: { dispose(): void } | undefined;
+      createOrShow: (
+        serverManager: unknown,
+        view?: string,
+        sessionIdOrOptions?:
+          | string
+          | { sessionId?: string; openWaiting?: boolean; openChatAgentId?: string },
+      ) => Promise<void>;
+    };
+    StudioSidebarProvider: new (serverManager: unknown) => {
+      resolveWebviewView(webviewView: unknown): void;
+      refresh(): Promise<void>;
+      dispose(): void;
+    };
+  };
+}
+
 const REPO_ROOT = path.resolve(process.cwd());
 const EXT_ROOT = path.join(REPO_ROOT, "extension");
 const EXT_ENTRY = path.join(EXT_ROOT, "dist", "extension.js");
@@ -334,7 +621,7 @@ describe("VS Code / Antigravity IDE Extension (.vsix)", () => {
     assert.ok(statusBarSrc.includes("buildScopedSessionsQuery("));
   });
 
-  it("modelSync formats Copilot picker labels without duplication, guards missing vscode.lm, and falls back to CLI when offline", async () => {
+  it("modelSync preserves native runtime model IDs for Copilot and Antigravity, guards missing vscode.lm, and falls back to CLI when offline", async () => {
     const {
       ModelSyncManager,
       formatPickerLabel,
@@ -342,7 +629,7 @@ describe("VS Code / Antigravity IDE Extension (.vsix)", () => {
       mapLanguageModelsForHost,
     } = loadExtensionModelSyncModule();
 
-    // Picker formatting + deduplication
+    // Deprecated helper compatibility check
     assert.equal(formatPickerLabel("Claude Sonnet 4.5", "copilot"), "Claude Sonnet 4.5 (copilot)");
     assert.equal(
       formatPickerLabel("Claude Sonnet 4.5 (copilot)", "copilot"),
@@ -358,13 +645,20 @@ describe("VS Code / Antigravity IDE Extension (.vsix)", () => {
       true,
     );
 
-    // Host scoping: Copilot appends (vendor); Antigravity never injects Copilot picker labels
+    // Host scoping: Copilot & Antigravity both preserve native runtime m.id and deduplicate by id
     const copilotMapped = mapLanguageModelsForHost("copilot-vscode", [
-      { id: "claude-sonnet-4.5", name: "Claude Sonnet 4.5", vendor: "copilot", family: "claude-sonnet-4.5", maxInputTokens: 200_000 },
-      { id: "dup", name: "Claude Sonnet 4.5 (copilot)", vendor: "copilot" },
+      { id: "claude-sonnet-4.6", name: "Claude Sonnet 4.6", vendor: "copilot", family: "claude-sonnet-4.6", version: "20250929", maxInputTokens: 200_000 },
+      { id: "claude-sonnet-4.6", name: "Claude Sonnet 4.6 (duplicate)", vendor: "copilot" },
+      { id: "gpt-5.4", name: "GPT-5.4", vendor: "copilot", family: "gpt-5.4" },
     ]);
-    assert.equal(copilotMapped.length, 1);
-    assert.equal(copilotMapped[0]?.id, "Claude Sonnet 4.5 (copilot)");
+    assert.equal(copilotMapped.length, 2);
+    assert.equal(copilotMapped[0]?.id, "claude-sonnet-4.6");
+    assert.equal(copilotMapped[0]?.label, "Claude Sonnet 4.6");
+    assert.equal(copilotMapped[0]?.vendor, "copilot");
+    assert.equal(copilotMapped[0]?.version, "20250929");
+    assert.equal(copilotMapped[0]?.maxInputTokens, 200_000);
+    assert.equal(copilotMapped[1]?.id, "gpt-5.4");
+    assert.equal(copilotMapped[1]?.label, "GPT-5.4");
 
     const agyMapped = mapLanguageModelsForHost("antigravity", [
       { id: "gemini-3.8-flash", name: "Gemini 3.8 Flash", vendor: "google" },
@@ -445,7 +739,8 @@ describe("VS Code / Antigravity IDE Extension (.vsix)", () => {
     assert.equal(offlineRes.ok, true);
     assert.equal(offlineRes.transport, "cli");
     assert.ok(cliCalls[0]?.args.includes("--stdin"));
-    assert.match(cliCalls[0]?.stdinText ?? "", /Claude Haiku 4\.5 \(copilot\)/);
+    assert.match(cliCalls[0]?.stdinText ?? "", /"id"\s*:\s*"claude-haiku-4\.5"/);
+    assert.match(cliCalls[0]?.stdinText ?? "", /"label"\s*:\s*"Claude Haiku 4\.5"/);
     offlineMgr.dispose();
 
     // Verify extension/package.json contributes agentStudio.refreshModelIndex
@@ -590,6 +885,424 @@ describe("VS Code / Antigravity IDE Extension (.vsix)", () => {
         process.env.AGENT_STUDIO_HOME = prevEnvHome;
       }
       fs.rmSync(tmpBase, { recursive: true, force: true });
+    }
+  });
+
+  it("statusBar highlights scoped waiting sessions with warningBackground, tooltip summaries, and resets when waitingCount is 0", async () => {
+    const mock = createVscodeMock();
+    const { StatusBarManager, buildStatusBarPresentation } =
+      loadExtensionStatusBarModule(mock.vscodeMock);
+
+    // Pure presentation checks: subagent waiting alone does not count as human waiting
+    const subagentOnly = buildStatusBarPresentation({
+      sessions: [
+        { sessionId: "s-sub", title: "Subagent Task", status: "WORKING", waitingOn: "subagent" },
+      ],
+      openItemsCount: 2,
+      openBugsCount: 0,
+      sprint: "S1",
+      hostIdeName: "VS Code",
+      workspaceLabel: "Repo",
+      mode: "managed",
+      port: 8767,
+    });
+    assert.equal(subagentOnly.waitingCount, 0);
+    assert.equal(subagentOnly.isWarning, false);
+    assert.equal(subagentOnly.text, "$(pulse) Agent Studio: 1 active");
+
+    // Live StatusBarManager poll transitions: waiting -> cleared -> offline
+    let currentSessions: Array<{
+      sessionId: string;
+      title?: string;
+      status?: string;
+      waitingOn?: string | null;
+      pendingQuestionCount?: number;
+      waitingSummary?: string;
+    }> = [
+      {
+        sessionId: "sess-wait-1",
+        title: "Auth Refactor",
+        status: "WAITING",
+        waitingOn: "user",
+        pendingQuestionCount: 2,
+        waitingSummary: "Choose OAuth vs PAT",
+      },
+      {
+        sessionId: "sess-wait-2",
+        title: "DB Migration",
+        status: "WORKING",
+        waitingOn: "tool_approval",
+        waitingSummary: "Approve schema push",
+      },
+      {
+        sessionId: "sess-work-3",
+        title: "Lint Pass",
+        status: "WORKING",
+        waitingOn: null,
+      },
+    ];
+    let serverOnline = true;
+
+    const fakeServerManager = {
+      onStatusChanged: () => ({ dispose() {} }),
+      getStatus: () => ({
+        mode: serverOnline ? "managed" : "offline",
+        online: serverOnline,
+        localBaseUrl: "http://127.0.0.1:8767",
+        browserBaseUrl: "http://127.0.0.1:8767",
+        port: 8767,
+      }),
+      getLocalBaseUrl: () => "http://127.0.0.1:8767",
+      checkHealth: async () => serverOnline,
+      detectWorkspaceProjectId: () => "agent-studio",
+      getHostIdeDisplayName: () => "VS Code",
+      getWorkspaceLabel: () => "AgentVisualizer",
+      buildScopedSessionsQuery: (limit?: number) =>
+        `?ide=copilot-vscode&workspace=C%3A%2FRepo&limit=${limit ?? 25}`,
+      fetchJson: async (endpoint: string) => {
+        if (endpoint.startsWith("/api/sessions")) {
+          return { sessions: currentSessions };
+        }
+        return { board: { active_sprint: "S1", items: [] } };
+      },
+    };
+
+    const mgr = new StatusBarManager(fakeServerManager);
+    try {
+      await mgr.poll();
+      const item = mock.createdStatusItems[0];
+      assert.ok(item, "Expected StatusBarItem to be created");
+      assert.match(item.text, /\$\(question\) 2 waiting/);
+      assert.match(item.text, /3 active/);
+      assert.ok(item.backgroundColor instanceof mock.vscodeMock.ThemeColor);
+      assert.equal(
+        (item.backgroundColor as { id: string }).id,
+        "statusBarItem.warningBackground",
+      );
+      const tipValue = (item.tooltip as { value: string }).value;
+      assert.match(tipValue, /Waiting for input: \*\*2\*\*/);
+      assert.match(tipValue, /`Auth Refactor` — Choose OAuth vs PAT/);
+      assert.match(tipValue, /`DB Migration` — Approve schema push/);
+
+      // Reset warning when waiting sessions resolve
+      currentSessions = [
+        { sessionId: "sess-work-3", title: "Lint Pass", status: "WORKING", waitingOn: null },
+      ];
+      await mgr.poll();
+      assert.equal(item.backgroundColor, undefined);
+      assert.equal(item.text, "$(pulse) Agent Studio: 1 active");
+
+      // Also clear background when offline
+      currentSessions = [
+        { sessionId: "sess-wait-1", title: "Auth Refactor", status: "WAITING", waitingOn: "user" },
+      ];
+      await mgr.poll();
+      assert.ok(item.backgroundColor);
+      serverOnline = false;
+      await mgr.poll();
+      assert.equal(item.backgroundColor, undefined);
+      assert.match(item.text, /offline/);
+    } finally {
+      mgr.dispose();
+    }
+  });
+
+  it("sidebar renders waiting badges/summaries and StudioPanel supports openWaiting/openChat deep-links and focusSession reuse", async () => {
+    const mock = createVscodeMock();
+    const {
+      StudioPanel,
+      StudioSidebarProvider,
+      renderSidebarSessionsHtml,
+    } = loadExtensionWebviewProviderModule(mock.vscodeMock);
+    const { buildScopedViewUrl, appendDeepLinkParams } = loadExtensionScopingModule();
+
+    // Verify URL helpers
+    const scopedUrl = new URL(
+      buildScopedViewUrl({
+        baseUrl: "http://127.0.0.1:8767",
+        view: "studio",
+        projectId: "agent-studio",
+        sessionId: "sess-9",
+        openWaiting: true,
+        openChatAgentId: "architect",
+        embed: true,
+        hostIde: "copilot-vscode",
+        workspaceRoot: "C:\\Repo",
+      }),
+    );
+    assert.equal(scopedUrl.searchParams.get("embed"), "1");
+    assert.equal(scopedUrl.searchParams.get("openWaiting"), "1");
+    assert.equal(scopedUrl.searchParams.get("openChat"), "architect");
+    const appended = new URL(
+      appendDeepLinkParams("http://127.0.0.1:8767/?embed=1&session=s1", {
+        openWaiting: true,
+        openChatAgentId: "qa",
+      }),
+    );
+    assert.equal(appended.searchParams.get("openWaiting"), "1");
+    assert.equal(appended.searchParams.get("openChat"), "qa");
+
+    // Verify sidebar waiting markup prioritizes waiting sessions and includes reduced-motion-safe dot + badge + summary
+    const listHtml = renderSidebarSessionsHtml([
+      { sessionId: "work-1", title: "Idle Session", status: "IDLE", ide: "copilot-vscode" },
+      {
+        sessionId: "wait-1",
+        title: "Need Choice",
+        status: "WAITING",
+        ide: "copilot-vscode",
+        waitingOn: "user",
+        pendingQuestionCount: 2,
+        waitingSummary: "Pick deployment target",
+      },
+    ]);
+    assert.ok(listHtml.indexOf("wait-1") < listHtml.indexOf("work-1"));
+    assert.match(listHtml, /class="dot waiting"/);
+    assert.match(listHtml, /Needs Input \(2\)/);
+    assert.match(listHtml, /Pick deployment target/);
+    assert.match(listHtml, /data-open-waiting="1"/);
+
+    // Verify full StudioSidebarProvider refresh & click relay
+    const fakeServerManager = {
+      onStatusChanged: () => ({ dispose() {} }),
+      ensureRunning: async () => ({ online: true }),
+      getStatus: () => ({
+        mode: "managed",
+        online: true,
+        localBaseUrl: "http://127.0.0.1:8767",
+        browserBaseUrl: "http://127.0.0.1:8767",
+        port: 8767,
+      }),
+      detectWorkspaceProjectId: () => "agent-studio",
+      getHostIdeDisplayName: () => "VS Code",
+      getWorkspaceLabel: () => "AgentVisualizer",
+      buildScopedSessionsQuery: () => "?ide=copilot-vscode&workspace=C%3A%2FRepo&limit=15",
+      buildViewUrl: (
+        baseUrl: string,
+        view?: string,
+        projectId?: string,
+        opts?: { embed?: boolean; sessionId?: string },
+      ) =>
+        buildScopedViewUrl({
+          baseUrl,
+          view: view as "studio" | undefined,
+          projectId: projectId ?? "agent-studio",
+          sessionId: opts?.sessionId,
+          embed: opts?.embed,
+          hostIde: "copilot-vscode",
+          workspaceRoot: "C:\\Repo",
+        }),
+      fetchJson: async (endpoint: string) => {
+        if (endpoint.startsWith("/api/sessions")) {
+          return {
+            sessions: [
+              {
+                sessionId: "wait-1",
+                title: "Need Choice",
+                status: "WAITING",
+                ide: "copilot-vscode",
+                waitingOn: "user",
+                waitingSummary: "Pick option A or B",
+              },
+            ],
+          };
+        }
+        return { project: { id: "agent-studio", title: "Agent Studio" }, board: { active_sprint: "S1", items: [] } };
+      },
+    };
+
+    const sidebar = new StudioSidebarProvider(fakeServerManager);
+    let sidebarMsgHandler: ((msg: unknown) => Promise<void>) | undefined;
+    const mockWebviewView = {
+      visible: true,
+      webview: {
+        options: {},
+        html: "",
+        onDidReceiveMessage: (cb: (msg: unknown) => Promise<void>) => {
+          sidebarMsgHandler = cb;
+          return { dispose() {} };
+        },
+      },
+      onDidChangeVisibility: () => ({ dispose() {} }),
+      onDidDispose: () => ({ dispose() {} }),
+    };
+    sidebar.resolveWebviewView(mockWebviewView);
+    await sidebar.refresh();
+    assert.match(mockWebviewView.webview.html, /prefers-reduced-motion:\s*reduce/);
+    assert.match(mockWebviewView.webview.html, /body\.vscode-light \.waiting-badge/);
+    assert.match(mockWebviewView.webview.html, /@media \(forced-colors: active\)[\s\S]*?\.waiting-badge[\s\S]*?CanvasText/);
+    assert.match(mockWebviewView.webview.html, /data-open-waiting="1"/);
+
+    await sidebarMsgHandler?.({
+      command: "agentStudio.openStudio",
+      sessionId: "wait-1",
+      openWaiting: true,
+    });
+    assert.deepEqual(mock.executedCommands[0], {
+      command: "agentStudio.openStudio",
+      args: [{ sessionId: "wait-1", openWaiting: true }],
+    });
+    sidebar.dispose();
+
+    // Verify StudioPanel.createOrShow new panel URL vs existing panel focusSession postMessage
+    try {
+      await StudioPanel.createOrShow(fakeServerManager, "studio", {
+        sessionId: "wait-1",
+        openWaiting: true,
+        openChatAgentId: "backend",
+      });
+      assert.equal(mock.createdPanels.length, 1);
+      const panel = mock.createdPanels[0]!;
+      assert.match(panel.webview.html, /openWaiting=1/);
+      assert.match(panel.webview.html, /openChat=backend/);
+      assert.match(panel.webview.html, /agentStudio:focusSession/);
+      assert.match(panel.webview.html, /agentStudio:replyToAgent/);
+      assert.match(panel.webview.html, /agentStudio:replyResult/);
+
+      const initialHtml = panel.webview.html;
+      await StudioPanel.createOrShow(fakeServerManager, "studio", {
+        sessionId: "wait-2",
+        openWaiting: true,
+      });
+      assert.equal(mock.createdPanels.length, 1);
+      assert.equal(panel.webview.html, initialHtml, "Existing panel should focus via postMessage without reloading iframe");
+      assert.deepEqual(panel.webview.postedMessages.at(-1), {
+        type: "agentStudio:focusSession",
+        sessionId: "wait-2",
+        openWaiting: true,
+      });
+    } finally {
+      StudioPanel.currentPanel?.dispose();
+    }
+  });
+
+  it("handles agentStudio:replyToAgent validation, non-blocking prefill, blocking focus+copy, and command fallback", async () => {
+    const mock = createVscodeMock();
+    const {
+      REPLY_MAX_TEXT_BYTES,
+      StudioPanel,
+      handleReplyToAgent,
+    } = loadExtensionWebviewProviderModule(mock.vscodeMock);
+    const { buildScopedViewUrl } = loadExtensionScopingModule();
+
+    const makeDeps = () => ({
+      writeClipboard: (text: string) => mock.vscodeMock.env.clipboard.writeText(text),
+      getCommands: () => mock.vscodeMock.commands.getCommands(),
+      executeCommand: (cmd: string, ...args: unknown[]) =>
+        mock.vscodeMock.commands.executeCommand(cmd, ...args),
+    });
+
+    // Validation rejections return error without throwing
+    const emptyErr = await handleReplyToAgent(
+      { requestId: "req-empty", text: "   ", blockingToolCall: false },
+      makeDeps(),
+    );
+    assert.equal(emptyErr.ok, false);
+    assert.equal(emptyErr.mode, "error");
+    assert.equal(emptyErr.requestId, "req-empty");
+
+    const oversizeErr = await handleReplyToAgent(
+      {
+        requestId: "req-big",
+        text: "a".repeat(REPLY_MAX_TEXT_BYTES + 1),
+        blockingToolCall: false,
+      },
+      makeDeps(),
+    );
+    assert.equal(oversizeErr.ok, false);
+    assert.equal(oversizeErr.mode, "error");
+    assert.equal(oversizeErr.requestId, "req-big");
+
+    const badBoolErr = await handleReplyToAgent(
+      { requestId: "req-bool", text: "hello", blockingToolCall: "yes" },
+      makeDeps(),
+    );
+    assert.equal(badBoolErr.ok, false);
+    assert.equal(badBoolErr.mode, "error");
+
+    // Non-blocking: copy + prefill workbench.action.chat.open
+    const prefillRes = await handleReplyToAgent(
+      { requestId: "req-1", text: "Proceed with Option A", blockingToolCall: false },
+      makeDeps(),
+    );
+    assert.equal(prefillRes.ok, true);
+    assert.equal(prefillRes.mode, "prefilled");
+    assert.equal(prefillRes.requestId, "req-1");
+    assert.equal(mock.clipboardWrites.at(-1), "Proceed with Option A");
+    assert.deepEqual(mock.executedCommands.at(-1), {
+      command: "workbench.action.chat.open",
+      args: [{ query: "Proceed with Option A", isPartialQuery: true }],
+    });
+
+    // Blocking synchronous tool call: copy + focus only (no query args)
+    const focusRes = await handleReplyToAgent(
+      { requestId: "req-2", text: "Option B", blockingToolCall: true },
+      makeDeps(),
+    );
+    assert.equal(focusRes.ok, true);
+    assert.equal(focusRes.mode, "focused_copied");
+    assert.equal(focusRes.requestId, "req-2");
+    assert.equal(mock.clipboardWrites.at(-1), "Option B");
+    assert.deepEqual(mock.executedCommands.at(-1), {
+      command: "workbench.action.chat.open",
+      args: [],
+    });
+
+    // Fallback when workbench.action.chat.open throws
+    mock.setExecuteCommandImpl(async () => {
+      throw new Error("command unavailable");
+    });
+    const throwFallback = await handleReplyToAgent(
+      { requestId: "req-3", text: "Fallback text", blockingToolCall: true },
+      makeDeps(),
+    );
+    assert.equal(throwFallback.ok, true);
+    assert.equal(throwFallback.mode, "copied");
+    assert.equal(throwFallback.requestId, "req-3");
+
+    // Fallback when workbench.action.chat.open is not registered on host IDE
+    mock.setExecuteCommandImpl(undefined);
+    mock.setAvailableCommands([]);
+    const missingCmdFallback = await handleReplyToAgent(
+      { requestId: "req-4", text: "No chat cmd", blockingToolCall: false },
+      makeDeps(),
+    );
+    assert.equal(missingCmdFallback.ok, true);
+    assert.equal(missingCmdFallback.mode, "copied");
+    assert.equal(missingCmdFallback.requestId, "req-4");
+
+    // End-to-end StudioPanel webview message relay for agentStudio:replyToAgent
+    mock.setAvailableCommands(["workbench.action.chat.open"]);
+    const fakeServerManager = {
+      ensureRunning: async () => ({ online: true }),
+      getStatus: () => ({
+        mode: "managed",
+        online: true,
+        localBaseUrl: "http://127.0.0.1:8767",
+        browserBaseUrl: "http://127.0.0.1:8767",
+        port: 8767,
+      }),
+      buildViewUrl: (baseUrl: string, view?: string, projectId?: string, opts?: { embed?: boolean; sessionId?: string }) =>
+        buildScopedViewUrl({ baseUrl, view: view as "studio", projectId, sessionId: opts?.sessionId, embed: opts?.embed }),
+    };
+
+    try {
+      await StudioPanel.createOrShow(fakeServerManager, "studio", "sess-e2e");
+      const panel = mock.createdPanels[0]!;
+      await panel.webview.emitMessage({
+        type: "agentStudio:replyToAgent",
+        requestId: "req-e2e",
+        text: "Approve plan",
+        blockingToolCall: false,
+      });
+      assert.deepEqual(panel.webview.postedMessages.at(-1), {
+        type: "agentStudio:replyResult",
+        requestId: "req-e2e",
+        ok: true,
+        mode: "prefilled",
+        message: "Prefilled IDE chat input (and copied to clipboard) — review and press Enter to send.",
+      });
+    } finally {
+      StudioPanel.currentPanel?.dispose();
     }
   });
 });

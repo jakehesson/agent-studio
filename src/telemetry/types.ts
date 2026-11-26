@@ -1,15 +1,22 @@
 import { createHash } from "node:crypto";
 import path from "node:path";
 import type {
+  AgentChatMessage,
+  AgentChatResponse,
   AgentEdgeSnapshot,
   AgentNodeSnapshot,
   AgentStatus,
   AgentUsageMetrics,
+  ChatMessageRole,
+  ChatToolCallRef,
   EventKind,
   IdeSource,
   ModelSource,
   ModelUsageBucket,
   NormalizedEvent,
+  PendingHumanPrompt,
+  PendingQuestionItem,
+  PendingQuestionOption,
   SessionCounters,
   SessionSnapshot,
   SessionTeamRosterEntry,
@@ -19,15 +26,22 @@ import type {
 } from "../schema/telemetry.js";
 
 export type {
+  AgentChatMessage,
+  AgentChatResponse,
   AgentEdgeSnapshot,
   AgentNodeSnapshot,
   AgentStatus,
   AgentUsageMetrics,
+  ChatMessageRole,
+  ChatToolCallRef,
   EventKind,
   IdeSource,
   ModelSource,
   ModelUsageBucket,
   NormalizedEvent,
+  PendingHumanPrompt,
+  PendingQuestionItem,
+  PendingQuestionOption,
   SessionCounters,
   SessionSnapshot,
   SessionTeamRosterEntry,
@@ -144,7 +158,9 @@ export interface DiscoveredSession {
   sizeBytes: number;
   isMultiAgent: boolean;
   status?: AgentStatus;
-  waitingOn?: string | null;
+  waitingOn?: "user" | "tool_approval" | "subagent" | null;
+  pendingQuestionCount?: number;
+  waitingSummary?: string;
   isWaiting?: boolean;
   isCompleted?: boolean;
 }
@@ -166,7 +182,7 @@ export interface RichAgentNode extends AgentNodeSnapshot {
   ageSec: number | null;
   convId?: string;
   recentActions: RecentActionItem[];
-  pendingPrompt?: Record<string, unknown> | null;
+  pendingPrompt?: PendingHumanPrompt | null;
   model?: string;
   usage?: AgentUsageMetrics;
 }
@@ -223,10 +239,17 @@ export interface RichSessionSnapshot extends SessionSnapshot {
     name?: string;
     role?: string;
   }>;
+  modelContextWindows?: Record<string, number>;
+  pendingPrompts?: PendingHumanPrompt[];
 }
 
 export interface ParseSessionOptions {
   onFullBody?: (eventId: string, body: string) => void;
+}
+
+export interface ParseChatOptions {
+  agentId?: string;
+  agentAliases?: string[];
 }
 
 export interface PassiveIdeAdapter {
@@ -240,6 +263,10 @@ export interface PassiveIdeAdapter {
     session: DiscoveredSession,
     opts?: ParseSessionOptions,
   ): Promise<EnrichedEvent[]>;
+  parseChat?(
+    session: DiscoveredSession,
+    opts?: ParseChatOptions,
+  ): Promise<AgentChatMessage[]>;
 }
 
 export const PALETTE = [
@@ -301,6 +328,27 @@ export function isOpaqueAgentId(raw?: string): boolean {
     return true;
   }
   return false;
+}
+
+export function stripSubagentNamespacePrefix(raw: string): string {
+  const s = raw.trim();
+  const colonIdx = s.indexOf(":");
+  if (colonIdx > 0 && colonIdx < s.length - 1) {
+    const rest = s.slice(colonIdx + 1).trim();
+    if (rest) return rest;
+  }
+  return s;
+}
+
+export function normalizeSubagentLabel(raw?: string): string {
+  if (!raw) return "";
+  const unprefixed = stripSubagentNamespacePrefix(raw);
+  return unprefixed
+    .replace(/([a-z0-9])([A-Z])/g, "$1 $2")
+    .replace(/([A-Z]+)([A-Z][a-z])/g, "$1 $2")
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, " ")
+    .trim();
 }
 
 export function prettifyAgentLabel(rawId: string): string {
@@ -396,6 +444,7 @@ export function computeDeterministicEventId(parts: {
   kind: EventKind;
   toolCallId?: string;
   toolName?: string;
+  targetAgentId?: string;
   epoch: number;
   summary: string;
 }): string {
@@ -408,6 +457,7 @@ export function computeDeterministicEventId(parts: {
     parts.toolCallId ?? parts.toolName ?? "",
     String(Math.floor(parts.epoch)),
     parts.summary.slice(0, 80),
+    ...(parts.targetAgentId ? [parts.targetAgentId] : []),
   ];
   hash.update(fields.join("\u001f"));
   return hash.digest("hex").slice(0, 16);
@@ -521,6 +571,9 @@ const FS_TOOL_SET = new Set([
   "copilot_geterrors",
   "edit/editfiles",
   "edit/createfile",
+  "create",
+  "str_replace",
+  "str_replace_editor",
 ]);
 
 const SHELL_TOOL_SET = new Set([
@@ -542,7 +595,9 @@ const WEB_TOOL_SET = new Set([
   "browser_subagent",
   "open_browser_url",
   "webfetch",
+  "web_fetch",
   "websearch",
+  "web_search",
   "copilot_fetchwebpage",
   "vscode_fetchwebpage_internal",
   "gemini_search_docs",
@@ -552,7 +607,10 @@ const WEB_TOOL_SET = new Set([
 const HUMAN_TOOL_SET = new Set([
   "ask_question",
   "askuserquestion",
+  "ask_user",
   "vscode_askquestions",
+  "ask_questions",
+  "askquestions",
   "questioncarousel",
   "elicitationserialized",
 ]);
@@ -911,6 +969,21 @@ export function summarizeToolCall(
   }
 
   // 2. File & workspace tools
+  if (low === "str_replace_editor") {
+    const cmd = unquoteArg(args.command ?? args.Command).trim().toLowerCase();
+    const p = unquoteArg(
+      args.Path ??
+        args.file_path ??
+        args.path ??
+        args.filePath ??
+        args.target_file ??
+        args.targetFile ??
+        args.uri,
+    );
+    if (cmd === "view") return `Read ${formatShortFile(p)}`;
+    if (cmd === "create") return `Wrote ${formatShortFile(p)}`;
+    return `Edited ${formatShortFile(p)}`;
+  }
   if (
     low === "read_file" ||
     low === "read" ||
@@ -918,21 +991,39 @@ export function summarizeToolCall(
     low === "view_file" ||
     low === "view"
   ) {
-    const p = unquoteArg(args.Path ?? args.file_path ?? args.path ?? args.filePath ?? args.uri);
+    const p = unquoteArg(
+      args.Path ??
+        args.file_path ??
+        args.path ??
+        args.filePath ??
+        args.target_file ??
+        args.targetFile ??
+        args.uri,
+    );
     return `Read ${formatShortFile(p)}`;
   }
   if (
     low === "write_file" ||
     low === "write" ||
+    low === "create" ||
     low === "copilot_createfile" ||
     low === "edit/createfile"
   ) {
-    const p = unquoteArg(args.Path ?? args.file_path ?? args.path ?? args.filePath ?? args.uri);
+    const p = unquoteArg(
+      args.Path ??
+        args.file_path ??
+        args.path ??
+        args.filePath ??
+        args.target_file ??
+        args.targetFile ??
+        args.uri,
+    );
     return `Wrote ${formatShortFile(p)}`;
   }
   if (
     low === "edit_file" ||
     low === "edit" ||
+    low === "str_replace" ||
     low === "multiedit" ||
     low === "apply_patch" ||
     low === "copilot_applypatch" ||
@@ -943,7 +1034,15 @@ export function summarizeToolCall(
     low === "replace_file_content" ||
     low === "multi_replace_file_content"
   ) {
-    let p = unquoteArg(args.Path ?? args.file_path ?? args.path ?? args.filePath ?? args.uri);
+    let p = unquoteArg(
+      args.Path ??
+        args.file_path ??
+        args.path ??
+        args.filePath ??
+        args.target_file ??
+        args.targetFile ??
+        args.uri,
+    );
     if (!p && low === "apply_patch") {
       const patchText = unquoteArg(args.patch ?? args.input);
       const m = /\*\*\*\s+(?:Update|Add|Delete)\s+File:\s+([^\r\n]+)/i.exec(patchText);
@@ -1021,9 +1120,35 @@ export function summarizeToolCall(
     low === "agent/runsubagent"
   ) {
     const role = unquoteArg(
-      args.Role ?? args.TypeName ?? args.subagent_type ?? args.agentName ?? args.description,
+      args.Role ??
+        args.TypeName ??
+        args.subagent_type ??
+        args.agent_type ??
+        args.agentType ??
+        args.agentName ??
+        args.subAgentName ??
+        args.subagentName ??
+        args.name ??
+        args.description,
     );
     return cleanHumanSummary(`Spawned ${role || "subagent"}`, 140);
+  }
+  if (HUMAN_TOOL_SET.has(low)) {
+    const q = cleanHumanSummary(
+      unquoteArg(args.question ?? args.prompt ?? args.message ?? args.title),
+      90,
+    );
+    return q ? cleanHumanSummary(`Ask user: ${q}`, 120) : "Waiting for user answer";
+  }
+  if (
+    low === "web_fetch" ||
+    low === "webfetch" ||
+    low === "read_url_content" ||
+    low === "copilot_fetchwebpage" ||
+    low === "vscode_fetchwebpage_internal"
+  ) {
+    const url = unquoteArg(args.url ?? args.uri ?? args.Url ?? args.URL);
+    return url ? cleanHumanSummary(`Fetch ${url}`, 100) : "Fetched web page";
   }
   if (low === "send_message" || low === "sendmessage") {
     return "Sent message";
@@ -1104,10 +1229,15 @@ export function inferContextWindow(model: string, ide?: IdeSource): number {
   if (!low || low === "unknown") {
     return ide === "antigravity" ? 1_000_000 : 200_000;
   }
+  if (/\bmai\b/i.test(low) || /^mai[-_]/i.test(low)) {
+    return 1_000_000;
+  }
   if (
     low.includes("gemini") ||
     low.includes("gpt-4.1") ||
-    low.includes("gpt 4.1")
+    low.includes("gpt 4.1") ||
+    low.includes("gpt-5.4") ||
+    low.includes("gpt 5.4")
   ) {
     return 1_000_000;
   }
@@ -1127,6 +1257,38 @@ export function inferContextWindow(model: string, ide?: IdeSource): number {
     return 128_000;
   }
   return 200_000;
+}
+
+export function lookupModelContextWindow(
+  model: string,
+  modelContextWindows?: Record<string, number>,
+): number | undefined {
+  if (!modelContextWindows || !model) return undefined;
+  const low = model.trim().toLowerCase();
+  if (!low || low === "unknown") return undefined;
+  const direct = modelContextWindows[low];
+  if (typeof direct === "number" && Number.isFinite(direct) && direct > 0) {
+    return Math.round(direct);
+  }
+  const stripped = low.replace(/\s*\([^)]+\)\s*$/, "").trim();
+  if (stripped && stripped !== low) {
+    const byStripped = modelContextWindows[stripped];
+    if (
+      typeof byStripped === "number" &&
+      Number.isFinite(byStripped) &&
+      byStripped > 0
+    ) {
+      return Math.round(byStripped);
+    }
+  }
+  const pretty = prettifyModelName(model).toLowerCase();
+  if (pretty && pretty !== low) {
+    const byPretty = modelContextWindows[pretty];
+    if (typeof byPretty === "number" && Number.isFinite(byPretty) && byPretty > 0) {
+      return Math.round(byPretty);
+    }
+  }
+  return undefined;
 }
 
 const MODEL_PREFIX_RE = /^(?:copilot|models|google|anthropic|openai|azure|vertex)\//i;
@@ -1211,4 +1373,259 @@ export function prettifyModelName(raw: string): string {
     }
   }
   return formatted.join(" ") + suffix;
+}
+
+export const CHAT_FIELD_MAX_BYTES = 128 * 1024;
+
+export function capChatText(
+  raw: string,
+  maxBytes = CHAT_FIELD_MAX_BYTES,
+): string {
+  if (!raw) return "";
+  const buf = Buffer.from(raw, "utf8");
+  if (buf.byteLength <= maxBytes) return raw;
+  let end = Math.max(0, maxBytes);
+  while (end > 0 && end < buf.byteLength && (buf[end]! & 0xc0) === 0x80) {
+    end -= 1;
+  }
+  return buf.subarray(0, end).toString("utf8");
+}
+
+export function resolveEmptyFileLinks(text: string): string {
+  if (!text) return "";
+  return text.replace(/\[\]\(([^)]+)\)/g, (_m, url: string) => {
+    const rawTarget = (url ?? "").trim().split(/[?#]/)[0] ?? "";
+    let decoded = rawTarget;
+    try {
+      decoded = decodeURIComponent(rawTarget);
+    } catch {
+      decoded = rawTarget;
+    }
+    const cleanPath = decoded
+      .replace(/^[a-zA-Z][a-zA-Z0-9+.-]*:\/\//, "")
+      .replace(/\\/g, "/")
+      .replace(/\/+$/, "");
+    const base = path.posix.basename(cleanPath) || "link";
+    return `[${base}](${url})`;
+  });
+}
+
+const RECOMMENDED_RE = /\s*\(recommended\)\s*/i;
+
+export function normalizePendingOption(
+  raw: unknown,
+): PendingQuestionOption | null {
+  if (typeof raw === "string") {
+    const unq = unquoteArg(raw).trim();
+    if (!unq) return null;
+    const recommended = RECOMMENDED_RE.test(unq);
+    const cleaned = unq.replace(/\s*\(recommended\)\s*/gi, " ").trim();
+    return {
+      label: cleaned || unq,
+      ...(recommended ? { recommended: true } : {}),
+    };
+  }
+  if (raw && typeof raw === "object" && !Array.isArray(raw)) {
+    const rec = raw as Record<string, unknown>;
+    const rawLabel = unquoteArg(
+      rec.label ?? rec.title ?? rec.value ?? rec.name ?? rec.id,
+    ).trim();
+    if (!rawLabel) return null;
+    const recommended =
+      rec.recommended === true || RECOMMENDED_RE.test(rawLabel);
+    const cleaned = rawLabel.replace(/\s*\(recommended\)\s*/gi, " ").trim();
+    const id =
+      typeof rec.id === "string" && rec.id.trim() ? rec.id.trim() : undefined;
+    const description =
+      typeof rec.description === "string" && rec.description.trim()
+        ? rec.description.trim()
+        : undefined;
+    return {
+      ...(id ? { id } : {}),
+      label: cleaned || rawLabel,
+      ...(description ? { description } : {}),
+      ...(recommended ? { recommended: true } : {}),
+    };
+  }
+  return null;
+}
+
+export function normalizePendingQuestions(
+  raw: unknown,
+  opts?: { defaultAllowCustomInput?: boolean },
+): PendingQuestionItem[] {
+  let target = raw;
+  if (typeof target === "string") {
+    const unq = unquoteArg(target).trim();
+    if (unq.startsWith("[") || unq.startsWith("{")) {
+      try {
+        target = JSON.parse(unq);
+      } catch {
+        // Not valid JSON; treat string as single text question below.
+        target = unq;
+      }
+    } else {
+      target = unq;
+    }
+  }
+
+  if (typeof target === "string") {
+    const qText = target.trim();
+    if (!qText) return [];
+    return [
+      {
+        question: qText,
+        type: "text",
+        options: [],
+        ...(opts?.defaultAllowCustomInput !== undefined
+          ? { allowCustomInput: opts.defaultAllowCustomInput }
+          : {}),
+      },
+    ];
+  }
+
+  let rawItems: unknown[] = [];
+  if (Array.isArray(target)) {
+    rawItems = target;
+  } else if (target && typeof target === "object") {
+    const obj = target as Record<string, unknown>;
+    if (obj.questions !== undefined) {
+      return normalizePendingQuestions(obj.questions, opts);
+    }
+    if (
+      obj.question !== undefined ||
+      obj.message !== undefined ||
+      obj.prompt !== undefined ||
+      obj.text !== undefined ||
+      obj.title !== undefined
+    ) {
+      rawItems = [obj];
+    }
+  }
+
+  const out: PendingQuestionItem[] = [];
+  for (const item of rawItems) {
+    if (typeof item === "string") {
+      const qText = unquoteArg(item).trim();
+      if (qText) {
+        out.push({
+          question: qText,
+          type: "text",
+          options: [],
+          ...(opts?.defaultAllowCustomInput !== undefined
+            ? { allowCustomInput: opts.defaultAllowCustomInput }
+            : {}),
+        });
+      }
+      continue;
+    }
+    if (!item || typeof item !== "object" || Array.isArray(item)) continue;
+    const rec = item as Record<string, unknown>;
+
+    const msgVal =
+      typeof rec.message === "object" && rec.message !== null
+        ? (rec.message as Record<string, unknown>).value
+        : rec.message;
+    const questionText = unquoteArg(
+      rec.question ?? msgVal ?? rec.prompt ?? rec.text ?? rec.title,
+    ).trim();
+    if (!questionText) continue;
+
+    const rawHeader = unquoteArg(rec.header ?? rec.title).trim();
+    const header =
+      rawHeader && rawHeader !== questionText ? rawHeader : undefined;
+
+    let rawOpts = rec.options ?? rec.choices;
+    if (typeof rawOpts === "string") {
+      const unqOpts = unquoteArg(rawOpts).trim();
+      if (unqOpts.startsWith("[")) {
+        try {
+          rawOpts = JSON.parse(unqOpts);
+        } catch {
+          rawOpts = [];
+        }
+      }
+    }
+    const options: PendingQuestionOption[] = Array.isArray(rawOpts)
+      ? rawOpts
+          .map((o) => normalizePendingOption(o))
+          .filter((o): o is PendingQuestionOption => o !== null)
+      : [];
+
+    const rawType = unquoteArg(rec.type).trim().toLowerCase();
+    const isMulti =
+      rawType === "multiselect" ||
+      rawType === "multi_select" ||
+      rec.is_multi_select === true ||
+      unquoteArg(rec.is_multi_select).toLowerCase() === "true" ||
+      rec.isMultiSelect === true ||
+      rec.multiSelect === true;
+
+    const type: PendingQuestionItem["type"] =
+      options.length === 0 || rawType === "text" || rawType === "freeform"
+        ? "text"
+        : isMulti
+          ? "multi_select"
+          : "single_select";
+
+    const id =
+      typeof rec.id === "string" && rec.id.trim() ? rec.id.trim() : undefined;
+    const allowCustomInput =
+      typeof rec.allowCustomInput === "boolean"
+        ? rec.allowCustomInput
+        : typeof rec.allowFreeformInput === "boolean"
+          ? rec.allowFreeformInput
+          : typeof rec.allow_custom_input === "boolean"
+            ? rec.allow_custom_input
+            : typeof rec.allow_freeform === "boolean"
+              ? rec.allow_freeform
+              : typeof rec.allowFreeform === "boolean"
+                ? rec.allowFreeform
+                : opts?.defaultAllowCustomInput;
+    const defaultValue =
+      typeof rec.defaultValue === "string"
+        ? rec.defaultValue
+        : typeof rec.default_value === "string"
+          ? rec.default_value
+          : undefined;
+
+    out.push({
+      ...(id ? { id } : {}),
+      ...(header ? { header } : {}),
+      question: questionText,
+      type,
+      options,
+      ...(allowCustomInput !== undefined ? { allowCustomInput } : {}),
+      ...(defaultValue !== undefined ? { defaultValue } : {}),
+    });
+  }
+
+  return out;
+}
+
+export function computePendingPromptId(
+  agentId: string,
+  toolCallId?: string,
+  eventId?: string,
+): string {
+  if (toolCallId && toolCallId.trim()) {
+    return `prompt:${agentId}:${toolCallId.trim()}`;
+  }
+  return `prompt:${agentId}:${eventId ?? "pending"}`;
+}
+
+export function formatQuestionsPreview(
+  questions: PendingQuestionItem[],
+  fallback = "Waiting for user answer",
+): string {
+  if (questions.length === 0) return fallback;
+  return questions
+    .map((q) => {
+      if (q.options.length === 0) return q.question;
+      const opts = q.options
+        .map((o) => (o.recommended ? `${o.label} (Recommended)` : o.label))
+        .join(", ");
+      return `${q.question} [${opts}]`;
+    })
+    .join("\n");
 }
