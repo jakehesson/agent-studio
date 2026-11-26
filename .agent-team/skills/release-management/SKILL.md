@@ -41,7 +41,11 @@ Follow this sequence whenever preparing a new **Agent Studio** release:
    - Add a `## [<version>] - YYYY-MM-DD` section at the top of `CHANGELOG.md` following [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) (`Added`, `Changed`, `Fixed`, `Security`).
    - Verify `.github/workflows/release.yml` extracts the exact `## [<version>]` section cleanly (matching `TAG_VERSION="${GITHUB_REF_NAME#v}"`).
 
-3. **Run Full CI & Packaging Verification Pipeline**
+3. **Verify QA Validation Status (Do Not Re-Run QA Suites)**
+   - Check via `agent-studio` MCP (`testrun` / `board`) or the orchestrator handoff that `qa-validator` has already recorded closed, passing `testrun`s covering all items in the release.
+   - Do **not** re-run `npm test` or `python tests/smoke_test.py` when QA has already signed off (since release edits only touch version lockstep, `CHANGELOG.md`, and docs). If QA sign-off is missing or stale after code changes, flag `orchestrator` / `qa-validator` rather than duplicating QA.
+
+4. **Run Build, Lockstep & Packaging Verification Pipeline**
    ```bash
    npm run check
    npm --prefix web run check
@@ -49,18 +53,16 @@ Follow this sequence whenever preparing a new **Agent Studio** release:
    npm run build:all
    npm --prefix extension run package
    node antigravity-plugin/scripts/build-plugin.mjs
-   npm test
    node dist/cli/index.js sync --check
-   python tests/smoke_test.py
    npm pack --dry-run
    ```
    - Confirm `extension/agent-studio-<version>.vsix` exists and `antigravity-plugin/dist/plugin.json` reports `<version>`.
 
-4. **Verify Privacy & Release Hygiene**
+5. **Verify Privacy & Release Hygiene**
    - Ensure zero personal paths, hostnames, UUIDs, or `pipeline/board.json` are staged.
    - Verify `SECURITY.md` lists the current minor branch (e.g. `0.5.x`) as supported.
 
-5. **Install Local IDE Plugins & Extensions for Pre-Push Testing**
+6. **Install Local IDE Plugins & Extensions for Pre-Push Testing**
    - Refresh the native Antigravity MCP App plugin (`~/.gemini/config/plugins/agent-studio/`) and install the newly packaged `.vsix` into available local IDE CLIs (skipping gracefully if a CLI is not on `PATH`):
      ```bash
      node antigravity-plugin/scripts/build-plugin.mjs --install
@@ -69,7 +71,7 @@ Follow this sequence whenever preparing a new **Agent Studio** release:
      ```
    - Remind the user to reload IDE windows / refresh the `agent-studio-app` MCP server to test locally before approving `git push`.
 
-6. **Prepare Pre-Push / Pre-Tag Checklist for User Approval**
+7. **Prepare Pre-Push / Pre-Tag Checklist for User Approval**
    - Never run `git push` or force-push without explicit user confirmation.
    - Present the exact commit, tag, and push commands for the user to approve or execute:
      ```bash
