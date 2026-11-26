@@ -655,6 +655,13 @@ function renderBlocks(lines: string[], ctx: ParseContext): string {
   return out.join("\n");
 }
 
+export function renderInlineMarkdown(md: string): string {
+  const normalized = String(md ?? "")
+    .replace(/\r\n?/g, "\n")
+    .replace(/[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/g, "");
+  return renderInline(normalized, false);
+}
+
 export function renderMarkdown(
   md: string,
   opts: RenderMarkdownOptions = {}

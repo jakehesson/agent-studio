@@ -60,7 +60,16 @@ Follow this sequence whenever preparing a new **Agent Studio** release:
    - Ensure zero personal paths, hostnames, UUIDs, or `pipeline/board.json` are staged.
    - Verify `SECURITY.md` lists the current minor branch (e.g. `0.5.x`) as supported.
 
-5. **Prepare Pre-Push / Pre-Tag Checklist for User Approval**
+5. **Install Local IDE Plugins & Extensions for Pre-Push Testing**
+   - Refresh the native Antigravity MCP App plugin (`~/.gemini/config/plugins/agent-studio/`) and install the newly packaged `.vsix` into available local IDE CLIs (skipping gracefully if a CLI is not on `PATH`):
+     ```bash
+     node antigravity-plugin/scripts/build-plugin.mjs --install
+     code --install-extension ./extension/agent-studio-<version>.vsix --force
+     agy --install-extension ./extension/agent-studio-<version>.vsix --force
+     ```
+   - Remind the user to reload IDE windows / refresh the `agent-studio-app` MCP server to test locally before approving `git push`.
+
+6. **Prepare Pre-Push / Pre-Tag Checklist for User Approval**
    - Never run `git push` or force-push without explicit user confirmation.
    - Present the exact commit, tag, and push commands for the user to approve or execute:
      ```bash

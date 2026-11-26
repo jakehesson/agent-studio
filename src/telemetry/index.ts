@@ -15,7 +15,7 @@ import {
   type EventBodyEntry,
   type EventBodyStore,
 } from "./body-store.js";
-import { discoverTeamDetailsCached } from "./definitions.js";
+import { discoverTeamDetailsCached, type TeamDetails } from "./definitions.js";
 import { buildSessionSnapshot } from "./normalizer.js";
 import {
   PushBus,
@@ -163,6 +163,41 @@ function sessionMatchesFilter(
   }
 
   return true;
+}
+
+function resolveProjectRootHint(projectHint?: string): string | undefined {
+  const hint = projectHint?.trim();
+  if (!hint || hint.toLowerCase() === "all") return undefined;
+  try {
+    return resolveProject(hint).root;
+  } catch {
+    return undefined;
+  }
+}
+
+function extractTeamRosterForSession(
+  team: TeamDetails | null,
+  explicitRoots: string[],
+): RichSessionSnapshot["teamRoster"] {
+  if (!team || !team.hasManifest || team.roster.length === 0) {
+    return undefined;
+  }
+  if (explicitRoots.length > 0) {
+    const manifestRoot = team.project.root;
+    const matchesSessionRoot = explicitRoots.some((r) =>
+      pathMatchesRoot(r, manifestRoot),
+    );
+    if (!matchesSessionRoot) {
+      return undefined;
+    }
+  }
+  return team.roster.map((r) => ({
+    id: r.id,
+    ...(r.name ? { name: r.name } : {}),
+    ...(r.boardRole || r.roleType
+      ? { role: r.boardRole || r.roleType }
+      : {}),
+  }));
 }
 
 export class TelemetryAggregator {
@@ -325,6 +360,7 @@ export class TelemetryAggregator {
     const parseOne = async (
       tp: string,
       agentIdOverride?: string,
+      agentLabelOverride?: string,
     ): Promise<void> => {
       const validPath = await validateTranscriptPath(tp, allowedRoots);
       if (!validPath) return;
@@ -340,6 +376,7 @@ export class TelemetryAggregator {
       const evs = await copilotAdapter
         .parseTranscriptFile(validPath, sessionId, {
           agentIdOverride,
+          ...(agentLabelOverride ? { agentLabelOverride } : {}),
           workspacePath: opts.workspacePath,
           projectId: opts.projectId,
           allowedRoots,
@@ -358,7 +395,7 @@ export class TelemetryAggregator {
     }
     for (const [aid, tp] of agentPaths.entries()) {
       if (aid === "root") continue;
-      await parseOne(tp, aid);
+      await parseOne(tp, aid, this.pushBus.getAgentLabel(sessionId, aid));
     }
     for (const tp of this.pushBus.getTranscriptPaths(sessionId)) {
       await parseOne(tp, undefined);
@@ -401,14 +438,22 @@ export class TelemetryAggregator {
             ide: pushIde,
           })
         : [];
-      const fallbackRoots = [
+      const resolvedPushProjectRoot = resolveProjectRootHint(pushProj);
+      const resolvedFilterProjectRoot = resolveProjectRootHint(filter.project);
+      const explicitRoots = [
         ...(pushWs ? [pushWs] : []),
+        ...(resolvedPushProjectRoot ? [resolvedPushProjectRoot] : []),
         ...(filter.workspace ? [filter.workspace] : []),
-        process.cwd(),
+        ...(resolvedFilterProjectRoot ? [resolvedFilterProjectRoot] : []),
       ];
+      const fallbackRoots =
+        explicitRoots.length > 0 ? explicitRoots : [process.cwd()];
       const team = await discoverTeamDetailsCached(
         fallbackRoots,
-        pushWs ?? filter.workspace,
+        pushWs ??
+          resolvedPushProjectRoot ??
+          filter.workspace ??
+          resolvedFilterProjectRoot,
         15_000,
       ).catch(() => null);
       const snap = buildSessionSnapshot([...transcriptEvents, ...pushEvents], {
@@ -419,6 +464,10 @@ export class TelemetryAggregator {
         definitions: team?.definitions,
       });
       snap.definitions = team?.definitions ?? [];
+      const teamRoster = extractTeamRosterForSession(team, explicitRoots);
+      if (teamRoster) {
+        snap.teamRoster = teamRoster;
+      }
       return { snapshot: snap, sessions, boardProjects };
     }
 
@@ -450,14 +499,23 @@ export class TelemetryAggregator {
       },
     );
 
-    const sessionWorkspaces = [
+    const resolvedTargetProjectRoot = resolveProjectRootHint(target.projectId);
+    const resolvedFilterProjectRoot = resolveProjectRootHint(filter.project);
+    const explicitRoots = [
       ...(target.workspacePath ? [target.workspacePath] : []),
       ...target.workspaces,
-      process.cwd(),
+      ...(resolvedTargetProjectRoot ? [resolvedTargetProjectRoot] : []),
+      ...(filter.workspace ? [filter.workspace] : []),
+      ...(resolvedFilterProjectRoot ? [resolvedFilterProjectRoot] : []),
     ];
+    const sessionWorkspaces =
+      explicitRoots.length > 0 ? explicitRoots : [process.cwd()];
     const team = await discoverTeamDetailsCached(
       sessionWorkspaces,
-      target.workspacePath,
+      target.workspacePath ??
+        resolvedTargetProjectRoot ??
+        filter.workspace ??
+        resolvedFilterProjectRoot,
       15_000,
     ).catch(() => null);
 
@@ -472,6 +530,10 @@ export class TelemetryAggregator {
       },
     );
     snapshot.definitions = team?.definitions ?? [];
+    const teamRoster = extractTeamRosterForSession(team, explicitRoots);
+    if (teamRoster) {
+      snapshot.teamRoster = teamRoster;
+    }
 
     // Backfill summary status on matched session entry
     target.status = snapshot.status;
@@ -507,22 +569,51 @@ export class TelemetryAggregator {
     if (afterPoll) return afterPoll;
 
     const target = sessions.find((s) => s.sessionId === sessionId);
-    if (!target || !target.filePath) {
-      return null;
+
+    if (target && target.filePath) {
+      const adapter = this.adapters.find((a) => a.ide === target.ide);
+      if (adapter) {
+        await adapter
+          .parseSession(target, {
+            onFullBody: (eid, body) => {
+              this.bodyStore.set(target.sessionId, eid, body);
+            },
+          })
+          .catch(() => []);
+        const fromPassive = this.bodyStore.get(sessionId, eventId);
+        if (fromPassive) return fromPassive;
+      }
     }
 
-    const adapter = this.adapters.find((a) => a.ide === target.ide);
-    if (!adapter) {
-      return null;
-    }
+    // Fallback: check push-linked transcript files (including Copilot subagent transcripts)
+    const pushEvents = this.pushBus.getSessionEvents(sessionId);
+    const rawParamIde =
+      params.ide && params.ide !== "all" ? (params.ide as IdeSource) : undefined;
+    const pushIde = (target?.ide ??
+      pushEvents[0]?.ide ??
+      rawParamIde ??
+      "unknown") as IdeSource;
+    const pushWs =
+      target?.workspacePath ??
+      pushEvents.find((e) => e.workspacePath)?.workspacePath ??
+      params.workspace;
+    const pushProj =
+      target?.projectId ??
+      pushEvents.find((e) => e.projectId)?.projectId ??
+      params.project;
+    const isPassiveSession =
+      Boolean(target?.filePath) &&
+      path.basename(target!.filePath).toLowerCase() !== "telemetry.jsonl";
 
-    await adapter
-      .parseSession(target, {
-        onFullBody: (eid, body) => {
-          this.bodyStore.set(target.sessionId, eid, body);
-        },
-      })
-      .catch(() => []);
+    await this.loadPushTranscriptEvents(sessionId, {
+      excludeFilePath: target?.filePath,
+      workspacePath: pushWs,
+      trustedWorkspacePath: isPassiveSession
+        ? target!.workspacePath
+        : undefined,
+      projectId: pushProj,
+      ide: pushIde,
+    }).catch(() => []);
 
     return this.bodyStore.get(sessionId, eventId) ?? null;
   }

@@ -4,9 +4,11 @@ import fs from "node:fs/promises";
 import { createRequire } from "node:module";
 import os from "node:os";
 import path from "node:path";
+import { pathToFileURL } from "node:url";
 import { afterEach, beforeEach, describe, it } from "node:test";
 import ts from "typescript";
 import type * as FileLinkBridgeModule from "../../extension/src/fileLinkBridge.js";
+import { dispatchToolCall } from "../../src/mcp/server.js";
 
 function loadFileLinkBridge(): typeof FileLinkBridgeModule {
   const srcPath = path.resolve(
@@ -42,7 +44,9 @@ import {
   MAX_TOTAL_BYTES,
   TelemetryAggregator,
   buildSessionSnapshot,
+  normalizeWsPath,
 } from "../../src/telemetry/index.js";
+import { pathMatchesRoot } from "../../src/telemetry/adapters/project-match.js";
 
 describe("S1-45: EventBodyStore, Adapter Full-Body Capture, /api/event-body & file:// Bridge", () => {
   let tmpDir: string;
@@ -530,5 +534,525 @@ describe("S1-45: EventBodyStore, Adapter Full-Body Capture, /api/event-body & fi
       ).ok,
       false,
     );
+  });
+
+  it("S1-61 (1): Copilot isMsgTool calls hydrate onFullBody with accurate bodyLength/bodyTruncated across chatSessions & transcripts", async () => {
+    const longMsg = "COPILOT_MSG_LONG_" + "M".repeat(2200) + "_END";
+    const shortMsg = "Short peer ping";
+
+    // A. chatSessions JSON (toolInvocationSerialized -> write_agent & send_message)
+    const vscDir = path.join(tmpDir, "vsc-msg-storage");
+    const chatDir = path.join(vscDir, "ws-msg", "chatSessions");
+    await fs.mkdir(chatDir, { recursive: true });
+    await fs.writeFile(
+      path.join(chatDir, "vsc-msg-1.json"),
+      JSON.stringify({
+        sessionId: "vsc-msg-1",
+        creationDate: Date.parse("2026-11-26T01:00:00Z"),
+        requests: [
+          {
+            requestId: "mr0",
+            timestamp: Date.parse("2026-11-26T01:00:00Z"),
+            message: { text: "Coordinate team" },
+            response: [
+              {
+                kind: "toolInvocationSerialized",
+                toolId: "write_agent",
+                toolCallId: "msg-call-long",
+                isComplete: true,
+                toolSpecificData: {
+                  agent_id: "backend-engineer",
+                  message: longMsg,
+                },
+              },
+              {
+                kind: "toolInvocationSerialized",
+                toolId: "send_message",
+                toolCallId: "msg-call-short",
+                isComplete: true,
+                toolSpecificData: {
+                  recipient: "qa-validator",
+                  message: shortMsg,
+                },
+              },
+            ],
+            modelState: { completedAt: Date.parse("2026-11-26T01:00:05Z") },
+          },
+        ],
+      }),
+      "utf8",
+    );
+
+    const vsc = new CopilotVSCodeAdapter({ storageDir: vscDir });
+    const sessions = await vsc.discoverSessions();
+    assert.equal(sessions.length, 1);
+
+    const chatBodies = new Map<string, string>();
+    const chatEvents = await vsc.parseSession(sessions[0]!, {
+      onFullBody: (id, body) => chatBodies.set(id, body),
+    });
+    const chatLongEv = chatEvents.find((e) => e.toolCallId === "msg-call-long")!;
+    const chatShortEv = chatEvents.find((e) => e.toolCallId === "msg-call-short")!;
+    assert.equal(chatLongEv.kind, "message");
+    assert.equal(chatLongEv.targetAgentId, "backend-engineer");
+    assert.equal(String(chatLongEv.payload?.body).length, 1400);
+    assert.equal(
+      String((chatLongEv.payload?.toolSpecificData as Record<string, unknown>)?.message).length,
+      1400,
+    );
+    assert.equal(chatLongEv.bodyLength, longMsg.length);
+    assert.equal(chatLongEv.bodyTruncated, true);
+    assert.equal(chatBodies.get(chatLongEv.id), longMsg);
+
+    assert.equal(chatShortEv.kind, "message");
+    assert.equal(chatShortEv.targetAgentId, "qa-validator");
+    assert.equal(chatShortEv.payload?.body, shortMsg);
+    assert.equal(chatShortEv.bodyLength, shortMsg.length);
+    assert.equal(chatShortEv.bodyTruncated, false);
+    assert.equal(chatBodies.get(chatShortEv.id), shortMsg);
+
+    // B. Copilot JSONL transcript (both assistant.message toolRequests and tool.execution_start)
+    const transcriptDir = path.join(tmpDir, ".copilot", "session-state", "tr-msg-1");
+    await fs.mkdir(transcriptDir, { recursive: true });
+    const transcriptFile = path.join(transcriptDir, "events.jsonl");
+    const trRows = [
+      {
+        type: "assistant.message",
+        timestamp: "2026-11-26T01:05:00Z",
+        data: {
+          toolRequests: [
+            {
+              name: "write_agent",
+              toolCallId: "tr-req-long",
+              arguments: { agent_id: "frontend-engineer", message: longMsg },
+            },
+          ],
+        },
+      },
+      {
+        type: "tool.execution_start",
+        timestamp: "2026-11-26T01:05:01Z",
+        data: {
+          toolName: "send_message",
+          toolCallId: "tr-exec-long",
+          arguments: { recipient: "qa-validator", content: longMsg },
+        },
+      },
+    ];
+    await fs.writeFile(
+      transcriptFile,
+      trRows.map((r) => JSON.stringify(r)).join("\n") + "\n",
+      "utf8",
+    );
+
+    const trBodies = new Map<string, string>();
+    const trEvents = await vsc.parseTranscriptFile(transcriptFile, "tr-msg-1", {
+      onFullBody: (id, body) => trBodies.set(id, body),
+    });
+    const reqEv = trEvents.find((e) => e.toolCallId === "tr-req-long")!;
+    const execEv = trEvents.find((e) => e.toolCallId === "tr-exec-long")!;
+
+    for (const ev of [reqEv, execEv]) {
+      assert.equal(ev.kind, "message");
+      assert.equal(String(ev.payload?.body).length, 1400);
+      assert.equal(ev.bodyLength, longMsg.length);
+      assert.equal(ev.bodyTruncated, true);
+      assert.equal(trBodies.get(ev.id), longMsg);
+    }
+    assert.equal(
+      String((reqEv.payload?.args as Record<string, unknown>)?.message).length,
+      1400,
+    );
+    assert.equal(
+      String((execEv.payload?.args as Record<string, unknown>)?.content).length,
+      1400,
+    );
+  });
+
+  it("S1-61 (2): TelemetryAggregator.getEventBody and GET /api/event-body hydrate full bodies from push-linked subagent transcripts", async () => {
+    const vscDir = path.join(tmpDir, "vsc-push-tr");
+    const chatDir = path.join(vscDir, "ws-tr", "chatSessions");
+    await fs.mkdir(chatDir, { recursive: true });
+    await fs.writeFile(
+      path.join(chatDir, "sess-parent-1.json"),
+      JSON.stringify({
+        sessionId: "sess-parent-1",
+        creationDate: Date.parse("2026-11-26T02:00:00Z"),
+        requests: [
+          {
+            requestId: "r0",
+            timestamp: Date.parse("2026-11-26T02:00:00Z"),
+            message: { text: "Run subagent" },
+            response: [{ kind: "markdownContent", content: { value: "Spawned" } }],
+            modelState: { completedAt: Date.parse("2026-11-26T02:00:01Z") },
+          },
+        ],
+      }),
+      "utf8",
+    );
+
+    const subTranscriptDir = path.join(tmpDir, ".copilot", "session-state", "sub-tr-1");
+    await fs.mkdir(subTranscriptDir, { recursive: true });
+    const subTranscriptPath = path.join(subTranscriptDir, "subagent.jsonl");
+    const subFullMsg = "SUBAGENT_PUSH_LINKED_MSG_" + "S".repeat(2300) + "_END";
+    await fs.writeFile(
+      subTranscriptPath,
+      JSON.stringify({
+        type: "assistant.message",
+        timestamp: "2026-11-26T02:00:03Z",
+        data: {
+          toolRequests: [
+            {
+              name: "send_message",
+              toolCallId: "sub-msg-1",
+              arguments: { recipient: "orchestrator", message: subFullMsg },
+            },
+          ],
+        },
+      }) + "\n",
+      "utf8",
+    );
+
+    const aggregator = new TelemetryAggregator({
+      brainDir: path.join(tmpDir, "no-brain"),
+      claudeDir: path.join(tmpDir, "no-claude"),
+      vscodeDir: vscDir,
+      includeGlobalTelemetryFile: false,
+      bodyStore: new EventBodyStore(),
+    });
+
+    // Link subagent transcript via PushBus subagent_spawn event
+    aggregator.ingest([
+      {
+        id: "spawn-link-1",
+        sessionId: "sess-parent-1",
+        ide: "copilot-vscode",
+        agentId: "root",
+        kind: "subagent_spawn",
+        targetAgentId: "backend-sub-1",
+        summary: "Spawned backend",
+        payload: {
+          agentLabel: "Backend Engineer",
+          agentTranscriptPath: subTranscriptPath,
+        },
+      },
+    ]);
+
+    // Populate snapshot to discover the exact event ID in the subagent transcript
+    const { snapshot } = await aggregator.getSessionSnapshot("sess-parent-1");
+    const subMsgEv = snapshot.events.find((e) => e.toolCallId === "sub-msg-1")!;
+    assert.ok(subMsgEv, "subagent message event should appear in snapshot");
+    assert.equal(subMsgEv.bodyLength, subFullMsg.length);
+    assert.equal(subMsgEv.bodyTruncated, true);
+
+    // Clear bodyStore to simulate cold cache / LRU eviction
+    aggregator.bodyStore.clear();
+    assert.equal(aggregator.bodyStore.has("sess-parent-1", subMsgEv.id), false);
+
+    // Direct aggregator.getEventBody() must re-parse the push-linked subagent transcript
+    const hydrated = await aggregator.getEventBody({
+      sessionId: "sess-parent-1",
+      eventId: subMsgEv.id,
+    });
+    assert.ok(hydrated);
+    assert.equal(hydrated.body, subFullMsg);
+
+    // Clear again and verify GET /api/event-body end-to-end
+    aggregator.bodyStore.clear();
+    const handle = createStudioServer({
+      host: "127.0.0.1",
+      port: 0,
+      aggregator,
+    });
+    const { port } = await handle.listen(0, "127.0.0.1");
+    try {
+      const resp = await fetch(
+        `http://127.0.0.1:${port}/api/event-body?session=sess-parent-1&event=${subMsgEv.id}`,
+      );
+      assert.equal(resp.status, 200);
+      const json = (await resp.json()) as { ok: boolean; body: string };
+      assert.equal(json.ok, true);
+      assert.equal(json.body, subFullMsg);
+    } finally {
+      await handle.close();
+    }
+  });
+
+  it("S1-61 (3): RichSessionSnapshot includes teamRoster from workspace .agent-team/team.yaml and omits safely when absent", async () => {
+    const wsWithTeam = path.join(tmpDir, "ws-with-team");
+    const wsWithoutTeam = path.join(tmpDir, "ws-without-team");
+    await fs.mkdir(path.join(wsWithTeam, ".agent-team", "agents"), {
+      recursive: true,
+    });
+    await fs.mkdir(wsWithoutTeam, { recursive: true });
+    await fs.writeFile(
+      path.join(wsWithTeam, ".agent-team", "agents", "backend-engineer.md"),
+      "---\nname: Backend Engineer\ndescription: Builds backend\n---\nPrompt\n",
+      "utf8",
+    );
+    await fs.writeFile(
+      path.join(wsWithTeam, ".agent-team", "team.yaml"),
+      [
+        "schemaVersion: 1",
+        "project:",
+        "  id: demo-team",
+        "  title: Demo Team",
+        "targets:",
+        "  - copilot-vscode",
+        "roster:",
+        "  - id: backend-engineer",
+        "    name: Backend Engineer",
+        "    roleType: specialist",
+        "    boardRole: backend",
+        "    promptFile: agents/backend-engineer.md",
+      ].join("\n") + "\n",
+      "utf8",
+    );
+
+    const aggregator = new TelemetryAggregator({
+      brainDir: path.join(tmpDir, "no-brain"),
+      claudeDir: path.join(tmpDir, "no-claude"),
+      vscodeDir: path.join(tmpDir, "no-vsc"),
+      includeGlobalTelemetryFile: false,
+      bodyStore: new EventBodyStore(),
+    });
+
+    aggregator.ingest([
+      {
+        id: "ev-with-team",
+        sessionId: "sess-team-yes",
+        ide: "copilot-vscode",
+        workspacePath: wsWithTeam,
+        agentId: "root",
+        kind: "user_input",
+        summary: "Hello team",
+      },
+      {
+        id: "ev-no-team",
+        sessionId: "sess-team-no",
+        ide: "copilot-vscode",
+        workspacePath: wsWithoutTeam,
+        agentId: "root",
+        kind: "user_input",
+        summary: "Hello solo",
+      },
+    ]);
+
+    const { snapshot: withSnap } = await aggregator.getSessionSnapshot("sess-team-yes", {
+      workspace: wsWithTeam,
+    });
+    assert.deepEqual(withSnap.teamRoster, [
+      {
+        id: "backend-engineer",
+        name: "Backend Engineer",
+        role: "backend",
+      },
+    ]);
+
+    const { snapshot: withoutSnap } = await aggregator.getSessionSnapshot("sess-team-no", {
+      workspace: wsWithoutTeam,
+    });
+    assert.equal(withoutSnap.teamRoster, undefined);
+  });
+
+  it("BUG-25: Antigravity passive session delivers teamRoster via ancestor discovery, file:// URI workspace, MCP app_get_state, HTTP /api/state & SSE /api/stream", async () => {
+    const repoRoot = path.join(tmpDir, "ag-team-repo");
+    const subDir = path.join(repoRoot, "docs", "mockups");
+    const brainDir = path.join(tmpDir, "ag-brain");
+    const rootCid = "11111111-2222-3333-4444-555555555555";
+    const childCid = "66666666-7777-8888-9999-aaaaaaaaaaaa";
+
+    await fs.mkdir(path.join(repoRoot, ".agent-team", "agents"), {
+      recursive: true,
+    });
+    await fs.mkdir(subDir, { recursive: true });
+    await fs.mkdir(path.join(brainDir, rootCid, ".system_generated", "logs"), {
+      recursive: true,
+    });
+    await fs.mkdir(path.join(brainDir, childCid, ".system_generated", "logs"), {
+      recursive: true,
+    });
+
+    await fs.writeFile(
+      path.join(repoRoot, ".agent-team", "agents", "backend-engineer.md"),
+      "---\nname: Backend Engineer\ndescription: Builds backend\n---\nPrompt\n",
+      "utf8",
+    );
+    await fs.writeFile(
+      path.join(repoRoot, ".agent-team", "agents", "frontend-engineer.md"),
+      "---\nname: Frontend Engineer\ndescription: Builds UI\n---\nPrompt\n",
+      "utf8",
+    );
+    await fs.writeFile(
+      path.join(repoRoot, ".agent-team", "team.yaml"),
+      [
+        "schemaVersion: 1",
+        "project:",
+        "  id: ag-demo-team",
+        "  title: AG Demo Team",
+        "targets:",
+        "  - antigravity",
+        "roster:",
+        "  - id: backend-engineer",
+        "    name: Backend Engineer",
+        "    roleType: specialist",
+        "    boardRole: backend",
+        "    promptFile: agents/backend-engineer.md",
+        "  - id: frontend-engineer",
+        "    name: Frontend Engineer",
+        "    roleType: specialist",
+        "    boardRole: frontend",
+        "    promptFile: agents/frontend-engineer.md",
+      ].join("\n") + "\n",
+      "utf8",
+    );
+
+    await fs.writeFile(
+      path.join(brainDir, rootCid, ".system_generated", "logs", "transcript.jsonl"),
+      [
+        JSON.stringify({
+          type: "USER_INPUT",
+          created_at: "2026-11-26T05:00:00.000Z",
+          content: `Active Workspaces:\n- ${subDir}\nImplement BUG-25`,
+        }),
+        JSON.stringify({
+          type: "PLANNER_RESPONSE",
+          created_at: "2026-11-26T05:00:02.000Z",
+          tool_calls: [
+            {
+              name: "invoke_subagent",
+              args: {
+                Role: "Backend Engineer",
+                Name: "backend-engineer",
+                Prompt: "Fix backend roster",
+              },
+            },
+          ],
+        }),
+        JSON.stringify({
+          type: "GENERIC",
+          created_at: "2026-11-26T05:00:03.000Z",
+          content: `Created the following subagent: {"conversationId":"${childCid}"}`,
+        }),
+      ].join("\n") + "\n",
+      "utf8",
+    );
+
+    await fs.writeFile(
+      path.join(brainDir, childCid, ".system_generated", "logs", "transcript.jsonl"),
+      [
+        JSON.stringify({
+          type: "SYSTEM_MESSAGE",
+          created_at: "2026-11-26T05:00:03.500Z",
+          content: `sender=${rootCid} content=Fix backend roster`,
+        }),
+        JSON.stringify({
+          type: "PLANNER_RESPONSE",
+          created_at: "2026-11-26T05:00:05.000Z",
+          content: "Done fixing roster.",
+        }),
+      ].join("\n") + "\n",
+      "utf8",
+    );
+
+    // Verify Windows drive casing & file:/// URI normalization in pathMatchesRoot
+    assert.equal(
+      pathMatchesRoot("D:\\Work\\Personal\\AgentVisualizer\\docs", "d:/Work/Personal/AgentVisualizer"),
+      true,
+    );
+    assert.equal(
+      pathMatchesRoot("file:///d%3A/Work/Personal/AgentVisualizer", "D:\\Work\\Personal\\AgentVisualizer"),
+      true,
+    );
+    assert.equal(
+      normalizeWsPath("file://localhost/D%3A/Work/Personal/AgentVisualizer/"),
+      "d:/Work/Personal/AgentVisualizer",
+    );
+
+    const aggregator = new TelemetryAggregator({
+      brainDir,
+      claudeDir: path.join(tmpDir, "no-claude"),
+      vscodeDir: path.join(tmpDir, "no-vsc"),
+      includeGlobalTelemetryFile: false,
+      bodyStore: new EventBodyStore(),
+    });
+
+    const expectedRoster = [
+      { id: "backend-engineer", name: "Backend Engineer", role: "backend" },
+      { id: "frontend-engineer", name: "Frontend Engineer", role: "frontend" },
+    ];
+
+    // 1. Direct aggregator snapshot (without explicit project/workspace filter; subdir workspace walks up to repoRoot)
+    const { snapshot: directSnap } = await aggregator.getSessionSnapshot(rootCid, {
+      ide: "antigravity",
+    });
+    assert.deepEqual(directSnap.teamRoster, expectedRoster);
+
+    // 2. Aggregator snapshot with file:// URI workspace filter
+    const fileUriWs = pathToFileURL(repoRoot).href;
+    const { snapshot: uriSnap } = await aggregator.getSessionSnapshot(rootCid, {
+      ide: "antigravity",
+      workspace: fileUriWs,
+    });
+    assert.deepEqual(uriSnap.teamRoster, expectedRoster);
+
+    // 3. MCP app_get_state preserves teamRoster
+    const mcpRes = await dispatchToolCall(
+      "app_get_state",
+      { ide: "antigravity", session: rootCid },
+      { aggregator },
+    );
+    assert.notEqual(mcpRes.isError, true);
+    assert.deepEqual(
+      (mcpRes.structuredContent as { teamRoster?: unknown }).teamRoster,
+      expectedRoster,
+    );
+
+    // 4. HTTP /api/state and SSE /api/stream preserve teamRoster
+    const handle = createStudioServer({
+      host: "127.0.0.1",
+      port: 0,
+      aggregator,
+    });
+    const { port } = await handle.listen(0, "127.0.0.1");
+    try {
+      const stateResp = await fetch(
+        `http://127.0.0.1:${port}/api/state?ide=antigravity&session=${rootCid}`,
+      );
+      assert.equal(stateResp.status, 200);
+      const stateJson = (await stateResp.json()) as { teamRoster?: unknown };
+      assert.deepEqual(stateJson.teamRoster, expectedRoster);
+
+      const ac = new AbortController();
+      const sseResp = await fetch(
+        `http://127.0.0.1:${port}/api/stream?ide=antigravity&session=${rootCid}`,
+        { signal: ac.signal },
+      );
+      assert.equal(sseResp.status, 200);
+      const reader = sseResp.body!.getReader();
+      const decoder = new TextDecoder();
+      let buf = "";
+      try {
+        while (!buf.includes("event: state\n") || !buf.includes("\n\n")) {
+          const { value, done } = await reader.read();
+          if (done) break;
+          buf += decoder.decode(value, { stream: true });
+          const idx = buf.indexOf("data: ");
+          if (idx >= 0 && buf.indexOf("\n\n", idx) > idx) break;
+        }
+      } finally {
+        ac.abort();
+      }
+      const dataLine = buf
+        .split(/\r?\n/)
+        .find((l) => l.startsWith("data: "));
+      assert.ok(dataLine, "expected SSE data line");
+      const sseJson = JSON.parse(dataLine.slice("data: ".length)) as {
+        teamRoster?: unknown;
+      };
+      assert.deepEqual(sseJson.teamRoster, expectedRoster);
+    } finally {
+      await handle.close();
+    }
   });
 });

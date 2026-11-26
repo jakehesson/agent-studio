@@ -45,17 +45,35 @@ function extractFullNarrative(ev: NormalizedEvent): string {
   return cleanedSummary || "No summary recorded.";
 }
 
+interface CapturedViewState {
+  detailsOpen: Map<string, boolean>;
+  rootScrollTop: number;
+  preScrollTops: Map<string, number>;
+}
+
 export class PayloadInspector {
   private container: HTMLElement;
   private cb: PayloadInspectorCallbacks;
   private dialog: HTMLDialogElement;
   private dlgReaderBtn: HTMLButtonElement | null = null;
   private currentEvent: NormalizedEvent | null = null;
+  private currentTargetKey: string | null = null;
   private lastCopyText = "";
   private lastMarkup: {
     headerTitleHtml: string;
     inlineBodyHtml: string;
     modalBodyHtml: string;
+  } | null = null;
+  private lastRenderedInline: {
+    targetKey: string | null;
+    headerTitleHtml: string;
+    bodyHtml: string;
+    hasEvent: boolean;
+  } | null = null;
+  private lastRenderedDialog: {
+    targetKey: string | null;
+    headerTitleHtml: string;
+    bodyHtml: string;
   } | null = null;
 
   constructor(container: HTMLElement, cb: PayloadInspectorCallbacks = {}) {
@@ -136,21 +154,28 @@ export class PayloadInspector {
 
   public renderEmpty(): void {
     this.currentEvent = null;
+    this.currentTargetKey = null;
     if (this.dlgReaderBtn) this.dlgReaderBtn.hidden = true;
     this.lastCopyText = "";
     this.lastMarkup = null;
-    this.container.setAttribute("data-inspector-state", "empty");
-    this.container.innerHTML = `
-      <div class="insp-empty-bar">
-        <span class="insp-title">Payload Inspector</span>
-        <span class="insp-sub">Select an event or agent to inspect payload</span>
-      </div>
-    `;
+    this.lastRenderedInline = null;
+    this.lastRenderedDialog = null;
+    if (this.container.getAttribute("data-inspector-state") !== "empty") {
+      this.container.setAttribute("data-inspector-state", "empty");
+      this.container.innerHTML = `
+        <div class="insp-empty-bar">
+          <span class="insp-title">Payload Inspector</span>
+          <span class="insp-sub">Select an event or agent to inspect payload</span>
+        </div>
+      `;
+    }
     if (this.dialog.open) this.dialog.close();
   }
 
   public renderEvent(ev: NormalizedEvent, opts: InspectRenderOptions = {}): void {
+    const targetKey = `ev:${ev.id}`;
     this.currentEvent = ev;
+    this.currentTargetKey = targetKey;
     if (this.dlgReaderBtn) this.dlgReaderBtn.hidden = false;
     const ide = getIdeMeta(ev.ide);
     const cls = classifyEventReadable(ev);
@@ -183,7 +208,7 @@ export class PayloadInspector {
         <span><b>Time:</b> ${escHtml(fmtClock(ev.ts || ev.epoch))}</span>
       </div>
       <div class="insp-summary insp-narrative">${escHtml(narrative)}</div>
-      <details class="insp-def-details" ${jsonOpenByDefault ? "open" : ""}>
+      <details class="insp-def-details" data-details-key="event-payload-json" ${jsonOpenByDefault ? "open" : ""}>
         <summary>Raw Telemetry Payload (JSON)</summary>
         <div class="insp-pre-wrap" role="region" tabindex="0" aria-label="Event JSON payload">
           <pre class="insp-pre"><code>${escHtml(payloadJson)}</code></pre>
@@ -195,7 +220,7 @@ export class PayloadInspector {
     const modalBodyHtml = buildBody(true);
 
     this.lastMarkup = { headerTitleHtml, inlineBodyHtml, modalBodyHtml };
-    this.renderInline(headerTitleHtml, inlineBodyHtml);
+    this.renderInline(headerTitleHtml, inlineBodyHtml, targetKey);
     if (opts.openSheet) {
       this.openModal();
     } else if (this.dialog.open) {
@@ -204,7 +229,9 @@ export class PayloadInspector {
   }
 
   public renderAgent(agent: AgentNodeSnapshot, opts: InspectRenderOptions = {}): void {
+    const targetKey = `agent:${agent.id}`;
     this.currentEvent = null;
+    this.currentTargetKey = targetKey;
     if (this.dlgReaderBtn) this.dlgReaderBtn.hidden = true;
     const ide = getIdeMeta(agent.ide);
     const st = getStatusStyle(agent.status);
@@ -260,7 +287,7 @@ export class PayloadInspector {
           }
           ${
             def.preview
-              ? `<details class="insp-def-details">
+              ? `<details class="insp-def-details" data-details-key="agent-prompt-preview">
                   <summary>Prompt Preview (<code>${escHtml(def.source_path)}</code>)</summary>
                   <div class="insp-pre-wrap" role="region" tabindex="0" aria-label="Agent prompt preview">
                     <pre class="insp-pre"><code>${escHtml(def.preview)}</code></pre>
@@ -326,7 +353,7 @@ export class PayloadInspector {
       inlineBodyHtml: bodyHtml,
       modalBodyHtml: bodyHtml,
     };
-    this.renderInline(headerTitleHtml, bodyHtml);
+    this.renderInline(headerTitleHtml, bodyHtml, targetKey);
     if (opts.openSheet) {
       this.openModal();
     } else if (this.dialog.open) {
@@ -334,8 +361,100 @@ export class PayloadInspector {
     }
   }
 
-  private renderInline(headerTitleHtml: string, bodyHtml: string): void {
+  private getDetailsKey(el: HTMLDetailsElement, idx: number): string {
+    const explicit = el.dataset.detailsKey?.trim();
+    if (explicit) return explicit;
+    const summary = el.querySelector("summary")?.textContent?.trim();
+    const cls = el.className.trim();
+    return `${cls}|${summary || idx}`;
+  }
+
+  private captureViewState(scrollRoot: Element | null): CapturedViewState {
+    const detailsOpen = new Map<string, boolean>();
+    const preScrollTops = new Map<string, number>();
+    if (!scrollRoot) {
+      return { detailsOpen, rootScrollTop: 0, preScrollTops };
+    }
+    scrollRoot.querySelectorAll<HTMLDetailsElement>("details").forEach((det, idx) => {
+      detailsOpen.set(this.getDetailsKey(det, idx), det.open);
+    });
+    scrollRoot.querySelectorAll<HTMLElement>(".insp-pre-wrap").forEach((pre, idx) => {
+      const det = pre.closest("details");
+      const key = det ? this.getDetailsKey(det, idx) : `pre:${idx}`;
+      if (pre.scrollTop > 0) preScrollTops.set(key, pre.scrollTop);
+    });
+    return {
+      detailsOpen,
+      rootScrollTop: (scrollRoot as HTMLElement).scrollTop || 0,
+      preScrollTops,
+    };
+  }
+
+  private restoreViewState(scrollRoot: Element | null, state: CapturedViewState): void {
+    if (!scrollRoot) return;
+    // Restore <details> open states first so expanded layout height exists before restoring scrollTop
+    scrollRoot.querySelectorAll<HTMLDetailsElement>("details").forEach((det, idx) => {
+      const key = this.getDetailsKey(det, idx);
+      if (state.detailsOpen.has(key)) {
+        det.open = Boolean(state.detailsOpen.get(key));
+      }
+    });
+    if (state.rootScrollTop > 0) {
+      (scrollRoot as HTMLElement).scrollTop = state.rootScrollTop;
+    }
+    scrollRoot.querySelectorAll<HTMLElement>(".insp-pre-wrap").forEach((pre, idx) => {
+      const det = pre.closest("details");
+      const key = det ? this.getDetailsKey(det, idx) : `pre:${idx}`;
+      const saved = state.preScrollTops.get(key);
+      if (saved && saved > 0) pre.scrollTop = saved;
+    });
+  }
+
+  private renderInline(headerTitleHtml: string, bodyHtml: string, targetKey: string): void {
     const hasEvent = this.currentEvent !== null;
+    const isOpen = this.container.getAttribute("data-inspector-state") === "open";
+    const prev = this.lastRenderedInline;
+
+    if (
+      isOpen &&
+      prev &&
+      prev.targetKey === targetKey &&
+      prev.hasEvent === hasEvent &&
+      prev.headerTitleHtml === headerTitleHtml &&
+      prev.bodyHtml === bodyHtml
+    ) {
+      return;
+    }
+
+    const sameTarget = isOpen && prev?.targetKey === targetKey;
+    const existingTitle = isOpen ? this.container.querySelector(".insp-title-row") : null;
+    const existingBody = isOpen
+      ? this.container.querySelector<HTMLElement>(".insp-inline-body")
+      : null;
+
+    if (isOpen && prev && prev.hasEvent === hasEvent && existingTitle && existingBody) {
+      if (prev.headerTitleHtml !== headerTitleHtml) {
+        existingTitle.innerHTML = headerTitleHtml;
+      }
+      if (!sameTarget || prev.bodyHtml !== bodyHtml) {
+        const containerScrollTop = sameTarget ? this.container.scrollTop : 0;
+        const captured = sameTarget ? this.captureViewState(existingBody) : null;
+        existingBody.innerHTML = bodyHtml;
+        if (captured) {
+          this.restoreViewState(existingBody, captured);
+          if (containerScrollTop > 0) this.container.scrollTop = containerScrollTop;
+        } else {
+          existingBody.scrollTop = 0;
+          this.container.scrollTop = 0;
+        }
+      }
+      this.lastRenderedInline = { targetKey, headerTitleHtml, bodyHtml, hasEvent };
+      return;
+    }
+
+    const containerScrollTop = sameTarget ? this.container.scrollTop : 0;
+    const captured = sameTarget ? this.captureViewState(existingBody ?? this.container) : null;
+
     this.container.setAttribute("data-inspector-state", "open");
     this.container.innerHTML = `
       <div class="insp-head">
@@ -367,14 +486,51 @@ export class PayloadInspector {
       this.renderEmpty();
       this.cb.onClose?.();
     });
+
+    if (captured) {
+      const nextBody = this.container.querySelector<HTMLElement>(".insp-inline-body");
+      this.restoreViewState(nextBody ?? this.container, captured);
+      if (containerScrollTop > 0) this.container.scrollTop = containerScrollTop;
+    } else {
+      this.container.scrollTop = 0;
+    }
+
+    this.lastRenderedInline = { targetKey, headerTitleHtml, bodyHtml, hasEvent };
   }
 
   private syncDialogContent(): void {
     if (!this.lastMarkup) return;
+    const targetKey = this.currentTargetKey;
+    const prev = this.lastRenderedDialog;
+    if (
+      prev &&
+      prev.targetKey === targetKey &&
+      prev.headerTitleHtml === this.lastMarkup.headerTitleHtml &&
+      prev.bodyHtml === this.lastMarkup.modalBodyHtml
+    ) {
+      return;
+    }
+
     const titleEl = this.dialog.querySelector("[data-dlg-title]");
-    const bodyEl = this.dialog.querySelector("[data-dlg-body]");
-    if (titleEl) titleEl.innerHTML = this.lastMarkup.headerTitleHtml;
-    if (bodyEl) bodyEl.innerHTML = this.lastMarkup.modalBodyHtml;
+    const bodyEl = this.dialog.querySelector<HTMLElement>("[data-dlg-body]");
+    if (titleEl && prev?.headerTitleHtml !== this.lastMarkup.headerTitleHtml) {
+      titleEl.innerHTML = this.lastMarkup.headerTitleHtml;
+    }
+    const sameTarget = Boolean(prev && prev.targetKey === targetKey);
+    if (bodyEl && (!sameTarget || prev?.bodyHtml !== this.lastMarkup.modalBodyHtml)) {
+      const captured = sameTarget ? this.captureViewState(bodyEl) : null;
+      bodyEl.innerHTML = this.lastMarkup.modalBodyHtml;
+      if (captured) {
+        this.restoreViewState(bodyEl, captured);
+      } else {
+        bodyEl.scrollTop = 0;
+      }
+    }
+    this.lastRenderedDialog = {
+      targetKey,
+      headerTitleHtml: this.lastMarkup.headerTitleHtml,
+      bodyHtml: this.lastMarkup.modalBodyHtml,
+    };
   }
 
   private async handleCopyClick(btn: HTMLButtonElement): Promise<void> {

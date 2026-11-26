@@ -91,7 +91,7 @@ function resolveServerVersion(): string {
   } catch {
     // Fall through to default version
   }
-  return "0.11.1";
+  return "0.12.0";
 }
 
 export const MCP_PROTOCOL_VERSION = "2024-11-05";
@@ -145,6 +145,7 @@ export interface McpServerOptions {
   defaultProject?: string;
   cwd?: string;
   sessionId?: string;
+  aggregator?: TelemetryAggregator;
 }
 
 interface JsonRpcRequest {
@@ -1187,7 +1188,7 @@ async function executeAppGetStateTool(
   args: Record<string, unknown>,
   options: McpServerOptions,
 ): Promise<McpToolCallResult> {
-  const aggregator = getMcpAggregator();
+  const aggregator = options.aggregator ?? getMcpAggregator();
   const ide = str(args.ide);
   const project = str(args.project) ?? options.defaultProject;
   const workspace = str(args.workspace);
@@ -1236,7 +1237,7 @@ async function executeAppGetEventBodyTool(
     };
   }
 
-  const aggregator = getMcpAggregator();
+  const aggregator = options.aggregator ?? getMcpAggregator();
   const entry = await aggregator.getEventBody({
     sessionId: session,
     eventId,
@@ -1366,7 +1367,7 @@ async function executeAppGetDoctorTool(
   args: Record<string, unknown>,
   options: McpServerOptions,
 ): Promise<McpToolCallResult> {
-  const aggregator = getMcpAggregator();
+  const aggregator = options.aggregator ?? getMcpAggregator();
   const projectParam = str(args.project) ?? options.defaultProject;
   const workspaceParam = str(args.workspace);
   let resolvedRoot = workspaceParam;
@@ -1406,7 +1407,7 @@ async function executeAppSendTestEventTool(
   args: Record<string, unknown>,
   options: McpServerOptions,
 ): Promise<McpToolCallResult> {
-  const aggregator = getMcpAggregator();
+  const aggregator = options.aggregator ?? getMcpAggregator();
   const ideRaw = str(args.ide);
   const ide: IdeSource =
     ideRaw === "antigravity" ||

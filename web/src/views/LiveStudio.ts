@@ -2,17 +2,24 @@ import { ActivityFeed } from "../components/ActivityFeed.js";
 import { CommReaderModal } from "../components/CommReaderModal.js";
 import { PayloadInspector } from "../components/PayloadInspector.js";
 import { TimelineScrubber } from "../components/TimelineScrubber.js";
-import { buildSnapshot } from "../state/snapshot.js";
 import { TopologySvg } from "../components/TopologySvg.js";
+import { buildSnapshot } from "../state/snapshot.js";
+import { buildTopologyModel } from "../state/topologyGrouping.js";
 import type {
   AgentNodeSnapshot,
   NormalizedEvent,
   SessionSnapshot,
   TeamDefinitionEntry,
+  TeamRosterRef,
 } from "../types.js";
+
+export interface LiveStudioCallbacks {
+  onCoverSubPaneChange?: (pane: "topology" | "feed") => void;
+}
 
 export class LiveStudioView {
   private root: HTMLElement;
+  private cb: LiveStudioCallbacks;
   private topology: TopologySvg;
   private feed: ActivityFeed;
   private inspector: PayloadInspector;
@@ -20,14 +27,17 @@ export class LiveStudioView {
   private readerModal: CommReaderModal;
 
   private snapshot: SessionSnapshot | null = null;
+  private fallbackTeamRoster: TeamRosterRef[] | undefined = undefined;
+  private fallbackDefinitions: TeamDefinitionEntry[] | undefined = undefined;
   private agentLabelMap: Map<string, string> = new Map();
   private selectedAgentId: string | null = null;
   private selectedEventId: string | null = null;
   private lastAnimatedEventId: string | null = null;
   private coverSubPane: "topology" | "feed" = "topology";
 
-  constructor(root: HTMLElement) {
+  constructor(root: HTMLElement, cb: LiveStudioCallbacks = {}) {
     this.root = root;
+    this.cb = cb;
     this.root.innerHTML = `
       <div class="studio-workspace" data-studio-workspace data-cover-pane="topology">
         <section class="card pane-topology" data-pane-topology aria-label="Topology mesh"></section>
@@ -54,6 +64,13 @@ export class LiveStudioView {
           this.inspectCurrentAgent(agentId, this.isCoverScreen());
         } else {
           this.inspector.renderEmpty();
+        }
+      },
+      onSelectThread: (selection) => {
+        const opened = this.feed.openThread(selection);
+        if (opened && this.isCoverScreen()) {
+          this.setCoverSubPane("feed");
+          this.cb.onCoverSubPaneChange?.("feed");
         }
       },
     });
@@ -106,6 +123,13 @@ export class LiveStudioView {
         this.feed.setSelectedEvent(ev.id);
         this.readerModal.open(ev, { labelMap: this.agentLabelMap });
       },
+      onThreadChange: (threadKey) => {
+        this.topology.setActiveThreadKey(threadKey);
+      },
+      onCoverBackToTopology: () => {
+        this.setCoverSubPane("topology");
+        this.cb.onCoverSubPaneChange?.("topology");
+      },
     });
 
     this.inspector = new PayloadInspector(inspEl, {
@@ -145,10 +169,28 @@ export class LiveStudioView {
     this.coverSubPane = pane;
     const ws = this.root.querySelector("[data-studio-workspace]");
     ws?.setAttribute("data-cover-pane", pane);
+    if (pane === "topology") {
+      window.requestAnimationFrame(() => this.topology.refreshLayout());
+    }
   }
 
   public getCoverSubPane(): "topology" | "feed" {
     return this.coverSubPane;
+  }
+
+  public setFallbackTeamRoster(
+    roster?: TeamRosterRef[],
+    definitions?: TeamDefinitionEntry[]
+  ): void {
+    this.fallbackTeamRoster = roster && roster.length > 0 ? roster : undefined;
+    this.fallbackDefinitions =
+      definitions && definitions.length > 0 ? definitions : undefined;
+    if (
+      this.snapshot &&
+      (!this.snapshot.teamRoster || this.snapshot.teamRoster.length === 0)
+    ) {
+      this.renderFromCursor(false);
+    }
   }
 
   public setSnapshot(next: SessionSnapshot): void {
@@ -160,9 +202,10 @@ export class LiveStudioView {
       this.selectedAgentId = null;
       this.selectedEventId = null;
       this.lastAnimatedEventId = null;
-      this.topology.setSelectedAgent(null);
+      this.topology.resetSessionState();
       this.feed.setAgentFilter(null);
       this.feed.setSelectedEvent(null);
+      this.feed.resetScroll();
       this.inspector.renderEmpty();
       this.scrubber.snapLive();
     }
@@ -190,6 +233,14 @@ export class LiveStudioView {
     const events = snap.events;
     const { cursor, liveTail } = this.scrubber.getState();
     const isHistory = events.length > 0 && (!liveTail || cursor < events.length - 1);
+    const effectiveTeamRoster =
+      snap.teamRoster && snap.teamRoster.length > 0
+        ? snap.teamRoster
+        : this.fallbackTeamRoster;
+    const effectiveDefinitions =
+      snap.definitions && snap.definitions.length > 0
+        ? snap.definitions
+        : this.fallbackDefinitions;
 
     if (!isHistory && snap.agents.length > 0) {
       // Live tail: treat server roster (snap.agents) as authoritative; hydrate recentActions/thinkingEpoch from replay
@@ -214,26 +265,55 @@ export class LiveStudioView {
           : reconstructed.edges.filter(
               (e) => serverById.has(e.from) && serverById.has(e.to)
             );
-      this.topology.render(mergedAgents, edges, snap.counters);
+      const topoMeta = {
+        events,
+        definitions: effectiveDefinitions,
+        teamRoster: effectiveTeamRoster,
+        labelMap: this.agentLabelMap,
+      };
+      const model = buildTopologyModel({
+        agents: mergedAgents,
+        edges,
+        ...topoMeta,
+      });
+      this.topology.render(mergedAgents, edges, snap.counters, topoMeta);
       this.feed.update(
         events,
         snap.pendingPrompts ?? [],
         this.agentLabelMap,
         mergedAgents,
-        snap.usage ?? reconstructed.usage
+        snap.usage ?? reconstructed.usage,
+        model.clusters
       );
     } else {
       const idx = events.length > 0 ? Math.max(0, Math.min(cursor, events.length - 1)) : -1;
       const reconstructed = buildSnapshot(events, idx, snap);
       this.agentLabelMap = this.buildLabelMap(reconstructed.agents, snap.agents);
-      this.topology.render(reconstructed.agents, reconstructed.edges, reconstructed.counters);
       const slicedEvents: NormalizedEvent[] = idx >= 0 ? events.slice(0, idx + 1) : [];
+      const topoMeta = {
+        events: slicedEvents,
+        definitions: effectiveDefinitions,
+        teamRoster: effectiveTeamRoster,
+        labelMap: this.agentLabelMap,
+      };
+      const model = buildTopologyModel({
+        agents: reconstructed.agents,
+        edges: reconstructed.edges,
+        ...topoMeta,
+      });
+      this.topology.render(
+        reconstructed.agents,
+        reconstructed.edges,
+        reconstructed.counters,
+        topoMeta
+      );
       this.feed.update(
         slicedEvents,
         [],
         this.agentLabelMap,
         reconstructed.agents,
-        reconstructed.usage
+        reconstructed.usage,
+        model.clusters
       );
       if (animateHead && reconstructed.activeEvent) {
         this.topology.animatePacket(reconstructed.activeEvent);
@@ -289,7 +369,11 @@ export class LiveStudioView {
           : srvAgent
         : recAgent ?? srvAgent;
     if (found) {
-      const definition = this.findMatchingDefinition(found, snap.definitions);
+      const effectiveDefinitions =
+        snap.definitions && snap.definitions.length > 0
+          ? snap.definitions
+          : this.fallbackDefinitions;
+      const definition = this.findMatchingDefinition(found, effectiveDefinitions);
       this.inspector.renderAgent(found, {
         openSheet,
         definition,

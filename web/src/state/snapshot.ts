@@ -1062,5 +1062,8 @@ export function normalizeServerSnapshot(raw: unknown): SessionSnapshot {
     definitions: Array.isArray(obj.definitions)
       ? (obj.definitions as SessionSnapshot["definitions"])
       : undefined,
+    teamRoster: Array.isArray(obj.teamRoster)
+      ? (obj.teamRoster as SessionSnapshot["teamRoster"])
+      : undefined,
   };
 }

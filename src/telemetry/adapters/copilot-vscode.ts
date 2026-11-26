@@ -8,6 +8,7 @@ import {
   computeDeterministicEventId,
   computeMergeKey,
   isBoardMutationToolCall,
+  isOpaqueAgentId,
   isSelfDaemonCommand,
   normalizeCopilotUsage,
   normalizeWsPath,
@@ -269,6 +270,28 @@ function extractMessageTarget(args: Record<string, unknown>): string | undefined
     }
   }
   return undefined;
+}
+
+function extractMessagePayload(args: Record<string, unknown>): {
+  msgTarget?: string;
+  msgBody?: string;
+  inlineBody?: string;
+  compactArgs: Record<string, unknown>;
+} {
+  const msgTarget = extractMessageTarget(args);
+  const rawVal = args.message ?? args.content ?? args.body;
+  const msgBody = typeof rawVal === "string" ? rawVal.trim() : undefined;
+  const inlineBody = msgBody ? msgBody.slice(0, 1400) : undefined;
+  const compactArgs =
+    msgBody && msgBody.length > 1400
+      ? {
+          ...args,
+          ...(typeof args.message === "string" ? { message: inlineBody } : {}),
+          ...(typeof args.content === "string" ? { content: inlineBody } : {}),
+          ...(typeof args.body === "string" ? { body: inlineBody } : {}),
+        }
+      : args;
+  return { msgTarget, msgBody, inlineBody, compactArgs };
 }
 
 function extractUsageNumbers(
@@ -1072,17 +1095,27 @@ export class CopilotVSCodeAdapter implements PassiveIdeAdapter {
         agentId !== "root" ? defaultParentId ?? "root" : undefined;
 
       const acc = ensureAcc(agentId);
-      if (opts.agentLabelOverride && !acc.agentLabel) {
+      if (
+        opts.agentLabelOverride &&
+        !isOpaqueAgentId(opts.agentLabelOverride) &&
+        !acc.agentLabel
+      ) {
         acc.agentLabel = opts.agentLabelOverride;
       }
 
-      const rawLabel =
-        (typeof d.agentDisplayName === "string" && d.agentDisplayName.trim()) ||
-        (typeof d.agentName === "string" && d.agentName.trim()) ||
-        (typeof d.agentType === "string" && d.agentType.trim()) ||
-        (typeof row.agentName === "string" && row.agentName.trim()) ||
-        (typeof row.agentType === "string" && row.agentType.trim()) ||
-        undefined;
+      const rawLabelCandidates = [
+        d.agentDisplayName,
+        d.agentName,
+        d.agentType,
+        d.subAgentName,
+        d.subagentName,
+        row.agentName,
+        row.agentType,
+      ];
+      const rawLabel = rawLabelCandidates.find(
+        (v): v is string =>
+          typeof v === "string" && Boolean(v.trim()) && !isOpaqueAgentId(v),
+      )?.trim();
       if (rawLabel && !rtype.startsWith("subagent.") && !acc.agentLabel) {
         acc.agentLabel = rawLabel;
       }
@@ -1212,7 +1245,7 @@ export class CopilotVSCodeAdapter implements PassiveIdeAdapter {
 
       const agentLabel =
         acc.agentLabel ||
-        (agentId === "root" ? "Copilot Agent" : prettifyAgentLabel(agentId));
+        (agentId === "root" ? "Copilot Agent" : undefined);
 
       const emit = (input: {
         epoch?: number;
@@ -1273,7 +1306,7 @@ export class CopilotVSCodeAdapter implements PassiveIdeAdapter {
           workspacePath,
           projectId,
           agentId: evAgentId,
-          agentLabel: evAgentLabel,
+          ...(evAgentLabel ? { agentLabel: evAgentLabel } : {}),
           ...(evParentId ? { parentAgentId: evParentId } : {}),
           kind: input.kind,
           toolName: input.toolName,
@@ -1392,12 +1425,7 @@ export class CopilotVSCodeAdapter implements PassiveIdeAdapter {
             const sum = summarizeToolCall(tname, args);
             acc.currTurnChars += sum.length;
             toolSummaryMap.set(callId, { toolName: tname, summary: sum, agentId });
-            const msgTarget = isMsgTool ? extractMessageTarget(args) : undefined;
-            const msgBody =
-              isMsgTool &&
-              typeof (args.message ?? args.content ?? args.body) === "string"
-                ? String(args.message ?? args.content ?? args.body).trim()
-                : undefined;
+            const msgInfo = isMsgTool ? extractMessagePayload(args) : undefined;
             emit({
               epoch: epoch + (ti + (msgText ? 1 : 0)) * 0.0001,
               kind: isMsgTool
@@ -1407,13 +1435,16 @@ export class CopilotVSCodeAdapter implements PassiveIdeAdapter {
                   : "tool_start",
               toolName: tname,
               toolCallId: callId,
-              ...(msgTarget ? { targetAgentId: msgTarget } : {}),
+              ...(msgInfo?.msgTarget ? { targetAgentId: msgInfo.msgTarget } : {}),
               summary: sum,
               status: isMsgTool ? "ok" : "running",
               payload: {
-                args,
-                ...(msgBody ? { body: msgBody } : {}),
+                args: msgInfo?.compactArgs ?? args,
+                ...(msgInfo?.inlineBody ? { body: msgInfo.inlineBody } : {}),
               },
+              ...(msgInfo?.msgBody
+                ? { fullBody: msgInfo.msgBody, inlineBody: msgInfo.inlineBody }
+                : {}),
             });
           }
         } else if (msgText) {
@@ -1462,12 +1493,7 @@ export class CopilotVSCodeAdapter implements PassiveIdeAdapter {
           sum + " " + JSON.stringify(args),
         );
         toolSummaryMap.set(callId, { toolName: tname, summary: sum, agentId });
-        const msgTarget = isMsgTool ? extractMessageTarget(args) : undefined;
-        const msgBody =
-          isMsgTool &&
-          typeof (args.message ?? args.content ?? args.body) === "string"
-            ? String(args.message ?? args.content ?? args.body).trim()
-            : undefined;
+        const msgInfo = isMsgTool ? extractMessagePayload(args) : undefined;
         emit({
           kind: isMsgTool
             ? "message"
@@ -1476,14 +1502,17 @@ export class CopilotVSCodeAdapter implements PassiveIdeAdapter {
               : "tool_start",
           toolName: tname,
           toolCallId: callId,
-          ...(msgTarget ? { targetAgentId: msgTarget } : {}),
+          ...(msgInfo?.msgTarget ? { targetAgentId: msgInfo.msgTarget } : {}),
           summary: sum,
           status: isMsgTool ? "ok" : "running",
           isSelfDaemon: selfDaemon,
           payload: {
-            args,
-            ...(msgBody ? { body: msgBody } : {}),
+            args: msgInfo?.compactArgs ?? args,
+            ...(msgInfo?.inlineBody ? { body: msgInfo.inlineBody } : {}),
           },
+          ...(msgInfo?.msgBody
+            ? { fullBody: msgInfo.msgBody, inlineBody: msgInfo.inlineBody }
+            : {}),
         });
       } else if (rtype === "tool.execution_complete") {
         const callId =
@@ -1516,14 +1545,23 @@ export class CopilotVSCodeAdapter implements PassiveIdeAdapter {
       ) {
         const callId =
           (typeof d.toolCallId === "string" && d.toolCallId) || undefined;
-        const subLabel = String(
-          d.agentDisplayName ??
-            d.subAgentName ??
-            d.agentName ??
-            d.agentType ??
-            d.description ??
-            "Subagent",
-        ).trim();
+        const subLabel =
+          [
+            d.agentDisplayName,
+            d.subAgentName,
+            d.subagentName,
+            d.agentName,
+            d.agentType,
+            d.subagentType,
+            d.description,
+          ]
+            .find(
+              (v): v is string =>
+                typeof v === "string" &&
+                Boolean(v.trim()) &&
+                !isOpaqueAgentId(v),
+            )
+            ?.trim() || "Subagent";
         const explicitSubId =
           (typeof d.subAgentInvocationId === "string" &&
             d.subAgentInvocationId.trim() &&
@@ -1573,7 +1611,11 @@ export class CopilotVSCodeAdapter implements PassiveIdeAdapter {
         const spawnActorLabel =
           defaultAgentId === "root"
             ? usageAccByAgent.get("root")?.agentLabel || "Copilot Agent"
-            : opts.agentLabelOverride || prettifyAgentLabel(defaultAgentId);
+            : usageAccByAgent.get(defaultAgentId)?.agentLabel ||
+              (opts.agentLabelOverride &&
+              !isOpaqueAgentId(opts.agentLabelOverride)
+                ? opts.agentLabelOverride
+                : undefined);
         emit({
           kind: "subagent_spawn",
           toolName: "runSubagent",
@@ -1607,13 +1649,22 @@ export class CopilotVSCodeAdapter implements PassiveIdeAdapter {
         const prevSub = callId ? subagentIdByCallId.get(callId) : undefined;
         const subLabel =
           prevSub?.subLabel ||
-          String(
-            d.agentDisplayName ??
-              d.subAgentName ??
-              d.agentName ??
-              d.agentType ??
-              "Subagent",
-          ).trim();
+          [
+            d.agentDisplayName,
+            d.subAgentName,
+            d.subagentName,
+            d.agentName,
+            d.agentType,
+            d.subagentType,
+          ]
+            .find(
+              (v): v is string =>
+                typeof v === "string" &&
+                Boolean(v.trim()) &&
+                !isOpaqueAgentId(v),
+            )
+            ?.trim() ||
+          "Subagent";
         const rawSubId =
           prevSub?.subId ||
           (typeof d.agentId === "string" && d.agentId.trim()) ||
@@ -1631,7 +1682,11 @@ export class CopilotVSCodeAdapter implements PassiveIdeAdapter {
         const doneActorLabel =
           defaultAgentId === "root"
             ? usageAccByAgent.get("root")?.agentLabel || "Copilot Agent"
-            : opts.agentLabelOverride || prettifyAgentLabel(defaultAgentId);
+            : usageAccByAgent.get(defaultAgentId)?.agentLabel ||
+              (opts.agentLabelOverride &&
+              !isOpaqueAgentId(opts.agentLabelOverride)
+                ? opts.agentLabelOverride
+                : undefined);
         emit({
           kind: "subagent_done",
           toolName: "runSubagent",
@@ -2223,24 +2278,25 @@ export class CopilotVSCodeAdapter implements PassiveIdeAdapter {
                 ? summarizeToolCall(tname, specificArgs)
                 : cleanHumanSummary(msg, 140) || summarizeToolCall(tname, specificArgs);
             if (isMsgTool) {
-              const msgTarget = extractMessageTarget(specificArgs);
-              const msgBody =
-                typeof (specificArgs.message ?? specificArgs.content ?? specificArgs.body) === "string"
-                  ? String(specificArgs.message ?? specificArgs.content ?? specificArgs.body).trim()
-                  : undefined;
+              const msgInfo = extractMessagePayload(specificArgs);
               emit({
                 epoch: stepEpoch,
                 kind: "message",
                 toolName: tname,
                 toolCallId: callId,
-                ...(msgTarget ? { targetAgentId: msgTarget } : {}),
+                ...(msgInfo.msgTarget ? { targetAgentId: msgInfo.msgTarget } : {}),
                 summary: cleanMsg,
                 isSelfDaemon: selfDaemon,
                 payload: {
                   isConfirmed: item.isConfirmed,
-                  toolSpecificData: item.toolSpecificData,
-                  ...(msgBody ? { body: msgBody } : {}),
+                  toolSpecificData: item.toolSpecificData
+                    ? msgInfo.compactArgs
+                    : item.toolSpecificData,
+                  ...(msgInfo.inlineBody ? { body: msgInfo.inlineBody } : {}),
                 },
+                ...(msgInfo.msgBody
+                  ? { fullBody: msgInfo.msgBody, inlineBody: msgInfo.inlineBody }
+                  : {}),
               });
             } else {
               emit({

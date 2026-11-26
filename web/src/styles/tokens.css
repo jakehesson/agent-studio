@@ -163,11 +163,23 @@ pre {
   }
 }
 
+@keyframes scanTrackSlide {
+  0% {
+    transform: translateX(-100%);
+  }
+  100% {
+    transform: translateX(300%);
+  }
+}
+
 @media (prefers-reduced-motion: reduce) {
   .flow-edge,
   .work-halo,
   .live-dot,
   .scan-bar,
+  .scan-track::after,
+  .bus-path,
+  .status-dot.working,
   .sse-pill.is-live .sse-dot,
   .live-pill .dot {
     animation: none !important;

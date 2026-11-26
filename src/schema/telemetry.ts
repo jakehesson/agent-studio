@@ -143,6 +143,13 @@ export const SessionCountersSchema = z.object({
 });
 export type SessionCounters = z.infer<typeof SessionCountersSchema>;
 
+export const SessionTeamRosterEntrySchema = z.object({
+  id: z.string().min(1),
+  name: z.string().optional(),
+  role: z.string().optional(),
+});
+export type SessionTeamRosterEntry = z.infer<typeof SessionTeamRosterEntrySchema>;
+
 export const SessionSnapshotSchema = z.object({
   sessionId: z.string().min(1),
   ide: IdeSourceSchema,
@@ -156,6 +163,7 @@ export const SessionSnapshotSchema = z.object({
   events: z.array(NormalizedEventSchema),
   counters: SessionCountersSchema,
   usage: SessionUsageSummarySchema.optional(),
+  teamRoster: z.array(SessionTeamRosterEntrySchema).optional(),
 });
 export type SessionSnapshot = z.infer<typeof SessionSnapshotSchema>;
 

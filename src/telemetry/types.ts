@@ -12,6 +12,7 @@ import type {
   NormalizedEvent,
   SessionCounters,
   SessionSnapshot,
+  SessionTeamRosterEntry,
   SessionUsageSource,
   SessionUsageSummary,
   UsageSource,
@@ -29,6 +30,7 @@ export type {
   NormalizedEvent,
   SessionCounters,
   SessionSnapshot,
+  SessionTeamRosterEntry,
   SessionUsageSource,
   SessionUsageSummary,
   UsageSource,
@@ -216,6 +218,11 @@ export interface RichSessionSnapshot extends SessionSnapshot {
     est_tokens: number;
     preview: string;
   }>;
+  teamRoster?: Array<{
+    id: string;
+    name?: string;
+    role?: string;
+  }>;
 }
 
 export interface ParseSessionOptions {
@@ -263,10 +270,44 @@ const ACRONYMS = new Set([
   "llm",
 ]);
 
+export function isOpaqueAgentId(raw?: string): boolean {
+  const s = (raw ?? "").trim();
+  if (!s) return true;
+  if (
+    /^(?:agent-)?[0-9a-f]{8}(?:[-\s][0-9a-f]{4}){3}[-\s][0-9a-f]{12}$/i.test(s)
+  ) {
+    return true;
+  }
+  if (
+    /^(?:agent-)?[0-9a-f]{8}(?:[-\s]+[0-9a-f]{4}){1,}(?:[-\s]+[0-9a-f]{1,12})?$/i.test(
+      s,
+    )
+  ) {
+    return true;
+  }
+  if (/^(?:agent-)?[0-9a-f]{8,}$/i.test(s)) {
+    return true;
+  }
+  const tokens = s
+    .replace(/^agent[-_\s]+/i, "")
+    .split(/[-_\s]+/)
+    .filter(Boolean);
+  if (
+    tokens.length >= 2 &&
+    tokens.every((t) => /^[0-9a-f]+$/i.test(t)) &&
+    tokens.some((t) => /\d/.test(t) || t.length >= 6) &&
+    tokens.join("").length >= 12
+  ) {
+    return true;
+  }
+  return false;
+}
+
 export function prettifyAgentLabel(rawId: string): string {
   if (!rawId) return "Agent";
   if (rawId === "root") return "Coordinator";
   if (rawId === "human" || rawId === "ext:human") return "Human";
+  if (isOpaqueAgentId(rawId)) return "Subagent";
   let parts = rawId
     .trim()
     .split(/[-_\s]+/)
@@ -283,6 +324,7 @@ export function prettifyAgentLabel(rawId: string): string {
     return p.charAt(0).toUpperCase() + p.slice(1);
   });
   const label = out.join(" ");
+  if (isOpaqueAgentId(label)) return "Subagent";
   return label.length > 24 ? label.slice(0, 24) : label;
 }
 
@@ -306,11 +348,13 @@ export function unquoteArg(val: unknown): string {
 export function normalizeWsPath(rawPath: string): string {
   let p = String(rawPath || "").trim();
   if (!p) return "";
-  if (p.startsWith("file:///")) {
+  const filePrefix = /^file:\/\/(?:localhost)?\//i.exec(p);
+  if (filePrefix) {
+    const rest = p.slice(filePrefix[0].length);
     try {
-      p = decodeURIComponent(p.slice("file:///".length));
+      p = decodeURIComponent(rest);
     } catch {
-      p = p.slice("file:///".length);
+      p = rest;
     }
     // On POSIX paths file:///home/foo becomes home/foo unless we keep leading / for non-drive paths
     if (!/^[a-zA-Z]:/.test(p) && !p.startsWith("/")) {

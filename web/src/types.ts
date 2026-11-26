@@ -180,6 +180,12 @@ export interface PendingHumanPrompt {
   ts?: string;
 }
 
+export interface TeamRosterRef {
+  id: string;
+  name?: string;
+  role?: string;
+}
+
 export interface SessionSnapshot {
   sessionId: string;
   ide: IdeSource;
@@ -201,6 +207,7 @@ export interface SessionSnapshot {
   boardProjects?: RegisteredProject[];
   pendingPrompts?: PendingHumanPrompt[];
   definitions?: TeamDefinitionEntry[];
+  teamRoster?: TeamRosterRef[];
 }
 
 export interface SessionsResponse {

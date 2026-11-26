@@ -7,6 +7,7 @@ import {
   computeDeterministicEventId,
   computeMergeKey,
   isBoardMutationToolCall,
+  isOpaqueAgentId,
   normalizeCopilotUsage,
   normalizeWsPath,
   prettifyModelName,
@@ -169,6 +170,22 @@ function numField(obj: Record<string, unknown>, ...keys: string[]): number | und
 function anyField(obj: Record<string, unknown>, ...keys: string[]): unknown {
   for (const k of keys) {
     if (obj[k] !== undefined) return obj[k];
+  }
+  return undefined;
+}
+
+function firstNonOpaqueField(
+  obj: Record<string, unknown>,
+  ...keys: string[]
+): string | undefined {
+  for (const k of keys) {
+    const v = obj[k];
+    if (typeof v === "string") {
+      const t = v.trim();
+      if (t && !isOpaqueAgentId(t) && t.toLowerCase() !== "subagent") {
+        return t;
+      }
+    }
   }
   return undefined;
 }
@@ -473,12 +490,28 @@ export async function runHookEmit(
     "toolResult",
   );
 
-  const subagentType = strField(
+  const isSubagentLifecycle =
+    hookLow === "subagentstart" || hookLow === "subagentstop";
+  const subagentType = firstNonOpaqueField(
     payload,
+    "agent_display_name",
+    "agentDisplayName",
     "agent_type",
     "agentType",
     "agent_name",
     "agentName",
+    "subagent_type",
+    "subagentType",
+    "subagent_name",
+    "subagentName",
+    "subAgentName",
+    "subAgentType",
+    "agent_label",
+    "agentLabel",
+    "agent_role",
+    "agentRole",
+    "role",
+    ...(isSubagentLifecycle ? ["name"] : []),
   );
   const rawSubagentId = strField(
     payload,
@@ -524,8 +557,6 @@ export async function runHookEmit(
         ? subagentId
         : typeSlug || "subagent";
 
-  const isSubagentLifecycle =
-    hookLow === "subagentstart" || hookLow === "subagentstop";
   const isToolHook =
     hookLow === "pretooluse" ||
     hookLow === "posttooluse" ||
@@ -648,12 +679,21 @@ export async function runHookEmit(
     isError = toolIsError;
   }
 
-  const readableActor = agentLabel || (agentId === "root" ? "Coordinator" : agentId);
+  const readableActor =
+    agentLabel ||
+    (agentId === "root"
+      ? "Coordinator"
+      : isOpaqueAgentId(agentId)
+        ? "Subagent"
+        : agentId);
+  const readableTarget =
+    subagentType ||
+    (isOpaqueAgentId(normalizedSubagentId) ? "Subagent" : normalizedSubagentId);
   const toolSummary = toolName ? summarizeToolCall(toolName, toolInput) : undefined;
   const summary = denyReason
     ? `DENIED ${toolName ?? "tool"}: ${denyReason}`
     : isSubagentLifecycle
-      ? `${hookLow === "subagentstart" ? "Spawned" : "Completed"} ${subagentType || normalizedSubagentId}`
+      ? `${hookLow === "subagentstart" ? "Spawned" : "Completed"} ${readableTarget}`
       : hookLow === "userpromptsubmit"
         ? isSubagentContext
           ? (promptText ? cleanHumanSummary(promptText, 130) : "") || "Starting task…"

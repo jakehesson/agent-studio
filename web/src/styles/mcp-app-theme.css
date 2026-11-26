@@ -35,6 +35,7 @@ body {
   --text: var(--color-text-primary, #0f172a);
   --text-strong: var(--color-text-primary, #020617);
   --muted: var(--color-text-secondary, #475569);
+  --sky: #0369a1;
 
   --scrollbar-thumb: #94a3b8;
   --scrollbar-track: #e2e8f0;
@@ -485,4 +486,158 @@ body {
 /* Keep SVG topology canvas dark for crisp glowing agent cards & animated packet contrast */
 :root[data-theme="light"] .graph-wrap {
   background: radial-gradient(circle at 50% 45%, #111827 0%, #090d16 78%);
+}
+
+/* Light theme adaptation for Grouped Topology, Segmented Controls & SMS Conversation Stream */
+:root[data-theme="light"] .seg-group,
+:root[data-theme="light"] .filter-strip,
+:root[data-theme="light"] .sms-thread-bar,
+:root[data-theme="light"] .run-filter-bar {
+  background: var(--panel-2);
+  border-color: var(--border);
+}
+
+:root[data-theme="light"] .seg-btn[aria-pressed="true"] {
+  background: #dbeafe;
+  border-color: #0284c7;
+  color: #0f172a;
+}
+
+:root[data-theme="light"] .btn-ghost,
+:root[data-theme="light"] .run-pill,
+:root[data-theme="light"] .collapse-btn {
+  background: var(--panel);
+  color: var(--text);
+  border-color: var(--border-strong);
+}
+
+:root[data-theme="light"] .btn-ghost:hover,
+:root[data-theme="light"] .collapse-btn:hover {
+  background: var(--panel-3);
+  color: var(--text-strong);
+}
+
+:root[data-theme="light"] .run-pill[aria-pressed="true"] {
+  background: #dbeafe;
+  border-color: #0284c7;
+  color: #0f172a;
+}
+
+:root[data-theme="light"] .topo-stage,
+:root[data-theme="light"] .sms-body {
+  background: var(--bg);
+}
+
+:root[data-theme="light"] .grouped-tree .node-card,
+:root[data-theme="light"] .grouped-tree .cluster-card,
+:root[data-theme="light"] .run-item,
+:root[data-theme="light"] .ext-lane-card,
+:root[data-theme="light"] .bubble.inbound,
+:root[data-theme="light"] .sms-day-divider {
+  background: var(--panel);
+  color: var(--text);
+  border-color: var(--border-strong);
+}
+
+:root[data-theme="light"] .bubble.inbound {
+  background: color-mix(in srgb, var(--bubble-accent, var(--slate)) 7%, #ffffff);
+  border-color: var(--border-strong);
+  border-left: 3px solid var(--bubble-accent, var(--border-strong));
+  color: var(--text);
+  --drawer-sticky-bg: color-mix(in srgb, var(--bubble-accent, var(--slate)) 7%, #ffffff);
+}
+
+:root[data-theme="light"] .bubble.outbound {
+  background: color-mix(in srgb, var(--bubble-accent, var(--sky)) 7%, #ffffff);
+  border-color: color-mix(in srgb, var(--bubble-accent, var(--sky)) 38%, var(--border-strong));
+  border-right: 3px solid var(--bubble-accent, #0284c7);
+  color: #0f172a;
+  --drawer-sticky-bg: color-mix(in srgb, var(--bubble-accent, var(--sky)) 7%, #ffffff);
+}
+
+:root[data-theme="light"] .bubble-route {
+  color: #0f172a;
+  background: color-mix(in srgb, var(--bubble-accent, #0284c7) 12%, #ffffff);
+  border-color: color-mix(in srgb, var(--bubble-accent, #0284c7) 42%, var(--border-strong));
+}
+
+:root[data-theme="light"] .bubble-role,
+:root[data-theme="light"] .bubble-text code {
+  background: var(--panel-2);
+  color: var(--text);
+  border-color: var(--border);
+}
+
+:root[data-theme="light"] .basic-summary-line,
+:root[data-theme="light"] .ext-lane-title {
+  color: var(--text);
+}
+
+:root[data-theme="light"] .ext-lane-sub {
+  color: var(--muted);
+}
+
+:root[data-theme="light"] .line-msg-pill,
+:root[data-theme="light"] .msg-pill,
+:root[data-theme="light"] .jump-latest-btn {
+  background: var(--panel);
+  color: var(--text-strong);
+}
+
+:root[data-theme="light"] .kpi-btn {
+  background: rgba(2, 132, 199, 0.08);
+  border-color: rgba(2, 132, 199, 0.35);
+  color: #0369a1;
+}
+
+:root[data-theme="light"] .read-full-btn {
+  background: rgba(2, 132, 199, 0.1);
+  color: #0369a1;
+  border-color: rgba(2, 132, 199, 0.35);
+}
+
+:root[data-theme="light"] .tool-strip-drawer {
+  background: var(--panel);
+  border-color: var(--border-strong);
+  color: var(--text);
+  --drawer-sticky-bg: var(--panel);
+}
+
+:root[data-theme="light"] .tool-strip-agent {
+  color: var(--text-strong);
+}
+
+:root[data-theme="light"] .tool-strip-err {
+  background: rgba(225, 29, 72, 0.12);
+  border-color: rgba(225, 29, 72, 0.45);
+  color: #be123c;
+}
+
+:root[data-theme="light"] .tool-burst-row.selected {
+  background: #dbeafe;
+  color: #0f172a;
+}
+
+:root[data-theme="light"] .tool-badge-btn {
+  background: rgba(2, 132, 199, 0.1);
+  border-color: rgba(2, 132, 199, 0.3);
+  color: #0369a1;
+}
+
+:root[data-theme="light"] .tool-badge-btn:hover,
+:root[data-theme="light"] .tool-badge-btn.is-expanded {
+  background: rgba(2, 132, 199, 0.2);
+  color: #0f172a;
+}
+
+:root[data-theme="light"] .tool-badge-btn.has-error {
+  background: rgba(225, 29, 72, 0.1);
+  border-color: rgba(225, 29, 72, 0.45);
+  color: #be123c;
+}
+
+:root[data-theme="light"] .tool-badge-btn.has-error:hover,
+:root[data-theme="light"] .tool-badge-btn.has-error.is-expanded {
+  background: rgba(225, 29, 72, 0.2);
+  color: #881337;
 }

@@ -1,4 +1,8 @@
 /* Global App Shell, Context Bar, Tabs, Pills, Buttons, and Native Bottom Sheet */
+[hidden] {
+  display: none !important;
+}
+
 .app-shell {
   display: flex;
   flex-direction: column;

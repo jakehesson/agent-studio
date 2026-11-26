@@ -8,6 +8,7 @@ import {
   cleanHumanSummary,
   computeDeterministicEventId,
   computeMergeKey,
+  isOpaqueAgentId,
   normalizeWsPath,
   parseEpochSeconds,
   prettifyModelName,
@@ -383,6 +384,7 @@ export class PushBus extends EventEmitter {
   private readonly subagentToParent = new Map<string, SubagentParentMapping>();
   private readonly sessionTranscriptPaths = new Map<string, Set<string>>();
   private readonly agentTranscriptPaths = new Map<string, Map<string, string>>();
+  private readonly agentLabels = new Map<string, Map<string, string>>();
   private readonly extraWorkspaces: string[];
   private readonly includeGlobalFile: boolean;
   private readonly bodyStore: EventBodyStore;
@@ -406,11 +408,48 @@ export class PushBus extends EventEmitter {
     return new Map(this.agentTranscriptPaths.get(sessionId) ?? []);
   }
 
+  private recordAgentLabel(
+    sessionId: string,
+    agentId: string,
+    label: string | undefined,
+  ): void {
+    const aid = agentId?.trim();
+    const lbl = label?.trim();
+    if (!aid || aid === "root" || aid === "subagent") return;
+    if (!lbl || isOpaqueAgentId(lbl) || lbl.toLowerCase() === "subagent") return;
+    let byAgent = this.agentLabels.get(sessionId);
+    if (!byAgent) {
+      byAgent = new Map();
+      this.agentLabels.set(sessionId, byAgent);
+    }
+    byAgent.set(aid, lbl);
+  }
+
+  getAgentLabel(sessionId: string, agentId: string): string | undefined {
+    const aid = agentId?.trim();
+    if (!aid) return undefined;
+    const direct = this.agentLabels.get(sessionId)?.get(aid);
+    if (direct && !isOpaqueAgentId(direct)) return direct;
+    const mapping = this.subagentToParent.get(aid);
+    if (mapping && mapping.parentSessionId === sessionId) {
+      const mLbl = (mapping.agentLabel ?? mapping.agentType)?.trim();
+      if (mLbl && !isOpaqueAgentId(mLbl) && mLbl.toLowerCase() !== "subagent") {
+        return mLbl;
+      }
+    }
+    return undefined;
+  }
+
   private recordTranscriptPath(
     sessionId: string,
     agentId: string,
     transcriptPath: string | undefined,
+    agentLabel?: string,
   ): void {
+    const targetKey = agentId && agentId.trim() ? agentId.trim() : "root";
+    if (agentLabel) {
+      this.recordAgentLabel(sessionId, targetKey, agentLabel);
+    }
     if (!isValidTranscriptPathSyntax(transcriptPath)) return;
     const tp = transcriptPath.trim();
     let set = this.sessionTranscriptPaths.get(sessionId);
@@ -427,7 +466,6 @@ export class PushBus extends EventEmitter {
       byAgent = new Map();
       this.agentTranscriptPaths.set(sessionId, byAgent);
     }
-    const targetKey = agentId && agentId.trim() ? agentId.trim() : "root";
     if (
       !byAgent.has(targetKey) &&
       byAgent.size >= MAX_TRANSCRIPT_PATHS_PER_SESSION
@@ -445,6 +483,21 @@ export class PushBus extends EventEmitter {
     const orphanEvents = this.sessions.get(orphanSessionId);
     const orphanPaths = this.sessionTranscriptPaths.get(orphanSessionId);
     const orphanAgentPaths = this.agentTranscriptPaths.get(orphanSessionId);
+
+    const mappingLabel = (mapping.agentLabel ?? mapping.agentType)?.trim();
+    const cleanMappingLabel =
+      mappingLabel &&
+      !isOpaqueAgentId(mappingLabel) &&
+      mappingLabel.toLowerCase() !== "subagent"
+        ? mappingLabel
+        : undefined;
+    if (cleanMappingLabel) {
+      this.recordAgentLabel(
+        mapping.parentSessionId,
+        mapping.agentId,
+        cleanMappingLabel,
+      );
+    }
 
     if (orphanEvents && orphanEvents.length > 0) {
       let parentList = this.sessions.get(mapping.parentSessionId);
@@ -469,6 +522,18 @@ export class PushBus extends EventEmitter {
           oldEv.kind === "user_input"
             ? oldEv.summary.replace(/^Human:\s*/i, "").trim() || "Starting task…"
             : oldEv.summary;
+        const existingLbl =
+          oldEv.agentLabel && !isOpaqueAgentId(oldEv.agentLabel)
+            ? oldEv.agentLabel
+            : undefined;
+        const resolvedMigratedLabel = existingLbl || cleanMappingLabel;
+        if (resolvedMigratedLabel) {
+          this.recordAgentLabel(
+            mapping.parentSessionId,
+            mapping.agentId,
+            resolvedMigratedLabel,
+          );
+        }
         const migrated: EnrichedEvent = {
           ...oldEv,
           kind: coercedKind,
@@ -476,7 +541,7 @@ export class PushBus extends EventEmitter {
           sessionId: mapping.parentSessionId,
           agentId: mapping.agentId,
           parentAgentId: "root",
-          agentLabel: oldEv.agentLabel || mapping.agentLabel,
+          ...(resolvedMigratedLabel ? { agentLabel: resolvedMigratedLabel } : {}),
           mergeKey: computeMergeKey({
             sessionId: mapping.parentSessionId,
             agentId: mapping.agentId,
@@ -486,6 +551,9 @@ export class PushBus extends EventEmitter {
             epoch: oldEv.epoch,
           }),
         };
+        if (!resolvedMigratedLabel) {
+          delete migrated.agentLabel;
+        }
         parentList.push(migrated);
         parentIds.add(migrated.id);
       }
@@ -501,12 +569,22 @@ export class PushBus extends EventEmitter {
 
     if (orphanPaths) {
       for (const tp of orphanPaths) {
-        this.recordTranscriptPath(mapping.parentSessionId, mapping.agentId, tp);
+        this.recordTranscriptPath(
+          mapping.parentSessionId,
+          mapping.agentId,
+          tp,
+          cleanMappingLabel,
+        );
       }
     }
     if (orphanAgentPaths) {
       for (const tp of orphanAgentPaths.values()) {
-        this.recordTranscriptPath(mapping.parentSessionId, mapping.agentId, tp);
+        this.recordTranscriptPath(
+          mapping.parentSessionId,
+          mapping.agentId,
+          tp,
+          cleanMappingLabel,
+        );
       }
     }
 
@@ -514,6 +592,7 @@ export class PushBus extends EventEmitter {
     this.seenIds.delete(orphanSessionId);
     this.sessionTranscriptPaths.delete(orphanSessionId);
     this.agentTranscriptPaths.delete(orphanSessionId);
+    this.agentLabels.delete(orphanSessionId);
   }
 
   ingest(rawItems: unknown[]): IngestResult {
@@ -553,7 +632,15 @@ export class PushBus extends EventEmitter {
         ev.sessionId = parentMapping.parentSessionId;
         ev.agentId = parentMapping.agentId;
         ev.parentAgentId = "root";
-        ev.agentLabel = ev.agentLabel || parentMapping.agentLabel;
+        const curLbl =
+          ev.agentLabel && !isOpaqueAgentId(ev.agentLabel)
+            ? ev.agentLabel
+            : undefined;
+        const inherited =
+          (parentMapping.agentLabel ?? parentMapping.agentType)?.trim();
+        ev.agentLabel =
+          curLbl ||
+          (inherited && !isOpaqueAgentId(inherited) ? inherited : undefined);
         ev.mergeKey = computeMergeKey({
           sessionId: ev.sessionId,
           agentId: ev.agentId,
@@ -562,6 +649,19 @@ export class PushBus extends EventEmitter {
           toolName: ev.toolName,
           epoch: ev.epoch,
         });
+      } else if (agentMapping && ev.sessionId === agentMapping.parentSessionId) {
+        ev.parentAgentId = ev.parentAgentId || "root";
+        const inherited =
+          (agentMapping.agentLabel ?? agentMapping.agentType)?.trim();
+        if (
+          inherited &&
+          !isOpaqueAgentId(inherited) &&
+          (!ev.agentLabel ||
+            isOpaqueAgentId(ev.agentLabel) ||
+            ev.agentLabel.trim().toLowerCase() === "subagent")
+        ) {
+          ev.agentLabel = inherited;
+        }
       } else if (explicitParentSid) {
         const payloadAgentId =
           typeof ev.payload?.agentId === "string" &&
@@ -573,17 +673,23 @@ export class PushBus extends EventEmitter {
           ev.agentId !== "root"
             ? ev.agentId
             : payloadAgentId ?? originalSessionId;
-        const resolvedLabel =
-          ev.agentLabel ||
-          (typeof ev.payload?.agentLabel === "string" &&
-          ev.payload.agentLabel.trim()
+        const rawEvLbl =
+          ev.agentLabel && !isOpaqueAgentId(ev.agentLabel)
+            ? ev.agentLabel
+            : undefined;
+        const rawPayloadLbl =
+          typeof ev.payload?.agentLabel === "string" &&
+          ev.payload.agentLabel.trim() &&
+          !isOpaqueAgentId(ev.payload.agentLabel.trim())
             ? ev.payload.agentLabel.trim()
-            : undefined);
+            : undefined;
         const resolvedType =
           typeof ev.payload?.agentType === "string" &&
-          ev.payload.agentType.trim()
+          ev.payload.agentType.trim() &&
+          !isOpaqueAgentId(ev.payload.agentType.trim())
             ? ev.payload.agentType.trim()
             : undefined;
+        const resolvedLabel = rawEvLbl || rawPayloadLbl || resolvedType;
         if (ev.kind === "user_input") {
           ev.kind = "thinking_start";
           ev.summary =
@@ -618,22 +724,54 @@ export class PushBus extends EventEmitter {
         }
       }
 
+      if (ev.agentLabel && isOpaqueAgentId(ev.agentLabel)) {
+        delete ev.agentLabel;
+      }
+      if (ev.agentId !== "root") {
+        const knownLbl =
+          (ev.agentLabel && !isOpaqueAgentId(ev.agentLabel)
+            ? ev.agentLabel
+            : undefined) ??
+          (typeof ev.payload?.agentLabel === "string" &&
+          ev.payload.agentLabel.trim() &&
+          !isOpaqueAgentId(ev.payload.agentLabel.trim())
+            ? ev.payload.agentLabel.trim()
+            : undefined) ??
+          (typeof ev.payload?.agentType === "string" &&
+          ev.payload.agentType.trim() &&
+          !isOpaqueAgentId(ev.payload.agentType.trim())
+            ? ev.payload.agentType.trim()
+            : undefined);
+        if (knownLbl) {
+          this.recordAgentLabel(ev.sessionId, ev.agentId, knownLbl);
+          if (!ev.agentLabel) ev.agentLabel = knownLbl;
+        } else {
+          const prevKnown = this.getAgentLabel(ev.sessionId, ev.agentId);
+          if (prevKnown) ev.agentLabel = prevKnown;
+        }
+      }
+
       // Register subagent-to-parent mapping on subagent_spawn and re-home any out-of-order orphan session
       if (ev.kind === "subagent_spawn" && ev.targetAgentId) {
         const rawSubId =
           typeof ev.payload?.agentId === "string" && ev.payload.agentId.trim()
             ? ev.payload.agentId.trim()
             : undefined;
-        const agentType =
+        const rawType =
           typeof ev.payload?.agentType === "string" &&
           ev.payload.agentType.trim()
             ? ev.payload.agentType.trim()
             : undefined;
-        const agentLabel =
-          (typeof ev.payload?.agentLabel === "string" &&
+        const rawLabel =
+          typeof ev.payload?.agentLabel === "string" &&
           ev.payload.agentLabel.trim()
             ? ev.payload.agentLabel.trim()
-            : undefined) ?? agentType;
+            : undefined;
+        const agentType =
+          rawType && !isOpaqueAgentId(rawType) ? rawType : undefined;
+        const agentLabel =
+          (rawLabel && !isOpaqueAgentId(rawLabel) ? rawLabel : undefined) ??
+          agentType;
         const mapping: SubagentParentMapping = {
           parentSessionId: ev.sessionId,
           agentId: ev.targetAgentId,
@@ -642,6 +780,7 @@ export class PushBus extends EventEmitter {
         };
         if (ev.targetAgentId !== "subagent" && ev.targetAgentId !== "root") {
           this.subagentToParent.set(ev.targetAgentId, mapping);
+          this.recordAgentLabel(ev.sessionId, ev.targetAgentId, agentLabel);
           this.migrateOrphanSession(ev.targetAgentId, mapping);
         }
         if (
@@ -651,7 +790,21 @@ export class PushBus extends EventEmitter {
           rawSubId !== "root"
         ) {
           this.subagentToParent.set(rawSubId, mapping);
+          this.recordAgentLabel(ev.sessionId, rawSubId, agentLabel);
           this.migrateOrphanSession(rawSubId, mapping);
+        }
+        if (agentLabel && agentLabel.toLowerCase() !== "subagent") {
+          for (const existing of this.sessions.get(ev.sessionId) ?? []) {
+            if (
+              (existing.agentId === ev.targetAgentId ||
+                (rawSubId && existing.agentId === rawSubId)) &&
+              (!existing.agentLabel ||
+                isOpaqueAgentId(existing.agentLabel) ||
+                existing.agentLabel.trim().toLowerCase() === "subagent")
+            ) {
+              existing.agentLabel = agentLabel;
+            }
+          }
         }
       }
 
@@ -659,11 +812,27 @@ export class PushBus extends EventEmitter {
         (ev.kind === "subagent_spawn" || ev.kind === "subagent_done") &&
         ev.targetAgentId
       ) {
+        const targetLbl =
+          (typeof ev.payload?.agentLabel === "string" &&
+          ev.payload.agentLabel.trim() &&
+          !isOpaqueAgentId(ev.payload.agentLabel.trim())
+            ? ev.payload.agentLabel.trim()
+            : undefined) ??
+          (typeof ev.payload?.agentType === "string" &&
+          ev.payload.agentType.trim() &&
+          !isOpaqueAgentId(ev.payload.agentType.trim())
+            ? ev.payload.agentType.trim()
+            : undefined) ??
+          this.getAgentLabel(ev.sessionId, ev.targetAgentId);
+        if (targetLbl) {
+          this.recordAgentLabel(ev.sessionId, ev.targetAgentId, targetLbl);
+        }
         if (typeof ev.payload?.agentTranscriptPath === "string") {
           this.recordTranscriptPath(
             ev.sessionId,
             ev.targetAgentId,
             ev.payload.agentTranscriptPath,
+            targetLbl,
           );
         }
       }
@@ -673,6 +842,7 @@ export class PushBus extends EventEmitter {
           ev.sessionId,
           ev.agentId,
           ev.payload.transcriptPath,
+          ev.agentLabel,
         );
       }
 

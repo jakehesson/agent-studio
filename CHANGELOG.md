@@ -5,6 +5,33 @@ All notable changes to **Agent Studio** will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.12.0] - 2026-11-25
+
+### Added
+- **Team-Agent Grouped Topology Visual (`S1-59`, `S1-64`):**
+  - Added an auto-smart `[Grouped | Mesh]` layout toggle and `[Basic | Detailed]` detail switch in `web/src/components/TopologySvg.ts` backed by `web/src/state/topologyGrouping.ts`.
+  - Organized **Grouped** mode into three clear swimlanes (Human, Coordinator, and Team-Agent clusters with per-run sub-rows, tool badges, cross-swimlane cluster splitting when a team member spans Active and Completed swimlanes, and external target chips) and added Radial Ring **Mesh** layout with cross-agent peer arcs, Galaxy Z Fold 7 three-tier responsive styling, and SEP-1865 MCP App parity (`docs/mockups/agent-mesh-grouped-and-sms.html`).
+- **Clickable Message Counts, Consolidated Tools & Unified SMS Conversation Stream (`S1-60`, `S1-62`, `S1-63`, `S1-64`):**
+  - Unified agent/human message events into an SMS-style conversation stream inside the `Messages` tab (`web/src/components/ActivityFeed.ts`, `web/src/views/LiveStudio.ts`) featuring team-member accent color alignment on SMS bubbles, sticky Run-Filter pills, `CommReaderModal` full-body hydration, and smart auto-scroll.
+  - Consolidated the `Tools` tab into `Messages` as compact Workspace FS / Local Shell pill chips with bounded `220px` scrollable drawers.
+  - Added clickable connector-line `[N msg]` pills, per-agent/per-run message badges, and footer `Messages` KPI jumps that navigate directly into the filtered thread.
+- **Backend Full-Body Hydration & `teamRoster` Snapshot Metadata (`S1-61`, `S1-63`):**
+  - Preserved and exposed full untruncated message/event bodies (`src/telemetry/types.ts`, `src/schema/telemetry.ts`, `src/telemetry/normalizer.ts`, `src/telemetry/push-bus.ts`, `src/telemetry/adapters/copilot-vscode.ts`, `src/cli/commands/hook-emit.ts`) with unit coverage in `tests/unit/event-body.test.ts` and Markdown/inspector support (`web/src/utils/markdown.ts`, `web/src/components/PayloadInspector.ts`).
+  - Added `teamRoster` discovery metadata to `RichSessionSnapshot` in `src/telemetry/index.ts` and `src/telemetry/definitions.ts` for Grouped topology role resolution.
+- **In-App GitHub Feedback Modal & Release Guardrails (`S1-57`, `S1-58`):**
+  - Added the in-app GitHub Issues feedback modal across Web Studio, MCP App, and VS Code/Antigravity extension (`FeedbackDialog`, `ContextBar`, server/extension feedback handlers), `scripts/check-version-lockstep.mjs` integrated into `npm run check`, contract parity tests, and Vite `__APP_VERSION__` defines.
+  - Added pre-push local Antigravity MCP App plugin (`--install`) and `.vsix` extension installation steps to the `release-management` skill and `release-engineer` agent.
+
+### Fixed
+- **Antigravity Canonical Team Roster Discovery (`BUG-25`, `S1-63`):**
+  - Fixed Antigravity team roster discovery with `file://` URI decoding, ancestor `.agent-team/team.yaml` walk-up, multi-line `Active Workspaces:` parsing, and `"Specialist Subagent"` placeholder guards across `src/telemetry/adapters/antigravity.ts`, `src/telemetry/definitions.ts`, and `src/telemetry/index.ts`.
+- **Messages Stream, `#msg` Filtering & Tool Drawer Layout (`BUG-23`, `BUG-24`):**
+  - Fixed stacked flat-feed rendering in `Messages`, strict `#msg` line-endpoint filtering, and `.tool-burst-card` `0px` collapse across `web/src/components/ActivityFeed.ts`, `web/src/styles/studio.css`, and `web/src/styles/mcp-app-theme.css`.
+- **Copilot Subagent UUID Display Names (`BUG-21`):**
+  - Fixed VS Code / Copilot subagent UUID fragments rendering as mesh agent names by resolving readable subagent names across `CopilotVSCodeAdapter`, `PushBus`, and `src/telemetry/normalizer.ts` (`tests/unit/telemetry.test.ts`).
+- **Live Refresh Scroll & `<details>` Stability (`BUG-22`):**
+  - Preserved `<details>` open/closed state and container/`<pre>` scroll positions in `web/src/components/PayloadInspector.ts` and prevented live SSE/polling refreshes from jumping scroll position in `ActivityFeed`.
+
 ## [0.11.1] - 2026-11-25
 
 ### Fixed

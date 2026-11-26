@@ -1,0 +1,3818 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
+  <title>Agent Topology — Grouped Cluster View &amp; SMS Viewer</title>
+  <style>
+    /* Deep Slate / Obsidian Developer Studio Tokens (matches web/src/styles/tokens.css) */
+    :root {
+      color-scheme: dark;
+      --bg: #07090f;
+      --panel: #0e131f;
+      --panel-2: #141c2e;
+      --panel-3: #1b253d;
+      --border: #1e2942;
+      --border-strong: #31446b;
+      --text: #e8effa;
+      --text-strong: #f8fafc;
+      --muted: #8b9bb8;
+
+      --thinking: #c084fc;
+      --working: #f59e0b;
+      --waiting: #06b6d4;
+      --blocked: #f43f5e;
+      --done: #10b981;
+      --sky: #38bdf8;
+      --indigo: #818cf8;
+
+      --target-size: 30px;
+      --cover-nav-h: 60px;
+      --scrollbar-thumb: #2b3c5e;
+      --scrollbar-track: #0a0f1a;
+      accent-color: var(--waiting);
+      scrollbar-color: var(--scrollbar-thumb) var(--scrollbar-track);
+    }
+
+    *, *::before, *::after { box-sizing: border-box; }
+    [hidden] { display: none !important; }
+
+    html {
+      background: var(--bg);
+      color: var(--text);
+      scroll-padding-bottom: calc(84px + env(safe-area-inset-bottom, 0px));
+    }
+
+    body {
+      margin: 0;
+      height: 100dvh;
+      overflow: hidden;
+      background: var(--bg);
+      color: var(--text);
+      font-family: Inter, "Segoe UI", system-ui, -apple-system, sans-serif;
+      font-size: 13px;
+      line-height: 1.45;
+      display: flex;
+      flex-direction: column;
+    }
+
+    :focus-visible {
+      outline: 2px solid var(--sky);
+      outline-offset: 2px;
+    }
+
+    :where(button, select, [role="tab"]) {
+      touch-action: manipulation;
+      font-family: inherit;
+    }
+
+    code, pre {
+      font-family: ui-monospace, SFMono-Regular, Consolas, "Liberation Mono", monospace;
+    }
+
+    /* Top Studio Context Bar */
+    .topbar {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 10px;
+      flex-wrap: wrap;
+      padding: max(8px, env(safe-area-inset-top, 0px)) max(14px, env(safe-area-inset-right, 0px))
+        8px max(14px, env(safe-area-inset-left, 0px));
+      background: var(--panel);
+      border-bottom: 1px solid var(--border);
+      flex-shrink: 0;
+    }
+
+    .topbar-left {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      min-width: 0;
+      flex-wrap: wrap;
+    }
+
+    .brand-title {
+      font-size: 13.5px;
+      font-weight: 700;
+      color: var(--text-strong);
+      letter-spacing: 0.01em;
+      display: inline-flex;
+      align-items: center;
+      gap: 7px;
+    }
+
+    .brand-dot {
+      width: 8px;
+      height: 8px;
+      border-radius: 50%;
+      background: var(--done);
+      box-shadow: 0 0 8px rgba(16, 185, 129, 0.7);
+    }
+
+    .auto-pill {
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      padding: 3px 9px;
+      border-radius: 999px;
+      background: rgba(6, 182, 212, 0.11);
+      border: 1px solid rgba(6, 182, 212, 0.32);
+      color: var(--sky);
+      font-size: 11px;
+      font-weight: 600;
+      white-space: nowrap;
+    }
+
+    .topbar-right {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      flex-wrap: wrap;
+    }
+
+    .scenario-select {
+      background: #090e19;
+      color: var(--text);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      padding: 4px 10px;
+      font-size: 11.5px;
+      min-block-size: var(--target-size);
+      cursor: pointer;
+    }
+
+    .kbd-hint {
+      font-size: 11px;
+      color: var(--muted);
+      background: #090e19;
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      padding: 3px 7px;
+    }
+
+    /* Main Split Workspace: Topology Left / SMS & Feed Right */
+    .workspace {
+      flex: 1;
+      min-height: 0;
+      display: grid;
+      grid-template-columns: 1.45fr 1fr;
+      gap: 12px;
+      padding: 12px max(14px, env(safe-area-inset-right, 0px))
+        max(12px, env(safe-area-inset-bottom, 0px)) max(14px, env(safe-area-inset-left, 0px));
+    }
+
+    .card {
+      background: var(--panel);
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      display: flex;
+      flex-direction: column;
+      min-width: 0;
+      min-height: 0;
+      overflow: hidden;
+      container-type: inline-size;
+      container-name: pane;
+    }
+
+    .card-head {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 8px;
+      flex-wrap: wrap;
+      padding: 9px 13px;
+      background: #0b101b;
+      border-bottom: 1px solid var(--border);
+      flex-shrink: 0;
+    }
+
+    .card-title {
+      font-size: 12.5px;
+      font-weight: 700;
+      color: var(--text-strong);
+      letter-spacing: 0.02em;
+    }
+
+    .topo-head-left, .topo-head-right {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      flex-wrap: wrap;
+    }
+
+    .legend {
+      display: flex;
+      align-items: center;
+      gap: 9px;
+      font-size: 11px;
+      color: var(--muted);
+      flex-wrap: wrap;
+    }
+
+    .legend span {
+      display: inline-flex;
+      align-items: center;
+      gap: 5px;
+    }
+
+    .sw {
+      width: 8px;
+      height: 8px;
+      border-radius: 50%;
+      display: inline-block;
+      flex-shrink: 0;
+    }
+
+    /* Segmented View Switcher: [ Grouped | Mesh ] & [ Basic | Detailed ] (matches studio.css feed-mode-toggle) */
+    .seg-group {
+      display: inline-flex;
+      align-items: center;
+      background: #090e19;
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      padding: 2px;
+      gap: 2px;
+    }
+
+    .seg-btn {
+      border: 1px solid transparent;
+      background: transparent;
+      color: var(--muted);
+      padding: 4px 10px;
+      border-radius: 6px;
+      font-size: 11px;
+      font-weight: 650;
+      cursor: pointer;
+      min-block-size: var(--target-size);
+      position: relative;
+      transition: background 0.15s ease, color 0.15s ease, border-color 0.15s ease;
+    }
+
+    .seg-btn:hover {
+      color: var(--text-strong);
+    }
+
+    .seg-btn[aria-pressed="true"] {
+      background: #1d2c4c;
+      border-color: rgba(6, 182, 212, 0.5);
+      color: var(--text-strong);
+    }
+
+    .seg-btn[aria-pressed="true"]::after {
+      content: "";
+      position: absolute;
+      inset: auto 8px 1px;
+      border-block-end: 2px solid var(--waiting);
+    }
+
+    .btn-ghost {
+      border: 1px solid var(--border);
+      background: #090e19;
+      color: var(--muted);
+      border-radius: 8px;
+      padding: 4px 9px;
+      font-size: 11px;
+      font-weight: 600;
+      cursor: pointer;
+      min-block-size: var(--target-size);
+    }
+
+    .btn-ghost:hover {
+      background: var(--panel-3);
+      color: var(--text-strong);
+      border-color: var(--border-strong);
+    }
+
+    /* Horizontal Scroll Filter Bar */
+    .filter-strip {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      padding: 7px 13px;
+      border-bottom: 1px solid var(--border);
+      background: #090e19;
+      overflow-x: auto;
+      scrollbar-width: none;
+      flex-shrink: 0;
+    }
+    .filter-strip::-webkit-scrollbar { display: none; }
+
+    .filter-chip {
+      flex: 0 0 auto;
+      border: 1px solid var(--border);
+      background: var(--panel);
+      color: var(--muted);
+      border-radius: 999px;
+      padding: 4px 11px;
+      font-size: 11.5px;
+      font-weight: 600;
+      cursor: pointer;
+      min-block-size: var(--target-size);
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+    }
+
+    .filter-chip[aria-pressed="true"] {
+      background: rgba(56, 189, 248, 0.14);
+      border-color: var(--sky);
+      color: var(--text-strong);
+    }
+
+    /* Topology Stage */
+    .topo-stage {
+      flex: 1;
+      min-height: 0;
+      overflow: auto;
+      position: relative;
+      background: radial-gradient(circle at 50% 25%, #11192c 0%, #070a11 78%);
+      padding: 16px;
+    }
+
+    .grouped-tree {
+      position: relative;
+      display: flex;
+      flex-direction: column;
+      gap: 20px;
+      min-width: 0;
+    }
+
+    /* Swimlanes shared across Grouped (Basic & Detailed) */
+    .swimlane {
+      position: relative;
+      z-index: 1;
+      display: flex;
+      flex-direction: column;
+      gap: 12px;
+      min-width: 0;
+    }
+
+    .swimlane-head {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      font-size: 10px;
+      font-weight: 750;
+      letter-spacing: 0.08em;
+      text-transform: uppercase;
+      color: #64748b;
+    }
+
+    .swimlane-head::after {
+      content: "";
+      flex: 1;
+      border-top: 1px dashed var(--border-strong);
+      opacity: 0.75;
+    }
+
+    .ext-lane-cards {
+      display: flex;
+      align-items: stretch;
+      justify-content: center;
+      gap: 14px;
+      flex-wrap: wrap;
+    }
+
+    .ext-lane-card {
+      min-width: 210px;
+      max-width: 280px;
+      flex: 1 1 210px;
+      background: #0b1322;
+      border: 1.4px dashed #38bdf8;
+      border-radius: 9px;
+      padding: 9px 12px;
+      text-align: left;
+      color: var(--text);
+      cursor: pointer;
+      display: flex;
+      flex-direction: column;
+      gap: 3px;
+      transition: background 0.15s ease, border-color 0.15s ease;
+    }
+
+    .ext-lane-card:hover,
+    .ext-lane-card[aria-pressed="true"] {
+      background: rgba(56, 189, 248, 0.14);
+      border-style: solid;
+      border-color: var(--text-strong);
+    }
+
+    .ext-lane-title {
+      font-size: 11.5px;
+      font-weight: 700;
+      color: #e2e8f0;
+    }
+
+    .ext-lane-sub {
+      font-size: 10px;
+      font-family: ui-monospace, Consolas, monospace;
+      color: #94a3b8;
+    }
+
+    /* Unified Agent Studio Card Theme for both Basic (compact) & Detailed (expanded runs) */
+    .basic-only { display: none; }
+    .grouped-tree.is-basic .basic-only { display: inline-flex; }
+    .grouped-tree.is-basic .detail-only { display: none; }
+    .grouped-tree.is-basic .run-list,
+    .grouped-tree.is-basic .collapse-btn { display: none; }
+
+    .grouped-tree .node-card,
+    .grouped-tree .cluster-card {
+      position: relative;
+      padding-left: 16px;
+      overflow: hidden;
+    }
+
+    .grouped-tree .node-card::before,
+    .grouped-tree .cluster-card::before {
+      content: "";
+      position: absolute;
+      inset: 2px auto 2px 2px;
+      width: 5px;
+      border-radius: 4px;
+      background: var(--rail-color, var(--waiting));
+    }
+
+    .grouped-tree .node-card.user-node {
+      background: #1d1609;
+      border-color: #f59e0b;
+      --rail-color: #f59e0b;
+    }
+
+    .grouped-tree .node-card.root-agent {
+      background: #1a1433;
+      border-color: #c084fc;
+      --rail-color: #c084fc;
+      box-shadow: 0 0 0 2px rgba(192, 132, 252, 0.25), 0 8px 24px rgba(192, 132, 252, 0.14);
+    }
+
+    .grouped-tree .cluster-card[data-state="working"] {
+      background: #1e1a12;
+      border-color: #f59e0b;
+      --rail-color: #f59e0b;
+      box-shadow: 0 0 0 3px rgba(245, 158, 11, 0.25), 0 8px 24px rgba(245, 158, 11, 0.12);
+    }
+
+    .grouped-tree .cluster-card[data-state="waiting"] {
+      background: #111a2c;
+      border-color: #06b6d4;
+      --rail-color: #06b6d4;
+    }
+
+    .grouped-tree .cluster-card[data-state="done"] {
+      background: #111a2c;
+      border-color: #10b981;
+      --rail-color: #10b981;
+      opacity: 1;
+    }
+
+    .ide-chip {
+      display: inline-flex;
+      align-items: center;
+      padding: 1px 6px;
+      border-radius: 4px;
+      background: rgba(56, 189, 248, 0.14);
+      border: 1px solid rgba(56, 189, 248, 0.45);
+      color: #7dd3fc;
+      font-size: 9px;
+      font-weight: 750;
+      letter-spacing: 0.04em;
+    }
+
+    .scan-track {
+      display: none;
+      position: absolute;
+      inset: auto 8px 2px 12px;
+      height: 3px;
+      border-radius: 99px;
+      background: rgba(245, 158, 11, 0.22);
+      overflow: hidden;
+    }
+    .grouped-tree .cluster-card[data-state="working"] .scan-track,
+    .grouped-tree .node-card.root-agent .scan-track {
+      display: block;
+    }
+    .scan-track::after {
+      content: "";
+      display: block;
+      width: 38%;
+      height: 100%;
+      border-radius: 99px;
+      background: linear-gradient(90deg, transparent, var(--working), transparent);
+      animation: scanSlide 1.4s linear infinite;
+    }
+    .grouped-tree .node-card.root-agent .scan-track {
+      background: rgba(192, 132, 252, 0.2);
+    }
+    .grouped-tree .node-card.root-agent .scan-track::after {
+      background: linear-gradient(90deg, transparent, var(--thinking), transparent);
+    }
+    @keyframes scanSlide {
+      0% { transform: translateX(-100%); }
+      100% { transform: translateX(300%); }
+    }
+
+    .cluster-foot-row {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 8px;
+      flex-wrap: wrap;
+    }
+
+    .tele-mono {
+      display: inline;
+      font-family: ui-monospace, Consolas, monospace;
+      font-size: 10px;
+      color: var(--muted);
+    }
+
+    .basic-summary-line {
+      display: none;
+      font-size: 10.8px;
+      color: #cbd5e1;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+    .grouped-tree.is-basic .basic-summary-line { display: block; }
+
+    /* Basic Mode: Exact Original Screenshot Agent Box Geometry & Radiating Lines */
+    .grouped-tree.is-basic .cluster-grid {
+      display: flex;
+      flex-wrap: wrap;
+      justify-content: center;
+      gap: 42px 14px;
+      margin-top: 24px;
+    }
+
+    .grouped-tree.is-basic .cluster-card {
+      flex: 0 1 198px;
+      width: 198px;
+      min-height: 76px;
+      padding: 9px 10px 8px 14px;
+      border-radius: 11px;
+      gap: 5px;
+      border-width: 1.6px;
+    }
+
+    .grouped-tree.is-basic .node-card.user-node {
+      width: 178px;
+      min-width: 178px;
+      min-height: 68px;
+      border-radius: 15px;
+      padding: 9px 10px 8px 14px;
+      border-width: 1.6px;
+      display: flex;
+      flex-direction: column;
+      gap: 4px;
+    }
+
+    .grouped-tree.is-basic .node-card.root-agent {
+      width: 206px;
+      min-width: 206px;
+      min-height: 76px;
+      border-radius: 11px;
+      padding: 9px 10px 8px 14px;
+      border-width: 2px;
+      display: flex;
+      flex-direction: column;
+      gap: 5px;
+    }
+
+    .grouped-tree.is-basic .cluster-name {
+      font-size: 11.8px;
+      flex-wrap: nowrap;
+      min-width: 0;
+    }
+    .grouped-tree.is-basic .cluster-name > span:first-of-type {
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+
+    .grouped-tree.is-basic .state-tag {
+      border-radius: 999px;
+      padding: 1.5px 7px;
+      font-size: 8.6px;
+      font-weight: 750;
+      letter-spacing: 0.03em;
+      border: 1.1px solid transparent;
+    }
+    .grouped-tree.is-basic .state-tag.working {
+      border-color: #f59e0b;
+      background: rgba(245, 158, 11, 0.18);
+      color: #fcd34d;
+    }
+    .grouped-tree.is-basic .node-card.root-agent .state-tag.working {
+      border-color: #c084fc;
+      background: rgba(192, 132, 252, 0.18);
+      color: #e9d5ff;
+    }
+    .grouped-tree.is-basic .state-tag.waiting {
+      border-color: #06b6d4;
+      background: rgba(6, 182, 212, 0.18);
+      color: #67e8f9;
+    }
+    .grouped-tree.is-basic .state-tag.done {
+      border-color: #10b981;
+      background: rgba(16, 185, 129, 0.16);
+      color: #6ee7b7;
+    }
+
+    .grouped-tree.is-basic .ide-chip {
+      background: rgba(168, 85, 247, 0.16);
+      border: 1px solid rgba(168, 85, 247, 0.48);
+      color: #d8b4fe;
+    }
+
+    .grouped-tree.is-basic .edge-link .msg-pill {
+      background: #0d1424;
+      color: #f8fafc;
+      border-width: 1.5px;
+    }
+    .grouped-tree.is-basic .edge-link .msg-pill.is-active {
+      background: #f59e0b;
+      color: #06101d;
+    }
+
+    @container pane (inline-size < 430px) {
+      .grouped-tree.is-basic .cluster-card {
+        flex: 1 1 100%;
+        width: 100%;
+      }
+    }
+
+    .bus-svg {
+      position: absolute;
+      inset: 0;
+      width: 100%;
+      height: 100%;
+      pointer-events: none;
+      z-index: 0;
+      overflow: visible;
+    }
+
+    .bus-pills-layer {
+      position: absolute;
+      inset: 0;
+      pointer-events: none;
+      z-index: 2;
+    }
+
+    /* Oval [N msg] pill centered directly on connector line (matches screenshot) */
+    .line-msg-pill {
+      position: absolute;
+      transform: translate(-50%, -50%);
+      pointer-events: auto;
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      padding: 2px 9px;
+      border-radius: 999px;
+      background: #0d1424;
+      border: 1.5px solid var(--pill-color, #06b6d4);
+      color: #f8fafc;
+      font-size: 10.5px;
+      font-weight: 750;
+      letter-spacing: 0.01em;
+      white-space: nowrap;
+      cursor: pointer;
+      box-shadow: 0 2px 10px rgba(0, 0, 0, 0.55);
+      transition: transform 0.12s ease, background 0.15s ease;
+    }
+
+    .line-msg-pill:hover {
+      background: #16243f;
+      transform: translate(-50%, -50%) scale(1.06);
+    }
+
+    .line-msg-pill.is-active {
+      background: var(--pill-color, #06b6d4);
+      color: #06101d;
+    }
+
+    .bus-path {
+      fill: none;
+      stroke: var(--border-strong);
+      stroke-width: 1.6;
+      stroke-dasharray: 5 4;
+    }
+
+    .bus-path.is-live {
+      stroke: var(--waiting);
+      stroke-width: 1.9;
+      stroke-dasharray: 5 4;
+      animation: dashFlow 1.2s linear infinite;
+    }
+
+    .bus-path.is-work {
+      stroke: var(--working);
+      stroke-width: 2.1;
+      stroke-dasharray: 5 4;
+      animation: dashFlow 0.9s linear infinite;
+    }
+
+    @keyframes dashFlow {
+      to { stroke-dashoffset: -18; }
+    }
+
+    /* Root Orchestrator Row */
+    .root-row {
+      position: relative;
+      z-index: 1;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      gap: 14px;
+      flex-wrap: wrap;
+    }
+
+    .node-card {
+      background: var(--panel-2);
+      border: 1px solid var(--border-strong);
+      border-radius: 10px;
+      padding: 10px 13px;
+      min-width: 0;
+      box-shadow: 0 6px 20px rgba(0, 0, 0, 0.32);
+    }
+
+    .node-card.root-agent {
+      border-color: rgba(16, 185, 129, 0.55);
+      background: linear-gradient(180deg, #162238 0%, #101727 100%);
+      min-width: 240px;
+      max-width: 100%;
+    }
+
+    .node-card.user-node {
+      border-color: rgba(129, 140, 248, 0.5);
+      min-width: 175px;
+    }
+
+    .edge-link {
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      color: var(--sky);
+      font-size: 11px;
+      font-weight: 600;
+    }
+
+    .edge-line {
+      width: 22px;
+      height: 2px;
+      background: var(--sky);
+      opacity: 0.7;
+    }
+
+    /* Clickable [N msg] Pill */
+    .msg-pill {
+      display: inline-flex;
+      align-items: center;
+      gap: 5px;
+      padding: 3px 9px;
+      border-radius: 999px;
+      border: 1px solid rgba(56, 189, 248, 0.45);
+      background: rgba(56, 189, 248, 0.12);
+      color: var(--sky);
+      font-size: 11px;
+      font-weight: 700;
+      cursor: pointer;
+      min-block-size: 26px;
+      transition: background 0.15s ease, transform 0.12s ease;
+    }
+
+    .msg-pill:hover {
+      background: rgba(56, 189, 248, 0.24);
+      color: var(--text-strong);
+    }
+
+    .msg-pill.is-active {
+      background: var(--sky);
+      color: #06101d;
+      border-color: var(--text-strong);
+    }
+
+    /* Team Agent Cluster Grid */
+    .cluster-grid {
+      position: relative;
+      z-index: 1;
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(245px, 1fr));
+      gap: 30px 14px;
+      margin-top: 12px;
+      align-items: start;
+    }
+
+    .node-card[data-agent-id],
+    .cluster-card {
+      cursor: pointer;
+    }
+
+    .node-card.is-selected,
+    .cluster-card.is-selected {
+      box-shadow: 0 0 0 2px var(--sky) !important;
+    }
+
+    .cluster-card {
+      background: var(--panel-2);
+      border: 1px solid var(--border);
+      border-radius: 11px;
+      padding: 11px 12px;
+      display: flex;
+      flex-direction: column;
+      gap: 8px;
+      min-width: 0;
+      transition: border-color 0.16s ease, box-shadow 0.16s ease;
+    }
+
+    .cluster-card[data-state="working"] {
+      border-color: rgba(245, 158, 11, 0.65);
+      box-shadow: 0 0 0 1px rgba(245, 158, 11, 0.18), 0 8px 22px rgba(245, 158, 11, 0.08);
+    }
+
+    .cluster-card[data-state="waiting"] {
+      border-color: rgba(6, 182, 212, 0.5);
+    }
+
+    .cluster-card[data-state="done"] {
+      border-color: rgba(16, 185, 129, 0.34);
+      opacity: 0.94;
+    }
+
+    .cluster-card.is-selected {
+      box-shadow: 0 0 0 2px var(--sky);
+    }
+
+    .cluster-head {
+      display: flex;
+      align-items: flex-start;
+      justify-content: space-between;
+      gap: 8px;
+    }
+
+    .cluster-title-wrap {
+      min-width: 0;
+      display: flex;
+      flex-direction: column;
+      gap: 2px;
+    }
+
+    .cluster-name {
+      display: inline-flex;
+      align-items: center;
+      gap: 7px;
+      font-size: 13px;
+      font-weight: 700;
+      color: var(--text-strong);
+      flex-wrap: wrap;
+    }
+
+    .count-badge {
+      font-size: 10.5px;
+      font-weight: 700;
+      padding: 1px 6px;
+      border-radius: 6px;
+      background: var(--panel-3);
+      color: var(--text);
+      border: 1px solid var(--border-strong);
+    }
+
+    .role-meta {
+      font-size: 11px;
+      color: var(--muted);
+    }
+
+    .status-dot {
+      width: 9px;
+      height: 9px;
+      border-radius: 50%;
+      flex-shrink: 0;
+    }
+    .status-dot.working {
+      background: var(--working);
+      box-shadow: 0 0 0 3px rgba(245, 158, 11, 0.25);
+      animation: pulseDot 1.3s ease-in-out infinite;
+    }
+    .status-dot.waiting { background: var(--waiting); }
+    .status-dot.done { background: var(--done); }
+
+    @keyframes pulseDot {
+      0%, 100% { box-shadow: 0 0 0 2px rgba(245, 158, 11, 0.22); }
+      50% { box-shadow: 0 0 0 5px rgba(245, 158, 11, 0.45); }
+    }
+
+    .run-list {
+      display: flex;
+      flex-direction: column;
+      gap: 6px;
+    }
+
+    .run-item {
+      background: #0c111d;
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      padding: 7px 9px;
+      display: flex;
+      flex-direction: column;
+      gap: 3px;
+    }
+
+    .run-item.is-done {
+      border-style: dashed;
+      opacity: 0.85;
+    }
+
+    .run-top {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 6px;
+      font-size: 11.5px;
+    }
+
+    .run-id {
+      font-weight: 650;
+      color: var(--text-strong);
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+    }
+
+    .state-tag {
+      font-size: 10px;
+      font-weight: 750;
+      letter-spacing: 0.04em;
+      padding: 1px 6px;
+      border-radius: 5px;
+      text-transform: uppercase;
+    }
+    .state-tag.working { background: rgba(245, 158, 11, 0.16); color: var(--working); }
+    .state-tag.waiting { background: rgba(6, 182, 212, 0.16); color: var(--waiting); }
+    .state-tag.done { background: rgba(16, 185, 129, 0.14); color: var(--done); }
+
+    .run-task {
+      font-size: 11px;
+      color: var(--muted);
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+
+    .collapse-btn {
+      align-self: flex-start;
+      border: 1px dashed var(--border-strong);
+      background: #0a101b;
+      color: var(--muted);
+      border-radius: 7px;
+      padding: 4px 10px;
+      font-size: 11px;
+      font-weight: 650;
+      cursor: pointer;
+      min-block-size: var(--target-size);
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+    }
+
+    .collapse-btn:hover {
+      background: var(--panel-3);
+      color: var(--text-strong);
+    }
+
+    /* Raw Mesh Comparison View */
+    .mesh-view {
+      display: flex;
+      flex-direction: column;
+      gap: 10px;
+      height: 100%;
+    }
+
+    .mesh-banner {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 10px;
+      flex-wrap: wrap;
+      background: rgba(245, 158, 11, 0.08);
+      border: 1px solid rgba(245, 158, 11, 0.3);
+      border-radius: 8px;
+      padding: 7px 10px;
+      font-size: 11.5px;
+      color: #fde68a;
+    }
+
+    .mesh-canvas-wrap {
+      flex: 1;
+      min-height: 280px;
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      background: radial-gradient(circle at 50% 35%, #101728 0%, #070a11 78%);
+      overflow: auto;
+      position: relative;
+    }
+
+    .mesh-svg {
+      width: 100%;
+      min-width: 680px;
+      height: 100%;
+      min-height: 380px;
+      display: block;
+    }
+
+    @keyframes nodePulse {
+      0%, 100% { stroke-opacity: 0.35; }
+      50% { stroke-opacity: 0.9; }
+    }
+    @keyframes dotBlink {
+      0%, 100% { opacity: 1; }
+      50% { opacity: 0.35; }
+    }
+    .work-halo { animation: nodePulse 1.4s ease-in-out infinite; }
+    .live-dot { animation: dotBlink 1.1s ease-in-out infinite; }
+    .flow-edge { animation: dashFlow 1.2s linear infinite; }
+
+    /* External Systems Footer + 4-col KPI Strip */
+    .ext-footer {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 8px;
+      flex-wrap: wrap;
+      padding: 8px 13px;
+      border-top: 1px solid var(--border);
+      background: #0b101c;
+      flex-shrink: 0;
+    }
+
+    .ext-label {
+      font-size: 11px;
+      font-weight: 700;
+      color: var(--muted);
+      text-transform: uppercase;
+      letter-spacing: 0.04em;
+    }
+
+    .ext-chips {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      flex-wrap: wrap;
+    }
+
+    .ext-chip {
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      padding: 4px 10px;
+      border-radius: 8px;
+      border: 1px solid var(--border-strong);
+      background: var(--panel-2);
+      color: var(--text);
+      font-size: 11.5px;
+      font-weight: 600;
+      cursor: pointer;
+      min-block-size: var(--target-size);
+    }
+
+    .ext-chip[aria-pressed="true"] {
+      border-color: var(--sky);
+      background: rgba(56, 189, 248, 0.14);
+      color: var(--text-strong);
+    }
+
+    .summary-strip {
+      display: grid;
+      grid-template-columns: repeat(4, minmax(0, 1fr));
+      gap: 8px;
+      padding: 8px 13px;
+      border-top: 1px solid var(--border);
+      background: #0a0f1a;
+      font-size: 11px;
+      color: var(--muted);
+      flex-shrink: 0;
+    }
+
+    .summary-strip b {
+      display: block;
+      font-size: 14px;
+      font-family: ui-monospace, Consolas, monospace;
+      color: var(--text-strong);
+    }
+
+    .kpi-btn {
+      text-align: left;
+      background: rgba(56, 189, 248, 0.06);
+      border: 1px solid rgba(56, 189, 248, 0.32);
+      border-radius: 8px;
+      padding: 4px 9px;
+      color: var(--sky);
+      font: inherit;
+      cursor: pointer;
+      display: flex;
+      flex-direction: column;
+      justify-content: center;
+      transition: background 0.15s ease, border-color 0.15s ease;
+    }
+
+    .kpi-btn:hover,
+    .kpi-btn.is-active {
+      background: rgba(56, 189, 248, 0.16);
+      border-color: var(--sky);
+      color: var(--text-strong);
+    }
+
+    .kpi-btn b { color: var(--text-strong); }
+
+    /* Agent-Card / Run-Card Message Count Badge */
+    .card-msg-badge {
+      display: inline-flex;
+      align-items: center;
+      gap: 4px;
+      padding: 2px 7px;
+      border-radius: 999px;
+      border: 1px solid rgba(129, 140, 248, 0.45);
+      background: rgba(129, 140, 248, 0.12);
+      color: #c7d2fe;
+      font-size: 10.5px;
+      font-weight: 700;
+      cursor: pointer;
+      transition: background 0.15s ease, border-color 0.15s ease;
+    }
+
+    .card-msg-badge:hover {
+      background: rgba(129, 140, 248, 0.25);
+      color: var(--text-strong);
+      border-color: var(--indigo);
+    }
+
+    .card-msg-badge.is-active {
+      background: var(--indigo);
+      color: #070b14;
+      border-color: var(--text-strong);
+    }
+
+    .run-top-right {
+      display: inline-flex;
+      align-items: center;
+      gap: 5px;
+      flex-shrink: 0;
+    }
+
+    /* Right Pane: SMS Conversation Viewer & Live Feed */
+    .tablist {
+      display: flex;
+      align-items: center;
+      gap: 4px;
+    }
+
+    .tab-btn {
+      border: 1px solid transparent;
+      background: transparent;
+      color: var(--muted);
+      padding: 5px 10px;
+      border-radius: 7px;
+      font-size: 11.5px;
+      font-weight: 650;
+      cursor: pointer;
+      min-block-size: var(--target-size);
+      position: relative;
+    }
+
+    .tab-btn[aria-selected="true"] {
+      color: var(--text-strong);
+      background: var(--panel-2);
+      border-color: var(--border-strong);
+    }
+
+    .tab-btn[aria-selected="true"]::after {
+      content: "";
+      position: absolute;
+      inset: auto 8px 0;
+      border-block-end: 3px solid var(--waiting);
+    }
+
+    .sms-thread-bar {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 8px;
+      padding: 8px 12px;
+      border-bottom: 1px solid var(--border);
+      background: #090e19;
+      flex-wrap: wrap;
+      flex-shrink: 0;
+    }
+
+    .run-filter-bar {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      padding: 6px 12px;
+      border-bottom: 1px solid var(--border);
+      background: #0b1120;
+      overflow-x: auto;
+      scrollbar-width: none;
+      flex-shrink: 0;
+      position: sticky;
+      top: 0;
+      z-index: 2;
+    }
+    .run-filter-bar::-webkit-scrollbar { display: none; }
+
+    .run-filter-label {
+      font-size: 10.5px;
+      font-weight: 700;
+      color: var(--muted);
+      text-transform: uppercase;
+      letter-spacing: 0.04em;
+      flex: 0 0 auto;
+    }
+
+    .run-pill {
+      flex: 0 0 auto;
+      border: 1px solid var(--border);
+      background: var(--panel);
+      color: var(--muted);
+      border-radius: 999px;
+      padding: 3px 10px;
+      font-size: 11px;
+      font-weight: 650;
+      cursor: pointer;
+      min-block-size: 26px;
+      display: inline-flex;
+      align-items: center;
+      gap: 5px;
+    }
+
+    .run-pill[aria-pressed="true"] {
+      background: rgba(6, 182, 212, 0.16);
+      border-color: var(--waiting);
+      color: var(--text-strong);
+    }
+
+    .sms-body-wrap {
+      position: relative;
+      flex: 1;
+      min-height: 0;
+      display: flex;
+      flex-direction: column;
+    }
+
+    .jump-latest-btn {
+      position: absolute;
+      left: 50%;
+      bottom: 12px;
+      transform: translateX(-50%);
+      z-index: 4;
+      border: 1px solid var(--sky);
+      background: rgba(14, 19, 31, 0.94);
+      color: var(--text-strong);
+      border-radius: 999px;
+      padding: 6px 14px;
+      font-size: 11.5px;
+      font-weight: 700;
+      cursor: pointer;
+      box-shadow: 0 8px 24px rgba(0, 0, 0, 0.55);
+      min-block-size: 32px;
+    }
+
+    .jump-latest-btn:hover {
+      background: var(--panel-3);
+    }
+
+    .thread-select {
+      flex: 1;
+      min-width: 180px;
+      background: var(--panel-2);
+      color: var(--text-strong);
+      border: 1px solid var(--border-strong);
+      border-radius: 8px;
+      padding: 5px 10px;
+      font-size: 12px;
+      font-weight: 600;
+      min-block-size: var(--target-size);
+    }
+
+    .sms-body {
+      flex: 1;
+      min-height: 0;
+      overflow-y: auto;
+      padding: 12px;
+      display: flex;
+      flex-direction: column;
+      gap: 10px;
+      background: linear-gradient(180deg, #0b101b 0%, #080b13 100%);
+    }
+
+    .sms-day-divider {
+      align-self: center;
+      font-size: 10.5px;
+      color: var(--muted);
+      background: var(--panel-2);
+      border: 1px solid var(--border);
+      border-radius: 999px;
+      padding: 2px 10px;
+    }
+
+    .bubble {
+      max-width: 88%;
+      padding: 9px 11px;
+      border-radius: 12px;
+      border: 1px solid var(--border);
+      display: flex;
+      flex-direction: column;
+      gap: 5px;
+    }
+
+    .bubble.inbound {
+      align-self: flex-start;
+      background: var(--panel-2);
+      border-bottom-left-radius: 4px;
+    }
+
+    .bubble.outbound {
+      align-self: flex-end;
+      background: #12233b;
+      border-color: rgba(56, 189, 248, 0.34);
+      border-bottom-right-radius: 4px;
+    }
+
+    .bubble-head {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 10px;
+      font-size: 10.5px;
+      color: var(--muted);
+    }
+
+    .bubble-sender {
+      font-weight: 700;
+      color: var(--text-strong);
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      flex-wrap: wrap;
+    }
+
+    .bubble-role {
+      font-size: 10px;
+      font-weight: 600;
+      color: var(--muted);
+      background: #0a101b;
+      border: 1px solid var(--border);
+      padding: 0 5px;
+      border-radius: 4px;
+    }
+
+    .bubble-route {
+      font-size: 10px;
+      font-weight: 700;
+      color: var(--sky);
+      background: rgba(56, 189, 248, 0.1);
+      border: 1px solid rgba(56, 189, 248, 0.26);
+      padding: 1px 6px;
+      border-radius: 999px;
+      align-self: flex-start;
+    }
+
+    .bubble-text {
+      font-size: 12.5px;
+      line-height: 1.45;
+      color: var(--text);
+    }
+
+    .bubble-text code {
+      background: #080d17;
+      border: 1px solid var(--border);
+      color: #bae6fd;
+      padding: 0 4px;
+      border-radius: 4px;
+      font-size: 11.5px;
+    }
+
+    .bubble-foot {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 8px;
+      flex-wrap: wrap;
+      margin-top: 2px;
+    }
+
+    .read-full-btn {
+      margin-left: auto;
+      border: 1px solid rgba(56, 189, 248, 0.38);
+      background: rgba(56, 189, 248, 0.08);
+      color: var(--sky);
+      border-radius: 6px;
+      padding: 2px 8px;
+      font-size: 11px;
+      font-weight: 650;
+      cursor: pointer;
+    }
+
+    .read-full-btn:hover {
+      background: rgba(56, 189, 248, 0.2);
+      color: var(--text-strong);
+    }
+
+    .bubble-tools {
+      display: flex;
+      gap: 6px;
+      flex-wrap: wrap;
+    }
+
+    .tool-badge {
+      font-size: 10.5px;
+      padding: 2px 7px;
+      border-radius: 6px;
+      background: rgba(6, 182, 212, 0.12);
+      border: 1px solid rgba(6, 182, 212, 0.3);
+      color: var(--sky);
+    }
+
+    .sms-foot {
+      padding: 9px 12px;
+      border-top: 1px solid var(--border);
+      background: #0a0f1a;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 8px;
+      flex-wrap: wrap;
+      font-size: 11px;
+      color: var(--muted);
+      flex-shrink: 0;
+    }
+
+    /* Pre-feature Live Activity Stream + Inline Details Inspector */
+    .feed-subhead {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 8px;
+      padding: 7px 12px;
+      background: #090e19;
+      border-bottom: 1px solid var(--border);
+      flex-shrink: 0;
+    }
+
+    .feed-mode-toggle {
+      display: inline-flex;
+      gap: 2px;
+      padding: 2px;
+      background: #070b14;
+      border: 1px solid var(--border);
+      border-radius: 7px;
+    }
+
+    .feed-mode-btn {
+      border: none;
+      background: transparent;
+      color: var(--muted);
+      padding: 3px 8px;
+      border-radius: 5px;
+      font-size: 11px;
+      font-weight: 650;
+      cursor: pointer;
+    }
+
+    .feed-mode-btn[aria-pressed="true"] {
+      background: #1d2c4c;
+      color: var(--text-strong);
+    }
+
+    .feed-filters {
+      display: flex;
+      gap: 5px;
+      padding: 6px 10px;
+      border-bottom: 1px solid var(--border);
+      overflow-x: auto;
+      scrollbar-width: none;
+      flex-shrink: 0;
+    }
+    .feed-filters::-webkit-scrollbar { display: none; }
+
+    .feed-list {
+      flex: 1;
+      min-height: 0;
+      overflow-y: auto;
+      padding: 8px 10px;
+      display: flex;
+      flex-direction: column;
+      gap: 6px;
+    }
+
+    .ev-item {
+      width: 100%;
+      display: flex;
+      align-items: stretch;
+      gap: 6px;
+      background: var(--panel-2);
+      color: var(--text);
+      border: 1px solid var(--border);
+      border-left: 3px solid var(--waiting);
+      border-radius: 8px;
+    }
+
+    .ev-item.selected {
+      border-color: var(--sky);
+      background: #1a2744;
+    }
+
+    .ev-item.thinking { border-left-color: var(--thinking); }
+    .ev-item.complete { border-left-color: var(--done); }
+    .ev-item.dispatch { border-left-color: var(--indigo); }
+    .ev-item.human { border-left-color: var(--working); }
+    .ev-item.tool { border-left-color: #64748b; opacity: 0.92; }
+
+    .ev-row-btn {
+      flex: 1;
+      min-width: 0;
+      text-align: left;
+      background: transparent;
+      color: inherit;
+      border: none;
+      padding: 7px 10px;
+      cursor: pointer;
+    }
+
+    .ev-read-btn {
+      flex-shrink: 0;
+      align-self: center;
+      margin-right: 8px;
+      background: rgba(56, 189, 248, 0.12);
+      color: #7dd3fc;
+      border: 1px solid rgba(56, 189, 248, 0.35);
+      border-radius: 6px;
+      padding: 3px 9px;
+      font-size: 11px;
+      font-weight: 650;
+      cursor: pointer;
+    }
+
+    .ev-top {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 8px;
+      font-size: 11px;
+    }
+
+    .ev-route {
+      font-weight: 650;
+      color: var(--text-strong);
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+
+    .ev-title {
+      margin-top: 3px;
+      color: #dbe6f6;
+      font-size: 12px;
+      line-height: 1.4;
+    }
+
+    .pill {
+      display: inline-flex;
+      align-items: center;
+      padding: 1px 6px;
+      border-radius: 5px;
+      font-size: 9.5px;
+      font-weight: 750;
+      letter-spacing: 0.03em;
+      text-transform: uppercase;
+    }
+    .pill.thinking { background: rgba(192, 132, 252, 0.18); color: #e9d5ff; }
+    .pill.complete { background: rgba(16, 185, 129, 0.16); color: #6ee7b7; }
+    .pill.dispatch { background: rgba(129, 140, 248, 0.18); color: #c7d2fe; }
+    .pill.human { background: rgba(245, 158, 11, 0.18); color: #fde68a; }
+    .pill.tool { background: rgba(100, 116, 139, 0.22); color: #cbd5e1; }
+    .pill.status { background: rgba(6, 182, 212, 0.18); color: #67e8f9; }
+
+    /* Inline Agent / Event Details Inspector (bottom split of Feed pane) */
+    .stream-inspector-slot {
+      border-top: 1px solid var(--border-strong);
+      background: #0a101d;
+      display: flex;
+      flex-direction: column;
+      min-height: 0;
+      flex: 0 0 46%;
+      max-height: 52%;
+    }
+    .stream-inspector-slot[data-inspector-state="closed"] { display: none; }
+
+    .insp-head {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 8px;
+      padding: 7px 11px;
+      background: #0e1627;
+      border-bottom: 1px solid var(--border);
+      flex-shrink: 0;
+    }
+
+    .insp-title-row {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      flex-wrap: wrap;
+      min-width: 0;
+      font-size: 12.5px;
+      font-weight: 700;
+      color: var(--text-strong);
+    }
+
+    .insp-body {
+      flex: 1;
+      min-height: 0;
+      overflow-y: auto;
+      padding: 10px 12px;
+      display: flex;
+      flex-direction: column;
+      gap: 8px;
+    }
+
+    .insp-meta {
+      display: flex;
+      gap: 10px;
+      flex-wrap: wrap;
+      font-size: 11px;
+      color: var(--muted);
+    }
+    .insp-meta b { color: var(--text-strong); }
+
+    .insp-activity-hdr {
+      font-size: 10.5px;
+      font-weight: 750;
+      text-transform: uppercase;
+      letter-spacing: 0.05em;
+      color: var(--sky);
+    }
+
+    .insp-activity-list {
+      display: flex;
+      flex-direction: column;
+      gap: 5px;
+    }
+
+    .insp-act-row {
+      display: flex;
+      align-items: flex-start;
+      gap: 7px;
+      padding: 5px 8px;
+      border-radius: 7px;
+      background: var(--panel-2);
+      border: 1px solid var(--border);
+      font-size: 11.5px;
+    }
+
+    .insp-act-time {
+      font-family: ui-monospace, Consolas, monospace;
+      font-size: 10px;
+      color: var(--muted);
+      flex-shrink: 0;
+      margin-top: 2px;
+    }
+
+    .cover-back-btn {
+      display: none;
+    }
+
+    /* Fixed Cover-Screen Bottom Nav (hidden >= 640px) */
+    .cover-nav {
+      display: none;
+    }
+
+    /* Native Modal Dialog (Raw Event Preview) */
+    dialog {
+      background: var(--panel);
+      color: var(--text);
+      border: 1px solid var(--border-strong);
+      border-radius: 12px;
+      padding: 0;
+      max-width: min(560px, 92vw);
+      width: 100%;
+      box-shadow: 0 24px 64px rgba(0, 0, 0, 0.65);
+    }
+
+    dialog[open] {
+      display: flex;
+      flex-direction: column;
+    }
+
+    dialog:modal {
+      overscroll-behavior: contain;
+    }
+
+    dialog::backdrop {
+      background: rgba(3, 5, 10, 0.72);
+      overflow: hidden;
+      overscroll-behavior: contain;
+    }
+
+    .dlg-head {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      padding: 12px 15px;
+      border-bottom: 1px solid var(--border);
+      background: #0b101b;
+    }
+
+    .dlg-head h1 {
+      margin: 0;
+      font-size: 14px;
+      color: var(--text-strong);
+    }
+
+    .dlg-body {
+      padding: 14px 15px;
+      overflow: auto;
+      max-height: 60dvh;
+    }
+
+    .dlg-body pre {
+      margin: 0;
+      padding: 10px;
+      background: #070a12;
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      font-size: 11.5px;
+      color: #bae6fd;
+      overflow-x: auto;
+    }
+
+    .dlg-foot {
+      display: flex;
+      justify-content: flex-end;
+      gap: 8px;
+      padding: 10px 15px;
+      border-top: 1px solid var(--border);
+    }
+
+    .comm-reader-dialog {
+      max-width: min(650px, 94vw);
+    }
+
+    .reader-meta-bar {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 8px;
+      flex-wrap: wrap;
+      padding: 9px 15px;
+      border-bottom: 1px solid var(--border);
+      background: #090e19;
+      font-size: 11.5px;
+      color: var(--muted);
+    }
+
+    .reader-md {
+      display: flex;
+      flex-direction: column;
+      gap: 10px;
+      font-size: 13px;
+      line-height: 1.55;
+      color: var(--text);
+    }
+
+    .reader-md h3 {
+      margin: 4px 0 0;
+      font-size: 13.5px;
+      color: var(--text-strong);
+    }
+
+    .reader-md p { margin: 0; }
+
+    .reader-md ul {
+      margin: 0;
+      padding-left: 18px;
+      display: flex;
+      flex-direction: column;
+      gap: 4px;
+    }
+
+    .reader-md code {
+      background: #09101c;
+      border: 1px solid var(--border);
+      color: #bae6fd;
+      padding: 1px 5px;
+      border-radius: 4px;
+      font-size: 12px;
+    }
+
+    .reader-md pre code {
+      border: none;
+      padding: 0;
+      background: transparent;
+    }
+
+    /* Container Queries for Narrow Panes */
+    @container pane (inline-size < 430px) {
+      .summary-strip {
+        grid-template-columns: repeat(2, minmax(0, 1fr));
+      }
+      .legend {
+        display: none;
+      }
+      .cluster-grid {
+        grid-template-columns: 1fr;
+      }
+    }
+
+    /* TIER 2: Galaxy Z Fold 7 Unfolded (640px - 1020px) — 1fr 1fr + Hinge Gap */
+    @media (max-width: 1020px) and (min-width: 640px) {
+      .kbd-hint { display: none; }
+      .workspace {
+        grid-template-columns: 1fr 1fr;
+        gap: 14px;
+        padding: 10px max(10px, env(safe-area-inset-right, 0px))
+          max(10px, env(safe-area-inset-bottom, 0px)) max(10px, env(safe-area-inset-left, 0px));
+      }
+      .cluster-grid {
+        grid-template-columns: 1fr;
+      }
+    }
+
+    @media (horizontal-viewport-segments: 2) {
+      .workspace {
+        grid-template-columns: env(viewport-segment-width 0 0) env(viewport-segment-width 1 0);
+        gap: max(14px, calc(env(viewport-segment-left 1 0) - env(viewport-segment-right 0 0)));
+      }
+    }
+
+    /* TIER 1: Galaxy Z Fold 7 Cover Screen (< 640px) — Single-Screen 100dvh */
+    @media (max-width: 639px) {
+      .kbd-hint, .legend { display: none; }
+
+      .workspace {
+        display: block;
+        padding: 8px max(8px, env(safe-area-inset-right, 0px))
+          calc(var(--cover-nav-h) + 8px + env(safe-area-inset-bottom, 0px))
+          max(8px, env(safe-area-inset-left, 0px));
+      }
+
+      .pane-topology,
+      .pane-stream {
+        height: 100%;
+      }
+
+      body[data-cover-tab="topology"] .pane-stream { display: none; }
+      body[data-cover-tab="stream"] .pane-topology { display: none; }
+
+      .cover-back-btn {
+        display: inline-flex;
+      }
+
+      .cluster-grid {
+        grid-template-columns: 1fr;
+      }
+
+      .cover-nav {
+        position: fixed;
+        inset: auto 0 0 0;
+        height: calc(var(--cover-nav-h) + env(safe-area-inset-bottom, 0px));
+        padding: 6px max(10px, env(safe-area-inset-right, 0px))
+          max(8px, env(safe-area-inset-bottom, 0px)) max(10px, env(safe-area-inset-left, 0px));
+        background: #0a0f1b;
+        border-top: 1px solid var(--border-strong);
+        display: grid;
+        grid-template-columns: 1fr 1fr;
+        gap: 8px;
+        z-index: 20;
+      }
+
+      .cover-nav-btn {
+        border: 1px solid var(--border);
+        background: var(--panel-2);
+        color: var(--muted);
+        border-radius: 10px;
+        font-size: 12px;
+        font-weight: 700;
+        cursor: pointer;
+        position: relative;
+      }
+
+      .cover-nav-btn[aria-pressed="true"] {
+        color: var(--text-strong);
+        background: var(--panel-3);
+        border-color: var(--waiting);
+      }
+    }
+
+    /* Touch Ergonomics & Accessibility */
+    @media (pointer: coarse) {
+      :root { --target-size: 44px; }
+      .msg-pill, .line-msg-pill, .card-msg-badge, .read-full-btn, .kpi-btn, .run-pill, .jump-latest-btn, .ext-lane-card, .collapse-btn, .seg-btn, .filter-chip, .feed-mode-btn, .ev-read-btn, .tab-btn, .btn-ghost {
+        min-block-size: 44px;
+      }
+      .thread-select, .scenario-select {
+        min-block-size: 44px;
+        font-size: max(1rem, 1em);
+      }
+    }
+
+    @media (prefers-reduced-motion: reduce) {
+      .bus-path, .status-dot.working, .work-halo, .live-dot, .flow-edge, .scan-track::after { animation: none; }
+    }
+
+    @media (forced-colors: active) {
+      .cluster-card, .node-card, .bubble, .ext-chip, .msg-pill {
+        border: 1px solid CanvasText;
+      }
+      .seg-btn[aria-pressed="true"], .tab-btn[aria-selected="true"] {
+        outline: 2px solid Highlight;
+      }
+    }
+  </style>
+</head>
+<body data-cover-tab="topology">
+  <header class="topbar">
+    <div class="topbar-left">
+      <span class="brand-title"><span class="brand-dot" aria-hidden="true"></span>Agent Studio · Topology Mockup</span>
+      <span class="auto-pill" id="modeBadge">Auto-Smart: Grouped (&gt;8 agents)</span>
+    </div>
+    <div class="topbar-right">
+      <label class="sr-only" for="scenarioSelect">Agent count scenario</label>
+      <select class="scenario-select" id="scenarioSelect" aria-label="Agent count scenario">
+        <option value="swarm">33-Agent Copilot Swarm (Auto → Grouped)</option>
+        <option value="small">4-Agent Small Run (Auto → Mesh)</option>
+      </select>
+      <button type="button" class="btn-ghost" id="resetAutoBtn" hidden>Reset Auto</button>
+      <span class="kbd-hint">Card → Details · Pill on line → SMS</span>
+    </div>
+  </header>
+
+  <main class="workspace">
+    <!-- LEFT PANE: Topology -->
+    <section class="card pane-topology" aria-label="Agent Topology">
+      <div class="card-head">
+        <div class="topo-head-left">
+          <span class="card-title">Agent Topology</span>
+          <div class="legend" aria-label="Status legend">
+            <span><i class="sw" style="background:var(--working)"></i>Working</span>
+            <span><i class="sw" style="background:var(--waiting)"></i>Waiting</span>
+            <span><i class="sw" style="background:var(--thinking)"></i>Thinking</span>
+            <span><i class="sw" style="background:var(--blocked)"></i>Blocked</span>
+            <span><i class="sw" style="background:var(--done)"></i>Done</span>
+          </div>
+        </div>
+        <div class="topo-head-right">
+          <div class="seg-group" id="cardStyleSwitch" role="group" aria-label="Grouped card detail style">
+            <button type="button" class="seg-btn" id="btnStyleBasic" aria-pressed="true">Basic</button>
+            <button type="button" class="seg-btn" id="btnStyleDetailed" aria-pressed="false">Detailed</button>
+          </div>
+          <div class="seg-group" role="group" aria-label="Topology view mode">
+            <button type="button" class="seg-btn" id="btnViewGrouped" aria-pressed="true">Grouped</button>
+            <button type="button" class="seg-btn" id="btnViewMesh" aria-pressed="false">Mesh</button>
+          </div>
+        </div>
+      </div>
+
+      <div class="filter-strip" role="group" aria-label="Filter topology clusters">
+        <button type="button" class="filter-chip" data-filter="all" aria-pressed="true">All Roles (<span id="fAllCount">33</span>)</button>
+        <button type="button" class="filter-chip" data-filter="active" aria-pressed="false">Active &amp; Waiting (6)</button>
+        <button type="button" class="filter-chip" data-filter="done" aria-pressed="false">Completed (27)</button>
+        <button type="button" class="filter-chip" data-filter="ext:fs" aria-pressed="false">Workspace FS · 273</button>
+        <button type="button" class="filter-chip" data-filter="ext:shell" aria-pressed="false">Local Shell · 54</button>
+      </div>
+
+      <div class="topo-stage" id="topoStage" role="region" tabindex="0" aria-label="Interactive topology canvas">
+        <!-- Grouped Cluster Tree + Orthogonal Bus + Swimlanes -->
+        <div class="grouped-tree is-basic" id="groupedTree">
+          <svg class="bus-svg" id="busSvg" aria-hidden="true"></svg>
+          <div class="bus-pills-layer" id="busPillsLayer"></div>
+
+          <div class="root-row">
+            <div class="node-card user-node" data-agent-id="user" tabindex="0" role="button" aria-label="Inspect User details">
+              <div class="cluster-head">
+                <div class="cluster-title-wrap">
+                  <div class="cluster-name"><span class="status-dot done detail-only" aria-hidden="true"></span>User</div>
+                  <div class="role-meta detail-only">Session Root · 12 prompts</div>
+                </div>
+                <div class="run-top-right">
+                  <button type="button" class="card-msg-badge detail-only" data-thread="user-copilot" aria-label="Open 12 messages for User">
+                    <svg width="11" height="11" viewBox="0 0 16 16" fill="currentColor" aria-hidden="true"><path d="M2 2.5A1.5 1.5 0 0 1 3.5 1h9A1.5 1.5 0 0 1 14 2.5v7A1.5 1.5 0 0 1 12.5 11H6.6l-3.2 2.8A.5.5 0 0 1 2.5 13.4V11A1.5 1.5 0 0 1 2 9.5v-7z"/></svg>
+                    12
+                  </button>
+                  <span class="state-tag basic-only" style="background:rgba(245,158,11,0.18);color:#fcd34d;border:1.1px solid #f59e0b;">HUMAN</span>
+                </div>
+              </div>
+              <div class="basic-summary-line">Human: Make sure the topology…</div>
+              <div class="cluster-foot-row">
+                <span class="tele-mono">12 prompts · 0 replies</span>
+              </div>
+            </div>
+
+            <div class="edge-link">
+              <span class="edge-line" aria-hidden="true" style="background:none;border-top:2px dashed #f59e0b;height:0;"></span>
+              <button type="button" class="msg-pill" data-thread="user-copilot" style="border-color:#f59e0b;color:#fde68a;" aria-label="Open 12 messages between User and Copilot Agent">12 msg</button>
+              <span class="edge-line" aria-hidden="true" style="background:none;border-top:2px dashed #f59e0b;height:0;"></span>
+              <span aria-hidden="true" style="color:#f59e0b;">▶</span>
+            </div>
+
+            <div class="node-card root-agent" id="rootOrchestrator" data-agent-id="copilot-agent" tabindex="0" role="button" aria-label="Inspect Copilot Agent details">
+              <div class="cluster-head">
+                <div class="cluster-title-wrap">
+                  <div class="cluster-name"><span class="status-dot working detail-only" aria-hidden="true"></span>Copilot Agent</div>
+                  <div class="role-meta detail-only" id="rootMeta">Orchestrator · 32 subagents · 327 tools</div>
+                </div>
+                <div class="run-top-right">
+                  <button type="button" class="card-msg-badge detail-only" data-thread="all" aria-label="Open all session messages for Copilot Agent">
+                    <svg width="11" height="11" viewBox="0 0 16 16" fill="currentColor" aria-hidden="true"><path d="M2 2.5A1.5 1.5 0 0 1 3.5 1h9A1.5 1.5 0 0 1 14 2.5v7A1.5 1.5 0 0 1 12.5 11H6.6l-3.2 2.8A.5.5 0 0 1 2.5 13.4V11A1.5 1.5 0 0 1 2 9.5v-7z"/></svg>
+                    <span id="copilotBadgeCount">48</span>
+                  </button>
+                  <span class="state-tag working">● THINKING</span>
+                </div>
+              </div>
+              <div class="basic-summary-line" id="rootBasicSummary">To angular-expert: Responsive Z Fold 7…</div>
+              <div class="cluster-foot-row">
+                <span class="tele-mono" id="rootBasicTele">thinking 13s · 327t</span>
+                <span class="ide-chip">VS</span>
+              </div>
+              <div class="scan-track" aria-hidden="true"></div>
+            </div>
+          </div>
+
+          <!-- Swimlane 1: Active / Working -->
+          <section class="swimlane" id="laneActive" aria-label="Active and waiting clusters">
+            <div class="swimlane-head" id="laneActiveHead">Active / Working</div>
+            <div class="cluster-grid" id="activeClusterGrid"></div>
+          </section>
+
+          <!-- Swimlane 2: Completed / Standby -->
+          <section class="swimlane" id="laneCompleted" aria-label="Completed and standby clusters">
+            <div class="swimlane-head" id="laneDoneHead">Completed / Standby</div>
+            <div class="cluster-grid" id="doneClusterGrid"></div>
+          </section>
+
+          <!-- Swimlane 3: External Systems & MCP Tools -->
+          <section class="swimlane" id="laneExternal" aria-label="External systems and MCP tools">
+            <div class="swimlane-head">External Systems &amp; MCP Tools</div>
+            <div class="ext-lane-cards">
+              <button type="button" class="ext-lane-card" data-ext-filter="ext:fs" aria-pressed="false">
+                <span class="ext-lane-title">📁 Workspace FS</span>
+                <span class="ext-lane-sub">273 calls · Edited TopologySvg.ts</span>
+              </button>
+              <button type="button" class="ext-lane-card" data-ext-filter="ext:shell" aria-pressed="false">
+                <span class="ext-lane-title">⚡ Local Shell</span>
+                <span class="ext-lane-sub">54 calls · Run: npm --prefix web check</span>
+              </button>
+            </div>
+          </section>
+        </div>
+
+        <!-- Radial Ring Mesh View (User & Copilot Center Core + Cross-Agent Comms) -->
+        <div class="mesh-view" id="meshView" hidden>
+          <div class="mesh-banner">
+            <span><strong>Radial Ring Mesh:</strong> <code>User</code> &amp; <code>Copilot</code> in center core, Active &amp; Standby rings, plus <strong>cross-agent communication chords</strong> with clickable <code>[N msg]</code> pills.</span>
+            <button type="button" class="btn-ghost" id="switchGroupedCta">Back to Grouped</button>
+          </div>
+          <div class="mesh-canvas-wrap" role="region" tabindex="0" aria-label="Radial ring multi-agent mesh diagram with cross-communication arcs">
+            <svg class="mesh-svg" id="meshSvg" viewBox="0 0 880 540" preserveAspectRatio="xMidYMid meet"></svg>
+          </div>
+        </div>
+      </div>
+
+      <div class="summary-strip" aria-label="Topology KPIs">
+        <div><span>Agents</span><b id="kpiAgents">33</b></div>
+        <div><span>Active</span><b id="kpiActive">6</b></div>
+        <div><span>Tool Calls</span><b id="kpiTools">327</b></div>
+        <button type="button" class="kpi-btn" id="kpiMsgsBtn" data-thread="all" aria-label="Open all 48 session messages in Thread">
+          <span>Messages ↗</span><b id="kpiMsgs">48</b>
+        </button>
+      </div>
+    </section>
+
+    <!-- RIGHT PANE: Original Live Activity Stream + Pill-Filtered SMS Mode (No Extra Tabs / No Dropdown) -->
+    <section class="card pane-stream" aria-label="Live Activity Stream and Details">
+      <div class="card-head">
+        <div class="topo-head-left">
+          <button type="button" class="btn-ghost cover-back-btn" id="coverBackBtn">← Topology</button>
+          <span class="card-title">Live Activity Stream</span>
+        </div>
+        <div class="run-top-right">
+          <div class="feed-mode-toggle" role="group" aria-label="Stream verbosity">
+            <button type="button" class="feed-mode-btn" id="btnFeedSummary" aria-pressed="true">Summary</button>
+            <button type="button" class="feed-mode-btn" id="btnFeedDetailed" aria-pressed="false">Detailed</button>
+          </div>
+          <span class="role-meta" id="feedCountLabel">8 events</span>
+          <button type="button" class="btn-ghost" id="openRawBtn" style="padding:3px 7px;">{}</button>
+        </div>
+      </div>
+
+      <!-- Original Pre-Feature Live Feed Tabs (Unchanged) -->
+      <div class="feed-filters" role="group" aria-label="Filter live activity events">
+        <button type="button" class="filter-chip" data-feed-filter="all" aria-pressed="true">All</button>
+        <button type="button" class="filter-chip" data-feed-filter="messages" aria-pressed="false">Messages</button>
+        <button type="button" class="filter-chip" data-feed-filter="tools" aria-pressed="false">Tools</button>
+        <button type="button" class="filter-chip" data-feed-filter="board" aria-pressed="false">Board</button>
+        <button type="button" class="filter-chip" data-feed-filter="errors" aria-pressed="false">Errors</button>
+        <button type="button" class="filter-chip" data-feed-filter="usage" aria-pressed="false">Usage</button>
+      </div>
+
+      <!-- Pill-Filtered / Messages-Tab SMS Stream Banner -->
+      <div class="sms-thread-bar" id="smsPillBar" hidden>
+        <div class="run-top-right" style="min-width:0;flex:1;">
+          <span class="pill status" id="activePillRouteChip">All Session Messages</span>
+          <span class="role-meta" id="activePillHint" style="overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">SMS view in Messages tab</span>
+        </div>
+        <div class="run-top-right">
+          <button type="button" class="btn-ghost" id="simMsgBtn" title="Append a live message to test smart auto-scroll">+1 Live Msg</button>
+          <button type="button" class="btn-ghost" id="clearPillBtn" hidden>✕ Show All Messages</button>
+        </div>
+      </div>
+      <div class="run-filter-bar" id="runFilterBar" role="group" aria-label="Filter messages by agent run" hidden></div>
+
+      <!-- Standard Live Feed List (when no pill filter active) -->
+      <div class="feed-list" id="feedList"></div>
+
+      <!-- Pill-Filtered SMS Bubble List (when a [N msg] pill is active) -->
+      <div class="sms-body-wrap" id="smsBodyWrap" hidden>
+        <div class="sms-body" id="smsBody" aria-live="polite"></div>
+        <button type="button" class="jump-latest-btn" id="jumpLatestBtn" hidden>↓ Jump to latest</button>
+      </div>
+
+      <!-- Inline Agent / Event Details Inspector (bottom split) -->
+      <div class="stream-inspector-slot" id="inspectorSlot" data-inspector-state="open" aria-label="Agent and event details inspector">
+        <div class="insp-head">
+          <div class="insp-title-row" id="inspTitleRow">Details</div>
+          <div class="run-top-right">
+            <button type="button" class="btn-ghost" id="inspJumpThreadBtn" style="padding:2px 8px;font-size:10.5px;">SMS Pill →</button>
+            <button type="button" class="btn-ghost" id="closeInspectorBtn" aria-label="Close details" style="padding:2px 7px;">✕</button>
+          </div>
+        </div>
+        <div class="insp-body" id="inspBody"></div>
+      </div>
+    </section>
+  </main>
+
+  <!-- Cover Screen (<640px) Fixed Segmented Navigation -->
+  <nav class="cover-nav" aria-label="Mobile view switcher">
+    <button type="button" class="cover-nav-btn" id="navTopoBtn" aria-pressed="true">Topology (33)</button>
+    <button type="button" class="cover-nav-btn" id="navFeedBtn" aria-pressed="false">Live Feed</button>
+  </nav>
+
+  <!-- Native Modal Dialog for Raw Event Inspection -->
+  <dialog id="rawDialog" aria-labelledby="rawDlgTitle" closedby="any">
+    <div class="dlg-head">
+      <h1 id="rawDlgTitle">Raw Telemetry Event Snapshot</h1>
+      <form method="dialog">
+        <button type="submit" class="btn-ghost" autofocus>Close</button>
+      </form>
+    </div>
+    <div class="dlg-body">
+      <pre id="rawJsonPre"></pre>
+    </div>
+    <div class="dlg-foot">
+      <form method="dialog">
+        <button type="submit" class="btn-ghost">Done</button>
+      </form>
+    </div>
+  </dialog>
+
+  <!-- Native Modal Dialog: CommReaderModal Preview (Read full →) -->
+  <dialog id="commReaderDialog" class="comm-reader-dialog" aria-labelledby="commReaderTitle" closedby="any">
+    <div class="dlg-head">
+      <h1 id="commReaderTitle">Full Agent Communication</h1>
+      <form method="dialog">
+        <button type="submit" class="btn-ghost" autofocus>Close</button>
+      </form>
+    </div>
+    <div class="reader-meta-bar" id="commReaderMeta"></div>
+    <div class="dlg-body">
+      <div class="reader-md" id="commReaderBody"></div>
+    </div>
+    <div class="dlg-foot">
+      <button type="button" class="btn-ghost" id="copyFullMsgBtn">Copy Markdown</button>
+      <form method="dialog">
+        <button type="submit" class="btn-ghost">Done</button>
+      </form>
+    </div>
+  </dialog>
+
+  <script>
+    (() => {
+      const STORAGE_KEY = "agentStudio.topologyViewMode";
+      const STYLE_KEY = "agentStudio.groupedCardStyle.v2";
+      const safeStore = {
+        get(k) { try { return window.localStorage.getItem(k); } catch { return null; } },
+        set(k, v) { try { window.localStorage.setItem(k, v); } catch {} },
+        del(k) { try { window.localStorage.removeItem(k); } catch {} }
+      };
+
+      const TEAM_CLUSTERS = [
+        {
+          id: "angular-expert",
+          teamRole: "angular-expert",
+          subtitle: "Team Agent · Frontend UI",
+          state: "working",
+          threadId: "copilot-angular",
+          msgCount: 4,
+          extTools: ["ext:fs", "ext:shell"],
+          totalTools: 14,
+          runs: [
+            { id: "angular-expert #1", state: "working", tools: 14, msgs: 4, task: "Wire sticky header & responsive Z Fold 7 tabs" }
+          ]
+        },
+        {
+          id: "azure-architect",
+          teamRole: "azure-architect",
+          subtitle: "Team Agent · Cloud Architecture",
+          state: "waiting",
+          threadId: "copilot-azure",
+          msgCount: 6,
+          extTools: ["ext:fs"],
+          totalTools: 38,
+          runs: [
+            { id: "azure-architect #3", state: "waiting", tools: 18, msgs: 2, task: "Validate Bicep App Service SKU & VNet peering" },
+            { id: "azure-architect #2", state: "done", tools: 12, msgs: 2, task: "Provision Key Vault RBAC policy" },
+            { id: "azure-architect #1", state: "done", tools: 8, msgs: 2, task: "Draft initial AKS ingress topology" }
+          ]
+        },
+        {
+          id: "dotnet-api-dev",
+          teamRole: "dotnet-api-dev",
+          subtitle: "Team Agent · Backend API",
+          state: "waiting",
+          threadId: "copilot-dotnet",
+          msgCount: 5,
+          extTools: ["ext:fs", "ext:shell"],
+          totalTools: 52,
+          runs: [
+            { id: "dotnet-api-dev #2", state: "waiting", tools: 31, msgs: 3, task: "OrdersController DTO mapping & EF query check" },
+            { id: "dotnet-api-dev #1", state: "done", tools: 21, msgs: 2, task: "Add FluentValidation middleware & unit tests" }
+          ]
+        },
+        {
+          id: "jss-db-dev",
+          teamRole: "JSS DB Developer",
+          subtitle: "Team Agent · Database Schema",
+          state: "done",
+          threadId: "copilot-db",
+          msgCount: 3,
+          extTools: ["ext:fs"],
+          totalTools: 19,
+          runs: [
+            { id: "JSS DB Developer #2", state: "done", tools: 11, msgs: 2, task: "Index tuning on OrderLineItems" },
+            { id: "JSS DB Developer #1", state: "done", tools: 8, msgs: 1, task: "Create migration v14_photo_refs.sql" }
+          ]
+        },
+        {
+          id: "business-analyst",
+          teamRole: "business-analyst",
+          subtitle: "Team Agent · Requirements & AC",
+          state: "done",
+          threadId: "copilot-ba",
+          msgCount: 4,
+          extTools: ["ext:fs"],
+          totalTools: 8,
+          runs: [
+            { id: "business-analyst #2", state: "done", tools: 5, msgs: 2, task: "Verify sprint acceptance checklist" },
+            { id: "business-analyst #1", state: "done", tools: 3, msgs: 2, task: "Map checkout edge cases to stories" }
+          ]
+        },
+        {
+          id: "adhoc-task",
+          teamRole: "Ad-hoc / Task",
+          subtitle: "Unmatched task subagents ×7",
+          state: "waiting",
+          threadId: "copilot-task",
+          msgCount: 9,
+          extTools: ["ext:fs", "ext:shell"],
+          totalTools: 67,
+          runs: [
+            { id: "task #7", state: "waiting", tools: 11, msgs: 2, task: "Cross-check API contract fixtures" },
+            { id: "task #6", state: "waiting", tools: 9, msgs: 2, task: "Run lint & smoke check on web bundle" },
+            { id: "task #5", state: "done", tools: 12, msgs: 1, task: "Extract shared date parser" },
+            { id: "task #4", state: "done", tools: 10, msgs: 1, task: "Audit CSS tokens for contrast" },
+            { id: "task #3", state: "done", tools: 9, msgs: 1, task: "Scan stale test mocks" },
+            { id: "task #2", state: "done", tools: 8, msgs: 1, task: "Normalize route constants" },
+            { id: "task #1", state: "done", tools: 8, msgs: 1, task: "Index workspace entry points" }
+          ]
+        },
+        {
+          id: "board-photo",
+          teamRole: "Board / Photo Subagents",
+          subtitle: "Ad-hoc feature subagents ×14",
+          state: "waiting",
+          threadId: "copilot-board",
+          msgCount: 5,
+          extTools: ["ext:fs"],
+          totalTools: 129,
+          runs: [
+            { id: "photo-sync #14", state: "waiting", tools: 14, msgs: 1, task: "Verify thumbnail aspect-ratio & lazy decode" },
+            ...Array.from({ length: 13 }, (_, idx) => ({
+              id: `board-photo #${13 - idx}`,
+              state: "done",
+              tools: 8 + (idx % 3),
+              msgs: idx < 4 ? 1 : 0,
+              task: `Completed board/photo subtask #${13 - idx}`
+            }))
+          ]
+        }
+      ];
+
+      const THREADS = {
+        "user-copilot": {
+          label: "User ↔ Copilot Agent (12 msg)",
+          route: "User ↔ Copilot Agent",
+          messages: [
+            {
+              dir: "inbound", from: "User", role: "Session Root", time: "14:18:02",
+              text: "Orchestrate the **Angular UI**, **.NET API**, DB indexes, and Azure infra for Board & Photo upload.",
+              tools: []
+            },
+            {
+              dir: "outbound", from: "Copilot Agent", role: "Orchestrator", time: "14:18:09",
+              text: "Spawning specialist team agents (`azure-architect`, `dotnet-api-dev`, `JSS DB Developer`, `angular-expert`) plus verification tasks…",
+              tools: ["Workspace FS · 6"],
+              fullMarkdown: [
+                "### Multi-Agent Execution Plan",
+                "Dispatched 32 subagent runs across 5 defined team roles plus ad-hoc feature workers:",
+                "- `azure-architect ×3`: Key Vault RBAC, AKS ingress, and App Service SKU check",
+                "- `dotnet-api-dev ×2`: FluentValidation middleware & `/api/orders` DTO projections",
+                "- `JSS DB Developer ×2`: `OrderLineItems` covering index & `v14_photo_refs.sql`",
+                "- `angular-expert`: Responsive grid header & Z Fold 7 three-tier styles",
+                "```json\n{ \"parallel\": true, \"teamAgents\": 5, \"adhocWorkers\": 21 }\n```"
+              ].join("\n")
+            },
+            {
+              dir: "inbound", from: "User", role: "Session Root", time: "14:21:40",
+              text: "Make sure the topology stays clean on **Z Fold 7** cover & unfolded screens too.",
+              tools: []
+            },
+            {
+              dir: "outbound", from: "Copilot Agent", role: "Orchestrator", time: "14:21:46",
+              text: "Forwarding responsive fold constraints to `angular-expert` now; **27 subtasks done**, 6 active.",
+              tools: ["Local Shell · 3"]
+            }
+          ]
+        },
+        "copilot-angular": {
+          label: "Copilot Agent ↔ angular-expert (4 msg)",
+          route: "Copilot ↔ angular-expert",
+          messages: [
+            {
+              dir: "inbound", from: "Copilot Agent", role: "Orchestrator", time: "14:22:08",
+              text: "Update the board & topology grid with sticky headers and **3-tier Z Fold 7** responsive CSS…",
+              tools: [],
+              fullMarkdown: [
+                "### Responsive Constraints Spec",
+                "Please enforce all three Galaxy Z Fold 7 tiers in `web/src/styles/responsive.css`:",
+                "- **Cover (`<640px`)**: Single-screen `100dvh` layout with fixed bottom segmented nav",
+                "- **Unfolded (`640–1020px`)**: Preserve `1fr 1fr` split + `@media (horizontal-viewport-segments: 2)` crease gap",
+                "- **Desktop (`>=1021px`)**: Full studio workspace with `@container` KPI adaptation",
+                "```css\n@media (pointer: coarse) { button { min-block-size: 44px; } }\n```"
+              ].join("\n")
+            },
+            {
+              dir: "outbound", from: "angular-expert", role: "Frontend UI", time: "14:22:19",
+              text: "Editing `TopologySvg.ts` + container queries; running **Workspace FS** updates & local typecheck.",
+              tools: ["Workspace FS · 12", "Local Shell · 2"]
+            },
+            {
+              dir: "inbound", from: "Copilot Agent", role: "Orchestrator", time: "14:22:30",
+              text: "Keep `44px` touch targets under `pointer: coarse`.",
+              tools: []
+            },
+            {
+              dir: "outbound", from: "angular-expert", role: "Frontend UI · WORKING", time: "14:22:34",
+              text: "Applying `44px` coarse-pointer rules and running `npm --prefix web run check`…",
+              tools: ["Workspace FS · 2"]
+            }
+          ]
+        },
+        "copilot-azure": {
+          label: "Copilot Agent ↔ azure-architect (6 msg)",
+          route: "Copilot ↔ azure-architect",
+          messages: [
+            {
+              dir: "inbound", from: "Copilot Agent", role: "Orchestrator", time: "14:18:22",
+              runIds: ["azure-architect #1", "azure-architect #2", "azure-architect #3"],
+              text: "Design App Service + Key Vault + Storage SAS boundary for Photo uploads.",
+              tools: []
+            },
+            {
+              dir: "outbound", from: "azure-architect #1", role: "Cloud Arch · DONE", time: "14:19:04",
+              runId: "azure-architect #1",
+              text: "Drafted AKS/App Service ingress topology and private subnet CIDR plan.",
+              tools: ["Workspace FS · 8"]
+            },
+            {
+              dir: "outbound", from: "azure-architect #2", role: "Cloud Arch · DONE", time: "14:19:45",
+              runId: "azure-architect #2",
+              text: "Key Vault RBAC & ingress templates finished; `#3` waiting on final SKU confirmation…",
+              tools: ["Workspace FS · 12"],
+              fullMarkdown: [
+                "### Azure Infrastructure Handoff",
+                "- Completed Key Vault `Key Vault Secrets User` role assignment in `infra/keyvault.bicep`",
+                "- Configured private endpoint DNS zone for Blob Storage photo container",
+                "- Pending final `/healthz` readiness path from `dotnet-api-dev #2` before locking App Service slot settings"
+              ].join("\n")
+            },
+            {
+              dir: "outbound", from: "azure-architect #3", role: "Cloud Arch · WAITING", time: "14:22:12",
+              runId: "azure-architect #3",
+              text: "Awaiting API health-probe route from `dotnet-api-dev #2` before locking Bicep template.",
+              tools: ["Workspace FS · 18"]
+            }
+          ]
+        },
+        "copilot-dotnet": {
+          label: "Copilot Agent ↔ dotnet-api-dev (5 msg)",
+          route: "Copilot ↔ dotnet-api-dev",
+          messages: [
+            {
+              dir: "inbound", from: "Copilot Agent", role: "Orchestrator", time: "14:18:30",
+              runIds: ["dotnet-api-dev #1", "dotnet-api-dev #2"],
+              text: "Implement `/api/orders` & `/api/photos` DTO validation and EF Core projections.",
+              tools: []
+            },
+            {
+              dir: "outbound", from: "dotnet-api-dev #1", role: "Backend API · DONE", time: "14:20:14",
+              runId: "dotnet-api-dev #1",
+              text: "**FluentValidation** middleware & unit tests passed cleanly (`18/18`).",
+              tools: ["Local Shell · 9", "Workspace FS · 12"]
+            },
+            {
+              dir: "outbound", from: "dotnet-api-dev #2", role: "Backend API · WAITING", time: "14:22:05",
+              runId: "dotnet-api-dev #2",
+              text: "Waiting on DB index confirmation for `OrderLineItems` before merging EF projection…",
+              tools: ["Workspace FS · 31"],
+              fullMarkdown: [
+                "### OrdersController Projection Check",
+                "Verified `OrderSummaryDto` eliminates N+1 queries across `OrderLineItems` and `PhotoAttachments`.",
+                "```csharp\nreturn await _db.Orders\n  .AsNoTracking()\n  .Select(o => new OrderSummaryDto(o.Id, o.Photos.Count))\n  .ToListAsync(ct);\n```",
+                "Blocked only on verifying covering index `IX_OrderLineItems_OrderId_Status` from `JSS DB Developer`."
+              ].join("\n")
+            }
+          ]
+        },
+        "copilot-db": {
+          label: "Copilot Agent ↔ JSS DB Developer (3 msg)",
+          route: "Copilot ↔ JSS DB Developer",
+          messages: [
+            {
+              dir: "inbound", from: "Copilot Agent", role: "Orchestrator", time: "14:18:45",
+              runIds: ["JSS DB Developer #1", "JSS DB Developer #2"],
+              text: "Add covering index for `OrderLineItems` & photo reference FK migration.",
+              tools: []
+            },
+            {
+              dir: "outbound", from: "JSS DB Developer #1", role: "Database · DONE", time: "14:20:10",
+              runId: "JSS DB Developer #1",
+              text: "Created `v14_photo_refs.sql` with cascade delete guard.",
+              tools: ["Workspace FS · 8"]
+            },
+            {
+              dir: "outbound", from: "JSS DB Developer #2", role: "Database · DONE", time: "14:20:58",
+              runId: "JSS DB Developer #2",
+              text: "Verified `IX_OrderLineItems_OrderId_Status` execution plan (`0` table scans).",
+              tools: ["Workspace FS · 11"]
+            }
+          ]
+        },
+        "copilot-ba": {
+          label: "Copilot Agent ↔ business-analyst (4 msg)",
+          route: "Copilot ↔ business-analyst",
+          messages: [
+            {
+              dir: "inbound", from: "Copilot Agent", role: "Orchestrator", time: "14:18:15",
+              runIds: ["business-analyst #1", "business-analyst #2"],
+              text: "Confirm acceptance criteria for multi-photo board attachments.",
+              tools: []
+            },
+            {
+              dir: "outbound", from: "business-analyst #1", role: "Specs & AC · DONE", time: "14:19:12",
+              runId: "business-analyst #1",
+              text: "Mapped checkout & upload edge cases to sprint user stories.",
+              tools: ["Workspace FS · 3"]
+            },
+            {
+              dir: "outbound", from: "business-analyst #2", role: "Specs & AC · DONE", time: "14:19:50",
+              runId: "business-analyst #2",
+              text: "Acceptance checklist verified and signed off for sprint scope.",
+              tools: ["Workspace FS · 5"]
+            }
+          ]
+        },
+        "copilot-task": {
+          label: "Copilot Agent ↔ Ad-hoc / Task ×7 (9 msg)",
+          route: "Copilot ↔ Ad-hoc / Task",
+          messages: [
+            {
+              dir: "inbound", from: "Copilot Agent", role: "Orchestrator", time: "14:19:02",
+              runIds: ["task #1", "task #2", "task #3", "task #4", "task #5", "task #6", "task #7"],
+              text: "Dispatching **7 parallel** verification & cleanup tasks.",
+              tools: []
+            },
+            {
+              dir: "outbound", from: "task #1–#5", role: "Ad-hoc · DONE", time: "14:21:11",
+              runIds: ["task #1", "task #2", "task #3", "task #4", "task #5"],
+              text: "5 cleanup/audit tasks finished cleanly.",
+              tools: ["Workspace FS · 47"]
+            },
+            {
+              dir: "outbound", from: "task #6", role: "Ad-hoc · WAITING", time: "14:22:20",
+              runId: "task #6",
+              text: "Waiting on `angular-expert` build output to run bundle smoke check.",
+              tools: ["Local Shell · 9"]
+            },
+            {
+              dir: "outbound", from: "task #7", role: "Ad-hoc · WAITING", time: "14:22:25",
+              runId: "task #7",
+              text: "Cross-checking API contract fixtures against `dotnet-api-dev #2`.",
+              tools: ["Local Shell · 11"]
+            }
+          ]
+        },
+        "copilot-board": {
+          label: "Copilot Agent ↔ Board / Photo ×14 (5 msg)",
+          route: "Copilot ↔ Board / Photo",
+          messages: [
+            {
+              dir: "inbound", from: "Copilot Agent", role: "Orchestrator", time: "14:19:20",
+              runIds: ["photo-sync #14", "board-photo #13", "board-photo #12"],
+              text: "Fan out 14 board card & photo-sync subagents.",
+              tools: []
+            },
+            {
+              dir: "outbound", from: "board-photo #1–#13", role: "Feature · DONE", time: "14:21:55",
+              runIds: ["board-photo #13", "board-photo #12", "board-photo #11", "board-photo #10"],
+              text: "13 subtasks completed cleanly.",
+              tools: ["Workspace FS · 115"]
+            },
+            {
+              dir: "outbound", from: "photo-sync #14", role: "Feature · WAITING", time: "14:22:18",
+              runId: "photo-sync #14",
+              text: "Awaiting final thumbnail `aspect-ratio` & lazy-decode verification.",
+              tools: ["Workspace FS · 14"]
+            }
+          ]
+        },
+        "peer-azure-dotnet": {
+          label: "azure-architect #3 ↔ dotnet-api-dev #2 (2 msg)",
+          route: "azure-architect #3 ↔ dotnet-api-dev #2",
+          messages: [
+            {
+              dir: "inbound", from: "azure-architect #3", role: "Peer Cross-Comm", time: "14:21:58",
+              text: "Which `/healthz` readiness endpoint & timeout should `infra/appservice.bicep` probe?",
+              tools: []
+            },
+            {
+              dir: "outbound", from: "dotnet-api-dev #2", role: "Peer Cross-Comm", time: "14:22:09",
+              text: "Use `GET /healthz/ready` (`intervalSeconds: 15`) once `OrderLineItems` index check finishes.",
+              tools: ["Workspace FS · 2"]
+            }
+          ]
+        },
+        "peer-dotnet-db": {
+          label: "dotnet-api-dev #2 ↔ JSS DB Developer #2 (2 msg)",
+          route: "dotnet-api-dev #2 ↔ JSS DB Developer #2",
+          messages: [
+            {
+              dir: "inbound", from: "dotnet-api-dev #2", role: "Peer Cross-Comm", time: "14:20:48",
+              text: "Does `IX_OrderLineItems_OrderId_Status` cover `PhotoCount` projection without key lookup?",
+              tools: []
+            },
+            {
+              dir: "outbound", from: "JSS DB Developer #2", role: "Peer Cross-Comm", time: "14:20:58",
+              text: "Confirmed: `INCLUDE (PhotoCount)` added in `v14_photo_refs.sql` (`0` table scans).",
+              tools: ["Workspace FS · 3"]
+            }
+          ]
+        },
+        "peer-angular-photo": {
+          label: "angular-expert #1 ↔ photo-sync #14 (2 msg)",
+          route: "angular-expert #1 ↔ photo-sync #14",
+          messages: [
+            {
+              dir: "inbound", from: "angular-expert #1", role: "Peer Cross-Comm", time: "14:22:14",
+              text: "Reserve `aspect-ratio: 4 / 3` on `.photo-thumb` to eliminate CLS during lazy decode.",
+              tools: []
+            },
+            {
+              dir: "outbound", from: "photo-sync #14", role: "Peer Cross-Comm", time: "14:22:18",
+              text: "Updated `photo-card` placeholder dimensions to match `4 / 3` across Fold & Desktop.",
+              tools: ["Workspace FS · 4"]
+            }
+          ]
+        },
+        "peer-angular-task": {
+          label: "angular-expert #1 ↔ task #6 (2 msg)",
+          route: "angular-expert #1 ↔ task #6",
+          messages: [
+            {
+              dir: "inbound", from: "task #6", role: "Peer Cross-Comm", time: "14:22:20",
+              text: "Standing by for `npm --prefix web run build` output to start bundle smoke check.",
+              tools: []
+            },
+            {
+              dir: "outbound", from: "angular-expert #1", role: "Peer Cross-Comm", time: "14:22:34",
+              text: "Running final typecheck now; build artifacts ready in ~5s.",
+              tools: ["Local Shell · 1"]
+            }
+          ]
+        }
+      };
+
+      const state = {
+        scenario: "swarm",
+        filter: "all",
+        extFilter: null,
+        viewMode: "grouped",
+        cardStyle: safeStore.get(STYLE_KEY) || "basic",
+        manualMode: safeStore.get(STORAGE_KEY),
+        selectedThread: "user-copilot",
+        activePillThread: null,
+        selectedRun: "all",
+        selectedAgentId: "angular-expert",
+        selectedEventIdx: null,
+        inspectorOpen: true,
+        feedMode: "summary",
+        feedFilter: "all",
+        expandedDone: new Set(),
+        coverTab: "topology",
+        isNearBottom: true,
+        unseenCount: 0,
+        activeReaderMarkdown: ""
+      };
+
+      const $ = (s) => document.querySelector(s);
+      const activeClusterGrid = $("#activeClusterGrid");
+      const doneClusterGrid = $("#doneClusterGrid");
+      const laneActive = $("#laneActive");
+      const laneCompleted = $("#laneCompleted");
+      const busSvg = $("#busSvg");
+      const busPillsLayer = $("#busPillsLayer");
+      const groupedTree = $("#groupedTree");
+      const meshView = $("#meshView");
+      const meshSvg = $("#meshSvg");
+      const modeBadge = $("#modeBadge");
+      const resetAutoBtn = $("#resetAutoBtn");
+
+      function getActiveClusters() {
+        if (state.scenario === "small") {
+          return TEAM_CLUSTERS.slice(0, 2).map((c, i) => ({
+            ...c,
+            runs: [c.runs[0]],
+            subtitle: i === 0 ? "Team Agent · Frontend" : "Team Agent · Cloud"
+          }));
+        }
+        return TEAM_CLUSTERS;
+      }
+
+      function computeAutoMode(clusters) {
+        const agentCount = 2 + clusters.reduce((sum, c) => sum + c.runs.length, 0);
+        const repeated = clusters.some((c) => c.runs.length > 1);
+        return agentCount > 8 || repeated ? "grouped" : "mesh";
+      }
+
+      function syncViewMode() {
+        const clusters = getActiveClusters();
+        const autoMode = computeAutoMode(clusters);
+        state.viewMode = state.manualMode || autoMode;
+
+        const isGrouped = state.viewMode === "grouped";
+        const isBasic = state.cardStyle === "basic";
+        groupedTree.hidden = !isGrouped;
+        groupedTree.classList.toggle("is-basic", isBasic);
+        groupedTree.classList.toggle("is-detailed", !isBasic);
+        meshView.hidden = isGrouped;
+        $("#cardStyleSwitch").hidden = !isGrouped;
+        $("#btnViewGrouped").setAttribute("aria-pressed", String(isGrouped));
+        $("#btnViewMesh").setAttribute("aria-pressed", String(!isGrouped));
+        $("#btnStyleBasic").setAttribute("aria-pressed", String(isBasic));
+        $("#btnStyleDetailed").setAttribute("aria-pressed", String(!isBasic));
+
+        const totalAgents = 2 + clusters.reduce((sum, c) => sum + c.runs.length, 0);
+        if (state.manualMode) {
+          modeBadge.textContent = `Manual: ${isGrouped ? "Grouped" : "Mesh"} (saved)`;
+          resetAutoBtn.hidden = false;
+        } else {
+          modeBadge.textContent = `Auto-Smart: ${isGrouped ? "Grouped (>8 agents)" : `Mesh (${totalAgents} agents)`}`;
+          resetAutoBtn.hidden = true;
+        }
+
+        $("#kpiAgents").textContent = String(totalAgents);
+        $("#fAllCount").textContent = String(totalAgents);
+        const activeCount = 1 + clusters.reduce((s, c) => s + c.runs.filter((r) => r.state !== "done").length, 0);
+        const toolsCount = clusters.reduce((s, c) => s + c.totalTools, 0);
+        const msgCount = 12 + clusters.reduce((s, c) => s + c.msgCount, 0);
+        $("#kpiActive").textContent = String(activeCount);
+        $("#kpiTools").textContent = String(toolsCount);
+        $("#kpiMsgs").textContent = String(msgCount);
+        $("#copilotBadgeCount").textContent = String(msgCount);
+        $("#rootMeta").textContent = `Orchestrator · ${totalAgents - 1} subagents · ${toolsCount} tools`;
+        $("#navTopoBtn").textContent = `Topology (${totalAgents})`;
+      }
+
+      function passesFilter(cluster) {
+        if (state.extFilter && !cluster.extTools.includes(state.extFilter)) return false;
+        if (state.filter === "active") return cluster.runs.some((r) => r.state !== "done");
+        if (state.filter === "done") return cluster.runs.some((r) => r.state === "done");
+        return true;
+      }
+
+      const RAIL_COLORS = {
+        "angular-expert": "#f59e0b",
+        "azure-architect": "#06b6d4",
+        "dotnet-api-dev": "#a855f7",
+        "jss-db-dev": "#10b981",
+        "business-analyst": "#ec4899",
+        "adhoc-task": "#6366f1",
+        "board-photo": "#38bdf8"
+      };
+
+      function buildClusterCardHtml(c) {
+        const activeRuns = c.runs.filter((r) => r.state !== "done");
+        const doneRuns = c.runs.filter((r) => r.state === "done");
+        const isExpanded = state.expandedDone.has(c.id);
+        const counts = [];
+        const wCount = c.runs.filter((r) => r.state === "working").length;
+        const waitCount = c.runs.filter((r) => r.state === "waiting").length;
+        if (wCount) counts.push(`${wCount} working`);
+        if (waitCount) counts.push(`${waitCount} waiting`);
+        if (doneRuns.length) counts.push(`${doneRuns.length} done`);
+        const visibleRuns = isExpanded ? c.runs : activeRuns;
+        const railColor = RAIL_COLORS[c.id] || "#06b6d4";
+        const basicPill = c.state === "working" ? "● WORKING" : c.state === "waiting" ? "WAITING" : "✓ DONE";
+        const leadTask = (activeRuns[0] || c.runs[0])?.task || c.subtitle;
+        const isSelected = state.selectedAgentId === c.id;
+
+        return `
+          <article class="cluster-card ${isSelected ? "is-selected" : ""}" data-cluster-id="${c.id}" data-agent-id="${c.id}" data-thread-ref="${c.threadId}" data-msg-count="${c.msgCount}" data-role-label="${escHtml(c.teamRole)}" data-state="${c.state}" style="--rail-color:${railColor}" tabindex="0" role="button" aria-label="Inspect ${escHtml(c.teamRole)} details and thinking stream">
+            <div class="cluster-head">
+              <div class="cluster-title-wrap">
+                <div class="cluster-name">
+                  <span class="status-dot ${c.state} detail-only" aria-hidden="true"></span>
+                  <span>${c.teamRole}</span>
+                  ${c.runs.length > 1 ? `<span class="count-badge">×${c.runs.length}</span>` : ""}
+                </div>
+                <div class="role-meta detail-only">${c.subtitle} · ${counts.join(", ")} · ${c.totalTools} tools</div>
+              </div>
+              <div class="run-top-right">
+                <span class="state-tag ${c.state} basic-only">${basicPill}</span>
+              </div>
+            </div>
+            <div class="basic-summary-line">${escHtml(leadTask)}</div>
+            ${visibleRuns.length ? `
+              <div class="run-list">
+                ${visibleRuns.map((r) => `
+                  <div class="run-item ${r.state === "done" ? "is-done" : ""}" data-run-state="${r.state}">
+                    <div class="run-top">
+                      <span class="run-id">${r.id}</span>
+                      <div class="run-top-right">
+                        ${r.msgs > 0 ? `
+                          <button type="button" class="card-msg-badge" data-thread="${c.threadId}" data-run-id="${r.id}" aria-label="Open ${r.msgs} messages for ${r.id}">
+                            <svg width="10" height="10" viewBox="0 0 16 16" fill="currentColor" aria-hidden="true"><path d="M2 2.5A1.5 1.5 0 0 1 3.5 1h9A1.5 1.5 0 0 1 14 2.5v7A1.5 1.5 0 0 1 12.5 11H6.6l-3.2 2.8A.5.5 0 0 1 2.5 13.4V11A1.5 1.5 0 0 1 2 9.5v-7z"/></svg>
+                            ${r.msgs}
+                          </button>
+                        ` : ""}
+                        <span class="state-tag ${r.state}">${r.state === "done" ? "✓ done" : r.state} · ${r.tools}t</span>
+                      </div>
+                    </div>
+                    <div class="run-task" title="${r.task}">${r.task}</div>
+                  </div>
+                `).join("")}
+              </div>
+            ` : ""}
+            <div class="cluster-foot-row">
+              ${doneRuns.length > 0 ? `
+                <button type="button" class="collapse-btn" data-toggle-done="${c.id}" aria-expanded="${isExpanded}">
+                  ${isExpanded ? `− Hide ${doneRuns.length} done` : `+${doneRuns.length} done ▾`}
+                </button>
+              ` : `<span></span>`}
+              <div class="run-top-right">
+                <span class="tele-mono">${c.totalTools} tools · ${c.msgCount}↑ ${c.msgCount}↓</span>
+                <span class="ide-chip">VS</span>
+              </div>
+            </div>
+            <div class="scan-track" aria-hidden="true"></div>
+          </article>
+        `;
+      }
+
+      function renderClusters() {
+        const clusters = getActiveClusters().filter(passesFilter);
+        const activeClusters = clusters.filter((c) => c.state !== "done");
+        const doneClusters = clusters.filter((c) => c.state === "done");
+
+        laneActive.hidden = activeClusters.length === 0;
+        laneCompleted.hidden = doneClusters.length === 0;
+        $("#laneActiveHead").textContent = `Active / Working (${activeClusters.length})`;
+        $("#laneDoneHead").textContent = `Completed / Standby (${doneClusters.length})`;
+
+        activeClusterGrid.innerHTML = activeClusters.map(buildClusterCardHtml).join("");
+        doneClusterGrid.innerHTML = doneClusters.map(buildClusterCardHtml).join("");
+
+        document.querySelectorAll(".node-card[data-agent-id]").forEach((el) => {
+          el.classList.toggle("is-selected", el.dataset.agentId === state.selectedAgentId);
+        });
+
+        requestAnimationFrame(drawOrthogonalBus);
+      }
+
+      function drawOrthogonalBus() {
+        if (groupedTree.hidden) return;
+        const rootEl = $("#rootOrchestrator");
+        const cards = [...groupedTree.querySelectorAll(".cluster-card")];
+        const treeRect = groupedTree.getBoundingClientRect();
+        if (!rootEl || cards.length === 0 || treeRect.width === 0) {
+          busSvg.innerHTML = "";
+          busPillsLayer.innerHTML = "";
+          return;
+        }
+        const rRect = rootEl.getBoundingClientRect();
+        const startX = rRect.left - treeRect.left + rRect.width / 2;
+        const startY = rRect.bottom - treeRect.top;
+
+        const paths = [];
+        const pills = [];
+        const isBasic = state.cardStyle === "basic";
+
+        if (isBasic) {
+          // Screenshot-faithful direct radiating curves + faint external system connectors
+          cards.forEach((card) => {
+            const cRect = card.getBoundingClientRect();
+            const endX = cRect.left - treeRect.left + cRect.width / 2;
+            const endY = cRect.top - treeRect.top;
+            const st = card.dataset.state;
+            const color = st === "working" ? "#f59e0b" : st === "waiting" ? "#a855f7" : "#a855f7";
+            const pillBorder = st === "working" ? "#f59e0b" : st === "waiting" ? "#06b6d4" : "#c084fc";
+            const op = st === "done" ? "0.68" : "0.92";
+            const dash = st === "working" ? `stroke-dasharray="6 4"` : "";
+            const cls = st === "working" ? "bus-path is-work" : "";
+            const cx = (startX + endX) / 2;
+            const cy = startY + (endY - startY) * 0.42;
+            paths.push(`<path class="${cls}" d="M ${startX} ${startY} Q ${cx.toFixed(1)} ${cy.toFixed(1)} ${endX} ${endY}" fill="none" stroke="${color}" stroke-width="${st === "working" ? "2" : "1.5"}" stroke-opacity="${op}" ${dash} />`);
+
+            const tid = card.dataset.threadRef;
+            const msgCount = card.dataset.msgCount;
+            const roleLabel = card.dataset.roleLabel;
+            const isActive = state.feedFilter === "messages" && state.selectedThread === tid;
+            const t = endY - startY < 155 ? 0.56 : Math.max(0.56, 1 - 22 / Math.max(40, endY - startY));
+            const mt = 1 - t;
+            const px = mt * mt * startX + 2 * mt * t * cx + t * t * endX;
+            const py = mt * mt * startY + 2 * mt * t * cy + t * t * endY;
+            pills.push(`<button type="button" class="line-msg-pill ${isActive ? "is-active" : ""}" data-thread="${tid}" style="left:${px.toFixed(1)}px;top:${py.toFixed(1)}px;--pill-color:${pillBorder}" aria-label="Open ${msgCount} SMS messages for ${roleLabel}">${msgCount} msg</button>`);
+          });
+
+          const extCards = [...document.querySelectorAll("#laneExternal .ext-lane-card")];
+          cards.forEach((card, idx) => {
+            const ext = extCards[idx % Math.max(1, extCards.length)];
+            if (!ext) return;
+            const cRect = card.getBoundingClientRect();
+            const eRect = ext.getBoundingClientRect();
+            const sx = cRect.left - treeRect.left + cRect.width / 2;
+            const sy = cRect.bottom - treeRect.top;
+            const ex = eRect.left - treeRect.left + eRect.width / 2;
+            const ey = eRect.top - treeRect.top;
+            paths.push(`<line x1="${sx.toFixed(1)}" y1="${sy.toFixed(1)}" x2="${ex.toFixed(1)}" y2="${ey.toFixed(1)}" stroke="#38bdf8" stroke-opacity="0.16" stroke-dasharray="3 4" stroke-width="1" />`);
+          });
+        } else {
+          cards.forEach((card) => {
+            const cRect = card.getBoundingClientRect();
+            const endX = cRect.left - treeRect.left + cRect.width / 2;
+            const endY = cRect.top - treeRect.top;
+            const busY = startY + 14;
+            const st = card.dataset.state;
+            const color = st === "working" ? "#f59e0b" : st === "waiting" ? "#06b6d4" : "#10b981";
+            const cls = st === "working" ? "bus-path is-work" : st === "waiting" ? "bus-path is-live" : "bus-path";
+            const op = st === "done" ? "0.52" : "1";
+            paths.push(`<path class="${cls}" opacity="${op}" d="M ${startX} ${startY} V ${busY} H ${endX} V ${endY}" />
+                        <circle cx="${endX}" cy="${endY}" r="3" opacity="${op}" fill="${color}" />`);
+
+            const tid = card.dataset.threadRef;
+            const msgCount = card.dataset.msgCount;
+            const roleLabel = card.dataset.roleLabel;
+            const isActive = state.feedFilter === "messages" && state.selectedThread === tid;
+            pills.push(`<button type="button" class="line-msg-pill ${isActive ? "is-active" : ""}" data-thread="${tid}" style="left:${endX.toFixed(1)}px;top:${(endY - 15).toFixed(1)}px;--pill-color:${color}" aria-label="Open ${msgCount} SMS messages for ${roleLabel}">${msgCount} msg</button>`);
+          });
+        }
+        busSvg.innerHTML = paths.join("");
+        busPillsLayer.innerHTML = pills.join("");
+      }
+
+      function escHtml(str) {
+        return String(str)
+          .replace(/&/g, "&amp;")
+          .replace(/</g, "&lt;")
+          .replace(/>/g, "&gt;")
+          .replace(/"/g, "&quot;");
+      }
+
+      function renderInlineMarkdown(str) {
+        return escHtml(str)
+          .replace(/`([^`]+)`/g, "<code>$1</code>")
+          .replace(/\*\*([^*]+)\*\*/g, "<strong>$1</strong>");
+      }
+
+      function renderFullMarkdown(md) {
+        const blocks = String(md).split(/```(\w*)\n([\s\S]*?)```/g);
+        let html = "";
+        for (let i = 0; i < blocks.length; i += 3) {
+          const textPart = blocks[i] || "";
+          const lines = textPart.split("\n").map((l) => l.trim()).filter(Boolean);
+          let inList = false;
+          for (const line of lines) {
+            if (line.startsWith("### ")) {
+              if (inList) { html += "</ul>"; inList = false; }
+              html += `<h3>${renderInlineMarkdown(line.slice(4))}</h3>`;
+            } else if (line.startsWith("- ")) {
+              if (!inList) { html += "<ul>"; inList = true; }
+              html += `<li>${renderInlineMarkdown(line.slice(2))}</li>`;
+            } else {
+              if (inList) { html += "</ul>"; inList = false; }
+              html += `<p>${renderInlineMarkdown(line)}</p>`;
+            }
+          }
+          if (inList) html += "</ul>";
+          if (i + 2 < blocks.length) {
+            html += `<pre><code>${escHtml(blocks[i + 2].trim())}</code></pre>`;
+          }
+        }
+        return html;
+      }
+
+      function renderMesh() {
+        const clusters = getActiveClusters().filter(passesFilter);
+        const flat = clusters.flatMap((c) => c.runs.map((r) => ({ ...r, agentId: c.id, threadId: c.threadId })));
+        const activeRuns = flat.filter((r) => r.state !== "done");
+        const doneRuns = flat.filter((r) => r.state === "done");
+
+        const W = 880;
+        const H = 540;
+        const CX = 440;
+        const CY = 270;
+        const R_INNER = 140;
+        const R_OUTER = 224;
+        meshSvg.setAttribute("viewBox", `0 0 ${W} ${H}`);
+
+        const userNode = { id: "User", agentId: "user", x: CX - 48, y: CY, color: "#f59e0b", threadId: "user-copilot" };
+        const rootNode = { id: "Copilot", agentId: "copilot-agent", x: CX + 48, y: CY, color: "#c084fc", threadId: "all" };
+
+        const activeNodes = activeRuns.map((r, i) => {
+          const angle = -Math.PI / 2 + (i * 2 * Math.PI) / Math.max(1, activeRuns.length);
+          return {
+            id: r.id,
+            agentId: r.agentId,
+            x: CX + Math.cos(angle) * R_INNER,
+            y: CY + Math.sin(angle) * R_INNER,
+            angle,
+            color: r.state === "working" ? "#f59e0b" : "#06b6d4",
+            threadId: r.threadId,
+            msgs: r.msgs
+          };
+        });
+
+        const doneNodes = doneRuns.map((r, i) => {
+          const angle = -Math.PI / 2 + 0.14 + (i * 2 * Math.PI) / Math.max(1, doneRuns.length);
+          return {
+            id: r.id,
+            agentId: r.agentId,
+            x: CX + Math.cos(angle) * R_OUTER,
+            y: CY + Math.sin(angle) * R_OUTER,
+            angle,
+            color: "#10b981",
+            threadId: r.threadId,
+            msgs: r.msgs
+          };
+        });
+
+        const allNodes = [userNode, rootNode, ...activeNodes, ...doneNodes];
+        const findNode = (prefix) => allNodes.find((n) => n.id.startsWith(prefix));
+
+        const extNodes = [
+          { id: "ext:fs", label: "📁 Workspace FS · 273", x: 108, y: 492 },
+          { id: "ext:shell", label: "⚡ Local Shell · 54", x: 772, y: 492 }
+        ];
+
+        const orbitGuides = `
+          <circle cx="${CX}" cy="${CY}" r="76" fill="rgba(192,132,252,0.03)" stroke="#233252" stroke-dasharray="3 4" />
+          <circle cx="${CX}" cy="${CY}" r="${R_INNER}" fill="none" stroke="#1e2942" stroke-dasharray="5 5" />
+          ${doneNodes.length ? `<circle cx="${CX}" cy="${CY}" r="${R_OUTER}" fill="none" stroke="#192338" stroke-dasharray="4 5" />` : ""}
+          <text x="${CX}" y="${CY - R_INNER - 10}" fill="#64748b" font-size="8.8" font-weight="750" letter-spacing="1" text-anchor="middle">ACTIVE RING (${activeNodes.length})</text>
+          ${doneNodes.length ? `<text x="${CX}" y="${CY + R_OUTER + 20}" fill="#64748b" font-size="8.8" font-weight="750" letter-spacing="1" text-anchor="middle">STANDBY / DONE RING (${doneNodes.length})</text>` : ""}
+          <g transform="translate(18, 16)">
+            <rect width="206" height="44" rx="8" fill="#0b1120" stroke="#1e2942" />
+            <line x1="10" y1="15" x2="34" y2="15" stroke="#06b6d4" stroke-dasharray="4 3" stroke-width="1.4" />
+            <text x="42" y="18" fill="#94a3b8" font-size="9">Orchestrator ↔ Agent</text>
+            <line x1="10" y1="31" x2="34" y2="31" stroke="#c084fc" stroke-dasharray="5 3" stroke-width="2" />
+            <text x="42" y="34" fill="#e9d5ff" font-size="9" font-weight="650">Cross-Agent Peer Comms</text>
+          </g>
+        `;
+
+        // Hub-and-spoke edges from Center Core
+        const hubEdges = [
+          `<line x1="${userNode.x}" y1="${userNode.y}" x2="${rootNode.x}" y2="${rootNode.y}" stroke="#f59e0b" stroke-dasharray="5 3" stroke-width="2.2" />`
+        ];
+        [...activeNodes, ...doneNodes].forEach((n) => {
+          const isDone = n.color === "#10b981";
+          hubEdges.push(`<line x1="${rootNode.x}" y1="${rootNode.y}" x2="${n.x.toFixed(1)}" y2="${n.y.toFixed(1)}" stroke="${n.color}" stroke-dasharray="4 4" stroke-opacity="${isDone ? "0.2" : "0.52"}" stroke-width="${isDone ? "1" : "1.4"}" />`);
+        });
+
+        // Subtle external tool connections
+        [...activeNodes, ...doneNodes.slice(0, 4)].forEach((n, idx) => {
+          const ext = extNodes[idx % 2];
+          hubEdges.push(`<line x1="${n.x.toFixed(1)}" y1="${n.y.toFixed(1)}" x2="${ext.x}" y2="${ext.y}" stroke="#38bdf8" stroke-opacity="0.12" stroke-dasharray="2 4" stroke-width="1" />`);
+        });
+
+        // Peer-to-peer cross-communication curved chords + clickable [N msg] pills
+        const peerPairs = [
+          { a: "azure-architect #3", b: "dotnet-api-dev #2", label: "2 msg", threadId: "peer-azure-dotnet", color: "#c084fc" },
+          { a: "dotnet-api-dev #2", b: "JSS DB Developer #2", label: "2 msg", threadId: "peer-dotnet-db", color: "#38bdf8" },
+          { a: "angular-expert #1", b: "photo-sync #14", label: "2 msg", threadId: "peer-angular-photo", color: "#c084fc" },
+          { a: "angular-expert #1", b: "task #6", label: "2 msg", threadId: "peer-angular-task", color: "#f59e0b" }
+        ];
+
+        const peerArcs = [];
+        const edgePills = [
+          { x: (userNode.x + rootNode.x) / 2, y: CY - 22, label: "12 msg", threadId: "user-copilot", color: "#f59e0b" }
+        ];
+
+        peerPairs.forEach((p) => {
+          const na = findNode(p.a);
+          const nb = findNode(p.b);
+          if (!na || !nb) return;
+          const mx = (na.x + nb.x) / 2;
+          const my = (na.y + nb.y) / 2;
+          // Bow outward away from center (CX, CY) so chords never cross User/Copilot core
+          const dx = mx - CX;
+          const dy = my - CY;
+          const dist = Math.hypot(dx, dy) || 1;
+          const bow = 36;
+          const qx = mx + (dx / dist) * bow;
+          const qy = my + (dy / dist) * bow;
+          peerArcs.push(`<path d="M ${na.x.toFixed(1)} ${na.y.toFixed(1)} Q ${qx.toFixed(1)} ${qy.toFixed(1)} ${nb.x.toFixed(1)} ${nb.y.toFixed(1)}" fill="none" stroke="${p.color}" stroke-width="2" stroke-dasharray="6 3" class="flow-edge" />`);
+          // Midpoint on quadratic bezier at t=0.5
+          const px = 0.25 * na.x + 0.5 * qx + 0.25 * nb.x;
+          const py = 0.25 * na.y + 0.5 * qy + 0.25 * nb.y;
+          edgePills.push({ x: px, y: py, label: p.label, threadId: p.threadId, color: p.color });
+        });
+
+        // Also add 2 hub-to-active pills on open spokes
+        activeNodes.slice(0, 2).forEach((n) => {
+          edgePills.push({
+            x: rootNode.x * 0.42 + n.x * 0.58,
+            y: rootNode.y * 0.42 + n.y * 0.58,
+            label: `${n.msgs || 1} msg`,
+            threadId: n.threadId,
+            runId: n.id,
+            color: n.color
+          });
+        });
+
+        const pillSvg = edgePills.map((p) => `
+          <g class="mesh-edge-pill" style="cursor:pointer" data-thread="${p.threadId}" ${p.runId ? `data-run-id="${escHtml(p.runId)}"` : ""}>
+            <rect x="${(p.x - 22).toFixed(1)}" y="${(p.y - 8.5).toFixed(1)}" width="44" height="17" rx="8.5" fill="#0d1424" stroke="${p.color || "#c084fc"}" stroke-width="1.4" />
+            <text x="${p.x.toFixed(1)}" y="${(p.y + 3).toFixed(1)}" fill="#f8fafc" font-size="8.8" font-weight="750" text-anchor="middle">${p.label}</text>
+          </g>
+        `);
+
+        const circles = allNodes.map((n) => {
+          const sel = state.selectedAgentId === n.agentId;
+          const isCore = n.id === "User" || n.id === "Copilot";
+          const r = isCore ? 15 : n.color === "#10b981" ? 9.5 : 12.5;
+          const lblY = isCore ? n.y + 26 : n.y >= CY ? n.y + 20 : n.y - 17;
+          return `
+            <g class="mesh-node" style="cursor:pointer" data-agent-id="${n.agentId}">
+              ${isCore ? `<circle cx="${n.x}" cy="${n.y}" r="${r + 4}" fill="none" stroke="${n.color}" stroke-opacity="0.32" stroke-width="2" class="work-halo" />` : ""}
+              <circle cx="${n.x.toFixed(1)}" cy="${n.y.toFixed(1)}" r="${r}" fill="#141c2e" stroke="${sel ? "#ffffff" : n.color}" stroke-width="${sel ? 2.8 : 2}" />
+              <text x="${n.x.toFixed(1)}" y="${lblY.toFixed(1)}" fill="${sel ? "#f8fafc" : isCore ? "#e2e8f0" : "#94a3b8"}" font-size="${isCore ? "10.5" : "8.6"}" font-weight="${isCore ? "700" : "600"}" text-anchor="middle">${escHtml(n.id.slice(0, 14))}</text>
+            </g>
+          `;
+        });
+
+        const extCards = extNodes.map((ext) => `
+          <g class="mesh-node" style="cursor:pointer" data-ext-toggle="${ext.id}">
+            <rect x="${ext.x - 92}" y="${ext.y - 16}" width="184" height="32" rx="8" fill="#0b1322" stroke="#38bdf8" stroke-width="1.2" stroke-dasharray="5 3" />
+            <text x="${ext.x}" y="${ext.y + 3.5}" fill="#e2e8f0" font-size="10" font-weight="700" text-anchor="middle">${ext.label}</text>
+          </g>
+        `);
+
+        meshSvg.innerHTML = orbitGuides + hubEdges.join("") + peerArcs.join("") + pillSvg.join("") + circles.join("") + extCards.join("");
+      }
+
+      function getAllSessionMessages() {
+        const list = [];
+        Object.entries(THREADS).forEach(([tid, t]) => {
+          t.messages.forEach((m, idx) => {
+            list.push({ ...m, threadId: tid, origIndex: idx, route: t.route });
+          });
+        });
+        return list.sort((a, b) => a.time.localeCompare(b.time));
+      }
+
+      function renderRunFilterBar() {
+        const bar = $("#runFilterBar");
+        const cluster = getActiveClusters().find((c) => c.threadId === state.selectedThread);
+        if (!cluster || cluster.runs.length <= 1) {
+          bar.hidden = true;
+          bar.innerHTML = "";
+          return;
+        }
+        bar.hidden = false;
+        const pills = [
+          `<button type="button" class="run-pill" data-run-filter="all" aria-pressed="${state.selectedRun === "all"}">All (${cluster.runs.length})</button>`,
+          ...cluster.runs.slice(0, 5).map((r, i) => {
+            const shortLabel = r.id.includes("#") ? `#${r.id.split("#")[1]}` : `Run #${i + 1}`;
+            return `<button type="button" class="run-pill" data-run-filter="${escHtml(r.id)}" aria-pressed="${state.selectedRun === r.id}">${shortLabel} · ${r.state}</button>`;
+          }),
+          ...(cluster.runs.length > 5 ? [`<span class="role-meta">+${cluster.runs.length - 5} older</span>`] : [])
+        ];
+        bar.innerHTML = `<span class="run-filter-label">Runs</span>` + pills.join("");
+      }
+
+      function syncJumpLatestBtn() {
+        const btn = $("#jumpLatestBtn");
+        if (state.isNearBottom) {
+          btn.hidden = true;
+          state.unseenCount = 0;
+        } else {
+          btn.hidden = false;
+          btn.textContent = state.unseenCount > 0 ? `↓ Jump to latest (${state.unseenCount} new)` : "↓ Jump to latest";
+        }
+      }
+
+      function renderSmsThread(opts = {}) {
+        const clusters = getActiveClusters();
+        const totalMsgCount = 12 + clusters.reduce((s, c) => s + c.msgCount, 0);
+        const activeThread = THREADS[state.selectedThread];
+        $("#activePillRouteChip").textContent = state.selectedThread === "all"
+          ? "All Session Messages"
+          : (activeThread ? activeThread.route : "Thread");
+        $("#activePillHint").textContent = state.selectedThread === "all"
+          ? `${totalMsgCount} total msgs · chronological`
+          : `Pill filter active · no dropdown`;
+
+        renderRunFilterBar();
+
+        let messages;
+        if (state.selectedThread === "all") {
+          messages = getAllSessionMessages();
+        } else {
+          const thread = activeThread || THREADS["user-copilot"];
+          messages = thread.messages.map((m, idx) => ({ ...m, threadId: state.selectedThread, origIndex: idx, route: thread.route }));
+          if (state.selectedRun !== "all") {
+            messages = messages.filter((m) => m.runId === state.selectedRun || (m.runIds && m.runIds.includes(state.selectedRun)));
+          }
+        }
+
+        const smsBody = $("#smsBody");
+        smsBody.innerHTML = `
+          <div class="sms-day-divider">${state.selectedThread === "all" ? "All Session Messages · Chronological Stream" : `${escHtml((activeThread || THREADS["user-copilot"]).route)} · Pill Stream`}</div>
+          ${messages.length === 0 ? `<div class="sms-day-divider">No messages recorded for ${escHtml(state.selectedRun)}.</div>` : messages.map((m) => `
+            <article class="bubble ${m.dir}">
+              ${state.selectedThread === "all" ? `<span class="bubble-route">${escHtml(m.route)}</span>` : ""}
+              <div class="bubble-head">
+                <span class="bubble-sender">${escHtml(m.from)} <span class="bubble-role">${escHtml(m.role || "Agent")}</span></span>
+                <span>${escHtml(m.time)}</span>
+              </div>
+              <div class="bubble-text">${renderInlineMarkdown(m.text)}</div>
+              ${(m.tools.length || m.fullMarkdown) ? `
+                <div class="bubble-foot">
+                  <div class="bubble-tools">${m.tools.map((t) => `<span class="tool-badge">${escHtml(t)}</span>`).join("")}</div>
+                  ${m.fullMarkdown ? `<button type="button" class="read-full-btn" data-read-msg="${escHtml(m.threadId)}:${m.origIndex}">Read full →</button>` : ""}
+                </div>
+              ` : ""}
+            </article>
+          `).join("")}
+        `;
+
+        $("#feedCountLabel").textContent = state.activePillThread
+          ? (state.activePillThread === "all" ? `${messages.length} msgs (${totalMsgCount})` : `${messages.length} msgs`)
+          : $("#feedCountLabel").textContent;
+
+        const onSms = Boolean(state.activePillThread);
+        document.querySelectorAll(".msg-pill, .line-msg-pill, .card-msg-badge, .kpi-btn").forEach((b) => {
+          b.classList.toggle("is-active", onSms && b.dataset.thread === state.selectedThread);
+        });
+
+        if (opts.scrollToBottom || state.isNearBottom) {
+          requestAnimationFrame(() => {
+            smsBody.scrollTop = smsBody.scrollHeight;
+            state.isNearBottom = true;
+            syncJumpLatestBtn();
+          });
+        } else {
+          syncJumpLatestBtn();
+        }
+      }
+
+      const AGENT_DETAILS = {
+        "user": {
+          name: "User",
+          status: "HUMAN",
+          pillCls: "human",
+          model: "Session Root",
+          tools: 0,
+          sent: 12,
+          recv: 0,
+          contextPct: null,
+          threadId: "user-copilot",
+          stream: [
+            { t: "14:21:40", kind: "HUMAN", cls: "human", text: "Ensure topology stays clean on Z Fold 7 cover & unfolded screens too." },
+            { t: "14:18:02", kind: "HUMAN", cls: "human", text: "Orchestrate Angular UI, .NET API, DB indexes, and Azure infra for Board & Photo." }
+          ]
+        },
+        "copilot-agent": {
+          name: "Copilot Agent",
+          status: "THINKING",
+          pillCls: "thinking",
+          model: "claude-opus-4.5",
+          tools: 327,
+          sent: 36,
+          recv: 12,
+          contextPct: 44,
+          threadId: "all",
+          stream: [
+            { t: "14:22:36", kind: "THINK", cls: "thinking", text: "Coordinating angular-expert CSS build with azure-architect health-probe dependency." },
+            { t: "14:22:30", kind: "MSG", cls: "dispatch", text: "Instructed angular-expert to enforce 44px pointer:coarse tap targets." },
+            { t: "14:21:46", kind: "MSG", cls: "status", text: "Replied to User: 27 subtasks completed, 6 active." },
+            { t: "14:18:09", kind: "DISPATCH", cls: "dispatch", text: "Spawned 5 specialist team roles + 21 parallel verification/feature subagents." }
+          ]
+        },
+        "angular-expert": {
+          name: "angular-expert",
+          status: "WORKING",
+          pillCls: "human",
+          model: "claude-sonnet-4.5",
+          tools: 14,
+          sent: 2,
+          recv: 2,
+          contextPct: 38,
+          threadId: "copilot-angular",
+          stream: [
+            { t: "14:22:34", kind: "THINK", cls: "thinking", text: "Checking @container pane (inline-size < 430px) KPI grid collapse on Z Fold 7 unfolded." },
+            { t: "14:22:31", kind: "TOOL", cls: "tool", text: "Local Shell: npm --prefix web run check (running...)" },
+            { t: "14:22:19", kind: "TOOL", cls: "tool", text: "Workspace FS: edited web/src/components/TopologySvg.ts & responsive.css" },
+            { t: "14:22:08", kind: "MSG", cls: "dispatch", text: "Received Z Fold 7 sticky header & 3-tier responsive spec from Copilot Agent." }
+          ]
+        },
+        "azure-architect": {
+          name: "azure-architect ×3",
+          status: "WAITING",
+          pillCls: "status",
+          model: "claude-opus-4.5",
+          tools: 38,
+          sent: 4,
+          recv: 2,
+          contextPct: 31,
+          threadId: "copilot-azure",
+          stream: [
+            { t: "14:22:12", kind: "THINK", cls: "thinking", text: "Run #3 waiting for /healthz route from dotnet-api-dev #2 before locking App Service SKU." },
+            { t: "14:19:45", kind: "COMPLETE", cls: "complete", text: "Run #2 finished infra/keyvault.bicep RBAC & private DNS zone." },
+            { t: "14:19:04", kind: "COMPLETE", cls: "complete", text: "Run #1 drafted AKS/App Service ingress topology." }
+          ]
+        },
+        "dotnet-api-dev": {
+          name: "dotnet-api-dev ×2",
+          status: "WAITING",
+          pillCls: "status",
+          model: "claude-sonnet-4.5",
+          tools: 52,
+          sent: 3,
+          recv: 2,
+          contextPct: 49,
+          threadId: "copilot-dotnet",
+          stream: [
+            { t: "14:22:05", kind: "THINK", cls: "thinking", text: "Verifying AsNoTracking() projection against IX_OrderLineItems_OrderId_Status." },
+            { t: "14:20:14", kind: "COMPLETE", cls: "complete", text: "Run #1 passed 18/18 FluentValidation unit tests." }
+          ]
+        },
+        "jss-db-dev": {
+          name: "JSS DB Developer ×2",
+          status: "DONE",
+          pillCls: "complete",
+          model: "claude-sonnet-4.5",
+          tools: 19,
+          sent: 2,
+          recv: 1,
+          contextPct: 22,
+          threadId: "copilot-db",
+          stream: [
+            { t: "14:20:58", kind: "COMPLETE", cls: "complete", text: "Verified IX_OrderLineItems_OrderId_Status query plan (0 table scans)." },
+            { t: "14:20:10", kind: "TOOL", cls: "tool", text: "Workspace FS: created migrations/v14_photo_refs.sql." }
+          ]
+        },
+        "business-analyst": {
+          name: "business-analyst ×2",
+          status: "DONE",
+          pillCls: "complete",
+          model: "gpt-5",
+          tools: 8,
+          sent: 2,
+          recv: 2,
+          contextPct: 16,
+          threadId: "copilot-ba",
+          stream: [
+            { t: "14:19:50", kind: "COMPLETE", cls: "complete", text: "Signed off sprint acceptance checklist for multi-photo board attachments." }
+          ]
+        },
+        "adhoc-task": {
+          name: "Ad-hoc / Task ×7",
+          status: "WAITING",
+          pillCls: "status",
+          model: "claude-haiku-4.5",
+          tools: 67,
+          sent: 7,
+          recv: 2,
+          contextPct: 28,
+          threadId: "copilot-task",
+          stream: [
+            { t: "14:22:25", kind: "THINK", cls: "thinking", text: "task #7 cross-checking API contract fixtures with dotnet-api-dev #2." },
+            { t: "14:22:20", kind: "TOOL", cls: "tool", text: "task #6 awaiting angular-expert bundle output for smoke check." },
+            { t: "14:21:11", kind: "COMPLETE", cls: "complete", text: "task #1–#5 completed lint, route normalization, and contrast audits." }
+          ]
+        },
+        "board-photo": {
+          name: "Board / Photo ×14",
+          status: "WAITING",
+          pillCls: "status",
+          model: "claude-haiku-4.5",
+          tools: 129,
+          sent: 4,
+          recv: 1,
+          contextPct: 35,
+          threadId: "copilot-board",
+          stream: [
+            { t: "14:22:18", kind: "THINK", cls: "thinking", text: "photo-sync #14 checking thumbnail aspect-ratio reservation to avoid CLS." },
+            { t: "14:21:55", kind: "COMPLETE", cls: "complete", text: "board-photo #1–#13 completed board card & photo-sync subtasks." }
+          ]
+        }
+      };
+
+      const FEED_EVENTS = [
+        { time: "14:22:36", cat: "messages", cls: "thinking", badge: "THINK", route: "Copilot Agent", summary: "Coordinating angular-expert CSS build with azure-architect health-probe dependency.", full: THREADS["user-copilot"].messages[1].fullMarkdown },
+        { time: "14:22:34", cat: "messages", cls: "thinking", badge: "WORKING", route: "angular-expert #1", summary: "Applying 44px coarse-pointer rules and running `npm --prefix web run check`…", full: THREADS["copilot-angular"].messages[0].fullMarkdown },
+        { time: "14:22:19", cat: "tools", cls: "tool", badge: "TOOL", route: "angular-expert → Workspace FS", summary: "Updated TopologySvg.ts & responsive.css (12 edits, 2 shell checks).", lowSignal: true },
+        { time: "14:22:12", cat: "messages", cls: "dispatch", badge: "WAITING", route: "azure-architect #3 → Copilot", summary: "Awaiting API health-probe route from dotnet-api-dev #2 before locking Bicep template.", full: THREADS["copilot-azure"].messages[2].fullMarkdown },
+        { time: "14:22:05", cat: "tools", cls: "tool", badge: "TOOL", route: "dotnet-api-dev #2 → Workspace FS", summary: "OrdersController DTO projection & EF query verification (31 calls).", full: THREADS["copilot-dotnet"].messages[2].fullMarkdown },
+        { time: "14:21:55", cat: "board", cls: "complete", badge: "BOARD", route: "board-photo #1..13 → Copilot", summary: "13 Board / Photo subtasks completed cleanly; #14 checking thumbnails." },
+        { time: "14:21:40", cat: "messages", cls: "human", badge: "HUMAN", route: "User → Copilot Agent", summary: "Make sure the topology stays clean on Z Fold 7 cover & unfolded screens too." },
+        { time: "14:20:58", cat: "usage", cls: "complete", badge: "DONE", route: "JSS DB Developer #2", summary: "Created v14_photo_refs.sql & verified OrderLineItems index (0 scans, 19 tools)." }
+      ];
+
+      function renderFeed() {
+        const filtered = FEED_EVENTS.filter((ev) => {
+          if (state.feedFilter !== "all" && ev.cat !== state.feedFilter) return false;
+          if (state.feedMode === "summary" && ev.lowSignal) return false;
+          return true;
+        });
+        $("#feedCountLabel").textContent = `${filtered.length} events`;
+        $("#feedList").innerHTML = filtered.map((ev) => {
+          const origIdx = FEED_EVENTS.indexOf(ev);
+          const sel = state.selectedEventIdx === origIdx;
+          return `
+            <div class="ev-item ${ev.cls} ${sel ? "selected" : ""}">
+              <button type="button" class="ev-row-btn" data-feed-idx="${origIdx}">
+                <div class="ev-top">
+                  <span class="ev-route">${escHtml(ev.route)}</span>
+                  <span class="run-top-right">
+                    <span class="pill ${ev.cls}">${ev.badge}</span>
+                    <span class="role-meta">${ev.time}</span>
+                  </span>
+                </div>
+                <div class="ev-title">${renderInlineMarkdown(ev.summary)}</div>
+              </button>
+              ${ev.full ? `<button type="button" class="ev-read-btn" data-feed-read="${origIdx}">Read</button>` : ""}
+            </div>
+          `;
+        }).join("");
+      }
+
+      function renderInspector() {
+        const slot = $("#inspectorSlot");
+        slot.setAttribute("data-inspector-state", state.inspectorOpen ? "open" : "closed");
+        if (!state.inspectorOpen) return;
+
+        if (state.selectedEventIdx !== null && FEED_EVENTS[state.selectedEventIdx]) {
+          const ev = FEED_EVENTS[state.selectedEventIdx];
+          $("#inspTitleRow").innerHTML = `
+            <span class="pill ${ev.cls}">${ev.badge}</span>
+            <span>${escHtml(ev.route)}</span>
+          `;
+          $("#inspJumpThreadBtn").hidden = true;
+          $("#inspBody").innerHTML = `
+            <div class="insp-meta">
+              <span><b>Category:</b> ${escHtml(ev.cat)}</span>
+              <span><b>Time:</b> ${escHtml(ev.time)}</span>
+            </div>
+            <div style="font-size:12.5px;line-height:1.45;">${renderInlineMarkdown(ev.summary)}</div>
+            ${ev.full ? `<button type="button" class="read-full-btn" style="align-self:flex-start;margin-left:0;" data-feed-read="${state.selectedEventIdx}">Read full formatted payload →</button>` : ""}
+          `;
+          return;
+        }
+
+        const agent = AGENT_DETAILS[state.selectedAgentId] || AGENT_DETAILS["angular-expert"];
+        $("#inspTitleRow").innerHTML = `
+          <span>${escHtml(agent.name)}</span>
+          <span class="pill ${agent.pillCls}">${escHtml(agent.status)}</span>
+          <span class="ide-chip" style="display:inline-flex;">VS</span>
+          <span class="role-meta">${escHtml(agent.model)}</span>
+        `;
+        $("#inspJumpThreadBtn").hidden = false;
+        $("#inspJumpThreadBtn").dataset.thread = agent.threadId;
+        $("#inspBody").innerHTML = `
+          <div class="insp-meta">
+            <span><b>ID:</b> <code>${escHtml(state.selectedAgentId)}</code></span>
+            <span><b>Tools:</b> ${agent.tools}</span>
+            <span><b>Msgs:</b> ${agent.sent}↑ / ${agent.recv}↓</span>
+            ${agent.contextPct !== null ? `<span><b>Ctx:</b> ${agent.contextPct}%</span>` : ""}
+          </div>
+          <div class="insp-activity-hdr">Thinking &amp; Work Stream</div>
+          <div class="insp-activity-list" role="list">
+            ${agent.stream.map((step) => `
+              <div class="insp-act-row" role="listitem">
+                <span class="insp-act-time">${escHtml(step.t)}</span>
+                <span class="pill ${step.cls}">${escHtml(step.kind)}</span>
+                <span>${renderInlineMarkdown(step.text)}</span>
+              </div>
+            `).join("")}
+          </div>
+        `;
+      }
+
+      function syncFeedFilterTabs() {
+        document.querySelectorAll("[data-feed-filter]").forEach((b) => {
+          b.setAttribute("aria-pressed", String(b.dataset.feedFilter === state.feedFilter));
+        });
+      }
+
+      function renderStreamView() {
+        const isSms = state.feedFilter === "messages";
+        const hasSpecificPill = Boolean(state.activePillThread && state.activePillThread !== "all");
+        syncFeedFilterTabs();
+        $("#smsPillBar").hidden = !isSms;
+        $("#clearPillBtn").hidden = !hasSpecificPill;
+        $("#feedList").hidden = isSms;
+        $("#smsBodyWrap").hidden = !isSms;
+        if (!isSms) {
+          $("#runFilterBar").hidden = true;
+          renderFeed();
+        } else {
+          state.selectedThread = state.activePillThread || "all";
+          renderSmsThread({ scrollToBottom: state.isNearBottom });
+        }
+        document.querySelectorAll(".msg-pill, .line-msg-pill, .card-msg-badge, .kpi-btn").forEach((b) => {
+          b.classList.toggle("is-active", isSms && b.dataset.thread === state.selectedThread);
+        });
+      }
+
+      function selectAgent(agentId) {
+        state.selectedAgentId = agentId;
+        state.selectedEventIdx = null;
+        state.inspectorOpen = true;
+        if (state.feedFilter === "messages") {
+          state.feedFilter = "all";
+          state.activePillThread = null;
+        }
+        renderClusters();
+        renderMesh();
+        renderStreamView();
+        renderInspector();
+        if (window.innerWidth < 640) {
+          setCoverTab("stream");
+        }
+      }
+
+      function selectThread(threadId, runId = "all") {
+        if (state.feedFilter === "messages" && state.activePillThread === threadId && (runId === "all" || state.selectedRun === runId)) {
+          state.feedFilter = "all";
+          state.activePillThread = null;
+          renderStreamView();
+          renderClusters();
+          renderMesh();
+          return;
+        }
+        state.feedFilter = "messages";
+        state.activePillThread = threadId;
+        state.selectedThread = threadId;
+        state.selectedRun = runId || "all";
+        state.isNearBottom = true;
+        state.unseenCount = 0;
+        renderStreamView();
+        renderClusters();
+        renderMesh();
+        if (window.innerWidth < 640) {
+          setCoverTab("stream");
+        }
+      }
+
+      function openCommReader(threadId, msgIdx, overrideTitle, overrideMd) {
+        let title = overrideTitle;
+        let meta = "";
+        let md = overrideMd;
+        if (!md) {
+          const thread = THREADS[threadId];
+          const msg = thread && thread.messages[Number(msgIdx)];
+          if (!msg) return;
+          md = msg.fullMarkdown || msg.text;
+          title = `${msg.from} · Full Message`;
+          meta = `<span><strong>Route:</strong> ${escHtml(thread.route)} &nbsp;·&nbsp; <strong>Role:</strong> ${escHtml(msg.role || "Agent")}</span><span>${escHtml(msg.time)}${msg.tools.length ? ` · ${msg.tools.map(escHtml).join(", ")}` : ""}</span>`;
+        } else {
+          meta = `<span><strong>Source:</strong> Live Activity Stream</span><span>${escHtml(overrideTitle)}</span>`;
+        }
+        state.activeReaderMarkdown = md;
+        $("#commReaderTitle").textContent = title;
+        $("#commReaderMeta").innerHTML = meta;
+        $("#commReaderBody").innerHTML = renderFullMarkdown(md);
+        $("#copyFullMsgBtn").textContent = "Copy Markdown";
+        $("#commReaderDialog").showModal();
+      }
+
+      function syncCoverNav() {
+        const onStream = state.coverTab === "stream";
+        $("#navTopoBtn").setAttribute("aria-pressed", String(!onStream));
+        $("#navFeedBtn").setAttribute("aria-pressed", String(onStream));
+      }
+
+      function setCoverTab(tab) {
+        state.coverTab = tab;
+        document.body.dataset.coverTab = tab;
+        syncCoverNav();
+        if (tab === "topology") requestAnimationFrame(drawOrthogonalBus);
+      }
+
+      // Event Bindings
+      $("#btnStyleBasic").addEventListener("click", () => {
+        state.cardStyle = "basic";
+        safeStore.set(STYLE_KEY, "basic");
+        syncViewMode();
+        requestAnimationFrame(drawOrthogonalBus);
+      });
+
+      $("#btnStyleDetailed").addEventListener("click", () => {
+        state.cardStyle = "detailed";
+        safeStore.set(STYLE_KEY, "detailed");
+        syncViewMode();
+        requestAnimationFrame(drawOrthogonalBus);
+      });
+
+      $("#btnViewGrouped").addEventListener("click", () => {
+        state.manualMode = "grouped";
+        safeStore.set(STORAGE_KEY, "grouped");
+        syncViewMode();
+        requestAnimationFrame(drawOrthogonalBus);
+      });
+
+      $("#btnViewMesh").addEventListener("click", () => {
+        state.manualMode = "mesh";
+        safeStore.set(STORAGE_KEY, "mesh");
+        syncViewMode();
+        renderMesh();
+      });
+
+      $("#switchGroupedCta").addEventListener("click", () => $("#btnViewGrouped").click());
+
+      resetAutoBtn.addEventListener("click", () => {
+        state.manualMode = null;
+        safeStore.del(STORAGE_KEY);
+        syncViewMode();
+        if (state.viewMode === "mesh") renderMesh();
+        else requestAnimationFrame(drawOrthogonalBus);
+      });
+
+      $("#scenarioSelect").addEventListener("change", (e) => {
+        state.scenario = e.target.value;
+        syncViewMode();
+        renderClusters();
+        renderMesh();
+      });
+
+      document.querySelectorAll(".filter-chip[data-filter]").forEach((btn) => {
+        btn.addEventListener("click", () => {
+          const f = btn.dataset.filter;
+          if (f.startsWith("ext:")) {
+            state.extFilter = state.extFilter === f ? null : f;
+          } else {
+            state.filter = f;
+            state.extFilter = null;
+          }
+          document.querySelectorAll(".filter-chip[data-filter]").forEach((b) => {
+            const bf = b.dataset.filter;
+            const active = bf.startsWith("ext:") ? state.extFilter === bf : state.filter === bf && !state.extFilter;
+            b.setAttribute("aria-pressed", String(active));
+          });
+          document.querySelectorAll(".ext-lane-card").forEach((b) => {
+            b.setAttribute("aria-pressed", String(state.extFilter === b.dataset.extFilter));
+          });
+          renderClusters();
+          renderMesh();
+        });
+      });
+
+      document.querySelectorAll(".ext-lane-card").forEach((btn) => {
+        btn.addEventListener("click", () => {
+          const ext = btn.dataset.extFilter;
+          state.extFilter = state.extFilter === ext ? null : ext;
+          document.querySelectorAll(".ext-lane-card").forEach((b) => b.setAttribute("aria-pressed", String(state.extFilter === b.dataset.extFilter)));
+          document.querySelectorAll(".filter-chip[data-filter]").forEach((b) => {
+            const bf = b.dataset.filter;
+            const active = bf.startsWith("ext:") ? state.extFilter === bf : state.filter === bf && !state.extFilter;
+            b.setAttribute("aria-pressed", String(active));
+          });
+          renderClusters();
+          renderMesh();
+        });
+      });
+
+      document.addEventListener("click", (e) => {
+        const readBtn = e.target.closest("[data-read-msg]");
+        if (readBtn) {
+          const [tid, idx] = readBtn.dataset.readMsg.split(":");
+          openCommReader(tid, idx);
+          return;
+        }
+        const feedRead = e.target.closest("[data-feed-read]");
+        if (feedRead) {
+          const ev = FEED_EVENTS[Number(feedRead.dataset.feedRead)];
+          if (ev) openCommReader(null, null, `${ev.route} · ${ev.time}`, ev.full || ev.summary);
+          return;
+        }
+        const feedRow = e.target.closest("[data-feed-idx]");
+        if (feedRow) {
+          state.selectedEventIdx = Number(feedRow.dataset.feedIdx);
+          state.inspectorOpen = true;
+          renderFeed();
+          renderInspector();
+          return;
+        }
+        const runBtn = e.target.closest("[data-run-filter]");
+        if (runBtn) {
+          state.selectedRun = runBtn.dataset.runFilter;
+          renderSmsThread({ scrollToBottom: true });
+          return;
+        }
+        const msgBtn = e.target.closest("[data-thread]");
+        if (msgBtn) {
+          selectThread(msgBtn.dataset.thread, msgBtn.dataset.runId || "all");
+          return;
+        }
+        const extToggle = e.target.closest("[data-ext-toggle]");
+        if (extToggle) {
+          const btn = document.querySelector(`.ext-lane-card[data-ext-filter="${extToggle.dataset.extToggle}"]`);
+          if (btn) btn.click();
+          return;
+        }
+        const toggleBtn = e.target.closest("[data-toggle-done]");
+        if (toggleBtn) {
+          const id = toggleBtn.dataset.toggleDone;
+          if (state.expandedDone.has(id)) state.expandedDone.delete(id);
+          else state.expandedDone.add(id);
+          renderClusters();
+          return;
+        }
+        const agentEl = e.target.closest("[data-agent-id]");
+        if (agentEl) {
+          selectAgent(agentEl.dataset.agentId);
+        }
+      });
+
+      document.addEventListener("keydown", (e) => {
+        if ((e.key === "Enter" || e.key === " ") && e.target.matches("[data-agent-id]")) {
+          e.preventDefault();
+          selectAgent(e.target.dataset.agentId);
+        }
+      });
+
+      $("#clearPillBtn").addEventListener("click", () => {
+        state.activePillThread = "all";
+        state.selectedRun = "all";
+        renderStreamView();
+        renderClusters();
+        renderMesh();
+      });
+
+      $("#btnFeedSummary").addEventListener("click", () => {
+        state.feedMode = "summary";
+        $("#btnFeedSummary").setAttribute("aria-pressed", "true");
+        $("#btnFeedDetailed").setAttribute("aria-pressed", "false");
+        renderStreamView();
+      });
+
+      $("#btnFeedDetailed").addEventListener("click", () => {
+        state.feedMode = "detailed";
+        $("#btnFeedSummary").setAttribute("aria-pressed", "false");
+        $("#btnFeedDetailed").setAttribute("aria-pressed", "true");
+        renderStreamView();
+      });
+
+      document.querySelectorAll("[data-feed-filter]").forEach((btn) => {
+        btn.addEventListener("click", () => {
+          state.feedFilter = btn.dataset.feedFilter;
+          if (state.feedFilter !== "messages") {
+            state.activePillThread = null;
+          } else {
+            state.activePillThread = state.activePillThread || "all";
+            state.selectedRun = "all";
+          }
+          renderStreamView();
+          renderClusters();
+          renderMesh();
+        });
+      });
+
+      $("#closeInspectorBtn").addEventListener("click", () => {
+        state.inspectorOpen = false;
+        renderInspector();
+      });
+
+      $("#smsBody").addEventListener("scroll", () => {
+        const el = $("#smsBody");
+        state.isNearBottom = el.scrollHeight - el.scrollTop - el.clientHeight < 48;
+        syncJumpLatestBtn();
+      });
+
+      $("#jumpLatestBtn").addEventListener("click", () => {
+        const el = $("#smsBody");
+        el.scrollTo({ top: el.scrollHeight, behavior: "smooth" });
+        state.isNearBottom = true;
+        state.unseenCount = 0;
+        syncJumpLatestBtn();
+      });
+
+      $("#simMsgBtn").addEventListener("click", () => {
+        const targetTid = state.selectedThread === "all" ? "copilot-angular" : state.selectedThread;
+        const thread = THREADS[targetTid];
+        if (!thread) return;
+        const now = new Date();
+        const ts = now.toTimeString().slice(0, 8);
+        thread.messages.push({
+          dir: "outbound",
+          from: targetTid === "user-copilot" ? "Copilot Agent" : targetTid.replace("copilot-", ""),
+          role: "Live Update",
+          time: ts,
+          runId: state.selectedRun !== "all" ? state.selectedRun : undefined,
+          text: `Live telemetry pulse (${ts}): verified responsive layout & \`0\` console errors.`,
+          tools: ["Local Shell · 1"]
+        });
+        if (!state.isNearBottom) state.unseenCount += 1;
+        renderSmsThread({ scrollToBottom: state.isNearBottom });
+      });
+
+      $("#navTopoBtn").addEventListener("click", () => setCoverTab("topology"));
+      $("#navFeedBtn").addEventListener("click", () => setCoverTab("stream"));
+      $("#coverBackBtn").addEventListener("click", () => setCoverTab("topology"));
+
+      // Native Dialogs + Light Dismiss Fallback per modern-web-guidance
+      const rawDialog = $("#rawDialog");
+      const commReaderDialog = $("#commReaderDialog");
+      $("#openRawBtn").addEventListener("click", () => {
+        const preview = state.selectedThread === "all"
+          ? getAllSessionMessages().at(-1)
+          : (THREADS[state.selectedThread] || THREADS["user-copilot"]).messages.at(-1);
+        $("#rawJsonPre").textContent = JSON.stringify({
+          selectedAgentId: state.selectedAgentId,
+          activePillThread: state.activePillThread,
+          runFilter: state.selectedRun,
+          viewMode: state.viewMode,
+          cardStyle: state.cardStyle,
+          latestMessage: preview
+        }, null, 2);
+        rawDialog.showModal();
+      });
+
+      $("#copyFullMsgBtn").addEventListener("click", async () => {
+        try {
+          await navigator.clipboard.writeText(state.activeReaderMarkdown);
+          $("#copyFullMsgBtn").textContent = "Copied!";
+        } catch {
+          $("#copyFullMsgBtn").textContent = "Clipboard N/A";
+        }
+      });
+
+      if (!("closedBy" in HTMLDialogElement.prototype)) {
+        const outside = (e, d) => {
+          const r = d.getBoundingClientRect();
+          return e.clientX < r.left || e.clientX > r.right || e.clientY < r.top || e.clientY > r.bottom;
+        };
+        for (const dlg of [rawDialog, commReaderDialog]) {
+          let pressedOutside = false;
+          dlg.addEventListener("pointerdown", (e) => { pressedOutside = outside(e, dlg); });
+          dlg.addEventListener("pointerup", (e) => { if (pressedOutside && outside(e, dlg)) dlg.close(); });
+        }
+      }
+
+      if ("ResizeObserver" in window) {
+        new ResizeObserver(() => drawOrthogonalBus()).observe(groupedTree);
+      }
+      window.addEventListener("resize", () => requestAnimationFrame(drawOrthogonalBus));
+
+      syncViewMode();
+      renderClusters();
+      renderMesh();
+      renderStreamView();
+      renderInspector();
+    })();
+  </script>
+</body>
+</html>

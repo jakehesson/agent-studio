@@ -140,6 +140,14 @@ function extractWorkspacesFromText(sampleText: string): string[] {
     found.add(norm);
   };
 
+  const activeBlockRe = /Active Workspaces?:\s*\n((?:\s*-\s*[^\n]+\n?)+)/gi;
+  for (const blockMatch of unescaped.matchAll(activeBlockRe)) {
+    const block = blockMatch[1] ?? "";
+    for (const line of block.split(/\r?\n/)) {
+      const m = /^\s*-\s*([a-zA-Z]:\/[^\n"'<>|]+|\/[^\n"'<>|]+)/.exec(line);
+      if (m?.[1]) addCandidate(m[1].trim(), true);
+    }
+  }
   for (const m of unescaped.matchAll(ACTIVE_WS_RE)) {
     if (m[1]) addCandidate(m[1], true);
   }

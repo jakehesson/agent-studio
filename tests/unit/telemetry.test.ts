@@ -21,6 +21,8 @@ import {
   deduplicateEvents,
   inferContextWindow,
   isBoardMutationToolCall,
+  isOpaqueAgentId,
+  prettifyAgentLabel,
   prettifyModelName,
   reconstructVSCodeDeltaJsonl,
   summarizeToolCall,
@@ -4347,6 +4349,294 @@ describe("Hybrid Telemetry Adapters, Deduplication, State Machine & hook-emit", 
     const ckRoot = ckSnap.agents.find((a) => a.id === "root");
     assert.equal(ckRoot?.usage?.contextTokens, 15_000);
     assert.equal(ckRoot?.usage?.contextWindow, 200_000);
+  });
+
+  it("BUG-21: guards UUID/spaced-hex labels, propagates SubagentStart labels across PushBus + child transcripts, expands hook-emit keys, and reconciles parallel/non-spawn Copilot subagents", async () => {
+    // 1. isOpaqueAgentId + prettifyAgentLabel UUID & spaced-hex guard
+    const rawUuid = "08b84ac1-a4b4-4b2c-9abc-1234567890ef";
+    assert.equal(isOpaqueAgentId(rawUuid), true);
+    assert.equal(isOpaqueAgentId("08b84ac1 A4b4 4b2c 9abc "), true);
+    assert.equal(isOpaqueAgentId("agent-08b84ac1a4b4"), true);
+    assert.equal(isOpaqueAgentId("qa-specialist"), false);
+    assert.equal(isOpaqueAgentId("agent-1"), false);
+    assert.equal(prettifyAgentLabel(rawUuid), "Subagent");
+    assert.equal(prettifyAgentLabel("08b84ac1 A4b4 4b2c 9abc "), "Subagent");
+    assert.equal(prettifyAgentLabel("qa-specialist"), "QA Specialist");
+    assert.equal(prettifyAgentLabel("agent-1"), "Agent 1");
+
+    // 2. CopilotVSCodeAdapter.parseTranscriptFile omits opaque agentLabel when rows lack agentName/agentType
+    const wsDir = path.join(tmpDir, "bug21-ws");
+    await fs.mkdir(wsDir, { recursive: true });
+    const subTrPath = path.join(wsDir, "sub-08b84ac1.jsonl");
+    await fs.writeFile(
+      subTrPath,
+      [
+        {
+          type: "user.message",
+          timestamp: "2026-11-25T21:00:01Z",
+          data: { content: "Investigate telemetry" },
+        },
+        {
+          type: "assistant.message",
+          timestamp: "2026-11-25T21:00:02Z",
+          data: { content: "Found root cause." },
+        },
+      ]
+        .map((r) => JSON.stringify(r))
+        .join("\n") + "\n",
+      "utf8",
+    );
+    const adapter = new CopilotVSCodeAdapter({ storageDir: path.join(tmpDir, "bug21-vsc") });
+    const rawSubEvs = await adapter.parseTranscriptFile(subTrPath, "b21-s1", {
+      agentIdOverride: rawUuid,
+      allowedRoots: [wsDir],
+    });
+    assert.ok(rawSubEvs.length >= 2);
+    assert.equal(rawSubEvs[0]?.agentLabel, undefined);
+
+    // 3. PushBus shares parentSessionId -> child hooks inherit agentLabel, out-of-order backfills, and loadPushTranscriptEvents passes agentLabelOverride
+    const bus = new PushBus({ includeGlobalTelemetryFile: false });
+    const childUuid2 = "11223344-5566-4777-8888-99aabbccdde0";
+    // Out-of-order child hook before SubagentStart
+    bus.ingest([
+      {
+        id: "b21-child-pre",
+        ts: "2026-11-25T21:00:00.500Z",
+        ide: "copilot-vscode",
+        sessionId: "b21-parent",
+        agentId: childUuid2,
+        kind: "tool_start",
+        toolName: "read_file",
+        summary: "Read src/index.ts",
+      },
+      {
+        id: "b21-spawn-1",
+        ts: "2026-11-25T21:00:00.000Z",
+        ide: "copilot-vscode",
+        sessionId: "b21-parent",
+        agentId: "root",
+        targetAgentId: rawUuid,
+        kind: "subagent_spawn",
+        summary: "Spawned Researcher",
+        payload: {
+          agentType: "Researcher",
+          agentLabel: "Researcher",
+          agentTranscriptPath: subTrPath,
+        },
+      },
+      {
+        id: "b21-spawn-2",
+        ts: "2026-11-25T21:00:00.800Z",
+        ide: "copilot-vscode",
+        sessionId: "b21-parent",
+        agentId: "root",
+        targetAgentId: childUuid2,
+        kind: "subagent_spawn",
+        summary: "Spawned Code Reviewer",
+        payload: {
+          agentType: "Code Reviewer",
+          agentLabel: "Code Reviewer",
+        },
+      },
+      {
+        id: "b21-child-same-sid",
+        ts: "2026-11-25T21:00:01.000Z",
+        ide: "copilot-vscode",
+        sessionId: "b21-parent",
+        agentId: childUuid2,
+        agentLabel: "08b84ac1 A4b4 4b2c 9abc ",
+        kind: "tool_start",
+        toolName: "grep_search",
+        summary: "Search refs",
+      },
+    ]);
+    assert.equal(bus.getAgentLabel("b21-parent", rawUuid), "Researcher");
+    const parentEvs = bus.getSessionEvents("b21-parent");
+    assert.equal(
+      parentEvs.find((e) => e.id === "b21-child-pre")?.agentLabel,
+      "Code Reviewer",
+    );
+    const sameSidEv = parentEvs.find((e) => e.id === "b21-child-same-sid");
+    assert.equal(sameSidEv?.agentLabel, "Code Reviewer");
+    assert.equal(sameSidEv?.parentAgentId, "root");
+
+    const agg = new TelemetryAggregator({
+      brainDir: path.join(tmpDir, "empty-brain"),
+      claudeDir: path.join(tmpDir, "empty-claude"),
+      vscodeDir: path.join(tmpDir, "bug21-vsc"),
+      includeGlobalTelemetryFile: false,
+    });
+    agg.pushBus.ingest([
+      {
+        id: "agg-b21-spawn",
+        ts: "2026-11-25T21:00:00.000Z",
+        ide: "copilot-vscode",
+        sessionId: "b21-agg-s",
+        workspacePath: wsDir,
+        agentId: "root",
+        targetAgentId: rawUuid,
+        kind: "subagent_spawn",
+        summary: "Spawned Researcher",
+        payload: {
+          agentType: "Researcher",
+          agentLabel: "Researcher",
+          agentTranscriptPath: subTrPath,
+        },
+      },
+    ]);
+    const aggRes = await agg.getSessionSnapshot("b21-agg-s", { ide: "copilot-vscode" });
+    const aggChild = aggRes.snapshot.agents.find((a) => a.id === rawUuid);
+    assert.equal(aggChild?.label, "Researcher");
+
+    // 4. hook-emit expands subagent_name / subagent_type / role and guards opaque UUIDs
+    const offlineFetch: typeof fetch = () => Promise.reject(new Error("ECONNREFUSED"));
+    const emitSubName = await runHookEmit(
+      ["--ide", "copilot-vscode", "--event", "SubagentStart"],
+      {
+        stdinText: JSON.stringify({
+          session_id: "b21-hook-s",
+          agent_id: rawUuid,
+          agent_name: rawUuid,
+          subagent_name: "Security Auditor",
+          cwd: wsDir,
+        }),
+        stdout: () => undefined,
+        stderr: () => undefined,
+        fetchImpl: offlineFetch,
+      },
+    );
+    assert.equal(emitSubName.event?.payload?.agentLabel, "Security Auditor");
+    assert.equal(emitSubName.event?.summary, "Spawned Security Auditor");
+
+    const emitUuidOnly = await runHookEmit(
+      ["--ide", "copilot-vscode", "--event", "SubagentStart"],
+      {
+        stdinText: JSON.stringify({
+          session_id: "b21-hook-s",
+          agent_id: rawUuid,
+          cwd: wsDir,
+        }),
+        stdout: () => undefined,
+        stderr: () => undefined,
+        fetchImpl: offlineFetch,
+      },
+    );
+    assert.equal(emitUuidOnly.event?.payload?.agentLabel, undefined);
+    assert.equal(emitUuidOnly.event?.summary, "Spawned Subagent");
+
+    // 5. Normalizer: spaced-hex label cleanup + passive non-spawn reconciliation + parallel spawn reconciliation
+    const baseEp = 1_795_600_000;
+    const parallelSnap = buildSessionSnapshot(
+      [
+        {
+          id: "p-par-1",
+          ts: toIsoTest(baseEp),
+          epoch: baseEp,
+          ide: "copilot-vscode",
+          channel: "passive",
+          sessionId: "b21-par",
+          agentId: "root",
+          targetAgentId: "qa-specialist",
+          kind: "subagent_spawn",
+          toolName: "runSubagent",
+          summary: "Spawned qa-specialist",
+          payload: { agentLabel: "qa-specialist", _passiveSource: "chatSessions" },
+        },
+        {
+          id: "p-par-2",
+          ts: toIsoTest(baseEp + 0.2),
+          epoch: baseEp + 0.2,
+          ide: "copilot-vscode",
+          channel: "passive",
+          sessionId: "b21-par",
+          agentId: "root",
+          targetAgentId: "backend-engineer",
+          kind: "subagent_spawn",
+          toolName: "runSubagent",
+          summary: "Spawned backend-engineer",
+          payload: { agentLabel: "backend-engineer", _passiveSource: "chatSessions" },
+        },
+        {
+          id: "h-par-1",
+          ts: toIsoTest(baseEp + 0.1),
+          epoch: baseEp + 0.1,
+          ide: "copilot-vscode",
+          channel: "hook",
+          sessionId: "b21-par",
+          agentId: "root",
+          targetAgentId: rawUuid,
+          kind: "subagent_spawn",
+          summary: "Spawned Subagent",
+        },
+        {
+          id: "h-par-1-tool",
+          ts: toIsoTest(baseEp + 1.0),
+          epoch: baseEp + 1.0,
+          ide: "copilot-vscode",
+          channel: "hook",
+          sessionId: "b21-par",
+          agentId: rawUuid,
+          agentLabel: "08b84ac1 A4b4 4b2c 9abc ",
+          kind: "tool_start",
+          toolName: "read_file",
+          summary: "Read test.ts",
+        },
+        {
+          id: "h-par-2",
+          ts: toIsoTest(baseEp + 0.3),
+          epoch: baseEp + 0.3,
+          ide: "copilot-vscode",
+          channel: "hook",
+          sessionId: "b21-par",
+          agentId: "root",
+          targetAgentId: childUuid2,
+          kind: "subagent_spawn",
+          summary: "Spawned Subagent",
+        },
+      ],
+      { sessionId: "b21-par", ide: "copilot-vscode", nowEpochSec: baseEp + 5 },
+    );
+    const parSubs = parallelSnap.agents.filter((a) => a.nodeType === "agent" && !a.isRoot);
+    assert.equal(parSubs.length, 2, "parallel spawns must reconcile without ghost nodes");
+    assert.equal(parSubs.find((a) => a.id === rawUuid)?.label, "qa-specialist");
+    assert.equal(parSubs.find((a) => a.id === childUuid2)?.label, "backend-engineer");
+
+    // Passive non-spawn events reconcile onto UUID hook event
+    const nonSpawnSnap = buildSessionSnapshot(
+      [
+        {
+          id: "p-ns-1",
+          ts: toIsoTest(baseEp),
+          epoch: baseEp,
+          ide: "copilot-vscode",
+          channel: "passive",
+          sessionId: "b21-ns",
+          agentId: "docs-writer",
+          parentAgentId: "root",
+          agentLabel: "Docs Writer",
+          kind: "thinking_start",
+          summary: "Drafting guide",
+        },
+        {
+          id: "h-ns-1",
+          ts: toIsoTest(baseEp + 0.5),
+          epoch: baseEp + 0.5,
+          ide: "copilot-vscode",
+          channel: "hook",
+          sessionId: "b21-ns",
+          agentId: rawUuid,
+          agentLabel: "08b84ac1 A4b4 4b2c 9abc ",
+          kind: "tool_start",
+          toolName: "read_file",
+          summary: "Read README.md",
+        },
+      ],
+      { sessionId: "b21-ns", ide: "copilot-vscode", nowEpochSec: baseEp + 5 },
+    );
+    const nsSubs = nonSpawnSnap.agents.filter((a) => a.nodeType === "agent" && !a.isRoot);
+    assert.equal(nsSubs.length, 1);
+    assert.equal(nsSubs[0]?.id, rawUuid);
+    assert.equal(nsSubs[0]?.label, "Docs Writer");
   });
 });
 

@@ -1,4 +1,10 @@
-import { fetchBoard, fetchSessions, fetchState, StudioStreamClient } from "./api.js";
+import {
+  fetchBoard,
+  fetchSessions,
+  fetchState,
+  fetchTeam,
+  StudioStreamClient,
+} from "./api.js";
 import { ContextBar } from "./components/ContextBar.js";
 import { FeedbackDialog } from "./components/FeedbackDialog.js";
 import { normalizeServerSnapshot } from "./state/snapshot.js";
@@ -13,6 +19,9 @@ import type {
   PrimaryView,
   RegisteredProject,
   SessionSnapshot,
+  TeamDefinitionEntry,
+  TeamRosterEntry,
+  TeamRosterRef,
 } from "./types.js";
 import { AgileBoardView } from "./views/AgileBoard.js";
 import { DoctorView } from "./views/Doctor.js";
@@ -66,6 +75,11 @@ export class AgentStudioApp {
   private contextBar: ContextBar;
   private feedbackDialog: FeedbackDialog;
   private lastSnapshot: SessionSnapshot | null = null;
+  private cachedTeamFallback = new Map<
+    string,
+    { roster: TeamRosterRef[]; definitions: TeamDefinitionEntry[] }
+  >();
+  private inflightTeamFallback = new Map<string, Promise<void>>();
   private studioView: LiveStudioView;
   private teamView: TeamView;
   private boardView: AgileBoardView;
@@ -195,7 +209,19 @@ export class AgentStudioApp {
       mcpAppMode: this.mcpAppMode,
     });
 
-    this.studioView = new LiveStudioView(this.panels.studio);
+    this.studioView = new LiveStudioView(this.panels.studio, {
+      onCoverSubPaneChange: (pane) => {
+        const coverTarget: CoverPane = pane === "feed" ? "feed" : "studio";
+        this.coverPane = coverTarget;
+        this.bottomNav
+          .querySelectorAll<HTMLButtonElement>("[data-cover-target]")
+          .forEach((btn) => {
+            const active = btn.dataset.coverTarget === coverTarget;
+            btn.classList.toggle("active", active);
+            btn.setAttribute("aria-current", active ? "page" : "false");
+          });
+      },
+    });
     this.teamView = new TeamView(this.panels.team);
 
     this.boardView = new AgileBoardView(this.panels.board, {
@@ -451,6 +477,58 @@ export class AgentStudioApp {
     return preferred?.sessionId ?? "";
   }
 
+  private getTeamScopeKey(project?: string, workspace?: string): string {
+    const proj = (project ?? this.selectedProject ?? "").trim();
+    const ws = (workspace ?? this.lockedWorkspace ?? "").trim();
+    return `${proj}::${ws}`;
+  }
+
+  private toTeamRosterRefs(entries: TeamRosterEntry[]): TeamRosterRef[] {
+    return entries.map((entry) => ({
+      id: entry.id,
+      name: entry.name,
+      role:
+        entry.roleType &&
+        entry.boardRole &&
+        entry.roleType.toLowerCase() !== entry.boardRole.toLowerCase()
+          ? `${entry.roleType} · ${entry.boardRole}`
+          : entry.roleType || entry.boardRole || entry.description || "",
+    }));
+  }
+
+  private ensureTeamRosterFallback(project?: string, workspace?: string): void {
+    const key = this.getTeamScopeKey(project, workspace);
+    if (this.cachedTeamFallback.has(key) || this.inflightTeamFallback.has(key)) {
+      return;
+    }
+    const task = (async () => {
+      try {
+        const team = await fetchTeam({
+          project: project || undefined,
+          workspace: workspace || undefined,
+        });
+        const roster = this.toTeamRosterRefs(team.roster);
+        const definitions = team.definitions ?? [];
+        this.cachedTeamFallback.set(key, { roster, definitions });
+        const curSnap = this.lastSnapshot;
+        if (curSnap) {
+          const curKey = this.getTeamScopeKey(
+            curSnap.projectId || this.selectedProject,
+            curSnap.workspacePath || this.lockedWorkspace
+          );
+          if (curKey === key && (!curSnap.teamRoster || curSnap.teamRoster.length === 0)) {
+            this.studioView.setFallbackTeamRoster(roster, definitions);
+          }
+        }
+      } catch {
+        // Non-fatal: topology still groups by readable subagent slug
+      } finally {
+        this.inflightTeamFallback.delete(key);
+      }
+    })();
+    this.inflightTeamFallback.set(key, task);
+  }
+
   private handleIncomingSnapshot(snap: SessionSnapshot): void {
     if (snap.boardProjects) this.mergeProjects(snap.boardProjects);
     if (Array.isArray(snap.sessions)) {
@@ -486,6 +564,24 @@ export class AgentStudioApp {
       return;
     }
     this.lastSnapshot = snap;
+
+    const scopeProject = snap.projectId || this.selectedProject || undefined;
+    const scopeWorkspace = snap.workspacePath || this.lockedWorkspace || undefined;
+    const scopeKey = this.getTeamScopeKey(scopeProject, scopeWorkspace);
+    if (snap.teamRoster && snap.teamRoster.length > 0) {
+      this.cachedTeamFallback.set(scopeKey, {
+        roster: snap.teamRoster,
+        definitions: snap.definitions ?? [],
+      });
+      this.studioView.setFallbackTeamRoster(snap.teamRoster, snap.definitions);
+    } else {
+      const cached = this.cachedTeamFallback.get(scopeKey);
+      this.studioView.setFallbackTeamRoster(cached?.roster, cached?.definitions);
+      if (!cached) {
+        this.ensureTeamRosterFallback(scopeProject, scopeWorkspace);
+      }
+    }
+
     this.studioView.setSnapshot(snap);
     this.doctorView.notifyLiveSnapshot(snap);
     this.refreshContextBar();

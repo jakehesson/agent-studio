@@ -311,6 +311,15 @@ async function isDirectory(dirPath: string): Promise<boolean> {
   }
 }
 
+function resolveWorkspaceRootPath(raw: string): string {
+  const trimmed = raw.trim();
+  if (!trimmed) return "";
+  const normalized = /^file:\/\//i.test(trimmed)
+    ? normalizeWsPath(trimmed)
+    : trimmed;
+  return path.resolve(normalized);
+}
+
 async function tryLoadManifest(rootDir: string): Promise<TeamManifest | null> {
   try {
     const raw = await fs.readFile(
@@ -321,6 +330,24 @@ async function tryLoadManifest(rootDir: string): Promise<TeamManifest | null> {
   } catch {
     return null;
   }
+}
+
+async function tryLoadManifestFromAncestors(
+  rootDir: string,
+): Promise<{ manifest: TeamManifest; root: string } | null> {
+  let cur = path.dirname(path.resolve(rootDir));
+  const visited = new Set<string>();
+  while (cur && !visited.has(cur)) {
+    visited.add(cur);
+    const loaded = await tryLoadManifest(cur);
+    if (loaded) {
+      return { manifest: loaded, root: cur };
+    }
+    const parent = path.dirname(cur);
+    if (parent === cur) break;
+    cur = parent;
+  }
+  return null;
 }
 
 function stripAgentFilename(filePath: string): string {
@@ -341,7 +368,8 @@ export async function discoverTeamDetails(
   const seenRootKeys = new Set<string>();
   const addRoot = async (candidate: string | undefined): Promise<void> => {
     if (!candidate || !candidate.trim()) return;
-    const abs = path.resolve(candidate);
+    const abs = resolveWorkspaceRootPath(candidate);
+    if (!abs) return;
     const key = normalizeWsPath(abs);
     if (!key || seenRootKeys.has(key)) return;
     if (!(await isDirectory(abs))) return;
@@ -359,7 +387,7 @@ export async function discoverTeamDetails(
 
   const effectiveRoot = orderedRoots[0] ?? path.resolve(process.cwd());
 
-  // Locate canonical .agent-team/team.yaml across ordered roots
+  // Locate canonical .agent-team/team.yaml across ordered roots (exact match first, then ancestor walk-up)
   let manifest: TeamManifest | null = null;
   let manifestRoot = effectiveRoot;
   for (const root of orderedRoots) {
@@ -368,6 +396,21 @@ export async function discoverTeamDetails(
       manifest = loaded;
       manifestRoot = root;
       break;
+    }
+  }
+  if (!manifest) {
+    for (const root of orderedRoots) {
+      const ancestorMatch = await tryLoadManifestFromAncestors(root);
+      if (ancestorMatch) {
+        manifest = ancestorMatch.manifest;
+        manifestRoot = ancestorMatch.root;
+        const mKey = normalizeWsPath(manifestRoot);
+        if (mKey && !seenRootKeys.has(mKey)) {
+          seenRootKeys.add(mKey);
+          orderedRoots.unshift(manifestRoot);
+        }
+        break;
+      }
     }
   }
 
@@ -688,9 +731,11 @@ export async function discoverTeamDetailsCached(
 ): Promise<TeamDetails> {
   const key = JSON.stringify({
     agentStudioHome: normalizeWsPath(path.resolve(getAgentStudioHome())),
-    projectRoot: projectRoot ? normalizeWsPath(path.resolve(projectRoot)) : "",
+    projectRoot: projectRoot
+      ? normalizeWsPath(resolveWorkspaceRootPath(projectRoot))
+      : "",
     workspaceRoots: (workspaceRoots ?? []).map((w) =>
-      normalizeWsPath(path.resolve(w)),
+      normalizeWsPath(resolveWorkspaceRootPath(w)),
     ),
     includeGlobal: opts?.includeGlobal ?? true,
   });

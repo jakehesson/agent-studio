@@ -25,6 +25,28 @@
     gap: 7px;
     font-size: 10.5px;
   }
+  .auto-pill {
+    display: none;
+  }
+  .cluster-grid {
+    grid-template-columns: 1fr;
+  }
+
+  .tool-burst-strip,
+  .tool-strip-drawer,
+  .bubble {
+    max-width: 100%;
+    width: 100%;
+  }
+
+  .tool-burst-row-text {
+    white-space: normal;
+    overflow-wrap: anywhere;
+  }
+  .grouped-tree.is-basic .cluster-card {
+    flex: 1 1 100%;
+    width: 100%;
+  }
 }
 
 /* ==========================================================================
@@ -98,6 +120,22 @@
   .model-add-grid,
   .mi-health-layers {
     grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  .cluster-grid {
+    grid-template-columns: 1fr;
+  }
+
+  .tool-burst-strip,
+  .tool-strip-drawer,
+  .bubble {
+    max-width: 100%;
+    width: 100%;
+  }
+
+  .tool-burst-row-text {
+    white-space: normal;
+    overflow-wrap: anywhere;
   }
 }
 
@@ -365,6 +403,26 @@
   .pane-stream {
     flex: 1;
     min-height: 0;
+  }
+
+  .cover-back-btn {
+    display: inline-flex;
+  }
+
+  .cluster-grid {
+    grid-template-columns: 1fr;
+  }
+
+  .tool-burst-strip,
+  .tool-strip-drawer,
+  .bubble {
+    max-width: 100%;
+    width: 100%;
+  }
+
+  .tool-burst-row-text {
+    white-space: normal;
+    overflow-wrap: anywhere;
   }
 
   /* Compact timeline docked right above the fixed bottom nav */
@@ -648,7 +706,22 @@
   .fb-cat-pill,
   .fb-diag-toggle,
   .fb-preview-summary,
-  .fb-issue-link {
+  .fb-issue-link,
+  .seg-btn,
+  .btn-ghost,
+  .msg-pill,
+  .line-msg-pill,
+  .card-msg-badge,
+  .read-full-btn,
+  .kpi-btn,
+  .run-pill,
+  .jump-latest-btn,
+  .ext-lane-card,
+  .collapse-btn,
+  .cover-back-btn,
+  .filter-chip,
+  .tool-burst-row,
+  .tool-badge-btn {
     min-block-size: 44px;
     min-inline-size: 44px;
   }
@@ -665,5 +738,39 @@
   .mr-select,
   .rm-select {
     font-size: max(1rem, 1em);
+  }
+}
+
+@media (forced-colors: active) {
+  .cluster-card,
+  .node-card,
+  .bubble,
+  .tool-strip-drawer,
+  .msg-pill,
+  .line-msg-pill,
+  .ext-lane-card,
+  .kpi-btn {
+    border: 1px solid CanvasText;
+  }
+  .bubble.inbound,
+  .bubble.outbound,
+  .bubble-route {
+    background: Canvas;
+    color: CanvasText;
+    border-color: CanvasText;
+  }
+  .tool-strip-dot {
+    background: Highlight;
+  }
+  .tool-badge-btn.has-error {
+    border-color: Highlight;
+  }
+  .seg-btn[aria-pressed="true"],
+  .run-pill[aria-pressed="true"],
+  .filter-chip[aria-selected="true"],
+  .filter-chip[aria-pressed="true"],
+  .tool-burst-row.selected,
+  .tool-badge-btn.is-expanded {
+    outline: 2px solid Highlight;
   }
 }
