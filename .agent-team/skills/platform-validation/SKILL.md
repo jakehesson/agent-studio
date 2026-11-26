@@ -24,3 +24,10 @@ Use this rubric alongside the three platform specialists (`vscode-copilot-specia
 3. **Single Authoritative Session Tree:** Subagent events must correlate under their parent orchestrator session (never spawning orphan sessions or phantom `subagent-<hash>` UI nodes).
 4. **Accurate Non-Monotonic Context & Model Accounting:** `lastTurnContext` must reflect the latest turn (decreasing after `/compact` or new smaller turns), and streaming/hook duplicates must never inflate token totals.
 5. **Embedded Extension Scoping (`embed=1`):** Extension panels detect host IDE (`antigravity` vs `copilot-vscode`) and workspace root, hiding cross-IDE/cross-project chrome while preserving full switching in standalone Web Studio.
+
+## 3. VS Code / Copilot & GHE Verified Schema Invariants
+- **UI Navigation Pointer:** Studio header lives in `web/src/components/ContextBar.ts` (not `TopBar.ts`).
+- **Inclusive Prompt Tokens:** OpenAI/Copilot `promptTokens`/`inputTokens` are **inclusive** of `cachedTokens` (unlike Anthropic/Claude Code's fresh-only `input_tokens`); normalize via `normalizeCopilotUsage` strictly for `copilot-vscode`.
+- **Incremental vs. Cumulative Events:** `~/.copilot/session-state/*/events.jsonl` mixes incremental rows (`assistant.message`, `session.usage_record`) with cumulative checkpoints (`session.usage_checkpoint`, `session.shutdown` `modelMetrics`) — use one source and never sum both.
+- **Chat Session Limits & Empty Links:** `chatSessions/*.jsonl` exposes host limits at `inputState.selectedModel.metadata.maxInputTokens` and emits empty-label Markdown links `[](file:///...)` — extract the URI basename for display.
+- **Hook Root Guard & Synced Namespace:** VS Code hooks echo `agent_id === sessionId` / `parent_agent_id === sessionId` on root turns (guard to `"root"`) and prefix synced subagents with `"VS Code Synced Data:"` (strip prefix during reconciliation).

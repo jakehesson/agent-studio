@@ -6,6 +6,9 @@ import type {
   ConnectionState,
   DoctorApiResponse,
   DoctorCheckItem,
+  FeedbackStatusResponse,
+  FeedbackSubmissionPayload,
+  FeedbackSubmitResult,
   HostIde,
   IdeFilter,
   IdeHealthCard,
@@ -34,6 +37,15 @@ import {
   synthesizeModelIndexViewFromTeam,
 } from "./state/modelIndex.js";
 import { normalizeStatus } from "./utils.js";
+import {
+  buildPrefilledIssueUrl,
+  FEEDBACK_GITHUB_OWNER,
+  FEEDBACK_GITHUB_REPO,
+  FEEDBACK_NEW_ISSUE_URL,
+  isAllowedFeedbackIssueUrl,
+  isAllowedFeedbackNewIssueUrl,
+  sanitizeClientDiagnostics,
+} from "./utils/feedbackUrl.js";
 
 export interface McpToolCallResult {
   isError?: boolean;
@@ -46,6 +58,7 @@ export interface McpAppClientLike {
     name: string;
     arguments?: Record<string, unknown>;
   }): Promise<McpToolCallResult>;
+  openLink?: (params: { url: string }) => Promise<{ isError?: boolean }>;
 }
 
 let mcpTransport: McpAppClientLike | null = null;
@@ -1050,6 +1063,285 @@ export async function postDoctorTestEvent(payload: {
     eventId,
     message: typeof raw.message === "string" ? raw.message : undefined,
   };
+}
+
+/* ---------- In-App GitHub Feedback API & Bridges (S1-57) ---------- */
+
+function createFeedbackRequestId(): string {
+  return `fb-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+}
+
+function requestExtensionFeedbackBridge<T extends Record<string, unknown>>(
+  requestType: string,
+  responseType: string,
+  extraPayload: Record<string, unknown>,
+  timeoutMs: number
+): Promise<T | null> {
+  if (typeof window === "undefined" || window.parent === window) {
+    return Promise.resolve(null);
+  }
+  const requestId = createFeedbackRequestId();
+  return new Promise<T | null>((resolve) => {
+    let settled = false;
+    const cleanup = () => {
+      window.removeEventListener("message", onMessage);
+      window.clearTimeout(timer);
+    };
+    const onMessage = (event: MessageEvent) => {
+      if (event.source !== window.parent) return;
+      const data = asRecord(event.data);
+      if (data.type !== responseType || data.requestId !== requestId) return;
+      if (settled) return;
+      settled = true;
+      cleanup();
+      resolve(data as T);
+    };
+    const timer = window.setTimeout(() => {
+      if (settled) return;
+      settled = true;
+      cleanup();
+      resolve(null);
+    }, timeoutMs);
+
+    window.addEventListener("message", onMessage);
+    window.parent.postMessage(
+      {
+        type: requestType,
+        requestId,
+        ...extraPayload,
+      },
+      "*"
+    );
+  });
+}
+
+export async function fetchFeedbackStatus(
+  embedMode: boolean
+): Promise<FeedbackStatusResponse> {
+  const lockedRepo = `${FEEDBACK_GITHUB_OWNER}/${FEEDBACK_GITHUB_REPO}`;
+  const defaultOffline: FeedbackStatusResponse = {
+    ok: true,
+    repo: lockedRepo,
+    directAvailable: false,
+    method: "none",
+    newIssueUrl: FEEDBACK_NEW_ISSUE_URL,
+  };
+
+  if (mcpTransport) {
+    return defaultOffline;
+  }
+
+  if (embedMode && typeof window !== "undefined" && window.parent !== window) {
+    const bridge = await requestExtensionFeedbackBridge<{
+      githubAuthAvailable?: boolean;
+      accountLabel?: string;
+    }>("agentStudio:feedbackStatusRequest", "agentStudio:feedbackStatus", {}, 1500);
+
+    if (bridge && bridge.githubAuthAvailable === true) {
+      return {
+        ok: true,
+        repo: lockedRepo,
+        directAvailable: true,
+        method: "vscode-github",
+        accountLabel:
+          typeof bridge.accountLabel === "string" ? bridge.accountLabel : undefined,
+        newIssueUrl: FEEDBACK_NEW_ISSUE_URL,
+      };
+    }
+  }
+
+  try {
+    const raw = await fetchJson<Record<string, unknown>>("/api/feedback/status");
+    const methodRaw = raw.method;
+    const method: FeedbackStatusResponse["method"] =
+      methodRaw === "github-token" || methodRaw === "gh-cli"
+        ? methodRaw
+        : "none";
+    const directAvailable = Boolean(raw.directAvailable) && method !== "none";
+    return {
+      ok: raw.ok !== false,
+      repo: lockedRepo,
+      directAvailable,
+      method,
+      newIssueUrl: FEEDBACK_NEW_ISSUE_URL,
+      appVersion: typeof raw.appVersion === "string" ? raw.appVersion : undefined,
+    };
+  } catch {
+    return defaultOffline;
+  }
+}
+
+export async function submitFeedbackIssue(
+  payload: FeedbackSubmissionPayload,
+  opts: {
+    embedMode: boolean;
+    preferredMethod?: FeedbackStatusResponse["method"];
+  }
+): Promise<FeedbackSubmitResult> {
+  const sanitized: FeedbackSubmissionPayload = {
+    category: payload.category,
+    title: payload.title.trim().slice(0, 200),
+    description: payload.description.trim().slice(0, 4000),
+    includeDiagnostics: Boolean(payload.includeDiagnostics),
+    diagnostics: payload.includeDiagnostics
+      ? sanitizeClientDiagnostics(payload.diagnostics)
+      : undefined,
+  };
+  const clientFallback = buildPrefilledIssueUrl(sanitized).url;
+
+  if (mcpTransport) {
+    return {
+      ok: false,
+      mode: "fallback",
+      prefillUrl: clientFallback,
+      reason: "Direct API submission is unavailable in MCP App mode.",
+    };
+  }
+
+  if (
+    opts.embedMode &&
+    opts.preferredMethod === "vscode-github" &&
+    typeof window !== "undefined" &&
+    window.parent !== window
+  ) {
+    const bridge = await requestExtensionFeedbackBridge<{
+      ok?: boolean;
+      mode?: string;
+      issueUrl?: string;
+      issueNumber?: number;
+      fallbackUrl?: string;
+      reason?: string;
+    }>(
+      "agentStudio:submitFeedback",
+      "agentStudio:submitFeedbackResult",
+      { payload: sanitized },
+      25_000
+    );
+
+    if (!bridge) {
+      return {
+        ok: false,
+        mode: "fallback",
+        prefillUrl: clientFallback,
+        reason: "Extension host feedback bridge did not respond in time.",
+      };
+    }
+
+    if (
+      bridge.ok === true &&
+      bridge.mode === "created" &&
+      typeof bridge.issueUrl === "string" &&
+      isAllowedFeedbackIssueUrl(bridge.issueUrl)
+    ) {
+      return {
+        ok: true,
+        mode: "created",
+        issueUrl: bridge.issueUrl,
+        issueNumber:
+          typeof bridge.issueNumber === "number" ? bridge.issueNumber : undefined,
+      };
+    }
+
+    const safeFallback =
+      typeof bridge.fallbackUrl === "string" &&
+      isAllowedFeedbackNewIssueUrl(bridge.fallbackUrl)
+        ? bridge.fallbackUrl
+        : clientFallback;
+
+    return {
+      ok: false,
+      mode: "fallback",
+      prefillUrl: safeFallback,
+      reason:
+        typeof bridge.reason === "string" && bridge.reason
+          ? bridge.reason
+          : "GitHub sign-in was cancelled or unavailable.",
+    };
+  }
+
+  try {
+    const raw = await fetchJson<Record<string, unknown>>("/api/feedback/github-issue", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(sanitized),
+    });
+
+    if (
+      raw.mode === "created" &&
+      typeof raw.issueUrl === "string" &&
+      isAllowedFeedbackIssueUrl(raw.issueUrl)
+    ) {
+      return {
+        ok: true,
+        mode: "created",
+        issueUrl: raw.issueUrl,
+        issueNumber:
+          typeof raw.issueNumber === "number" ? raw.issueNumber : undefined,
+      };
+    }
+
+    const safeFallback =
+      typeof raw.prefillUrl === "string" && isAllowedFeedbackNewIssueUrl(raw.prefillUrl)
+        ? raw.prefillUrl
+        : clientFallback;
+
+    return {
+      ok: false,
+      mode: "fallback",
+      prefillUrl: safeFallback,
+      reason:
+        typeof raw.reason === "string" && raw.reason
+          ? raw.reason
+          : "Direct submission unavailable; use the pre-filled GitHub link.",
+    };
+  } catch (err) {
+    return {
+      ok: false,
+      mode: "fallback",
+      prefillUrl: clientFallback,
+      reason:
+        err instanceof Error
+          ? err.message
+          : "Unable to submit directly to GitHub Issues.",
+    };
+  }
+}
+
+export async function openFeedbackExternalUrl(
+  rawUrl: string,
+  embedMode: boolean
+): Promise<boolean> {
+  if (!isAllowedFeedbackNewIssueUrl(rawUrl) && !isAllowedFeedbackIssueUrl(rawUrl)) {
+    return false;
+  }
+
+  if (
+    embedMode &&
+    typeof window !== "undefined" &&
+    window.parent !== window &&
+    (isAllowedFeedbackNewIssueUrl(rawUrl) || isAllowedFeedbackIssueUrl(rawUrl))
+  ) {
+    window.parent.postMessage(
+      {
+        type: "agentStudio:openFeedbackUrl",
+        url: rawUrl,
+      },
+      "*"
+    );
+    return true;
+  }
+
+  if (mcpTransport?.openLink) {
+    try {
+      const res = await mcpTransport.openLink({ url: rawUrl });
+      if (!res?.isError) return true;
+    } catch {
+      // Fall back to window.open below
+    }
+  }
+
+  const win = window.open(rawUrl, "_blank", "noopener,noreferrer");
+  return win !== null;
 }
 
 export interface StreamOptions {

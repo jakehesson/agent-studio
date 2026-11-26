@@ -4,6 +4,12 @@ import {
   getDefaultAllowedRoots,
   resolveAllowedFileUri,
 } from "./fileLinkBridge";
+import {
+  handleFeedbackStatusRequest,
+  handleSubmitFeedback,
+  validateFeedbackExternalUrl,
+  type VscodeAuthLike,
+} from "./feedback";
 import type { ServerManager } from "./serverManager";
 
 export type StudioViewName = "studio" | "board" | "team" | "mockups" | "doctor";
@@ -72,6 +78,9 @@ export class StudioPanel {
         uri?: string;
         startLine?: number;
         endLine?: number;
+        requestId?: unknown;
+        payload?: unknown;
+        url?: unknown;
       }) => {
         if (msg?.type === "retry") {
           await this.serverManager.ensureRunning(true);
@@ -84,6 +93,33 @@ export class StudioPanel {
             startLine: msg.startLine,
             endLine: msg.endLine,
           });
+        } else if (msg?.type === "agentStudio:feedbackStatusRequest") {
+          const auth = (
+            vscode as unknown as { authentication?: VscodeAuthLike }
+          ).authentication;
+          const reply = await handleFeedbackStatusRequest(msg.requestId, auth);
+          void this.panel.webview.postMessage(reply);
+        } else if (msg?.type === "agentStudio:submitFeedback") {
+          const auth = (
+            vscode as unknown as { authentication?: VscodeAuthLike }
+          ).authentication;
+          const extVersion = vscode.extensions.getExtension(
+            "agent-studio.agent-studio-vscode",
+          )?.packageJSON?.version;
+          const reply = await handleSubmitFeedback(msg.requestId, msg.payload, {
+            auth,
+            appVersion: typeof extVersion === "string" ? extVersion : undefined,
+          });
+          void this.panel.webview.postMessage(reply);
+        } else if (msg?.type === "agentStudio:openFeedbackUrl") {
+          const checked = validateFeedbackExternalUrl(msg.url);
+          if (!checked.ok) {
+            void vscode.window.showWarningMessage(
+              `Blocked unsafe feedback URL: ${checked.reason}`,
+            );
+            return;
+          }
+          await vscode.env.openExternal(vscode.Uri.parse(checked.url));
         }
       },
       null,
@@ -358,16 +394,43 @@ export class StudioPanel {
 
     const expectedOrigin = ${JSON.stringify(expectedOrigin)};
     window.addEventListener("message", (event) => {
-      if (event.source !== frame.contentWindow) return;
-      if (!expectedOrigin || event.origin !== expectedOrigin) return;
       const data = event.data;
       if (!data || typeof data !== "object") return;
+      if (event.source !== frame.contentWindow) {
+        if (
+          event.origin === window.location.origin &&
+          expectedOrigin &&
+          frame.contentWindow &&
+          (data.type === "agentStudio:feedbackStatus" ||
+            data.type === "agentStudio:submitFeedbackResult")
+        ) {
+          frame.contentWindow.postMessage(data, expectedOrigin);
+        }
+        return;
+      }
+      if (!expectedOrigin || event.origin !== expectedOrigin) return;
       if (data.type === "agentStudio.openFile" && typeof data.uri === "string") {
         vscode.postMessage({
           type: "openFile",
           uri: data.uri,
           startLine: typeof data.startLine === "number" ? data.startLine : undefined,
           endLine: typeof data.endLine === "number" ? data.endLine : undefined,
+        });
+      } else if (data.type === "agentStudio:feedbackStatusRequest") {
+        vscode.postMessage({
+          type: "agentStudio:feedbackStatusRequest",
+          requestId: typeof data.requestId === "string" ? data.requestId : "",
+        });
+      } else if (data.type === "agentStudio:submitFeedback") {
+        vscode.postMessage({
+          type: "agentStudio:submitFeedback",
+          requestId: typeof data.requestId === "string" ? data.requestId : "",
+          payload: data.payload,
+        });
+      } else if (data.type === "agentStudio:openFeedbackUrl" && typeof data.url === "string") {
+        vscode.postMessage({
+          type: "agentStudio:openFeedbackUrl",
+          url: data.url,
         });
       }
     });

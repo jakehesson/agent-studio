@@ -159,7 +159,9 @@ body {
 :root[data-theme="light"] .reader-dialog,
 :root[data-theme="light"] .team-detail-dialog,
 :root[data-theme="light"] .model-index-dialog,
+:root[data-theme="light"] .feedback-dialog,
 :root[data-theme="light"] .insp-sheet-head,
+:root[data-theme="light"] .fb-sheet-foot,
 :root[data-theme="light"] .reader-head,
 :root[data-theme="light"] .reader-meta-bar,
 :root[data-theme="light"] .reader-toc,
@@ -168,6 +170,80 @@ body {
 :root[data-theme="light"] .session-pop-head {
   background: var(--panel);
   color: var(--text);
+}
+
+:root[data-theme="light"] .feedback-trigger {
+  background: var(--panel);
+  color: var(--text);
+  border-color: var(--border-strong);
+}
+
+:root[data-theme="light"] .feedback-trigger:hover {
+  background: var(--panel-3);
+  color: var(--text-strong);
+  border-color: #0284c7;
+}
+
+:root[data-theme="light"] .fb-banner {
+  background: rgba(2, 132, 199, 0.08);
+  border-color: rgba(2, 132, 199, 0.3);
+  color: var(--text);
+}
+
+:root[data-theme="light"] .fb-banner code {
+  color: #0369a1;
+}
+
+:root[data-theme="light"] .fb-cat-pill {
+  background: var(--panel-2);
+  color: var(--muted);
+  border-color: var(--border-strong);
+}
+
+:root[data-theme="light"] .fb-cat-pill:has(input:checked) {
+  background: #dbeafe;
+  border-color: #0284c7;
+  color: #0f172a;
+}
+
+:root[data-theme="light"] .fb-input,
+:root[data-theme="light"] .fb-textarea,
+:root[data-theme="light"] .fb-preview-details,
+:root[data-theme="light"] .fb-preview-pre {
+  background: var(--panel);
+  color: var(--text);
+  border-color: var(--border-strong);
+}
+
+:root[data-theme="light"] .fb-diag-box {
+  background: var(--panel-2);
+}
+
+:root[data-theme="light"] .fb-preview-summary {
+  color: #0369a1;
+}
+
+:root[data-theme="light"] .fb-field-error {
+  color: #be123c;
+}
+
+:root[data-theme="light"] .fb-error-box {
+  background: rgba(244, 63, 94, 0.1);
+  border-color: rgba(190, 18, 60, 0.45);
+  color: #881337;
+}
+
+:root[data-theme="light"] .fb-error-title {
+  color: #9f1239;
+}
+
+:root[data-theme="light"] .fb-success-panel {
+  background: rgba(16, 185, 129, 0.1);
+  border-color: rgba(4, 120, 87, 0.4);
+}
+
+:root[data-theme="light"] .fb-success-badge {
+  color: #047857;
 }
 
 :root[data-theme="light"] .reader-md :not(pre) > code {

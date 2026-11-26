@@ -67,6 +67,12 @@ import {
   scanMockupEntries,
   type MockupEntry,
 } from "./mockups.js";
+import {
+  FEEDBACK_BODY_MAX_BYTES,
+  resolveFeedbackStatus,
+  submitFeedbackGithubIssue,
+  type FeedbackServerDeps,
+} from "./feedback.js";
 
 const MAX_INGEST_BODY_BYTES = 512 * 1024;
 const MAX_MODEL_BODY_BYTES = 512 * 1024;
@@ -197,6 +203,7 @@ export interface StudioServerOptions extends TelemetryAggregatorOptions {
   extraMockupDirs?: string[];
   doctorProvider?: DoctorProvider;
   aggregator?: TelemetryAggregator;
+  feedbackDeps?: FeedbackServerDeps;
 }
 
 export interface StudioServerHandle {
@@ -1332,6 +1339,32 @@ export function createStudioServer(
       }
       const saved = await appendMockupFeedback(entry.abs_dir, { note, view });
       sendJson(res, 200, { ok: true, id, feedback: saved.feedback });
+      return;
+    }
+
+    // 9b. GET /api/feedback/status
+    if (method === "GET" && pathname === "/api/feedback/status") {
+      const status = await resolveFeedbackStatus(options.feedbackDeps);
+      sendJson(res, 200, status);
+      return;
+    }
+
+    // 9c. POST /api/feedback/github-issue
+    if (method === "POST" && pathname === "/api/feedback/github-issue") {
+      let body: unknown;
+      try {
+        body = await readJsonBody(req, FEEDBACK_BODY_MAX_BYTES);
+      } catch (err) {
+        const code = err instanceof Error ? err.message : "";
+        if (code === "PAYLOAD_TOO_LARGE") {
+          sendJson(res, 413, { ok: false, error: "Payload exceeds 32 KB limit" });
+          return;
+        }
+        sendJson(res, 400, { ok: false, error: "Invalid JSON payload" });
+        return;
+      }
+      const result = await submitFeedbackGithubIssue(body, options.feedbackDeps);
+      sendJson(res, result.status, result.body);
       return;
     }
 

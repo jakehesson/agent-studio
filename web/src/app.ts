@@ -1,11 +1,13 @@
 import { fetchBoard, fetchSessions, fetchState, StudioStreamClient } from "./api.js";
 import { ContextBar } from "./components/ContextBar.js";
+import { FeedbackDialog } from "./components/FeedbackDialog.js";
 import { normalizeServerSnapshot } from "./state/snapshot.js";
 import type {
   ConnectionState,
   CoverPane,
   DiscoveredSessionSummary,
   EmbedScope,
+  FeedbackDiagnostics,
   HostIde,
   IdeFilter,
   PrimaryView,
@@ -62,6 +64,8 @@ export class AgentStudioApp {
   private coverPane: CoverPane = "studio";
 
   private contextBar: ContextBar;
+  private feedbackDialog: FeedbackDialog;
+  private lastSnapshot: SessionSnapshot | null = null;
   private studioView: LiveStudioView;
   private teamView: TeamView;
   private boardView: AgileBoardView;
@@ -183,6 +187,12 @@ export class AgentStudioApp {
       },
       onSelectView: (view) => this.setView(view),
       onReconnect: () => this.stream.reconnectNow(),
+      onOpenFeedback: () => this.openFeedbackDialog(),
+    });
+
+    this.feedbackDialog = new FeedbackDialog({
+      embedMode: this.embedMode,
+      mcpAppMode: this.mcpAppMode,
     });
 
     this.studioView = new LiveStudioView(this.panels.studio);
@@ -269,6 +279,10 @@ export class AgentStudioApp {
     if (scopeChanged) {
       this.applyShellAttributes();
       const scope = this.getEmbedScope();
+      this.feedbackDialog.setRuntimeScope({
+        embedMode: this.embedMode,
+        mcpAppMode: this.mcpAppMode,
+      });
       this.teamView.setEmbedScope(scope);
       this.doctorView.setEmbedScope(scope);
       this.refreshContextBar();
@@ -471,9 +485,51 @@ export class AgentStudioApp {
       this.refreshContextBar();
       return;
     }
+    this.lastSnapshot = snap;
     this.studioView.setSnapshot(snap);
     this.doctorView.notifyLiveSnapshot(snap);
     this.refreshContextBar();
+  }
+
+  private collectFeedbackDiagnostics(): FeedbackDiagnostics {
+    const snap = this.lastSnapshot;
+    const aiAgents = snap?.agents.filter((a) => (a.nodeType ?? "agent") === "agent") ?? [];
+    const peakAgent =
+      (snap?.usage?.peakContextAgentId
+        ? aiAgents.find((a) => a.id === snap.usage?.peakContextAgentId)
+        : undefined) ??
+      aiAgents.find((a) => a.usage?.model || a.model) ??
+      aiAgents[0];
+
+    const ide =
+      snap?.ide ??
+      this.lockedIde ??
+      (this.ideFilter !== "all" ? this.ideFilter : "unknown");
+
+    const model =
+      peakAgent?.usage?.model ??
+      peakAgent?.model ??
+      snap?.usage?.models?.[0]?.model;
+
+    return {
+      appVersion: typeof __APP_VERSION__ !== "undefined" ? __APP_VERSION__ : "0.0.0",
+      ide,
+      model: model && model !== "unknown" ? model : undefined,
+      contextTokens: peakAgent?.usage?.contextTokens,
+      contextWindow: peakAgent?.usage?.contextWindow,
+      contextPercent: snap?.usage?.peakContextPercent ?? peakAgent?.usage?.contextPercent,
+      agentCount: aiAgents.length > 0 ? aiAgents.length : undefined,
+      eventCount: snap?.counters?.totalEvents ?? snap?.events.length,
+      embedMode: this.embedMode,
+    };
+  }
+
+  private openFeedbackDialog(): void {
+    this.feedbackDialog.setRuntimeScope({
+      embedMode: this.embedMode,
+      mcpAppMode: this.mcpAppMode,
+    });
+    this.feedbackDialog.open(this.collectFeedbackDiagnostics());
   }
 
   private async refreshSessions(): Promise<void> {
@@ -610,6 +666,10 @@ export class AgentStudioApp {
     this.applyShellAttributes();
 
     const scope = this.getEmbedScope();
+    this.feedbackDialog.setRuntimeScope({
+      embedMode: this.embedMode,
+      mcpAppMode: this.mcpAppMode,
+    });
     this.teamView.setEmbedScope(scope);
     this.doctorView.setEmbedScope(scope);
     this.refreshContextBar();

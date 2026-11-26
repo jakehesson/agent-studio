@@ -33,11 +33,12 @@ workflow:
   checkpoints:
     CP0:
       title: TypeScript Typecheck & Unit Suite
-      command: npm run check && npm test
+      command: npm run check && npm --prefix extension run check && npm test
       steps:
-        - Run `npm run check && npm test` to verify TypeScript compilation,
-          schemas, board lock/QA gate, compiler, telemetry adapters, and
-          HTTP/SSE tests.
+        - Run `npm run check && npm --prefix extension run check && npm test`
+          to verify TypeScript compilation across `src/`, `tests/`, and
+          `extension/`, schemas, board lock/QA gate, compiler, telemetry
+          adapters, and HTTP/SSE tests.
       pass:
         - Exit code 0 with zero TypeScript errors and 100% passing unit tests.
       fail:

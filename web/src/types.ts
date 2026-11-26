@@ -617,3 +617,47 @@ export interface TeamDetailsResponse {
 export type PrimaryView = "studio" | "team" | "board" | "mockups" | "doctor";
 export type CoverPane = "studio" | "feed" | "team" | "board" | "mockups" | "doctor";
 export type ConnectionState = "connecting" | "live" | "reconnecting" | "offline";
+
+/* ---------- In-App GitHub Feedback Types (S1-57) ---------- */
+
+export type FeedbackCategory = "bug" | "feature" | "telemetry" | "question";
+
+export interface FeedbackDiagnostics {
+  appVersion?: string;
+  ide?: IdeSource;
+  model?: string;
+  contextTokens?: number;
+  contextWindow?: number;
+  contextPercent?: number;
+  agentCount?: number;
+  eventCount?: number;
+  embedMode?: boolean;
+  osPlatform?: string;
+}
+
+export interface FeedbackStatusResponse {
+  ok: boolean;
+  repo: string;
+  directAvailable: boolean;
+  method: "vscode-github" | "github-token" | "gh-cli" | "none";
+  accountLabel?: string;
+  newIssueUrl: string;
+  appVersion?: string;
+}
+
+export interface FeedbackSubmissionPayload {
+  category: FeedbackCategory;
+  title: string;
+  description: string;
+  includeDiagnostics: boolean;
+  diagnostics?: FeedbackDiagnostics;
+}
+
+export interface FeedbackSubmitResult {
+  ok: boolean;
+  mode: "created" | "fallback";
+  issueUrl?: string;
+  issueNumber?: number;
+  prefillUrl?: string;
+  reason?: string;
+}

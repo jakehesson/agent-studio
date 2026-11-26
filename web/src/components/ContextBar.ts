@@ -32,6 +32,7 @@ export interface ContextBarCallbacks {
   onResetFilters: () => void;
   onSelectView: (view: PrimaryView) => void;
   onReconnect: () => void;
+  onOpenFeedback: () => void;
 }
 
 const IDE_PILLS: Array<{ id: IdeFilter; label: string }> = [
@@ -57,6 +58,9 @@ export class ContextBar {
   private searchQuery = "";
   private sheetDialog: HTMLDialogElement | null = null;
   private onDocClick: (e: MouseEvent) => void;
+  private lastScopeChipHtml = "";
+  private lastPopListHtml = "";
+  private lastSheetListHtml = "";
 
   constructor(root: HTMLElement, initial: ContextBarState, cb: ContextBarCallbacks) {
     this.root = root;
@@ -114,6 +118,19 @@ export class ContextBar {
         </nav>
 
         <div class="ctx-status-wrap">
+          <button
+            type="button"
+            class="feedback-trigger"
+            data-feedback-open
+            aria-label="Send Feedback"
+            title="Send Feedback to jakehesson/agent-studio"
+          >
+            <svg class="feedback-btn-icon" viewBox="0 0 16 16" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+              <path d="M2.5 3.5h11a1 1 0 0 1 1 1v6.2a1 1 0 0 1-1 1H6.2l-3.2 2.4v-2.4H2.5a1 1 0 0 1-1-1V4.5a1 1 0 0 1 1-1Z" />
+              <path d="M5 7h6M5 9.4h4" />
+            </svg>
+            <span class="feedback-btn-label">Feedback</span>
+          </button>
           <button
             type="button"
             class="sse-pill"
@@ -272,6 +289,11 @@ export class ContextBar {
       });
     });
 
+    // Feedback modal trigger
+    this.root.querySelector("[data-feedback-open]")?.addEventListener("click", () => {
+      this.cb.onOpenFeedback();
+    });
+
     // SSE reconnect pill
     this.root.querySelector("[data-sse-pill]")?.addEventListener("click", () => {
       this.cb.onReconnect();
@@ -332,11 +354,15 @@ export class ContextBar {
       if (scopeChip) {
         scopeChip.hidden = false;
         scopeChip.title = next.lockedWorkspace || scopeLabel;
-        scopeChip.innerHTML = `
+        const chipHtml = `
           <span class="ide-chip" style="color:${ideMeta.color};border-color:${ideMeta.border};background:${ideMeta.bg}">${escHtml(ideMeta.short)}</span>
           <span class="embed-scope-sep" aria-hidden="true">·</span>
           <span class="embed-scope-name">${escHtml(trunc(scopeLabel, 32))}</span>
         `;
+        if (this.lastScopeChipHtml !== chipHtml) {
+          scopeChip.innerHTML = chipHtml;
+          this.lastScopeChipHtml = chipHtml;
+        }
       }
       if (sheetProjWrap) sheetProjWrap.hidden = true;
       if (sheetTitle) sheetTitle.textContent = `${ideMeta.label} Sessions`;
@@ -345,10 +371,14 @@ export class ContextBar {
       if (scopeChip) {
         scopeChip.hidden = false;
         scopeChip.title = `Scoped to ${ideMeta.label}`;
-        scopeChip.innerHTML = `
+        const chipHtml = `
           <span class="ide-chip" style="color:${ideMeta.color};border-color:${ideMeta.border};background:${ideMeta.bg}">${escHtml(ideMeta.short)}</span>
           <span class="embed-scope-name">${escHtml(ideMeta.label)}</span>
         `;
+        if (this.lastScopeChipHtml !== chipHtml) {
+          scopeChip.innerHTML = chipHtml;
+          this.lastScopeChipHtml = chipHtml;
+        }
       }
       if (sheetProjWrap) sheetProjWrap.hidden = false;
       if (sheetTitle) sheetTitle.textContent = `${ideMeta.label} Sessions & Projects`;
@@ -567,8 +597,14 @@ export class ContextBar {
             })
             .join("");
 
-    const bindList = (container: Element | null, closeAfter: () => void) => {
-      if (!container) return;
+    const bindList = (
+      container: HTMLElement | null,
+      prevHtml: string,
+      closeAfter: () => void
+    ): string => {
+      if (!container) return prevHtml;
+      if (html === prevHtml) return prevHtml;
+      const prevScrollTop = container.scrollTop;
       container.innerHTML = html;
       container.querySelectorAll<HTMLButtonElement>("[data-session-id]").forEach((btn) => {
         btn.addEventListener("click", () => {
@@ -588,14 +624,26 @@ export class ContextBar {
         this.cb.onResetFilters();
         closeAfter();
       });
+      if (prevScrollTop > 0) {
+        container.scrollTop = prevScrollTop;
+      }
+      return html;
     };
 
-    bindList(this.root.querySelector("[data-pop-list]"), () => {
-      this.popoverOpen = false;
-      this.updateSessionMenu();
-    });
-    bindList(this.sheetDialog?.querySelector("[data-sheet-list]") ?? null, () => {
-      this.sheetDialog?.close();
-    });
+    this.lastPopListHtml = bindList(
+      this.root.querySelector<HTMLElement>("[data-pop-list]"),
+      this.lastPopListHtml,
+      () => {
+        this.popoverOpen = false;
+        this.updateSessionMenu();
+      }
+    );
+    this.lastSheetListHtml = bindList(
+      this.sheetDialog?.querySelector<HTMLElement>("[data-sheet-list]") ?? null,
+      this.lastSheetListHtml,
+      () => {
+        this.sheetDialog?.close();
+      }
+    );
   }
 }

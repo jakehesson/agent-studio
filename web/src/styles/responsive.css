@@ -1,3 +1,6 @@
+/* Cascade Invariant: Keep @media (pointer: coarse) touch-target minimums (44px) at the bottom
+   of this file so narrower < 640px layout rules never silently shrink touch targets. */
+
 /* ==========================================================================
    Galaxy Z Fold 7 & Desktop Three-Tier Responsive Architecture
    Tier 1: Cover Screen (< 640px, ~360-412px) — Single-screen 100dvh + Bottom Nav
@@ -21,87 +24,6 @@
   .legend {
     gap: 7px;
     font-size: 10.5px;
-  }
-}
-
-/* Touch Ergonomics (44px tap targets on phones & foldables; hide desktop kbd hints) */
-@media (pointer: coarse) {
-  :root {
-    --target-size: 44px;
-  }
-  .tl-btn {
-    min-height: 40px;
-    min-width: 40px;
-  }
-  .tl-btn.play {
-    min-width: 46px;
-  }
-  .live-pill {
-    min-height: 40px;
-    padding: 6px 12px;
-  }
-  .tl-track-wrap {
-    height: 36px;
-  }
-  .tl-thumb {
-    width: 20px;
-    height: 20px;
-  }
-  .tl-hint {
-    display: none;
-  }
-  .copy-btn,
-  .guide-copy-btn {
-    min-height: 44px;
-    padding: 6px 14px;
-  }
-  .insp-icon-btn {
-    min-width: 44px;
-    min-height: 44px;
-  }
-  .guide-tab,
-  .ide-guide-jump,
-  .feed-mode-btn {
-    min-height: 44px;
-  }
-  .mr-select,
-  .rm-select,
-  .mi-select,
-  .mi-radio-label,
-  .mi-check-label,
-  .mi-mini-btn,
-  .model-routing-bar button,
-  .model-index-dialog button,
-  .model-index-dialog input:not([type="checkbox"], [type="radio"]),
-  .model-index-dialog select,
-  .team-detail-dialog button,
-  .team-detail-dialog input:not([type="checkbox"], [type="radio"]),
-  .team-detail-dialog select,
-  .roster-card-foot button,
-  .team-custom-jump-pill,
-  .team-catalog-hint-btn,
-  .ev-read-btn,
-  .reader-head button,
-  .reader-mode-btn,
-  .reader-code-copy,
-  .reader-file-chip,
-  .reader-retry-btn,
-  .reader-sections-toggle,
-  .reader-toc-drawer-nav .reader-toc-link {
-    min-block-size: 44px;
-    min-inline-size: 44px;
-  }
-  .reader-toc-drawer-nav .reader-toc-link {
-    display: flex;
-    align-items: center;
-  }
-  .model-index-dialog input:not([type="checkbox"], [type="radio"]),
-  .model-index-dialog select,
-  .team-detail-dialog input:not([type="checkbox"], [type="radio"]),
-  .team-detail-dialog select,
-  .mr-select,
-  .rm-select {
-    font-size: max(1rem, 1em);
   }
 }
 
@@ -227,8 +149,13 @@
   .brand-sub,
   .primary-tabs,
   .legend,
-  .tl-hint {
+  .tl-hint,
+  .feedback-btn-label {
     display: none;
+  }
+
+  .feedback-trigger {
+    padding: 6px 8px;
   }
 
   .ctx-controls-row {
@@ -302,6 +229,36 @@
     border: none;
     border-top: 1px solid var(--border-strong);
     border-radius: 16px 16px 0 0;
+  }
+
+  .feedback-dialog {
+    margin: auto 0 0 0;
+    width: 100%;
+    max-width: 100%;
+    max-height: 90dvh;
+    border: none;
+    border-top: 1px solid var(--border-strong);
+    border-radius: 16px 16px 0 0;
+  }
+
+  .fb-shell {
+    max-height: 90dvh;
+  }
+
+  .fb-sheet-foot {
+    flex-direction: column;
+    align-items: stretch;
+    padding: 10px 14px max(12px, env(safe-area-inset-bottom, 0px));
+  }
+
+  .fb-foot-actions {
+    flex-direction: column-reverse;
+    align-items: stretch;
+    width: 100%;
+  }
+
+  .fb-foot-actions > button {
+    width: 100%;
   }
 
   .insp-sheet-shell {
@@ -535,6 +492,12 @@
   }
 }
 
+@media (max-width: 639px) and (pointer: fine) {
+  .feedback-trigger {
+    min-inline-size: 36px;
+  }
+}
+
 @media (max-width: 400px) {
   .timeline-bar [data-tl="home"] {
     display: none;
@@ -611,5 +574,96 @@
   }
   .reader-toc-drawer {
     display: none !important;
+  }
+}
+
+/* Touch Ergonomics (44px tap targets on phones & foldables; hide desktop kbd hints) */
+@media (pointer: coarse) {
+  :root {
+    --target-size: 44px;
+  }
+  .tl-btn {
+    min-height: 40px;
+    min-width: 40px;
+  }
+  .tl-btn.play {
+    min-width: 46px;
+  }
+  .live-pill {
+    min-height: 40px;
+    padding: 6px 12px;
+  }
+  .tl-track-wrap {
+    height: 36px;
+  }
+  .tl-thumb {
+    width: 20px;
+    height: 20px;
+  }
+  .tl-hint {
+    display: none;
+  }
+  .copy-btn,
+  .guide-copy-btn {
+    min-height: 44px;
+    padding: 6px 14px;
+  }
+  .insp-icon-btn {
+    min-width: 44px;
+    min-height: 44px;
+  }
+  .guide-tab,
+  .ide-guide-jump,
+  .feed-mode-btn {
+    min-height: 44px;
+  }
+  .mr-select,
+  .rm-select,
+  .mi-select,
+  .mi-radio-label,
+  .mi-check-label,
+  .mi-mini-btn,
+  .model-routing-bar button,
+  .model-index-dialog button,
+  .model-index-dialog input:not([type="checkbox"], [type="radio"]),
+  .model-index-dialog select,
+  .team-detail-dialog button,
+  .team-detail-dialog input:not([type="checkbox"], [type="radio"]),
+  .team-detail-dialog select,
+  .roster-card-foot button,
+  .team-custom-jump-pill,
+  .team-catalog-hint-btn,
+  .ev-read-btn,
+  .reader-head button,
+  .reader-mode-btn,
+  .reader-code-copy,
+  .reader-file-chip,
+  .reader-retry-btn,
+  .reader-sections-toggle,
+  .reader-toc-drawer-nav .reader-toc-link,
+  .feedback-trigger,
+  .feedback-dialog button,
+  .feedback-dialog input:not([type="checkbox"], [type="radio"]),
+  .feedback-dialog textarea,
+  .fb-cat-pill,
+  .fb-diag-toggle,
+  .fb-preview-summary,
+  .fb-issue-link {
+    min-block-size: 44px;
+    min-inline-size: 44px;
+  }
+  .reader-toc-drawer-nav .reader-toc-link {
+    display: flex;
+    align-items: center;
+  }
+  .model-index-dialog input:not([type="checkbox"], [type="radio"]),
+  .model-index-dialog select,
+  .team-detail-dialog input:not([type="checkbox"], [type="radio"]),
+  .team-detail-dialog select,
+  .feedback-dialog input:not([type="checkbox"], [type="radio"]),
+  .feedback-dialog textarea,
+  .mr-select,
+  .rm-select {
+    font-size: max(1rem, 1em);
   }
 }

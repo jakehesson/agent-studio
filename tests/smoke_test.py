@@ -59,7 +59,14 @@ def main() -> int:
             scripts = re.findall(r"<script(?:\s[^>]*)?>(.*?)</script>", html_src, re.S)
             assert scripts, f"Missing <script> block in {label}"
             for idx, js_code in enumerate(scripts, start=1):
-                proc = subprocess.run(["node", "--check"], input=js_code, capture_output=True, text=True)
+                proc = subprocess.run(
+                    ["node", "--check"],
+                    input=js_code,
+                    capture_output=True,
+                    text=True,
+                    encoding="utf-8",
+                    errors="replace",
+                )
                 if proc.returncode != 0:
                     print(f"[FAIL] node --check ({label} script #{idx}):\n{proc.stderr}", file=sys.stderr)
                     return 1
