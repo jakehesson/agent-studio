@@ -5,6 +5,13 @@ All notable changes to **Agent Studio** will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.11.1] - 2026-11-25
+
+### Fixed
+- **Live SSE Test Reliability (`tests/unit/server.test.ts`):**
+  - Reused `pendingRead` across 100ms timer ticks in the live SSE `readUntil` helper to eliminate a `ReadableStreamDefaultReader.read()` race where abandoned concurrent reads could swallow SSE chunks under CI load.
+- Includes all **0.11.0** improvements: VS Code / Copilot & GitHub Enterprise feed parity (`S1-56`) and token/context usage accuracy (`BUG-20`).
+
 ## [0.11.0] - 2026-11-25
 
 ### Added
