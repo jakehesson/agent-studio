@@ -49,7 +49,7 @@ async function bootMcpApp(): Promise<void> {
   const mountEl = document.getElementById("app");
   if (!mountEl) return;
 
-  const mcpApp = new App({ name: "Agent Studio", version: "0.14.0" }, {});
+  const mcpApp = new App({ name: "Agent Studio", version: "0.15.0" }, {});
   setMcpAppTransport(mcpApp as unknown as McpAppClientLike);
   setMcpChatLoader(async (params) =>
     withMcpConcurrencySlot(async () => {
@@ -160,7 +160,10 @@ async function bootMcpApp(): Promise<void> {
       isEmbed: false,
     }),
     onReplyToHost: async (req) => {
-      const canSend = Boolean(mcpApp.getHostCapabilities()?.message) && !req.blockingToolCall;
+      const canSend =
+        Boolean(mcpApp.getHostCapabilities()?.message) &&
+        !req.directReply &&
+        !req.blockingToolCall;
       if (canSend) {
         try {
           const res = await mcpApp.sendMessage({

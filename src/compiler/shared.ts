@@ -240,6 +240,9 @@ export function renderSharedTeamRules(
       `- **Protected Board File:** Never hand-edit \`${manifest.workflow.boardPath}\`; use the \`agent-studio\` MCP \`board\` and \`testrun\` tools exclusively.`,
     );
   }
+  guardrails.push(
+    "- **Human Questions:** When Agent Studio is active, prefer `ask_human` (MCP) or `agent_studio_ask_human` (VS Code LM tool) so the user can answer directly in Messages; fall back to your native ask-user tool if unavailable or offline.",
+  );
 
   return [
     `# ${manifest.project.title} — Agent Studio Team Rules`,

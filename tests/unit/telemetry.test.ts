@@ -6437,6 +6437,133 @@ describe("Hybrid Telemetry Adapters, Deduplication, State Machine & hook-emit", 
     assert.ok(openSpawns.size <= MAX_CORRELATION_ENTRIES, `openUnlinkedSpawns (${openSpawns.size}) must be <= ${MAX_CORRELATION_ENTRIES}`);
     assert.ok(subParents.size <= MAX_CORRELATION_ENTRIES, `subagentToParent (${subParents.size}) must be <= ${MAX_CORRELATION_ENTRIES}`);
   });
+
+  it("S1-76 Normalizer: subagent isHumanAnswer creates human -> subagent edge & clears waiting; >200 thinking_start events strip older payload.body", () => {
+    const baseEp = Date.parse("2026-11-26T16:00:00Z") / 1000;
+    const events: EnrichedEvent[] = [
+      {
+        id: "ev-spawn",
+        ts: toIsoTest(baseEp),
+        epoch: baseEp,
+        ide: "antigravity",
+        channel: "passive",
+        sessionId: "s-norm-76",
+        agentId: "root",
+        targetAgentId: "backend-engineer",
+        kind: "subagent_spawn",
+        toolCallId: "spawn-1",
+        summary: "Spawned Backend Engineer",
+      },
+      {
+        id: "ev-sub-ask",
+        ts: toIsoTest(baseEp + 1),
+        epoch: baseEp + 1,
+        ide: "antigravity",
+        channel: "passive",
+        sessionId: "s-norm-76",
+        agentId: "backend-engineer",
+        parentAgentId: "root",
+        targetAgentId: "human",
+        kind: "tool_start",
+        toolName: "ask_question",
+        toolCallId: "sub-ask-1",
+        waitingReason: "user",
+        summary: "Which schema field?",
+        payload: {
+          questions: [{ question: "Which schema field?", options: ["id", "slug"] }],
+          promptKind: "question",
+          blockingToolCall: true,
+        },
+      },
+      {
+        id: "ev-sub-ans",
+        ts: toIsoTest(baseEp + 2),
+        epoch: baseEp + 2,
+        ide: "antigravity",
+        channel: "passive",
+        sessionId: "s-norm-76",
+        agentId: "backend-engineer",
+        parentAgentId: "root",
+        targetAgentId: "backend-engineer",
+        kind: "user_input",
+        toolCallId: "sub-ask-1:answer",
+        summary: "Human: Use slug",
+        bodyLength: 8,
+        bodyTruncated: false,
+        payload: {
+          isHumanAnswer: true,
+          questionToolCallId: "sub-ask-1",
+          questionPrompt: "Which schema field?",
+          targetAgentId: "backend-engineer",
+          body: "Use slug",
+        },
+      },
+    ];
+
+    for (let i = 0; i < 215; i++) {
+      const isMediumUnsetTruncated = i < 10;
+      const bodyStr = isMediumUnsetTruncated
+        ? `Thought body ${i} ` + "M".repeat(220)
+        : `Thought body ${i}`;
+      events.push({
+        id: `ev-think-${i}`,
+        ts: toIsoTest(baseEp + 10 + i * 0.1),
+        epoch: baseEp + 10 + i * 0.1,
+        ide: "antigravity",
+        channel: "passive",
+        sessionId: "s-norm-76",
+        agentId: "backend-engineer",
+        parentAgentId: "root",
+        kind: "thinking_start",
+        summary: `Thought ${i}`,
+        ...(isMediumUnsetTruncated
+          ? { bodyTruncated: false }
+          : { bodyLength: 1200, bodyTruncated: true }),
+        payload: {
+          isThought: true,
+          body: bodyStr,
+        },
+      });
+    }
+
+    const snap = buildSessionSnapshot(events, {
+      sessionId: "s-norm-76",
+      ide: "antigravity",
+      nowEpochSec: baseEp + 40,
+    });
+
+    const sub = snap.agents.find((a) => a.id === "backend-engineer")!;
+    assert.ok(sub);
+    assert.equal(sub.pendingPrompt, null, "human answer must clear subagent pendingPrompt");
+    assert.equal(sub.status, "THINKING");
+    assert.equal(snap.pendingPrompts?.length ?? 0, 0);
+    assert.equal(snap.waitingOn, "subagent:backend-engineer");
+    assert.equal(snap.agents.find((a) => a.id === "human")?.messagesSent, 1);
+    assert.ok(
+      snap.edges.some((e) => e.from === "human" && e.to === "backend-engineer"),
+      "must record human -> subagent edge when isHumanAnswer is true",
+    );
+    const ansAct = snap.activity.find(
+      (a) => a.from === "human" && a.to === "backend-engineer" && a.kind === "human",
+    );
+    assert.ok(ansAct, "must record human -> subagent activity item");
+    assert.equal(ansAct.body, "Use slug");
+
+    const thinkEvents = snap.events.filter((e) => e.kind === "thinking_start");
+    assert.equal(thinkEvents.length, 215);
+    for (let i = 0; i < 15; i++) {
+      assert.equal(thinkEvents[i]!.payload?.body, undefined, `oldest thinking #${i} body must be stripped`);
+      assert.equal(thinkEvents[i]!.summary, `Thought ${i}`);
+      assert.equal(
+        thinkEvents[i]!.bodyLength,
+        i < 10 ? (`Thought body ${i} `.length + 220) : 1200,
+      );
+      assert.equal(thinkEvents[i]!.bodyTruncated, true);
+    }
+    for (let i = 15; i < 215; i++) {
+      assert.equal(thinkEvents[i]!.payload?.body, `Thought body ${i}`, `latest 200 thinking #${i} must keep body`);
+    }
+  });
 });
 
 function toIsoTest(epochSec: number): string {

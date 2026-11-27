@@ -26,6 +26,8 @@ import type {
   ModelIndexView,
   ModelRoutingPolicy,
   ModelTier,
+  PendingHumanPrompt,
+  PromptStatus,
   RegisteredProject,
   SessionSnapshot,
   SessionsResponse,
@@ -459,6 +461,213 @@ export function cleanMcpArgs(
   args: Record<string, unknown>
 ): Record<string, unknown> {
   return cleanArgs(args);
+}
+
+export interface AnswerPendingPromptPayload {
+  answerText: string;
+  answers?: Record<string, string | string[]>;
+  responder?: string;
+}
+
+export interface PromptResolutionResult {
+  ok: boolean;
+  conflict?: boolean;
+  notFound?: boolean;
+  status?: PromptStatus;
+  prompt?: PendingHumanPrompt | null;
+  error?: string;
+}
+
+function normalizePromptStatusValue(raw: unknown): PromptStatus | undefined {
+  if (
+    raw === "pending" ||
+    raw === "answered" ||
+    raw === "canceled" ||
+    raw === "expired"
+  ) {
+    return raw;
+  }
+  return undefined;
+}
+
+function parseMcpResolutionResult(
+  res: McpToolCallResult,
+  defaultStatus: PromptStatus
+): PromptResolutionResult {
+  const textBlocks = (res.content ?? [])
+    .filter((c) => c && c.type === "text" && typeof c.text === "string")
+    .map((c) => c.text ?? "");
+  const combinedText = textBlocks.join("\n").trim();
+
+  let rec = asRecord(res.structuredContent);
+  if (Object.keys(rec).length === 0 && combinedText) {
+    try {
+      rec = asRecord(JSON.parse(combinedText));
+    } catch {
+      // Non-JSON text
+    }
+  }
+
+  const errText =
+    typeof rec.error === "string" && rec.error
+      ? rec.error
+      : combinedText || undefined;
+  const status = normalizePromptStatusValue(rec.status);
+  const conflict =
+    rec.conflict === true ||
+    /already\s+resolved|conflict|\b409\b/i.test(errText ?? "");
+  const notFound =
+    rec.notFound === true || /\b404\b|not\s+found/i.test(errText ?? "");
+
+  if (res.isError || rec.ok === false || conflict) {
+    return {
+      ok: false,
+      ...(conflict ? { conflict: true } : {}),
+      ...(notFound ? { notFound: true } : {}),
+      ...(status ? { status } : {}),
+      ...(rec.prompt !== undefined
+        ? { prompt: normalizePendingHumanPrompt(rec.prompt) }
+        : {}),
+      error: conflict
+        ? errText || "Already resolved"
+        : errText || "Prompt resolution failed",
+    };
+  }
+
+  return {
+    ok: true,
+    status: status ?? defaultStatus,
+    ...(rec.prompt !== undefined
+      ? { prompt: normalizePendingHumanPrompt(rec.prompt) }
+      : {}),
+  };
+}
+
+async function resolvePromptViaTransport(
+  toolName: "app_answer_prompt" | "app_cancel_prompt",
+  httpPath: string,
+  args: Record<string, unknown>,
+  defaultStatus: PromptStatus
+): Promise<PromptResolutionResult> {
+  if (mcpTransport) {
+    const client = mcpTransport;
+    try {
+      const res = await withMcpConcurrencySlot(() =>
+        client.callServerTool({
+          name: toolName,
+          arguments: cleanArgs(args),
+        })
+      );
+      return parseMcpResolutionResult(res, defaultStatus);
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      const conflict = /already\s+resolved|conflict|\b409\b/i.test(msg);
+      return {
+        ok: false,
+        ...(conflict ? { conflict: true } : {}),
+        error: conflict ? "Already resolved" : msg,
+      };
+    }
+  }
+
+  try {
+    const res = await fetch(httpPath, {
+      method: "POST",
+      cache: "no-store",
+      headers: {
+        Accept: "application/json",
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify(cleanArgs(args)),
+    });
+    const raw = (await res.json().catch(() => ({}))) as Record<string, unknown>;
+    const status = normalizePromptStatusValue(raw.status);
+    const prompt =
+      raw.prompt !== undefined ? normalizePendingHumanPrompt(raw.prompt) : undefined;
+    const rawError = typeof raw.error === "string" && raw.error ? raw.error : undefined;
+
+    if (res.status === 409) {
+      return {
+        ok: false,
+        conflict: true,
+        ...(status ? { status } : {}),
+        ...(prompt !== undefined ? { prompt } : {}),
+        error: rawError || "Already resolved",
+      };
+    }
+    if (res.status === 404) {
+      return {
+        ok: false,
+        notFound: true,
+        ...(status ? { status } : {}),
+        error: rawError || "Prompt not found or already resolved",
+      };
+    }
+    if (!res.ok || raw.ok === false) {
+      return {
+        ok: false,
+        ...(status ? { status } : {}),
+        error: rawError || `HTTP ${res.status} ${res.statusText}`.trim(),
+      };
+    }
+
+    return {
+      ok: true,
+      status: status ?? defaultStatus,
+      ...(prompt !== undefined ? { prompt } : {}),
+    };
+  } catch (err) {
+    return {
+      ok: false,
+      error: err instanceof Error ? err.message : String(err),
+    };
+  }
+}
+
+export async function answerPendingPrompt(
+  promptId: string,
+  payload: AnswerPendingPromptPayload
+): Promise<PromptResolutionResult> {
+  const cleanId = promptId.trim();
+  if (!cleanId) {
+    return { ok: false, error: "Missing prompt ID" };
+  }
+  const cleanAnswer = payload.answerText.trim();
+  if (!cleanAnswer) {
+    return { ok: false, error: "Answer text cannot be empty" };
+  }
+  return resolvePromptViaTransport(
+    "app_answer_prompt",
+    `/api/prompts/${encodeURIComponent(cleanId)}/answer`,
+    {
+      promptId: cleanId,
+      answerText: cleanAnswer,
+      ...(payload.answers && Object.keys(payload.answers).length > 0
+        ? { answers: payload.answers }
+        : {}),
+      ...(payload.responder ? { responder: payload.responder } : {}),
+    },
+    "answered"
+  );
+}
+
+export async function cancelPendingPrompt(
+  promptId: string,
+  reason?: string
+): Promise<PromptResolutionResult> {
+  const cleanId = promptId.trim();
+  if (!cleanId) {
+    return { ok: false, error: "Missing prompt ID" };
+  }
+  return resolvePromptViaTransport(
+    "app_cancel_prompt",
+    `/api/prompts/${encodeURIComponent(cleanId)}/cancel`,
+    {
+      promptId: cleanId,
+      ...(reason?.trim() ? { reason: reason.trim() } : {}),
+    },
+    "canceled"
+  );
 }
 
 export interface EventBodyResult {

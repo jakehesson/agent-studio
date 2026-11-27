@@ -13,10 +13,143 @@ import {
 import {
   appendDeepLinkParams,
   isSessionWaitingForHuman,
+  type StudioView,
 } from "./scoping";
 import type { ServerManager } from "./serverManager";
 
-export type StudioViewName = "studio" | "board" | "team" | "mockups" | "doctor";
+export type StudioViewName = StudioView;
+
+const CONTROL_CHAR_RE = /[\x00-\x1f\x7f]/;
+const CONTROL_CHAR_GLOBAL_RE = /[\x00-\x1f\x7f]/g;
+
+export interface OpenChatTabMessage {
+  sessionId: string;
+  agentId: string;
+  agentLabel?: string;
+  focusQuestion: boolean;
+}
+
+export interface AgentChatTabTarget {
+  sessionId: string;
+  agentId: string;
+  agentLabel?: string;
+  focusQuestion?: boolean;
+}
+
+export function validateOpenChatTabMessage(
+  raw: unknown,
+): OpenChatTabMessage | null {
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) {
+    return null;
+  }
+  const obj = raw as Record<string, unknown>;
+  if (typeof obj.sessionId !== "string" || typeof obj.agentId !== "string") {
+    return null;
+  }
+  if (
+    CONTROL_CHAR_RE.test(obj.sessionId) ||
+    CONTROL_CHAR_RE.test(obj.agentId)
+  ) {
+    return null;
+  }
+  const sessionId = obj.sessionId.trim();
+  const agentId = obj.agentId.trim();
+  if (
+    sessionId.length === 0 ||
+    sessionId.length > 256 ||
+    agentId.length === 0 ||
+    agentId.length > 256
+  ) {
+    return null;
+  }
+
+  let agentLabel: string | undefined;
+  if (typeof obj.agentLabel === "string") {
+    const cleaned = obj.agentLabel
+      .replace(CONTROL_CHAR_GLOBAL_RE, "")
+      .trim()
+      .slice(0, 120)
+      .trim();
+    if (cleaned.length > 0) {
+      agentLabel = cleaned;
+    }
+  }
+
+  return {
+    sessionId,
+    agentId,
+    ...(agentLabel !== undefined ? { agentLabel } : {}),
+    focusQuestion: obj.focusQuestion === true,
+  };
+}
+
+export interface FocusIdeChatResult {
+  type: "agentStudio:focusIdeChatResult";
+  requestId: string;
+  ok: boolean;
+  message: string;
+}
+
+export async function handleFocusIdeChat(
+  rawRequestId: unknown,
+  deps: Pick<ReplyBridgeDeps, "getCommands" | "executeCommand">,
+): Promise<FocusIdeChatResult> {
+  const requestId =
+    typeof rawRequestId === "string" && rawRequestId.trim().length <= 256
+      ? rawRequestId.trim()
+      : "";
+
+  let chatCommandAvailable = false;
+  try {
+    const commands = await deps.getCommands(true);
+    chatCommandAvailable =
+      Array.isArray(commands) &&
+      commands.includes("workbench.action.chat.open");
+  } catch {
+    chatCommandAvailable = false;
+  }
+
+  if (chatCommandAvailable) {
+    try {
+      await deps.executeCommand("workbench.action.chat.open");
+      return {
+        type: "agentStudio:focusIdeChatResult",
+        requestId,
+        ok: true,
+        message: "Focused IDE chat.",
+      };
+    } catch {
+      // Fall through to unavailable response
+    }
+  }
+
+  return {
+    type: "agentStudio:focusIdeChatResult",
+    requestId,
+    ok: false,
+    message: "IDE chat command is not available in this host.",
+  };
+}
+
+export function formatAgentChatPanelTitle(
+  agentLabel?: string,
+  agentId?: string,
+): string {
+  const cleanLabel =
+    typeof agentLabel === "string"
+      ? agentLabel.replace(CONTROL_CHAR_GLOBAL_RE, "").trim()
+      : "";
+  const cleanId =
+    typeof agentId === "string"
+      ? agentId.replace(CONTROL_CHAR_GLOBAL_RE, "").trim()
+      : "";
+  const label = cleanLabel || cleanId || "Agent";
+  const full = `Chat: ${label}`;
+  if (full.length <= 48) {
+    return full;
+  }
+  return `${full.slice(0, 47).trimEnd()}…`;
+}
 
 export interface StudioPanelOpenOptions {
   sessionId?: string;
@@ -249,6 +382,717 @@ function getNonce(): string {
   return out;
 }
 
+interface SharedWebviewMessage {
+  type?: string;
+  uri?: string;
+  startLine?: number;
+  endLine?: number;
+  requestId?: unknown;
+  payload?: unknown;
+  url?: unknown;
+  sessionId?: unknown;
+  agentId?: unknown;
+  agentLabel?: unknown;
+  focusQuestion?: unknown;
+  text?: unknown;
+  blockingToolCall?: unknown;
+}
+
+async function handleOpenFileMessage(msg: {
+  uri: string;
+  startLine?: number;
+  endLine?: number;
+}): Promise<void> {
+  const allowedRoots = getDefaultAllowedRoots(
+    (vscode.workspace.workspaceFolders ?? []).map((f) => f.uri.fsPath),
+  );
+  const resolved = resolveAllowedFileUri(msg.uri, allowedRoots, {
+    startLine: msg.startLine,
+    endLine: msg.endLine,
+  });
+  if (!resolved.ok) {
+    void vscode.window.showWarningMessage(resolved.reason);
+    return;
+  }
+
+  try {
+    const st = await fs.promises.stat(resolved.fsPath);
+    if (!st.isFile()) {
+      void vscode.window.showWarningMessage(
+        `Cannot open path (not a file): ${resolved.fsPath}`,
+      );
+      return;
+    }
+  } catch {
+    void vscode.window.showWarningMessage(
+      `File not found: ${resolved.fsPath}`,
+    );
+    return;
+  }
+
+  try {
+    const doc = await vscode.workspace.openTextDocument(
+      vscode.Uri.file(resolved.fsPath),
+    );
+    let selection: vscode.Range | undefined;
+    if (resolved.startLine !== undefined) {
+      const maxLine = Math.max(0, doc.lineCount - 1);
+      const start = Math.min(Math.max(0, resolved.startLine - 1), maxLine);
+      const end =
+        resolved.endLine !== undefined
+          ? Math.min(Math.max(start, resolved.endLine - 1), maxLine)
+          : start;
+      const endChar =
+        resolved.endLine !== undefined && end > start
+          ? doc.lineAt(end).text.length
+          : 0;
+      selection = new vscode.Range(start, 0, end, endChar);
+    }
+    await vscode.window.showTextDocument(doc, {
+      viewColumn: vscode.ViewColumn.Beside,
+      preserveFocus: true,
+      ...(selection ? { selection } : {}),
+    });
+  } catch (err) {
+    void vscode.window.showWarningMessage(
+      `Failed to open file: ${err instanceof Error ? err.message : String(err)}`,
+    );
+  }
+}
+
+async function handleSharedWebviewMessage(
+  msg: SharedWebviewMessage,
+  panel: vscode.WebviewPanel,
+  serverManager: ServerManager,
+): Promise<boolean> {
+  if (msg?.type === "openExternal") {
+    await vscode.commands.executeCommand("agentStudio.openInBrowser");
+    return true;
+  }
+  if (msg?.type === "openFile" && typeof msg.uri === "string") {
+    await handleOpenFileMessage({
+      uri: msg.uri,
+      startLine: msg.startLine,
+      endLine: msg.endLine,
+    });
+    return true;
+  }
+  if (msg?.type === "agentStudio:openChatTab") {
+    const checked = validateOpenChatTabMessage(msg);
+    if (checked) {
+      await AgentChatPanel.createOrShow(serverManager, checked);
+    }
+    return true;
+  }
+  if (msg?.type === "agentStudio:focusIdeChat") {
+    const reply = await handleFocusIdeChat(msg.requestId, {
+      getCommands: async (filterInternal) =>
+        await vscode.commands.getCommands(filterInternal),
+      executeCommand: async (command, ...args) =>
+        await vscode.commands.executeCommand(command, ...args),
+    });
+    void panel.webview.postMessage(reply);
+    return true;
+  }
+  if (msg?.type === "agentStudio:feedbackStatusRequest") {
+    const auth = (
+      vscode as unknown as { authentication?: VscodeAuthLike }
+    ).authentication;
+    const reply = await handleFeedbackStatusRequest(msg.requestId, auth);
+    void panel.webview.postMessage(reply);
+    return true;
+  }
+  if (msg?.type === "agentStudio:submitFeedback") {
+    const auth = (
+      vscode as unknown as { authentication?: VscodeAuthLike }
+    ).authentication;
+    const extVersion = vscode.extensions.getExtension(
+      "agent-studio.agent-studio-vscode",
+    )?.packageJSON?.version;
+    const reply = await handleSubmitFeedback(msg.requestId, msg.payload, {
+      auth,
+      appVersion: typeof extVersion === "string" ? extVersion : undefined,
+    });
+    void panel.webview.postMessage(reply);
+    return true;
+  }
+  if (msg?.type === "agentStudio:openFeedbackUrl") {
+    const checked = validateFeedbackExternalUrl(msg.url);
+    if (!checked.ok) {
+      void vscode.window.showWarningMessage(
+        `Blocked unsafe feedback URL: ${checked.reason}`,
+      );
+      return true;
+    }
+    await vscode.env.openExternal(vscode.Uri.parse(checked.url));
+    return true;
+  }
+  if (msg?.type === "agentStudio:replyToAgent") {
+    const reply = await handleReplyToAgent(msg, {
+      writeClipboard: async (text) => {
+        await vscode.env.clipboard.writeText(text);
+      },
+      getCommands: async (filterInternal) =>
+        await vscode.commands.getCommands(filterInternal),
+      executeCommand: async (command, ...args) =>
+        await vscode.commands.executeCommand(command, ...args),
+    });
+    void panel.webview.postMessage(reply);
+    return true;
+  }
+  return false;
+}
+
+async function resolveExternalPanelUrl(rawTargetUrl: string): Promise<{
+  resolvedUrl: string;
+  expectedOrigin: string;
+}> {
+  let resolvedUrl = rawTargetUrl;
+  try {
+    const external = await vscode.env.asExternalUri(
+      vscode.Uri.parse(rawTargetUrl),
+    );
+    resolvedUrl = external.toString(true);
+  } catch {
+    resolvedUrl = rawTargetUrl;
+  }
+
+  let expectedOrigin = "";
+  try {
+    expectedOrigin = new URL(resolvedUrl).origin;
+  } catch {
+    expectedOrigin = "";
+  }
+  return { resolvedUrl, expectedOrigin };
+}
+
+function renderEmbeddedIframeHtml(opts: {
+  title: string;
+  resolvedUrl: string;
+  expectedOrigin: string;
+  online: boolean;
+}): string {
+  const nonce = getNonce();
+  const safeUrl = escapeHtml(opts.resolvedUrl);
+  const safeTitle = escapeHtml(opts.title);
+
+  return `<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline'; script-src 'nonce-${nonce}'; frame-src http://127.0.0.1:* http://localhost:* https:;" />
+  <title>${safeTitle}</title>
+  <style>
+    html, body {
+      margin: 0;
+      padding: 0;
+      width: 100%;
+      height: 100%;
+      overflow: hidden;
+      background: #0b1020;
+      color: #e2e8f0;
+      font-family: var(--vscode-font-family, system-ui, -apple-system, sans-serif);
+    }
+    .frame-host {
+      position: relative;
+      width: 100%;
+      height: 100%;
+    }
+    iframe {
+      border: 0;
+      width: 100%;
+      height: 100%;
+      display: block;
+      background: #0b1020;
+    }
+    .overlay {
+      position: absolute;
+      inset: 0;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      gap: 12px;
+      background: rgba(11, 16, 32, 0.94);
+      padding: 24px;
+      text-align: center;
+      z-index: 10;
+      transition: opacity 0.2s ease;
+    }
+    .overlay.hidden {
+      opacity: 0;
+      pointer-events: none;
+    }
+    .spinner {
+      width: 28px;
+      height: 28px;
+      border: 3px solid rgba(148, 163, 184, 0.25);
+      border-top-color: #a855f7;
+      border-radius: 50%;
+      animation: spin 0.8s linear infinite;
+    }
+    @keyframes spin { to { transform: rotate(360deg); } }
+    .title { font-size: 14px; font-weight: 600; color: #f8fafc; }
+    .sub { font-size: 12px; color: #94a3b8; max-width: 440px; word-break: break-all; }
+    .actions { display: flex; gap: 8px; margin-top: 6px; }
+    button {
+      background: #1e293b;
+      color: #f8fafc;
+      border: 1px solid #334155;
+      border-radius: 6px;
+      padding: 6px 12px;
+      font-size: 12px;
+      cursor: pointer;
+    }
+    button.primary {
+      background: #7c3aed;
+      border-color: #8b5cf6;
+    }
+    button:hover { filter: brightness(1.1); }
+  </style>
+</head>
+<body>
+  <div class="frame-host">
+    <div id="overlay" class="overlay">
+      <div class="spinner" id="spinner"></div>
+      <div class="title" id="statusTitle">${opts.online ? "Connecting to Agent Studio..." : "Agent Studio server is offline"}</div>
+      <div class="sub">${safeUrl}</div>
+      <div class="actions">
+        <button class="primary" id="retryBtn">Retry Connection</button>
+        <button id="browserBtn">Open in Browser</button>
+      </div>
+    </div>
+    <iframe
+      id="studioFrame"
+      src="${safeUrl}"
+      allow="clipboard-read; clipboard-write"
+      title="${safeTitle}"
+    ></iframe>
+  </div>
+  <script nonce="${nonce}">
+    const vscode = acquireVsCodeApi();
+    const frame = document.getElementById("studioFrame");
+    const overlay = document.getElementById("overlay");
+    const statusTitle = document.getElementById("statusTitle");
+    const spinner = document.getElementById("spinner");
+    let loaded = false;
+    let pendingFocusMessage = null;
+
+    frame.addEventListener("load", () => {
+      loaded = true;
+      overlay.classList.add("hidden");
+      if (pendingFocusMessage && expectedOrigin && frame.contentWindow) {
+        frame.contentWindow.postMessage(pendingFocusMessage, expectedOrigin);
+        pendingFocusMessage = null;
+      }
+    });
+
+    setTimeout(() => {
+      if (!loaded) {
+        spinner.style.display = "none";
+        statusTitle.textContent = "Unable to load Agent Studio iframe — check server or open in browser.";
+      }
+    }, 5000);
+
+    document.getElementById("retryBtn").addEventListener("click", () => {
+      vscode.postMessage({ type: "retry" });
+    });
+    document.getElementById("browserBtn").addEventListener("click", () => {
+      vscode.postMessage({ type: "openExternal" });
+    });
+
+    const expectedOrigin = ${JSON.stringify(opts.expectedOrigin)};
+    window.addEventListener("message", (event) => {
+      const data = event.data;
+      if (!data || typeof data !== "object") return;
+      if (event.source !== frame.contentWindow) {
+        if (
+          event.origin === window.location.origin &&
+          expectedOrigin &&
+          frame.contentWindow &&
+          (data.type === "agentStudio:feedbackStatus" ||
+            data.type === "agentStudio:submitFeedbackResult" ||
+            data.type === "agentStudio:feedbackSubmitResult" ||
+            data.type === "agentStudio:focusSession" ||
+            data.type === "agentStudio:showAgentChat" ||
+            data.type === "agentStudio:focusIdeChatResult" ||
+            data.type === "agentStudio:replyResult")
+        ) {
+          if (
+            (data.type === "agentStudio:focusSession" ||
+              data.type === "agentStudio:showAgentChat") &&
+            !loaded
+          ) {
+            pendingFocusMessage = data;
+          } else {
+            frame.contentWindow.postMessage(data, expectedOrigin);
+          }
+        }
+        return;
+      }
+      if (!expectedOrigin || event.origin !== expectedOrigin) return;
+      if ((data.type === "agentStudio.openFile" || data.type === "agentStudio:openFile") && typeof data.uri === "string") {
+        vscode.postMessage({
+          type: "openFile",
+          uri: data.uri,
+          startLine: typeof data.startLine === "number" ? data.startLine : undefined,
+          endLine: typeof data.endLine === "number" ? data.endLine : undefined,
+        });
+      } else if (data.type === "agentStudio:openChatTab") {
+        vscode.postMessage({
+          type: "agentStudio:openChatTab",
+          sessionId: typeof data.sessionId === "string" ? data.sessionId : "",
+          agentId: typeof data.agentId === "string" ? data.agentId : "",
+          ...(typeof data.agentLabel === "string" ? { agentLabel: data.agentLabel } : {}),
+          focusQuestion: data.focusQuestion === true,
+        });
+      } else if (data.type === "agentStudio:chatTabReady") {
+        vscode.postMessage({
+          type: "agentStudio:chatTabReady",
+        });
+      } else if (data.type === "agentStudio:focusIdeChat") {
+        vscode.postMessage({
+          type: "agentStudio:focusIdeChat",
+          requestId: typeof data.requestId === "string" ? data.requestId : "",
+        });
+      } else if (data.type === "agentStudio:feedbackStatusRequest") {
+        vscode.postMessage({
+          type: "agentStudio:feedbackStatusRequest",
+          requestId: typeof data.requestId === "string" ? data.requestId : "",
+        });
+      } else if (data.type === "agentStudio:submitFeedback") {
+        vscode.postMessage({
+          type: "agentStudio:submitFeedback",
+          requestId: typeof data.requestId === "string" ? data.requestId : "",
+          payload: data.payload,
+        });
+      } else if (data.type === "agentStudio:openFeedbackUrl" && typeof data.url === "string") {
+        vscode.postMessage({
+          type: "agentStudio:openFeedbackUrl",
+          url: data.url,
+        });
+      } else if (data.type === "agentStudio:replyToAgent") {
+        vscode.postMessage({
+          type: "agentStudio:replyToAgent",
+          requestId: typeof data.requestId === "string" ? data.requestId : "",
+          text: typeof data.text === "string" && data.text.length <= 65536 ? data.text : "",
+          blockingToolCall: typeof data.blockingToolCall === "boolean" ? data.blockingToolCall : null,
+        });
+      }
+    });
+  </script>
+</body>
+</html>`;
+}
+
+function normalizeAgentChatTarget(
+  target: AgentChatTabTarget,
+): OpenChatTabMessage {
+  const cleanLabel =
+    typeof target.agentLabel === "string"
+      ? target.agentLabel
+          .replace(CONTROL_CHAR_GLOBAL_RE, "")
+          .trim()
+          .slice(0, 120)
+          .trim()
+      : "";
+  return {
+    sessionId: target.sessionId.trim(),
+    agentId: target.agentId.trim(),
+    ...(cleanLabel ? { agentLabel: cleanLabel } : {}),
+    focusQuestion: target.focusQuestion === true,
+  };
+}
+
+export class AgentChatPanel {
+  public static currentPanel: AgentChatPanel | undefined;
+  public static readonly viewType = "agentStudio.chatPanel";
+  private static pendingCreate: Promise<void> | undefined;
+  private static latestCreateTarget: OpenChatTabMessage | undefined;
+
+  private readonly panel: vscode.WebviewPanel;
+  private readonly disposables: vscode.Disposable[] = [];
+  private currentTarget: OpenChatTabMessage;
+  private pendingTarget: OpenChatTabMessage | null = null;
+  private iframeReady = false;
+  private currentResolvedUrl = "";
+  private currentBaseOrigin = "";
+  private currentOnline = false;
+  private isDisposed = false;
+  private opSeq = 0;
+
+  private constructor(
+    panel: vscode.WebviewPanel,
+    private readonly serverManager: ServerManager,
+    initialTarget: OpenChatTabMessage,
+  ) {
+    this.panel = panel;
+    this.currentTarget = initialTarget;
+    this.panel.onDidDispose(() => this.dispose(), null, this.disposables);
+    if (typeof this.serverManager.onStatusChanged === "function") {
+      this.disposables.push(
+        this.serverManager.onStatusChanged((status) => {
+          if (this.isDisposed) return;
+          const wasOnline = this.currentOnline;
+          if (!wasOnline && status.online) {
+            void this.render(this.currentTarget, { force: true });
+          } else if (!status.online) {
+            this.currentOnline = false;
+          }
+        }),
+      );
+    }
+    this.panel.webview.onDidReceiveMessage(
+      async (msg: SharedWebviewMessage) => {
+        if (this.isDisposed) return;
+        if (msg?.type === "retry") {
+          await this.serverManager.ensureRunning(true);
+          if (this.isDisposed) return;
+          await this.render(this.currentTarget, { force: true });
+          return;
+        }
+        if (msg?.type === "agentStudio:chatTabReady") {
+          this.iframeReady = true;
+          if (this.pendingTarget) {
+            const next = this.pendingTarget;
+            this.pendingTarget = null;
+            await this.postShowAgentChat(next);
+          }
+          return;
+        }
+        await handleSharedWebviewMessage(msg, this.panel, this.serverManager);
+      },
+      null,
+      this.disposables,
+    );
+  }
+
+  private reserveTarget(target: OpenChatTabMessage): number {
+    this.currentTarget = target;
+    return ++this.opSeq;
+  }
+
+  public static async createOrShow(
+    serverManager: ServerManager,
+    target: AgentChatTabTarget,
+  ): Promise<void> {
+    const normalized = normalizeAgentChatTarget(target);
+    AgentChatPanel.latestCreateTarget = normalized;
+
+    if (
+      AgentChatPanel.currentPanel &&
+      !AgentChatPanel.currentPanel.isDisposed
+    ) {
+      const current = AgentChatPanel.currentPanel;
+      const seq = current.reserveTarget(normalized);
+      current.panel.title = formatAgentChatPanelTitle(
+        normalized.agentLabel,
+        normalized.agentId,
+      );
+      current.panel.reveal(
+        current.panel.viewColumn ?? vscode.ViewColumn.Beside,
+        false,
+      );
+      await serverManager.ensureRunning(true);
+      if (current.isDisposed || seq !== current.opSeq) {
+        return;
+      }
+      await current.applyTargetWithSeq(normalized, seq);
+      return;
+    }
+
+    if (AgentChatPanel.pendingCreate) {
+      await AgentChatPanel.pendingCreate;
+      return;
+    }
+
+    const createPromise = (async () => {
+      await serverManager.ensureRunning(true);
+
+      const finalTarget = AgentChatPanel.latestCreateTarget ?? normalized;
+      if (
+        AgentChatPanel.currentPanel &&
+        !AgentChatPanel.currentPanel.isDisposed
+      ) {
+        const existing = AgentChatPanel.currentPanel;
+        const seq = existing.reserveTarget(finalTarget);
+        existing.panel.title = formatAgentChatPanelTitle(
+          finalTarget.agentLabel,
+          finalTarget.agentId,
+        );
+        existing.panel.reveal(
+          existing.panel.viewColumn ?? vscode.ViewColumn.Beside,
+          false,
+        );
+        await existing.applyTargetWithSeq(finalTarget, seq);
+        return;
+      }
+
+      const panel = vscode.window.createWebviewPanel(
+        AgentChatPanel.viewType,
+        formatAgentChatPanelTitle(
+          finalTarget.agentLabel,
+          finalTarget.agentId,
+        ),
+        { viewColumn: vscode.ViewColumn.Beside, preserveFocus: false },
+        {
+          enableScripts: true,
+          retainContextWhenHidden: true,
+        },
+      );
+
+      const instance = new AgentChatPanel(panel, serverManager, finalTarget);
+      AgentChatPanel.currentPanel = instance;
+      const seq = instance.reserveTarget(finalTarget);
+      await instance.renderWithSeq(finalTarget, seq, { force: true });
+    })();
+
+    AgentChatPanel.pendingCreate = createPromise;
+    try {
+      await createPromise;
+    } finally {
+      if (AgentChatPanel.pendingCreate === createPromise) {
+        AgentChatPanel.pendingCreate = undefined;
+      }
+    }
+  }
+
+  private async postShowAgentChat(target: OpenChatTabMessage): Promise<void> {
+    if (this.isDisposed) return;
+    await this.panel.webview.postMessage({
+      type: "agentStudio:showAgentChat",
+      sessionId: target.sessionId,
+      agentId: target.agentId,
+      ...(target.agentLabel !== undefined
+        ? { agentLabel: target.agentLabel }
+        : {}),
+      focusQuestion: target.focusQuestion === true,
+    });
+  }
+
+  public async showTarget(target: AgentChatTabTarget): Promise<void> {
+    if (this.isDisposed) return;
+    const normalized = normalizeAgentChatTarget(target);
+    const seq = this.reserveTarget(normalized);
+    await this.applyTargetWithSeq(normalized, seq);
+  }
+
+  private async applyTargetWithSeq(
+    normalized: OpenChatTabMessage,
+    seq: number,
+  ): Promise<void> {
+    if (this.isDisposed || seq !== this.opSeq) return;
+    const status = this.serverManager.getStatus();
+    const rawTargetUrl = this.serverManager.buildViewUrl(
+      status.online ? status.localBaseUrl : status.browserBaseUrl,
+      "chat",
+      undefined,
+      {
+        embed: true,
+        sessionId: normalized.sessionId,
+        agentId: normalized.agentId,
+        focusQuestion: normalized.focusQuestion,
+      },
+    );
+    const { expectedOrigin } = await resolveExternalPanelUrl(rawTargetUrl);
+    if (this.isDisposed || seq !== this.opSeq) return;
+
+    if (
+      !status.online ||
+      !this.currentOnline ||
+      !this.currentResolvedUrl ||
+      !expectedOrigin ||
+      expectedOrigin !== this.currentBaseOrigin
+    ) {
+      await this.renderWithSeq(normalized, seq, { force: true });
+      return;
+    }
+
+    this.currentTarget = normalized;
+    if (this.iframeReady) {
+      await this.postShowAgentChat(normalized);
+    } else {
+      this.pendingTarget = normalized;
+    }
+  }
+
+  public async render(
+    target: AgentChatTabTarget,
+    opts?: { force?: boolean },
+  ): Promise<void> {
+    if (this.isDisposed) return;
+    const normalized = normalizeAgentChatTarget(target);
+    const seq = this.reserveTarget(normalized);
+    await this.renderWithSeq(normalized, seq, opts);
+  }
+
+  private async renderWithSeq(
+    normalized: OpenChatTabMessage,
+    seq: number,
+    opts?: { force?: boolean },
+  ): Promise<void> {
+    if (this.isDisposed || seq !== this.opSeq) return;
+    const status = this.serverManager.getStatus();
+    const rawTargetUrl = this.serverManager.buildViewUrl(
+      status.online ? status.localBaseUrl : status.browserBaseUrl,
+      "chat",
+      undefined,
+      {
+        embed: true,
+        sessionId: normalized.sessionId,
+        agentId: normalized.agentId,
+        focusQuestion: normalized.focusQuestion,
+      },
+    );
+    const { resolvedUrl, expectedOrigin } =
+      await resolveExternalPanelUrl(rawTargetUrl);
+    if (this.isDisposed || seq !== this.opSeq) return;
+
+    if (
+      !opts?.force &&
+      this.currentResolvedUrl &&
+      resolvedUrl === this.currentResolvedUrl &&
+      status.online === this.currentOnline
+    ) {
+      return;
+    }
+
+    this.iframeReady = false;
+    this.pendingTarget = null;
+    this.currentTarget = normalized;
+    this.currentResolvedUrl = resolvedUrl;
+    this.currentBaseOrigin = expectedOrigin;
+    this.currentOnline = status.online;
+
+    const title = formatAgentChatPanelTitle(
+      normalized.agentLabel,
+      normalized.agentId,
+    );
+    this.panel.title = title;
+    this.panel.webview.html = renderEmbeddedIframeHtml({
+      title,
+      resolvedUrl,
+      expectedOrigin,
+      online: status.online,
+    });
+  }
+
+  public dispose(): void {
+    if (this.isDisposed) return;
+    this.isDisposed = true;
+    this.opSeq++;
+    this.pendingTarget = null;
+    if (AgentChatPanel.currentPanel === this) {
+      AgentChatPanel.currentPanel = undefined;
+    }
+    this.panel.dispose();
+    while (this.disposables.length > 0) {
+      this.disposables.pop()?.dispose();
+    }
+  }
+}
+
 export class StudioPanel {
   public static currentPanel: StudioPanel | undefined;
   private readonly panel: vscode.WebviewPanel;
@@ -266,131 +1110,18 @@ export class StudioPanel {
     this.panel = panel;
     this.panel.onDidDispose(() => this.dispose(), null, this.disposables);
     this.panel.webview.onDidReceiveMessage(
-      async (msg: {
-        type?: string;
-        uri?: string;
-        startLine?: number;
-        endLine?: number;
-        requestId?: unknown;
-        payload?: unknown;
-        url?: unknown;
-      }) => {
+      async (msg: SharedWebviewMessage) => {
+        if (this.isDisposed) return;
         if (msg?.type === "retry") {
           await this.serverManager.ensureRunning(true);
           await this.render(this.currentView, this.currentSessionId, { force: true });
-        } else if (msg?.type === "openExternal") {
-          await vscode.commands.executeCommand("agentStudio.openInBrowser");
-        } else if (msg?.type === "openFile" && typeof msg.uri === "string") {
-          await this.handleOpenFileMessage({
-            uri: msg.uri,
-            startLine: msg.startLine,
-            endLine: msg.endLine,
-          });
-        } else if (msg?.type === "agentStudio:feedbackStatusRequest") {
-          const auth = (
-            vscode as unknown as { authentication?: VscodeAuthLike }
-          ).authentication;
-          const reply = await handleFeedbackStatusRequest(msg.requestId, auth);
-          void this.panel.webview.postMessage(reply);
-        } else if (msg?.type === "agentStudio:submitFeedback") {
-          const auth = (
-            vscode as unknown as { authentication?: VscodeAuthLike }
-          ).authentication;
-          const extVersion = vscode.extensions.getExtension(
-            "agent-studio.agent-studio-vscode",
-          )?.packageJSON?.version;
-          const reply = await handleSubmitFeedback(msg.requestId, msg.payload, {
-            auth,
-            appVersion: typeof extVersion === "string" ? extVersion : undefined,
-          });
-          void this.panel.webview.postMessage(reply);
-        } else if (msg?.type === "agentStudio:openFeedbackUrl") {
-          const checked = validateFeedbackExternalUrl(msg.url);
-          if (!checked.ok) {
-            void vscode.window.showWarningMessage(
-              `Blocked unsafe feedback URL: ${checked.reason}`,
-            );
-            return;
-          }
-          await vscode.env.openExternal(vscode.Uri.parse(checked.url));
-        } else if (msg?.type === "agentStudio:replyToAgent") {
-          const reply = await handleReplyToAgent(msg, {
-            writeClipboard: async (text) => {
-              await vscode.env.clipboard.writeText(text);
-            },
-            getCommands: async (filterInternal) =>
-              await vscode.commands.getCommands(filterInternal),
-            executeCommand: async (command, ...args) =>
-              await vscode.commands.executeCommand(command, ...args),
-          });
-          void this.panel.webview.postMessage(reply);
+          return;
         }
+        await handleSharedWebviewMessage(msg, this.panel, this.serverManager);
       },
       null,
       this.disposables,
     );
-  }
-
-  private async handleOpenFileMessage(msg: {
-    uri: string;
-    startLine?: number;
-    endLine?: number;
-  }): Promise<void> {
-    const allowedRoots = getDefaultAllowedRoots(
-      (vscode.workspace.workspaceFolders ?? []).map((f) => f.uri.fsPath),
-    );
-    const resolved = resolveAllowedFileUri(msg.uri, allowedRoots, {
-      startLine: msg.startLine,
-      endLine: msg.endLine,
-    });
-    if (!resolved.ok) {
-      void vscode.window.showWarningMessage(resolved.reason);
-      return;
-    }
-
-    try {
-      const st = await fs.promises.stat(resolved.fsPath);
-      if (!st.isFile()) {
-        void vscode.window.showWarningMessage(
-          `Cannot open path (not a file): ${resolved.fsPath}`,
-        );
-        return;
-      }
-    } catch {
-      void vscode.window.showWarningMessage(
-        `File not found: ${resolved.fsPath}`,
-      );
-      return;
-    }
-
-    try {
-      const doc = await vscode.workspace.openTextDocument(
-        vscode.Uri.file(resolved.fsPath),
-      );
-      let selection: vscode.Range | undefined;
-      if (resolved.startLine !== undefined) {
-        const maxLine = Math.max(0, doc.lineCount - 1);
-        const start = Math.min(Math.max(0, resolved.startLine - 1), maxLine);
-        const end =
-          resolved.endLine !== undefined
-            ? Math.min(Math.max(start, resolved.endLine - 1), maxLine)
-            : start;
-        const endChar =
-          resolved.endLine !== undefined && end > start
-            ? doc.lineAt(end).text.length
-            : 0;
-        selection = new vscode.Range(start, 0, end, endChar);
-      }
-      await vscode.window.showTextDocument(doc, {
-        viewColumn: vscode.ViewColumn.Beside,
-        preserveFocus: true,
-        ...(selection ? { selection } : {}),
-      });
-    } catch (err) {
-      void vscode.window.showWarningMessage(
-        `Failed to open file: ${err instanceof Error ? err.message : String(err)}`,
-      );
-    }
   }
 
   public static async createOrShow(
@@ -484,15 +1215,9 @@ export class StudioPanel {
       openChatAgentId: openOpts.openChatAgentId,
     });
 
-    let resolvedUrl = rawTargetUrl;
-    try {
-      const external = await vscode.env.asExternalUri(
-        vscode.Uri.parse(rawTargetUrl),
-      );
-      resolvedUrl = external.toString(true);
-    } catch {
-      resolvedUrl = rawTargetUrl;
-    }
+    const { resolvedUrl, expectedOrigin } =
+      await resolveExternalPanelUrl(rawTargetUrl);
+    if (this.isDisposed) return;
 
     if (
       !opts?.force &&
@@ -510,205 +1235,20 @@ export class StudioPanel {
     this.currentResolvedUrl = resolvedUrl;
     this.currentOnline = status.online;
 
-    const nonce = getNonce();
-    const safeUrl = escapeHtml(resolvedUrl);
-    let expectedOrigin = "";
-    try {
-      expectedOrigin = new URL(resolvedUrl).origin;
-    } catch {
-      expectedOrigin = "";
-    }
-
-    this.panel.webview.html = `<!DOCTYPE html>
-<html lang="en">
-<head>
-  <meta charset="UTF-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline'; script-src 'nonce-${nonce}'; frame-src http://127.0.0.1:* http://localhost:* https:;" />
-  <title>Agent Studio</title>
-  <style>
-    html, body {
-      margin: 0;
-      padding: 0;
-      width: 100%;
-      height: 100%;
-      overflow: hidden;
-      background: #0b1020;
-      color: #e2e8f0;
-      font-family: var(--vscode-font-family, system-ui, -apple-system, sans-serif);
-    }
-    .frame-host {
-      position: relative;
-      width: 100%;
-      height: 100%;
-    }
-    iframe {
-      border: 0;
-      width: 100%;
-      height: 100%;
-      display: block;
-      background: #0b1020;
-    }
-    .overlay {
-      position: absolute;
-      inset: 0;
-      display: flex;
-      flex-direction: column;
-      align-items: center;
-      justify-content: center;
-      gap: 12px;
-      background: rgba(11, 16, 32, 0.94);
-      padding: 24px;
-      text-align: center;
-      z-index: 10;
-      transition: opacity 0.2s ease;
-    }
-    .overlay.hidden {
-      opacity: 0;
-      pointer-events: none;
-    }
-    .spinner {
-      width: 28px;
-      height: 28px;
-      border: 3px solid rgba(148, 163, 184, 0.25);
-      border-top-color: #a855f7;
-      border-radius: 50%;
-      animation: spin 0.8s linear infinite;
-    }
-    @keyframes spin { to { transform: rotate(360deg); } }
-    .title { font-size: 14px; font-weight: 600; color: #f8fafc; }
-    .sub { font-size: 12px; color: #94a3b8; max-width: 440px; word-break: break-all; }
-    .actions { display: flex; gap: 8px; margin-top: 6px; }
-    button {
-      background: #1e293b;
-      color: #f8fafc;
-      border: 1px solid #334155;
-      border-radius: 6px;
-      padding: 6px 12px;
-      font-size: 12px;
-      cursor: pointer;
-    }
-    button.primary {
-      background: #7c3aed;
-      border-color: #8b5cf6;
-    }
-    button:hover { filter: brightness(1.1); }
-  </style>
-</head>
-<body>
-  <div class="frame-host">
-    <div id="overlay" class="overlay">
-      <div class="spinner" id="spinner"></div>
-      <div class="title" id="statusTitle">${status.online ? "Connecting to Agent Studio..." : "Agent Studio server is offline"}</div>
-      <div class="sub">${safeUrl}</div>
-      <div class="actions">
-        <button class="primary" id="retryBtn">Retry Connection</button>
-        <button id="browserBtn">Open in Browser</button>
-      </div>
-    </div>
-    <iframe
-      id="studioFrame"
-      src="${safeUrl}"
-      allow="clipboard-read; clipboard-write"
-      title="Agent Studio"
-    ></iframe>
-  </div>
-  <script nonce="${nonce}">
-    const vscode = acquireVsCodeApi();
-    const frame = document.getElementById("studioFrame");
-    const overlay = document.getElementById("overlay");
-    const statusTitle = document.getElementById("statusTitle");
-    const spinner = document.getElementById("spinner");
-    let loaded = false;
-    let pendingFocusMessage = null;
-
-    frame.addEventListener("load", () => {
-      loaded = true;
-      overlay.classList.add("hidden");
-      if (pendingFocusMessage && expectedOrigin && frame.contentWindow) {
-        frame.contentWindow.postMessage(pendingFocusMessage, expectedOrigin);
-        pendingFocusMessage = null;
-      }
+    this.panel.webview.html = renderEmbeddedIframeHtml({
+      title: "Agent Studio",
+      resolvedUrl,
+      expectedOrigin,
+      online: status.online,
     });
-
-    setTimeout(() => {
-      if (!loaded) {
-        spinner.style.display = "none";
-        statusTitle.textContent = "Unable to load Agent Studio iframe — check server or open in browser.";
-      }
-    }, 5000);
-
-    document.getElementById("retryBtn").addEventListener("click", () => {
-      vscode.postMessage({ type: "retry" });
-    });
-    document.getElementById("browserBtn").addEventListener("click", () => {
-      vscode.postMessage({ type: "openExternal" });
-    });
-
-    const expectedOrigin = ${JSON.stringify(expectedOrigin)};
-    window.addEventListener("message", (event) => {
-      const data = event.data;
-      if (!data || typeof data !== "object") return;
-      if (event.source !== frame.contentWindow) {
-        if (
-          event.origin === window.location.origin &&
-          expectedOrigin &&
-          frame.contentWindow &&
-          (data.type === "agentStudio:feedbackStatus" ||
-            data.type === "agentStudio:submitFeedbackResult" ||
-            data.type === "agentStudio:focusSession" ||
-            data.type === "agentStudio:replyResult")
-        ) {
-          if (data.type === "agentStudio:focusSession" && !loaded) {
-            pendingFocusMessage = data;
-          } else {
-            frame.contentWindow.postMessage(data, expectedOrigin);
-          }
-        }
-        return;
-      }
-      if (!expectedOrigin || event.origin !== expectedOrigin) return;
-      if (data.type === "agentStudio.openFile" && typeof data.uri === "string") {
-        vscode.postMessage({
-          type: "openFile",
-          uri: data.uri,
-          startLine: typeof data.startLine === "number" ? data.startLine : undefined,
-          endLine: typeof data.endLine === "number" ? data.endLine : undefined,
-        });
-      } else if (data.type === "agentStudio:feedbackStatusRequest") {
-        vscode.postMessage({
-          type: "agentStudio:feedbackStatusRequest",
-          requestId: typeof data.requestId === "string" ? data.requestId : "",
-        });
-      } else if (data.type === "agentStudio:submitFeedback") {
-        vscode.postMessage({
-          type: "agentStudio:submitFeedback",
-          requestId: typeof data.requestId === "string" ? data.requestId : "",
-          payload: data.payload,
-        });
-      } else if (data.type === "agentStudio:openFeedbackUrl" && typeof data.url === "string") {
-        vscode.postMessage({
-          type: "agentStudio:openFeedbackUrl",
-          url: data.url,
-        });
-      } else if (data.type === "agentStudio:replyToAgent") {
-        vscode.postMessage({
-          type: "agentStudio:replyToAgent",
-          requestId: typeof data.requestId === "string" ? data.requestId : "",
-          text: typeof data.text === "string" && data.text.length <= 65536 ? data.text : "",
-          blockingToolCall: typeof data.blockingToolCall === "boolean" ? data.blockingToolCall : null,
-        });
-      }
-    });
-  </script>
-</body>
-</html>`;
   }
 
   public dispose(): void {
     if (this.isDisposed) return;
     this.isDisposed = true;
-    StudioPanel.currentPanel = undefined;
+    if (StudioPanel.currentPanel === this) {
+      StudioPanel.currentPanel = undefined;
+    }
     this.panel.dispose();
     while (this.disposables.length > 0) {
       this.disposables.pop()?.dispose();

@@ -292,7 +292,11 @@ export function classifyEventReadable(
         tool === "askuserquestion" ||
         tool === "vscode_askquestions" ||
         tool === "questioncarousel" ||
-        tool === "elicitationserialized"
+        tool === "elicitationserialized" ||
+        tool === "ask_human" ||
+        tool === "agent_studio_ask_human" ||
+        tool === "mcp__agent-studio__ask_human" ||
+        tool === "agent-studio/ask_human"
       ) {
         return {
           badge: "Waiting",
@@ -791,7 +795,11 @@ export function classifyExternalTarget(toolName?: string): { id: string; label: 
     low === "vscode_askquestions" ||
     low === "questioncarousel" ||
     low === "elicitationserealized" ||
-    low === "elicitationserialized"
+    low === "elicitationserialized" ||
+    low === "ask_human" ||
+    low === "agent_studio_ask_human" ||
+    low === "mcp__agent-studio__ask_human" ||
+    low === "agent-studio/ask_human"
   ) {
     return { id: "ext:human", label: "User" };
   }

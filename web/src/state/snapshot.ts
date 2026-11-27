@@ -9,6 +9,8 @@ import type {
   PendingHumanPrompt,
   PendingQuestionItem,
   PendingQuestionOption,
+  PromptSource,
+  PromptStatus,
   SessionCounters,
   SessionSnapshot,
   SessionUsageSummary,
@@ -350,7 +352,11 @@ function isHumanPromptTool(toolName?: string): boolean {
     low === "askuserquestion" ||
     low === "vscode_askquestions" ||
     low === "questioncarousel" ||
-    low === "elicitationserialized"
+    low === "elicitationserialized" ||
+    low === "ask_human" ||
+    low === "agent_studio_ask_human" ||
+    low === "mcp__agent-studio__ask_human" ||
+    low === "agent-studio/ask_human"
   );
 }
 
@@ -1130,6 +1136,25 @@ function normalizePendingQuestionItem(raw: unknown): PendingQuestionItem | null 
   };
 }
 
+function normalizePromptSource(raw: unknown): PromptSource | undefined {
+  if (raw === "native" || raw === "studio-mcp" || raw === "studio-vscode-lm") {
+    return raw;
+  }
+  return undefined;
+}
+
+function normalizePromptStatus(raw: unknown): PromptStatus | undefined {
+  if (
+    raw === "pending" ||
+    raw === "answered" ||
+    raw === "canceled" ||
+    raw === "expired"
+  ) {
+    return raw;
+  }
+  return undefined;
+}
+
 export function normalizePendingHumanPrompt(raw: unknown): PendingHumanPrompt | null {
   if (!raw || typeof raw !== "object" || Array.isArray(raw)) return null;
   const r = raw as Record<string, unknown>;
@@ -1164,6 +1189,13 @@ export function normalizePendingHumanPrompt(raw: unknown): PendingHumanPrompt | 
     ];
   }
 
+  const promptSource = normalizePromptSource(r.promptSource);
+  const status = normalizePromptStatus(r.status);
+  const answers =
+    r.answers && typeof r.answers === "object" && !Array.isArray(r.answers)
+      ? (r.answers as Record<string, unknown>)
+      : undefined;
+
   return {
     id: id || `prompt-${agentId || "agent"}`,
     toolCallId: typeof r.toolCallId === "string" ? r.toolCallId : undefined,
@@ -1177,6 +1209,15 @@ export function normalizePendingHumanPrompt(raw: unknown): PendingHumanPrompt | 
     options: rawOptions,
     ts: typeof r.ts === "string" ? r.ts : undefined,
     blockingToolCall: Boolean(r.blockingToolCall),
+    ...(typeof r.directReply === "boolean" ? { directReply: r.directReply } : {}),
+    ...(promptSource ? { promptSource } : {}),
+    ...(status ? { status } : {}),
+    ...(typeof r.answerText === "string" ? { answerText: r.answerText } : {}),
+    ...(answers ? { answers } : {}),
+    ...(typeof r.expiresAt === "string" ? { expiresAt: r.expiresAt } : {}),
+    ...(typeof r.sessionId === "string" ? { sessionId: r.sessionId } : {}),
+    ...(typeof r.workspacePath === "string" ? { workspacePath: r.workspacePath } : {}),
+    ...(typeof r.ide === "string" ? { ide: r.ide as IdeSource } : {}),
   };
 }
 

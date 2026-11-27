@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import fs from "node:fs/promises";
+import http from "node:http";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, beforeEach, describe, it } from "node:test";
@@ -10,6 +11,7 @@ import {
   resolveProject,
 } from "../../src/board/index.js";
 import { createStudioServer } from "../../src/server/index.js";
+import { MAX_ACTIVE_PROMPTS } from "../../src/telemetry/index.js";
 
 describe("Unified Single-Port HTTP & SSE Server", () => {
   let tmpDir: string;
@@ -722,6 +724,410 @@ describe("Unified Single-Port HTTP & SSE Server", () => {
 
       await readUntil((s) => s.includes("Passive heartbeat update streamed!"));
       sseController.abort();
+    } finally {
+      await srv.close();
+    }
+  });
+
+  it("S1-77: serves /api/health, /api/prompts lifecycle, long-poll waitMs, 409/413/429, path guards, and strict Origin guard", async () => {
+    const ws1 = path.join(tmpDir, "pb-ws1");
+    const ws2 = path.join(tmpDir, "pb-ws2");
+    await fs.mkdir(ws1, { recursive: true });
+    await fs.mkdir(ws2, { recursive: true });
+
+    const srv = createStudioServer({
+      extraWorkspaces: [ws1, ws2],
+      includeGlobalTelemetryFile: false,
+      brainDir: path.join(tmpDir, "empty-brain"),
+      claudeDir: path.join(tmpDir, "empty-claude"),
+      vscodeDir: path.join(tmpDir, "empty-vscode"),
+      copilotHomeDir: path.join(tmpDir, "empty-cop"),
+    });
+    const { port } = await srv.listen(0, "127.0.0.1");
+    const base = `http://127.0.0.1:${port}`;
+
+    try {
+      // 1. /api/health with zero SSE clients
+      const h0 = await fetch(`${base}/api/health?workspace=${encodeURIComponent(ws1)}`);
+      assert.equal(h0.status, 200);
+      const h0Json = (await h0.json()) as {
+        ok: boolean;
+        sseClients: number;
+        matchingSseClients: number;
+        hasActiveUi: boolean;
+        activePromptCount: number;
+      };
+      assert.equal(h0Json.ok, true);
+      assert.equal(h0Json.sseClients, 0);
+      assert.equal(h0Json.hasActiveUi, false);
+      assert.equal(h0Json.activePromptCount, 0);
+
+      // Connect SSE client scoped to ws1
+      const sseAc = new AbortController();
+      const sseResp = await fetch(
+        `${base}/api/stream?workspace=${encodeURIComponent(ws1)}`,
+        { signal: sseAc.signal },
+      );
+      assert.equal(sseResp.status, 200);
+      const sseReader = sseResp.body!.getReader();
+      await sseReader.read();
+
+      const hWs1 = await (
+        await fetch(`${base}/api/health?workspace=${encodeURIComponent(ws1)}`)
+      ).json() as { hasActiveUi: boolean; matchingSseClients: number };
+      assert.equal(hWs1.hasActiveUi, true);
+      assert.equal(hWs1.matchingSseClients, 1);
+
+      const hWs2 = await (
+        await fetch(`${base}/api/health?workspace=${encodeURIComponent(ws2)}`)
+      ).json() as { hasActiveUi: boolean; matchingSseClients: number; sseClients: number };
+      assert.equal(hWs2.sseClients, 1);
+      assert.equal(hWs2.matchingSseClients, 0);
+      assert.equal(hWs2.hasActiveUi, false);
+
+      // 2. Origin guard rejects non-loopback Origin with 403 & no wildcard CORS
+      const evilCreate = await fetch(`${base}/api/prompts`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Origin: "https://evil.example.com",
+        },
+        body: JSON.stringify({ questions: [{ question: "Evil?" }] }),
+      });
+      assert.equal(evilCreate.status, 403);
+      assert.notEqual(evilCreate.headers.get("access-control-allow-origin"), "*");
+
+      // Loopback and vscode-webview origins are allowed
+      const webviewCreate = await fetch(`${base}/api/prompts`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Origin: "vscode-webview://1234-5678",
+        },
+        body: JSON.stringify({
+          title: "Choose DB",
+          questions: [
+            {
+              question: "Which DB?",
+              type: "single_select",
+              options: [{ label: "Postgres", recommended: true }, { label: "SQLite" }],
+            },
+          ],
+          workspacePath: ws1,
+          ide: "copilot-vscode",
+          promptSource: "studio-vscode-lm",
+        }),
+      });
+      assert.equal(webviewCreate.status, 201);
+      assert.equal(
+        webviewCreate.headers.get("access-control-allow-origin"),
+        "vscode-webview://1234-5678",
+      );
+      const createdJson = (await webviewCreate.json()) as {
+        ok: boolean;
+        prompt: { id: string; status: string };
+      };
+      const pid = createdJson.prompt.id;
+
+      // 3. GET /api/prompts filters & /:id path traversal guards
+      const listWs1 = (await (
+        await fetch(`${base}/api/prompts?workspace=${encodeURIComponent(ws1)}`)
+      ).json()) as { prompts: Array<{ id: string }> };
+      assert.equal(listWs1.prompts.length, 1);
+      const listWs2 = (await (
+        await fetch(`${base}/api/prompts?workspace=${encodeURIComponent(ws2)}`)
+      ).json()) as { prompts: Array<{ id: string }> };
+      assert.equal(listWs2.prompts.length, 0);
+
+      for (const badPath of [
+        "/api/prompts/foo%2Fbar",
+        "/api/prompts/foo%5Cbar",
+        "/api/prompts/foo..bar",
+      ]) {
+        const badRes = await fetch(`${base}${badPath}`);
+        assert.equal(badRes.status, 400);
+      }
+      for (const rawBadPath of ["/api/prompts/..", "/api/prompts/%2e%2e"]) {
+        const status = await new Promise<number>((resolve, reject) => {
+          const r = http.request(
+            { host: "127.0.0.1", port, path: rawBadPath, method: "GET" },
+            (resp) => {
+              resp.resume();
+              resolve(resp.statusCode ?? 0);
+            },
+          );
+          r.on("error", reject);
+          r.end();
+        });
+        assert.equal(status, 400, `raw path ${rawBadPath} must return 400`);
+      }
+      const missingRes = await fetch(`${base}/api/prompts/pb_nonexistent`);
+      assert.equal(missingRes.status, 404);
+
+      // 4. Long-poll waitMs wakes immediately when answered, and repeat answer returns 409
+      const waitPromise = fetch(`${base}/api/prompts/${pid}?waitMs=5000`);
+      await new Promise((r) => setTimeout(r, 40));
+      const ansRes = await fetch(`${base}/api/prompts/${pid}/answer`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Origin: "http://127.0.0.1:5173",
+        },
+        body: JSON.stringify({ answerText: "Postgres", responder: "human" }),
+      });
+      assert.equal(ansRes.status, 200);
+      const waitedJson = (await (await waitPromise).json()) as {
+        prompt: { status: string; answerText: string };
+      };
+      assert.equal(waitedJson.prompt.status, "answered");
+      assert.equal(waitedJson.prompt.answerText, "Postgres");
+
+      const repeatAns = await fetch(`${base}/api/prompts/${pid}/answer`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ answerText: "SQLite" }),
+      });
+      assert.equal(repeatAns.status, 409);
+
+      const repeatCancel = await fetch(`${base}/api/prompts/${pid}/cancel`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ reason: "too late" }),
+      });
+      assert.equal(repeatCancel.status, 409);
+
+      // 5. Payload caps: 64 KB on /answer and 8 KB on /cancel
+      const c2Res = await fetch(`${base}/api/prompts`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ questions: [{ question: "Cap test?" }], workspacePath: ws1 }),
+      });
+      assert.equal(c2Res.status, 201);
+      const c2Id = ((await c2Res.json()) as { prompt: { id: string } }).prompt.id;
+
+      const tooLargeAns = await fetch(`${base}/api/prompts/${c2Id}/answer`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ answerText: "x".repeat(70 * 1024) }),
+      });
+      assert.equal(tooLargeAns.status, 413);
+
+      const tooLargeCancel = await fetch(`${base}/api/prompts/${c2Id}/cancel`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ reason: "y".repeat(9 * 1024) }),
+      });
+      assert.equal(tooLargeCancel.status, 413);
+
+      const okCancel = await fetch(`${base}/api/prompts/${c2Id}/cancel`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ reason: "Aborted by user" }),
+      });
+      assert.equal(okCancel.status, 200);
+
+      // 6. Active prompt limit (64 -> 429)
+      for (let i = 0; i < MAX_ACTIVE_PROMPTS; i++) {
+        const r = await fetch(`${base}/api/prompts`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ questions: [{ question: `Cap ${i}` }] }),
+        });
+        assert.equal(r.status, 201);
+      }
+      const cap429 = await fetch(`${base}/api/prompts`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ questions: [{ question: "Over cap" }] }),
+      });
+      assert.equal(cap429.status, 429);
+
+      sseAc.abort();
+    } finally {
+      await srv.close();
+    }
+  });
+
+  it("S1-77 fix: DNS rebinding Host, Origin null, bad vscode-webview, no wildcard ACAO on prompt GET/OPTIONS, raw dot-segment ids, 512 KB cap, empty-workspace SSE health", async () => {
+    const ws1 = path.join(tmpDir, "fx-ws1");
+    const ws2 = path.join(tmpDir, "fx-ws2");
+    await fs.mkdir(ws1, { recursive: true });
+    await fs.mkdir(ws2, { recursive: true });
+    const srv = createStudioServer({
+      extraWorkspaces: [ws1, ws2],
+      includeGlobalTelemetryFile: false,
+      brainDir: path.join(tmpDir, "empty-brain"),
+      claudeDir: path.join(tmpDir, "empty-claude"),
+      vscodeDir: path.join(tmpDir, "empty-vscode"),
+      copilotHomeDir: path.join(tmpDir, "empty-cop"),
+    });
+    const { port } = await srv.listen(0, "127.0.0.1");
+    const base = `http://127.0.0.1:${port}`;
+
+    const raw = (opts: {
+      method?: string;
+      path: string;
+      headers?: Record<string, string>;
+      body?: string;
+    }): Promise<{ status: number; headers: http.IncomingHttpHeaders; body: string }> =>
+      new Promise((resolve, reject) => {
+        const r = http.request(
+          {
+            host: "127.0.0.1",
+            port,
+            path: opts.path,
+            method: opts.method ?? "GET",
+            headers: opts.headers,
+          },
+          (resp) => {
+            const chunks: Buffer[] = [];
+            resp.on("data", (c: Buffer) => chunks.push(c));
+            resp.on("end", () =>
+              resolve({
+                status: resp.statusCode ?? 0,
+                headers: resp.headers,
+                body: Buffer.concat(chunks).toString("utf8"),
+              }),
+            );
+          },
+        );
+        r.on("error", reject);
+        if (opts.body) r.write(opts.body);
+        r.end();
+      });
+
+    const createBody = JSON.stringify({
+      questions: [{ question: "Rebind?" }],
+      workspacePath: ws1,
+    });
+
+    try {
+      // DNS rebinding: non-loopback Host on loopback bind -> 403 (POST, GET, OPTIONS)
+      const rebindPost = await raw({
+        method: "POST",
+        path: "/api/prompts",
+        headers: {
+          Host: `evil.example.com:${port}`,
+          Origin: `http://evil.example.com:${port}`,
+          "Content-Type": "application/json",
+        },
+        body: createBody,
+      });
+      assert.equal(rebindPost.status, 403);
+      const rebindGet = await raw({
+        path: "/api/prompts",
+        headers: { Host: `evil.example.com:${port}` },
+      });
+      assert.equal(rebindGet.status, 403);
+      const rebindOptions = await raw({
+        method: "OPTIONS",
+        path: "/api/prompts",
+        headers: { Host: `evil.example.com:${port}` },
+      });
+      assert.equal(rebindOptions.status, 403);
+
+      // Origin: null -> 403
+      const nullOrigin = await fetch(`${base}/api/prompts`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", Origin: "null" },
+        body: createBody,
+      });
+      assert.equal(nullOrigin.status, 403);
+
+      // Malformed vscode-webview origins -> 403
+      for (const bad of [
+        "vscode-webview://",
+        "vscode-webview://abc/evil",
+        "vscode-webview://abc?x=1",
+        "vscode-webviewx://abc",
+      ]) {
+        const r = await fetch(`${base}/api/prompts`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json", Origin: bad },
+          body: createBody,
+        });
+        assert.equal(r.status, 403, `origin ${bad} must be rejected`);
+      }
+
+      // Valid loopback create
+      const created = await fetch(`${base}/api/prompts`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: createBody,
+      });
+      assert.equal(created.status, 201);
+      const pid = ((await created.json()) as { prompt: { id: string } }).prompt.id;
+
+      // No wildcard ACAO on GET list / GET :id / OPTIONS
+      const listRes = await fetch(`${base}/api/prompts`, {
+        headers: { Origin: "http://127.0.0.1:5173" },
+      });
+      assert.equal(listRes.status, 200);
+      assert.equal(
+        listRes.headers.get("access-control-allow-origin"),
+        "http://127.0.0.1:5173",
+      );
+      const listNoOrigin = await fetch(`${base}/api/prompts`);
+      assert.equal(listNoOrigin.headers.get("access-control-allow-origin"), null);
+      const getRes = await fetch(`${base}/api/prompts/${pid}`);
+      assert.equal(getRes.status, 200);
+      assert.notEqual(getRes.headers.get("access-control-allow-origin"), "*");
+      const evilGet = await fetch(`${base}/api/prompts/${pid}`, {
+        headers: { Origin: "https://evil.example.com" },
+      });
+      assert.equal(evilGet.status, 403);
+      const optRes = await fetch(`${base}/api/prompts/${pid}/answer`, {
+        method: "OPTIONS",
+      });
+      assert.equal(optRes.status, 204);
+      assert.notEqual(optRes.headers.get("access-control-allow-origin"), "*");
+
+      // Raw dot-segment / encoded separators on /answer & /cancel -> 400
+      for (const badPath of [
+        `/api/prompts/foo/../${pid}/answer`,
+        `/api/prompts/foo%2F..%2F${pid}/answer`,
+        `/api/prompts/%2e%2e/${pid}/cancel`,
+        `/api/prompts/foo%5C${pid}/cancel`,
+      ]) {
+        const r = await raw({
+          method: "POST",
+          path: badPath,
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ answerText: "hijack", reason: "hijack" }),
+        });
+        assert.equal(r.status, 400, `${badPath} must be rejected`);
+      }
+      const stillPending = (await (await fetch(`${base}/api/prompts/${pid}`)).json()) as {
+        prompt: { status: string };
+      };
+      assert.equal(stillPending.prompt.status, "pending");
+
+      // >512 KB create -> 413
+      const huge = await fetch(`${base}/api/prompts`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          questions: [{ question: "Big?" }],
+          summary: "z".repeat(520 * 1024),
+        }),
+      });
+      assert.equal(huge.status, 413);
+
+      // Health: empty-workspace SSE client (no project) does not count for ?workspace=
+      const sseAc = new AbortController();
+      const sseResp = await fetch(`${base}/api/stream`, { signal: sseAc.signal });
+      const reader = sseResp.body!.getReader();
+      await reader.read();
+      const hAll = (await (await fetch(`${base}/api/health`)).json()) as {
+        matchingSseClients: number;
+      };
+      assert.equal(hAll.matchingSseClients, 1);
+      const hWs = (await (
+        await fetch(`${base}/api/health?workspace=${encodeURIComponent(ws1)}`)
+      ).json()) as { matchingSseClients: number; hasActiveUi: boolean };
+      assert.equal(hWs.matchingSseClients, 0);
+      assert.equal(hWs.hasActiveUi, false);
+      sseAc.abort();
     } finally {
       await srv.close();
     }

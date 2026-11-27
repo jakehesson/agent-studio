@@ -1026,6 +1026,8 @@ export async function runHookEmit(
     }
   }
 
+  const port = flags.port ?? process.env.AGENT_STUDIO_PORT ?? "8767";
+
   // Evaluate PreToolUse guardrails before delivering telemetry
   let denyReason: string | null = null;
   if (hookCanon === "preToolUse") {
@@ -1040,6 +1042,30 @@ export async function runHookEmit(
         manifest,
         cwd,
       });
+      if (
+        !denyReason &&
+        lowTool === "vscode_askquestions" &&
+        process.env.AGENT_STUDIO_DISABLE_ASK_REDIRECT !== "1"
+      ) {
+        try {
+          const healthUrl = `http://127.0.0.1:${port}/api/health?workspace=${encodeURIComponent(cwd)}`;
+          const healthRes = await fetchFn(healthUrl, {
+            method: "GET",
+            signal: AbortSignal.timeout(150),
+          });
+          if (healthRes.ok) {
+            const healthData = (await healthRes.json()) as {
+              hasActiveUi?: boolean;
+            };
+            if (healthData && healthData.hasActiveUi === true) {
+              denyReason =
+                "Agent Studio UI is active for this workspace. Use agent_studio_ask_human (or ask_human) instead of vscode_askquestions so the user can reply directly in Agent Studio Messages UI.";
+            }
+          }
+        } catch {
+          // Fail open when Agent Studio server is offline or probe times out.
+        }
+      }
     }
   }
 
@@ -1225,11 +1251,12 @@ export async function runHookEmit(
           blockingToolCall: true,
         }
       : {}),
+    ...(isBlockedNotifyUser ? { blockingToolCall: false } : {}),
     ...(parsedQuestions.length > 0
       ? {
           questions: parsedQuestions,
           promptKind: "question",
-          blockingToolCall: true,
+          blockingToolCall: !isBlockedNotifyUser,
         }
       : {}),
     ...(usageDelta ? { _usageDelta: usageDelta } : {}),
@@ -1279,7 +1306,6 @@ export async function runHookEmit(
   };
   void isToolHook;
 
-  const port = flags.port ?? process.env.AGENT_STUDIO_PORT ?? "8767";
   const ingestUrl = `http://127.0.0.1:${port}/api/ingest`;
   let deliveredVia: "http" | "file" | "none" = "none";
   let serverAdvisory: ContextAdvisory | undefined;

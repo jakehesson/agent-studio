@@ -2,7 +2,11 @@ import os from "node:os";
 import path from "node:path";
 import { listProjects, resolveProject } from "../board/registry.js";
 import type { ContextThresholds } from "../schema/team.js";
-import type { AgentStatus, IdeSource } from "../schema/telemetry.js";
+import type {
+  AgentStatus,
+  IdeSource,
+  PendingHumanPrompt,
+} from "../schema/telemetry.js";
 import { AntigravityAdapter } from "./adapters/antigravity.js";
 import { ClaudeCodeAdapter } from "./adapters/claude-code.js";
 import {
@@ -19,8 +23,18 @@ import {
   type EventBodyEntry,
   type EventBodyStore,
 } from "./body-store.js";
+import {
+  MAX_BREAKDOWN_SESSIONS,
+  aggregateBreakdownsFromSnapshots,
+} from "./breakdown.js";
 import { discoverTeamDetailsCached, type TeamDetails } from "./definitions.js";
 import { buildSessionSnapshot } from "./normalizer.js";
+import {
+  ACTIVE_SESSION_ATTRIBUTION_WINDOW_MS,
+  PromptBridge,
+  promptMatchesProjectFilter,
+  type PromptBridgeRecord,
+} from "./prompt-bridge.js";
 import {
   PushBus,
   validateTranscriptPath,
@@ -50,6 +64,8 @@ export * from "./types.js";
 export * from "./body-store.js";
 export * from "./definitions.js";
 export * from "./push-bus.js";
+export * from "./prompt-bridge.js";
+export * from "./breakdown.js";
 export * from "./normalizer.js";
 export { AntigravityAdapter } from "./adapters/antigravity.js";
 export { ClaudeCodeAdapter } from "./adapters/claude-code.js";
@@ -223,6 +239,8 @@ export class TelemetryAggregator {
   readonly adapters: PassiveIdeAdapter[];
   readonly pushBus: PushBus;
   readonly bodyStore: EventBodyStore;
+  readonly promptBridge: PromptBridge;
+  private lastMcpAppClientAtMs = 0;
   private readonly latestSnapshots = new Map<
     string,
     {
@@ -268,6 +286,108 @@ export class TelemetryAggregator {
       includeGlobalTelemetryFile: options?.includeGlobalTelemetryFile,
       bodyStore: this.bodyStore,
     });
+    this.promptBridge = new PromptBridge({
+      pushBus: this.pushBus,
+      bodyStore: this.bodyStore,
+      findActiveSession: (criteria) => this.findActiveSessionForPrompt(criteria),
+    });
+  }
+
+  touchMcpAppClient(): void {
+    this.lastMcpAppClientAtMs = Date.now();
+  }
+
+  hasRecentMcpAppClient(windowMs = 15_000): boolean {
+    return (
+      this.lastMcpAppClientAtMs > 0 &&
+      Date.now() - this.lastMcpAppClientAtMs <= windowMs
+    );
+  }
+
+  dispose(): void {
+    this.promptBridge.dispose();
+  }
+
+  private async findActiveSessionForPrompt(criteria: {
+    ide?: IdeSource;
+    workspacePath?: string;
+    projectId?: string;
+    sessionId?: string;
+  }): Promise<DiscoveredSession | null> {
+    await this.pushBus.pollFiles().catch(() => undefined);
+    const perAdapter = await Promise.all(
+      this.adapters.map((a) =>
+        a
+          .discoverSessions({ limit: 50 })
+          .catch(() => [] as DiscoveredSession[]),
+      ),
+    );
+    const byId = new Map<string, DiscoveredSession>();
+    for (const list of perAdapter) {
+      for (const s of list) {
+        byId.set(s.sessionId, s);
+      }
+    }
+    for (const ps of this.pushBus.discoverPushSessions()) {
+      const existing = byId.get(ps.sessionId);
+      if (existing) {
+        existing.mtimeMs = Math.max(existing.mtimeMs, ps.mtimeMs);
+        if (!existing.workspacePath && ps.workspacePath) {
+          existing.workspacePath = ps.workspacePath;
+        }
+        if (!existing.projectId && ps.projectId) {
+          existing.projectId = ps.projectId;
+        }
+      } else {
+        byId.set(ps.sessionId, ps);
+      }
+    }
+
+    if (criteria.sessionId) {
+      return byId.get(criteria.sessionId) ?? null;
+    }
+
+    const nowMs = Date.now();
+    const candidates = [...byId.values()].filter((s) => {
+      if (
+        s.sessionId.startsWith("mcp-") ||
+        s.sessionId.startsWith("prompt-")
+      ) {
+        return false;
+      }
+      if (nowMs - s.mtimeMs > ACTIVE_SESSION_ATTRIBUTION_WINDOW_MS) {
+        return false;
+      }
+      if (
+        criteria.ide &&
+        criteria.ide !== "mcp" &&
+        criteria.ide !== "unknown" &&
+        s.ide !== criteria.ide
+      ) {
+        return false;
+      }
+      const wss = [
+        ...(s.workspacePath ? [s.workspacePath] : []),
+        ...s.workspaces,
+      ].filter(Boolean);
+      if (criteria.workspacePath) {
+        const matchesWs = wss.some(
+          (w) =>
+            pathMatchesRoot(w, criteria.workspacePath!) ||
+            pathMatchesRoot(criteria.workspacePath!, w),
+        );
+        if (!matchesWs) return false;
+      }
+      if (criteria.projectId) {
+        const matchesProj =
+          s.projectId?.toLowerCase() === criteria.projectId.toLowerCase();
+        if (!matchesProj && !criteria.workspacePath) return false;
+      }
+      return true;
+    });
+
+    candidates.sort((a, b) => b.mtimeMs - a.mtimeMs);
+    return candidates[0] ?? null;
   }
 
   ingest(rawItems: unknown[]): IngestResult {
@@ -443,13 +563,45 @@ export class TelemetryAggregator {
       }
     }
 
+    const activePromptRecords = this.promptBridge.listPendingRecords();
+    const activeAutoPromptBySession = new Map<string, PromptBridgeRecord>();
+    for (const rec of activePromptRecords) {
+      if (rec.autoAttributed) {
+        activeAutoPromptBySession.set(rec.sessionId, rec);
+      }
+      const targetSession = byId.get(rec.sessionId);
+      if (targetSession) {
+        targetSession.waitingOn = "user";
+        targetSession.status = "WAITING";
+        targetSession.isWaiting = true;
+        targetSession.pendingQuestionCount = Math.max(
+          targetSession.pendingQuestionCount ?? 0,
+          rec.questions.length || 1,
+        );
+        targetSession.waitingSummary = targetSession.waitingSummary ?? rec.title;
+      }
+    }
+
     const projCriteria =
       filter.project && filter.project.trim().toLowerCase() !== "all"
         ? buildProjectFilterCriteria(filter.project)
         : undefined;
-    const filtered = [...byId.values()].filter((s) =>
-      sessionMatchesFilter(s, filter, projCriteria),
-    );
+    const filtered = [...byId.values()].filter((s) => {
+      if (sessionMatchesFilter(s, filter, projCriteria)) {
+        return true;
+      }
+      const autoRec = activeAutoPromptBySession.get(s.sessionId);
+      if (autoRec && autoRec.ide === "mcp") {
+        // Auto-attributed MCP prompt sessions surface across active IDE embeds
+        // ONLY when workspace/project filters match (preserving embed=1 isolation).
+        return sessionMatchesFilter(
+          s,
+          { ...filter, ide: undefined },
+          projCriteria,
+        );
+      }
+      return false;
+    });
     const isSyntheticMcp = (s: DiscoveredSession): boolean =>
       s.ide === "mcp" && s.sessionId.startsWith("mcp-");
     filtered.sort((a, b) => {
@@ -581,6 +733,133 @@ export class TelemetryAggregator {
     return out;
   }
 
+  private overlayBridgePromptsOnSnapshot(
+    snapshot: RichSessionSnapshot,
+    filter: SessionQueryFilter,
+  ): void {
+    const records = this.promptBridge.listPendingRecords();
+    if (records.length === 0) return;
+
+    const ideFilter = filter.ide?.trim().toLowerCase();
+    const wsFilter = filter.workspace?.trim();
+    const projFilter = filter.project?.trim();
+
+    const matchedPrompts: PendingHumanPrompt[] = [];
+    for (const rec of records) {
+      // Workspace isolation is enforced even for same-session prompts.
+      if (wsFilter && rec.workspacePath) {
+        if (!pathMatchesRoot(rec.workspacePath, wsFilter)) continue;
+      }
+      const sameSession =
+        Boolean(snapshot.sessionId) && rec.sessionId === snapshot.sessionId;
+      if (!sameSession) {
+        if (!rec.autoAttributed) continue;
+        // Workspace / project isolation
+        if (wsFilter) {
+          if (
+            !rec.workspacePath ||
+            !pathMatchesRoot(rec.workspacePath, wsFilter)
+          ) {
+            continue;
+          }
+        } else if (snapshot.workspacePath) {
+          if (rec.workspacePath) {
+            const wsMatches =
+              pathMatchesRoot(rec.workspacePath, snapshot.workspacePath) ||
+              pathMatchesRoot(snapshot.workspacePath, rec.workspacePath);
+            if (!wsMatches) continue;
+          } else if (
+            !snapshot.projectId ||
+            rec.projectId?.toLowerCase() !== snapshot.projectId.toLowerCase()
+          ) {
+            continue;
+          }
+        }
+        if (projFilter && projFilter.toLowerCase() !== "all") {
+          if (!promptMatchesProjectFilter(rec, projFilter)) {
+            continue;
+          }
+        }
+        // IDE isolation (embed=1): allow same IDE or auto-attributed MCP prompt
+        if (ideFilter && ideFilter !== "all") {
+          if (rec.ide.toLowerCase() !== ideFilter && rec.ide !== "mcp") {
+            continue;
+          }
+        } else if (
+          rec.ide !== "mcp" &&
+          snapshot.ide !== "unknown" &&
+          rec.ide !== snapshot.ide
+        ) {
+          continue;
+        }
+      }
+
+      const prompt = this.promptBridge.getPrompt(rec.id);
+      if (prompt) {
+        matchedPrompts.push(prompt);
+      }
+    }
+
+    if (matchedPrompts.length === 0) return;
+
+    const byId = new Map<string, PendingHumanPrompt>();
+    for (const existing of snapshot.pendingPrompts ?? []) {
+      byId.set(existing.id, existing);
+    }
+    // Direct-reply bridge prompts supersede matching passive (transcript-
+    // derived) prompts for the same agent / tool call.
+    const supersedes = (
+      passive: PendingHumanPrompt | undefined | null,
+      mp: PendingHumanPrompt,
+    ): boolean =>
+      Boolean(
+        passive &&
+          passive.id !== mp.id &&
+          !passive.directReply &&
+          mp.directReply &&
+          ((passive.toolCallId && passive.toolCallId === mp.toolCallId) ||
+            passive.agentId === mp.agentId),
+      );
+    for (const mp of matchedPrompts) {
+      for (const [pid, existing] of byId) {
+        if (supersedes(existing, mp)) byId.delete(pid);
+      }
+    }
+    for (const mp of matchedPrompts) {
+      byId.set(mp.id, mp);
+      for (const ag of snapshot.agents) {
+        if (ag.pendingPrompt && supersedes(ag.pendingPrompt, mp)) {
+          ag.pendingPrompt = undefined;
+        }
+      }
+      const targetAgent =
+        snapshot.agents.find((a) => a.id === mp.agentId) ??
+        snapshot.agents.find((a) => a.isRoot) ??
+        snapshot.agents.find((a) => a.nodeType === "agent");
+      if (
+        targetAgent &&
+        (!targetAgent.pendingPrompt || targetAgent.pendingPrompt.id === mp.id)
+      ) {
+        targetAgent.pendingPrompt = mp;
+        if (
+          targetAgent.status !== "BLOCKED" &&
+          targetAgent.status !== "WAITING"
+        ) {
+          targetAgent.status = "WAITING";
+          targetAgent.state = "waiting";
+        }
+      }
+    }
+
+    snapshot.pendingPrompts = [...byId.values()];
+    if (snapshot.status !== "BLOCKED") {
+      snapshot.status = "WAITING";
+    }
+    snapshot.waitingOn = snapshot.waitingOn ?? "user";
+    snapshot.waiting_on = snapshot.waiting_on ?? "user";
+    snapshot.is_waiting = true;
+  }
+
   async getSessionSnapshot(
     sessionId?: string,
     filter: SessionQueryFilter = {},
@@ -641,6 +920,7 @@ export class TelemetryAggregator {
         definitions: team?.definitions,
         modelContextWindows: team?.modelContextWindows,
       });
+      this.overlayBridgePromptsOnSnapshot(snap, filter);
       snap.definitions = team?.definitions ?? [];
       const teamRoster = extractTeamRosterForSession(team, explicitRoots);
       if (teamRoster) {
@@ -711,6 +991,7 @@ export class TelemetryAggregator {
         modelContextWindows: team?.modelContextWindows,
       },
     );
+    this.overlayBridgePromptsOnSnapshot(snapshot, filter);
     snapshot.definitions = team?.definitions ?? [];
     const teamRoster = extractTeamRosterForSession(team, explicitRoots);
     if (teamRoster) {
@@ -740,6 +1021,110 @@ export class TelemetryAggregator {
     }
 
     return { snapshot, sessions, boardProjects };
+  }
+
+  async getUsageBreakdown(
+    opts: SessionQueryFilter & {
+      sessionId?: string;
+      agentId?: string;
+      window?: "session" | "24h" | "7d" | "all";
+      nowMs?: number;
+    } = {},
+  ): Promise<{
+    scope: {
+      window: "session" | "24h" | "7d" | "all";
+      ide?: string;
+      project?: string;
+      workspace?: string;
+      sessionId?: string;
+      agentId?: string;
+      multiOnly?: boolean;
+      sessionCount: number;
+      sessionIds: string[];
+    };
+    summary: ReturnType<typeof aggregateBreakdownsFromSnapshots>["summary"];
+    breakdown: ReturnType<typeof aggregateBreakdownsFromSnapshots>["breakdown"];
+  }> {
+    const windowMode = opts.window ?? "session";
+    const nowMs = opts.nowMs ?? Date.now();
+    const filter: SessionQueryFilter = {
+      ide: opts.ide,
+      project: opts.project,
+      workspace: opts.workspace,
+      multiOnly: opts.multiOnly,
+      limit: windowMode === "session" ? 50 : 100,
+    };
+
+    let matchedSessions = await this.discoverSessions(filter);
+    const reqSessionId = opts.sessionId?.trim() || undefined;
+    if (reqSessionId) {
+      matchedSessions = matchedSessions.filter(
+        (s) => s.sessionId === reqSessionId,
+      );
+    }
+
+    if (windowMode === "24h") {
+      const cutoff = nowMs - 24 * 60 * 60 * 1000;
+      matchedSessions = matchedSessions.filter((s) => s.mtimeMs >= cutoff);
+    } else if (windowMode === "7d") {
+      const cutoff = nowMs - 7 * 24 * 60 * 60 * 1000;
+      matchedSessions = matchedSessions.filter((s) => s.mtimeMs >= cutoff);
+    }
+
+    const cappedSessions =
+      windowMode === "session"
+        ? matchedSessions.slice(0, 1)
+        : matchedSessions.slice(0, MAX_BREAKDOWN_SESSIONS);
+
+    const snapshots: RichSessionSnapshot[] = [];
+    for (const sess of cappedSessions) {
+      const cached = this.latestSnapshots.get(sess.sessionId);
+      const pushEvents = this.pushBus.getSessionEvents(sess.sessionId);
+      const lastPushEpoch =
+        pushEvents.length > 0 ? pushEvents[pushEvents.length - 1]!.epoch : 0;
+      const cachedLastEpoch =
+        cached && cached.snapshot.events.length > 0
+          ? cached.snapshot.events[cached.snapshot.events.length - 1]!.epoch
+          : 0;
+      const cacheValid =
+        Boolean(cached?.snapshot.usage?.breakdown) &&
+        cached!.cachedAtMs >= sess.mtimeMs &&
+        lastPushEpoch <= cachedLastEpoch;
+
+      if (cacheValid && cached) {
+        snapshots.push(cached.snapshot);
+      } else {
+        const res = await this.getSessionSnapshot(sess.sessionId, filter);
+        snapshots.push(res.snapshot);
+      }
+    }
+
+    const reqAgentId = opts.agentId?.trim() || undefined;
+    const { summary, breakdown } = aggregateBreakdownsFromSnapshots({
+      snapshots,
+      agentId: reqAgentId,
+    });
+
+    const sessionIds = cappedSessions.map((s) => s.sessionId);
+    return {
+      scope: {
+        window: windowMode,
+        ...(opts.ide ? { ide: opts.ide } : {}),
+        ...(opts.project ? { project: opts.project } : {}),
+        ...(opts.workspace ? { workspace: opts.workspace } : {}),
+        ...(reqSessionId
+          ? { sessionId: reqSessionId }
+          : sessionIds.length === 1
+            ? { sessionId: sessionIds[0] }
+            : {}),
+        ...(reqAgentId ? { agentId: reqAgentId } : {}),
+        ...(opts.multiOnly ? { multiOnly: true } : {}),
+        sessionCount: snapshots.length,
+        sessionIds,
+      },
+      summary,
+      breakdown,
+    };
   }
 
   async getEventBody(params: {
@@ -930,7 +1315,14 @@ export class TelemetryAggregator {
     const resolvedAgentId = agentNode?.id ?? requestedAgent;
     const agentLabel =
       agentNode?.label ?? prettifyAgentLabel(resolvedAgentId);
-    const pendingPrompt = agentNode?.pendingPrompt ?? null;
+    const pendingPrompt =
+      agentNode?.pendingPrompt ??
+      snapshot.pendingPrompts?.find(
+        (p) =>
+          p.agentId === resolvedAgentId ||
+          (requestedAgent === "root" && p.agentId === "root"),
+      ) ??
+      null;
 
     const agentAliases = new Set<string>([resolvedAgentId, requestedAgent]);
     if (agentNode) {
@@ -1295,7 +1687,10 @@ export function synthesizeChatFromEvents(
           agentId: ev.agentId,
           role: "question",
           text: capChatText(formatQuestionsPreview(qs, ev.summary)),
-          pendingPromptId: computePendingPromptId(ev.agentId, ev.toolCallId, ev.id),
+          pendingPromptId:
+            typeof ev.payload?.promptId === "string" && ev.payload.promptId.trim()
+              ? ev.payload.promptId.trim()
+              : computePendingPromptId(ev.agentId, ev.toolCallId, ev.id),
         });
       } else {
         const rawIn =
@@ -1369,7 +1764,10 @@ export function synthesizeChatFromEvents(
           agentId: ev.agentId,
           role: "question",
           text: capChatText(body),
-          pendingPromptId: computePendingPromptId(ev.agentId, ev.toolCallId, ev.id),
+          pendingPromptId:
+            typeof ev.payload?.promptId === "string" && ev.payload.promptId.trim()
+              ? ev.payload.promptId.trim()
+              : computePendingPromptId(ev.agentId, ev.toolCallId, ev.id),
         });
       } else if (ev.targetAgentId === "human") {
         messages.push({

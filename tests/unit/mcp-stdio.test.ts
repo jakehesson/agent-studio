@@ -7,7 +7,10 @@ import path from "node:path";
 import readline from "node:readline";
 import { afterEach, beforeEach, describe, it } from "node:test";
 import { initBoardFile } from "../../src/board/store.js";
+import { handleJsonRpcMessage } from "../../src/mcp/server.js";
 import { NormalizedEventSchema } from "../../src/schema/telemetry.js";
+import { createStudioServer } from "../../src/server/index.js";
+import { TelemetryAggregator } from "../../src/telemetry/index.js";
 
 const CLI_ENTRY = path.resolve(process.cwd(), "dist", "cli", "index.js");
 
@@ -24,13 +27,18 @@ class StdioMcpClient {
   readonly rawStdoutLines: string[] = [];
   private readonly pending = new Map<
     number,
-    { resolve: (msg: JsonRpcResponseMsg) => void; reject: (err: Error) => void }
+    {
+      resolve: (msg: JsonRpcResponseMsg) => void;
+      reject: (err: Error) => void;
+      timer: NodeJS.Timeout;
+    }
   >();
   private nextId = 1;
 
-  constructor(args: string[], env: NodeJS.ProcessEnv) {
+  constructor(args: string[], env: NodeJS.ProcessEnv, cwd?: string) {
     this.child = spawn(process.execPath, [CLI_ENTRY, ...args], {
       env,
+      ...(cwd ? { cwd } : {}),
       stdio: ["pipe", "pipe", "pipe"],
     });
 
@@ -63,7 +71,10 @@ class StdioMcpClient {
       if (typeof msg.id === "number" && this.pending.has(msg.id)) {
         const entry = this.pending.get(msg.id);
         this.pending.delete(msg.id);
-        entry?.resolve(msg);
+        if (entry) {
+          clearTimeout(entry.timer);
+          entry.resolve(msg);
+        }
       }
     });
   }
@@ -72,6 +83,13 @@ class StdioMcpClient {
     method: string,
     params?: Record<string, unknown>,
   ): Promise<JsonRpcResponseMsg> {
+    return this.requestWithId(method, params).promise;
+  }
+
+  requestWithId(
+    method: string,
+    params?: Record<string, unknown>,
+  ): { id: number; promise: Promise<JsonRpcResponseMsg> } {
     const id = this.nextId++;
     const frame = JSON.stringify({
       jsonrpc: "2.0",
@@ -79,7 +97,7 @@ class StdioMcpClient {
       method,
       ...(params ? { params } : {}),
     });
-    return new Promise((resolve, reject) => {
+    const promise = new Promise<JsonRpcResponseMsg>((resolve, reject) => {
       const timer = setTimeout(() => {
         this.pending.delete(id);
         reject(
@@ -90,6 +108,7 @@ class StdioMcpClient {
       }, 20_000);
 
       this.pending.set(id, {
+        timer,
         resolve: (msg) => {
           clearTimeout(timer);
           resolve(msg);
@@ -101,6 +120,7 @@ class StdioMcpClient {
       });
       this.child.stdin.write(frame + "\n");
     });
+    return { id, promise };
   }
 
   notify(method: string, params?: Record<string, unknown>): void {
@@ -112,7 +132,19 @@ class StdioMcpClient {
     this.child.stdin.write(frame + "\n");
   }
 
+  forget(id: number): void {
+    const entry = this.pending.get(id);
+    if (entry) {
+      clearTimeout(entry.timer);
+      this.pending.delete(id);
+    }
+  }
+
   async close(): Promise<number | null> {
+    for (const entry of this.pending.values()) {
+      clearTimeout(entry.timer);
+    }
+    this.pending.clear();
     this.child.stdin.end();
     return new Promise((resolve) => {
       if (this.child.exitCode !== null) {
@@ -188,6 +220,7 @@ describe("MCP stdio server (node dist/cli/index.js mcp)", () => {
           "testrun",
           "telemetry",
           "open_studio",
+          "ask_human",
           "app_get_state",
           "app_get_event_body",
           "app_get_chat",
@@ -195,6 +228,8 @@ describe("MCP stdio server (node dist/cli/index.js mcp)", () => {
           "app_get_team",
           "app_get_doctor",
           "app_send_test_event",
+          "app_answer_prompt",
+          "app_cancel_prompt",
         ],
       );
 
@@ -218,6 +253,8 @@ describe("MCP stdio server (node dist/cli/index.js mcp)", () => {
         "app_get_team",
         "app_get_doctor",
         "app_send_test_event",
+        "app_answer_prompt",
+        "app_cancel_prompt",
       ]) {
         const tool = tools.find((t) => t.name === appOnlyName);
         assert.deepEqual(tool?._meta?.ui, { visibility: ["app"] });
@@ -721,6 +758,304 @@ describe("MCP stdio server (node dist/cli/index.js mcp)", () => {
       const exitCode = await client.close();
       await new Promise<void>((resolve) => mockServer.close(() => resolve()));
       assert.equal(exitCode, 0, `MCP server exited with ${String(exitCode)}; stderr=${client.stderrChunks.join("")}`);
+    }
+  });
+
+  it("S1-77: ask_human fails fast when offline & unattached, runs off-queue concurrently with app_answer_prompt/ping, and cancels via notifications/cancelled", async () => {
+    const projDir = path.join(tmpDir, "ask-proj");
+    await initBoardFile(path.join(projDir, "pipeline", "board.json"), {
+      projectId: "ask-proj",
+      suites: { smoke: ["CP0"], full: ["CP0"] },
+    });
+
+    // 1. Offline & no recent app_get_state -> fail fast with fallbackRequired: true
+    const offlineClient = new StdioMcpClient(["mcp", "--project", projDir], {
+      ...process.env,
+      AGENT_STUDIO_HOME: path.join(tmpDir, "home"),
+      AGENT_STUDIO_MCP_NO_HTTP: "1",
+    });
+    try {
+      await offlineClient.request("initialize", {
+        protocolVersion: "2024-11-05",
+        capabilities: {},
+        clientInfo: { name: "ask-offline-test", version: "1.0.0" },
+      });
+      const failResp = await offlineClient.request("tools/call", {
+        name: "ask_human",
+        arguments: {
+          questions: [{ question: "Offline question?" }],
+        },
+      });
+      const failRes = failResp.result as {
+        isError?: boolean;
+        structuredContent?: Record<string, unknown>;
+      };
+      assert.equal(failRes.isError, true);
+      assert.equal(failRes.structuredContent?.status, "unavailable");
+      assert.equal(failRes.structuredContent?.fallbackRequired, true);
+    } finally {
+      await offlineClient.close();
+    }
+
+    // 2. Live HTTP server + MCP stdio client: off-queue ask_human does not block ping / app_get_state / app_answer_prompt
+    const srv = createStudioServer({
+      extraWorkspaces: [projDir],
+      includeGlobalTelemetryFile: false,
+      brainDir: path.join(tmpDir, "empty-brain"),
+      claudeDir: path.join(tmpDir, "empty-claude"),
+      vscodeDir: path.join(tmpDir, "empty-vscode"),
+      copilotHomeDir: path.join(tmpDir, "empty-cop"),
+    });
+    const { port } = await srv.listen(0, "127.0.0.1");
+    const liveClient = new StdioMcpClient(["mcp", "--project", projDir], {
+      ...process.env,
+      AGENT_STUDIO_HOME: path.join(tmpDir, "home"),
+      AGENT_STUDIO_PORT: String(port),
+      AGENT_STUDIO_MCP_NO_HTTP: "0",
+    });
+
+    try {
+      await liveClient.request("initialize", {
+        protocolVersion: "2024-11-05",
+        capabilities: {},
+        clientInfo: { name: "ask-live-test", version: "1.0.0" },
+      });
+
+      const askCall = liveClient.requestWithId("tools/call", {
+        name: "ask_human",
+        arguments: {
+          title: "Pick target",
+          questions: [{ question: "Which target?" }],
+          workspace: projDir,
+          timeoutSeconds: 30,
+        },
+      });
+
+      // Wait until the prompt appears in PromptBridge
+      let promptId = "";
+      for (let i = 0; i < 40; i++) {
+        const list = srv.aggregator.promptBridge.listPending({
+          workspace: projDir,
+        });
+        if (list.length > 0) {
+          promptId = list[0]!.id;
+          break;
+        }
+        await new Promise((r) => setTimeout(r, 25));
+      }
+      assert.ok(promptId, "ask_human must register pending prompt on HTTP server");
+
+      // While ask_human is blocked waiting, ping and app_get_state and app_answer_prompt execute immediately!
+      const pingResp = await liveClient.request("ping");
+      assert.deepEqual(pingResp.result, {});
+
+      const stateResp = await liveClient.request("tools/call", {
+        name: "app_get_state",
+        arguments: { workspace: projDir },
+      });
+      const stateSc = (
+        stateResp.result as {
+          structuredContent?: { pendingPrompts?: Array<{ id: string }> };
+        }
+      ).structuredContent;
+      assert.ok(
+        stateSc?.pendingPrompts?.some((p) => p.id === promptId),
+        "app_get_state should see pending prompt from HTTP bridge",
+      );
+
+      const ansCallResp = await liveClient.request("tools/call", {
+        name: "app_answer_prompt",
+        arguments: {
+          promptId,
+          answerText: "Production",
+          responder: "mcp-app",
+        },
+      });
+      assert.notEqual(
+        (ansCallResp.result as { isError?: boolean }).isError,
+        true,
+      );
+
+      // Now ask_human resolves with the answer!
+      const askResp = await askCall.promise;
+      const askRes = askResp.result as {
+        isError?: boolean;
+        content: Array<{ text: string }>;
+        structuredContent?: Record<string, unknown>;
+      };
+      assert.notEqual(askRes.isError, true);
+      assert.equal(askRes.content[0]?.text, "Production");
+      assert.equal(askRes.structuredContent?.status, "answered");
+
+      // 3. notifications/cancelled cancels in-flight ask_human on HTTP server
+      const cancelReq = liveClient.requestWithId("tools/call", {
+        name: "ask_human",
+        arguments: {
+          title: "Cancel me",
+          questions: [{ question: "Will this cancel?" }],
+          workspace: projDir,
+          timeoutSeconds: 30,
+        },
+      });
+      let cancelPromptId = "";
+      for (let i = 0; i < 40; i++) {
+        const list = srv.aggregator.promptBridge.listPending({
+          workspace: projDir,
+        });
+        if (list.length > 0) {
+          cancelPromptId = list[0]!.id;
+          break;
+        }
+        await new Promise((r) => setTimeout(r, 25));
+      }
+      assert.ok(cancelPromptId);
+
+      liveClient.notify("notifications/cancelled", {
+        requestId: cancelReq.id,
+        reason: "Client aborted",
+      });
+
+      let finalStatus: string | undefined;
+      for (let i = 0; i < 40; i++) {
+        const p = srv.aggregator.promptBridge.getPrompt(cancelPromptId);
+        if (p && p.status !== "pending") {
+          finalStatus = p.status;
+          break;
+        }
+        await new Promise((r) => setTimeout(r, 25));
+      }
+      assert.equal(finalStatus, "canceled");
+      liveClient.forget(cancelReq.id);
+    } finally {
+      await liveClient.close();
+      await srv.close();
+    }
+  });
+
+  it("S1-77 fix: NO_HTTP=1 local ask_human flow defaults workspace to cwd, maps clientInfo to ide, and resolves via app_cancel_prompt", async () => {
+    const normWs = (p: string | undefined): string =>
+      (p ?? "").replace(/\\/g, "/").replace(/\/+$/, "").toLowerCase();
+
+    const client = new StdioMcpClient(
+      ["mcp"],
+      {
+        ...process.env,
+        AGENT_STUDIO_HOME: studioHome,
+        AGENT_STUDIO_MCP_NO_HTTP: "1",
+      },
+      projDir,
+    );
+    try {
+      await client.request("initialize", {
+        protocolVersion: "2024-11-05",
+        capabilities: {},
+        clientInfo: { name: "Visual Studio Code", version: "1.99.0" },
+      });
+      // Attach as an MCP App client so the local (no-HTTP) bridge is used.
+      await client.request("tools/call", { name: "app_get_state", arguments: {} });
+
+      const askCall = client.requestWithId("tools/call", {
+        name: "ask_human",
+        arguments: {
+          title: "Local flow",
+          questions: [{ question: "Local question?" }],
+          timeoutSeconds: 30,
+        },
+      });
+
+      let found: { id: string; workspacePath?: string; ide?: string } | undefined;
+      for (let i = 0; i < 60 && !found; i++) {
+        const st = await client.request("tools/call", {
+          name: "app_get_state",
+          arguments: { workspace: projDir },
+        });
+        const sc = (
+          st.result as {
+            structuredContent?: {
+              pendingPrompts?: Array<{ id: string; workspacePath?: string; ide?: string }>;
+            };
+          }
+        ).structuredContent;
+        found = sc?.pendingPrompts?.find((p) => p.id.startsWith("pb_"));
+        if (!found) await new Promise((r) => setTimeout(r, 50));
+      }
+      assert.ok(found, "local ask_human prompt must surface in app_get_state");
+      assert.equal(normWs(found.workspacePath), normWs(projDir), "workspace defaults to cwd");
+      assert.equal(found.ide, "copilot-vscode", "clientInfo.name maps to default ide");
+
+      const cancelResp = await client.request("tools/call", {
+        name: "app_cancel_prompt",
+        arguments: { promptId: found.id, reason: "test cancel" },
+      });
+      assert.notEqual((cancelResp.result as { isError?: boolean }).isError, true);
+
+      const askResp = await askCall.promise;
+      const askRes = askResp.result as {
+        isError?: boolean;
+        structuredContent?: Record<string, unknown>;
+      };
+      assert.equal(askRes.isError, true);
+      assert.equal(askRes.structuredContent?.status, "canceled");
+      assert.equal(askRes.structuredContent?.promptId, found.id);
+    } finally {
+      await client.close();
+    }
+
+    // In-process: project inferred only from local markers (never defaultProject),
+    // clientInfo -> ide on the created record.
+    const agg = new TelemetryAggregator({
+      brainDir: path.join(tmpDir, "ip-brain"),
+      claudeDir: path.join(tmpDir, "ip-claude"),
+      vscodeDir: path.join(tmpDir, "ip-vscode"),
+      copilotHomeDir: path.join(tmpDir, "ip-cop"),
+      includeGlobalTelemetryFile: false,
+      extraWorkspaces: [projDir],
+    });
+    const opts: Parameters<typeof handleJsonRpcMessage>[1] = {
+      aggregator: agg,
+      cwd: projDir,
+      defaultProject: "some-unrelated-global-project",
+    };
+    try {
+      await handleJsonRpcMessage(
+        {
+          jsonrpc: "2.0",
+          id: 1,
+          method: "initialize",
+          params: { clientInfo: { name: "claude-code", version: "2.0" } },
+        },
+        opts,
+      );
+      assert.equal(opts.clientIde, "claude-code");
+      agg.touchMcpAppClient();
+      const pending = handleJsonRpcMessage(
+        {
+          jsonrpc: "2.0",
+          id: 2,
+          method: "tools/call",
+          params: {
+            name: "ask_human",
+            arguments: { questions: [{ question: "In-process?" }], timeoutSeconds: 30 },
+          },
+        },
+        opts,
+      );
+      let rec: ReturnType<typeof agg.promptBridge.getRecord> = null;
+      for (let i = 0; i < 40 && !rec; i++) {
+        const list = agg.promptBridge.listPendingRecords();
+        rec = list[0] ?? null;
+        if (!rec) await new Promise((r) => setTimeout(r, 25));
+      }
+      assert.ok(rec);
+      assert.equal(rec.projectId, "mcp-demo");
+      assert.equal(rec.ide, "claude-code");
+      assert.equal(normWs(rec.workspacePath), normWs(projDir));
+      agg.promptBridge.cancelPrompt(rec.id, "done");
+      const resp = await pending;
+      const r = resp?.result as { structuredContent?: Record<string, unknown> };
+      assert.equal(r.structuredContent?.status, "canceled");
+    } finally {
+      agg.dispose();
     }
   });
 });

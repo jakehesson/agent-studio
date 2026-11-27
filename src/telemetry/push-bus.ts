@@ -8,6 +8,7 @@ import {
   cleanHumanSummary,
   computeDeterministicEventId,
   computeMergeKey,
+  extractProviderUsageDetails,
   inferContextWindow,
   isOpaqueAgentId,
   lookupModelContextWindow,
@@ -351,6 +352,47 @@ export function coerceToEnrichedEvent(raw: unknown): EnrichedEvent {
   let usageDelta: UsageDelta | undefined = rawUsageDelta
     ? { ...rawUsageDelta }
     : undefined;
+  if (usageDelta) {
+    const rawRec = usageDelta as unknown as Record<string, unknown>;
+    const rawOut =
+      typeof usageDelta.outputTokens === "number" &&
+      Number.isFinite(usageDelta.outputTokens)
+        ? usageDelta.outputTokens
+        : typeof rawRec.output_tokens === "number"
+          ? (rawRec.output_tokens as number)
+          : typeof rawRec.completion_tokens === "number"
+            ? (rawRec.completion_tokens as number)
+            : typeof rawRec.completionTokens === "number"
+              ? (rawRec.completionTokens as number)
+              : undefined;
+    const details = extractProviderUsageDetails([rawRec, rawPayload], rawOut);
+    if (
+      typeof usageDelta.inputTokens !== "number" &&
+      typeof rawRec.input_tokens === "number"
+    ) {
+      usageDelta.inputTokens = Math.max(0, Math.round(rawRec.input_tokens as number));
+    }
+    if (
+      rawOut !== undefined ||
+      details.reasoningSource === "exact"
+    ) {
+      usageDelta.outputTokens = details.outputTokens;
+    }
+    if (details.cacheSplitKnown) {
+      usageDelta.cacheReadTokens = details.cacheReadTokens;
+      usageDelta.cacheWriteTokens = details.cacheWriteTokens;
+      usageDelta.cachedTokens = details.cachedTokens;
+    } else if (
+      usageDelta.cachedTokens === undefined &&
+      details.cachedTokens > 0
+    ) {
+      usageDelta.cachedTokens = details.cachedTokens;
+    }
+    if (details.reasoningTokens !== undefined) {
+      usageDelta.reasoningTokens = details.reasoningTokens;
+      usageDelta.reasoningSource = usageDelta.reasoningSource ?? "exact";
+    }
+  }
   if (topModel && !usageDelta?.model) {
     const pretty = prettifyModelName(topModel) || topModel;
     usageDelta = {

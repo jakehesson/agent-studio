@@ -10,6 +10,7 @@ import {
   computeDeterministicEventId,
   computeMergeKey,
   computePendingPromptId,
+  extractProviderUsageDetails,
   formatQuestionsPreview,
   isBoardMutationToolCall,
   isOpaqueAgentId,
@@ -201,6 +202,21 @@ interface CachedTranscriptDiscoveryMeta {
   waitingSummary?: string;
 }
 
+/**
+ * Agent Studio's own direct-reply ask tools. These are answered through the
+ * Prompt Bridge (`/api/prompts`), so the adapter must NOT also synthesize a
+ * passive `blockingToolCall: true` prompt for them.
+ */
+export function isStudioDirectAskTool(lowTool: string): boolean {
+  const t = lowTool.toLowerCase();
+  return (
+    t === "ask_human" ||
+    t === "agent_studio_ask_human" ||
+    t === "mcp__agent-studio__ask_human" ||
+    t === "agent-studio/ask_human"
+  );
+}
+
 function isCopilotAskTool(lowTool: string): boolean {
   return (
     lowTool === "vscode_askquestions" ||
@@ -208,7 +224,7 @@ function isCopilotAskTool(lowTool: string): boolean {
     lowTool === "askquestions" ||
     lowTool === "ask_question" ||
     lowTool === "ask_user"
-  );
+  ) && !isStudioDirectAskTool(lowTool);
 }
 
 function extractCopilotItemQuestions(
@@ -567,6 +583,91 @@ function extractMessageTarget(args: Record<string, unknown>): string | undefined
   return undefined;
 }
 
+const THINKING_INLINE_MAX = 800;
+
+function formatToolOutput(val: unknown): string {
+  if (val === undefined || val === null) return "";
+  if (typeof val === "string") return val;
+  if (typeof val === "object") {
+    const rec = val as Record<string, unknown>;
+    if (typeof rec.content === "string") return rec.content;
+    try {
+      return JSON.stringify(val, null, 2);
+    } catch {
+      return String(val);
+    }
+  }
+  return String(val);
+}
+
+function formatCopilotAnswerValue(val: unknown): string {
+  if (val === null || val === undefined) return "";
+  if (typeof val === "string") {
+    const trimmed = val.trim();
+    if (
+      (trimmed.startsWith("{") && trimmed.endsWith("}")) ||
+      (trimmed.startsWith("[") && trimmed.endsWith("]"))
+    ) {
+      try {
+        const parsed: unknown = JSON.parse(trimmed);
+        const formatted = formatCopilotAnswerValue(parsed);
+        if (formatted) return formatted;
+      } catch {
+        // Fallback to raw trimmed string.
+      }
+    }
+    return trimmed;
+  }
+  if (typeof val === "number" || typeof val === "boolean") return String(val);
+  if (Array.isArray(val)) {
+    return val.map(formatCopilotAnswerValue).filter(Boolean).join(", ");
+  }
+  if (typeof val === "object") {
+    const rec = val as Record<string, unknown>;
+    if (typeof rec.content === "string") {
+      return formatCopilotAnswerValue(rec.content);
+    }
+    for (const key of ["answers", "answer", "response", "text"]) {
+      if (rec[key] !== undefined) {
+        const unwrapped = formatCopilotAnswerValue(rec[key]);
+        if (unwrapped) return unwrapped;
+      }
+    }
+    if (
+      typeof rec.question === "string" &&
+      (rec.answer !== undefined || rec.value !== undefined)
+    ) {
+      const a = formatCopilotAnswerValue(rec.answer ?? rec.value);
+      return a ? `${rec.question.trim()}: ${a}` : "";
+    }
+    return Object.entries(rec)
+      .map(([k, v]) => {
+        const formatted = formatCopilotAnswerValue(v);
+        if (!formatted) return "";
+        return k.trim() ? `${k.trim()}: ${formatted}` : formatted;
+      })
+      .filter(Boolean)
+      .join("\n");
+  }
+  return "";
+}
+
+function extractCopilotAnswerText(
+  rawVal: unknown,
+  pastTenseMsg?: string,
+): string {
+  const formatted = formatCopilotAnswerValue(rawVal);
+  if (formatted) return formatted;
+  const past = (pastTenseMsg ?? "").trim();
+  if (
+    past &&
+    !/^(answered|asked|completed|done|waiting for user answer)\.?$/i.test(past)
+  ) {
+    return past;
+  }
+  return "";
+}
+
 function extractMessagePayload(args: Record<string, unknown>): {
   msgTarget?: string;
   msgBody?: string;
@@ -595,12 +696,17 @@ function extractUsageNumbers(
   inTok?: number;
   outTok?: number;
   cachedTok: number;
+  cacheReadTok?: number;
+  cacheWriteTok?: number;
+  cacheSplitKnown: boolean;
+  reasoningTok?: number;
+  reasoningSource?: "exact";
   contextTok?: number;
   contextWindow?: number;
   costUsd?: number;
 } {
   if (!u || typeof u !== "object") {
-    return { cachedTok: 0 };
+    return { cachedTok: 0, cacheSplitKnown: false };
   }
   const rec = u as Record<string, unknown>;
   const num = (...keys: string[]): number | undefined => {
@@ -611,28 +717,18 @@ function extractUsageNumbers(
     return undefined;
   };
   const inTok = num("promptTokens", "inputTokens", "input_tokens", "prompt_tokens");
-  const outTok = num(
+  const rawOutTok = num(
     "completionTokens",
     "outputTokens",
     "output_tokens",
     "completion_tokens",
+    "candidatesTokenCount",
   );
-  const cacheRead =
-    num(
-      "cachedTokens",
-      "cachedPromptTokens",
-      "cacheReadInputTokens",
-      "cacheReadTokens",
-      "cache_read_input_tokens",
-      "cache_read_tokens",
-    ) ?? 0;
-  const cacheCreate =
-    num(
-      "cacheCreationInputTokens",
-      "cache_creation_input_tokens",
-      "cacheWriteTokens",
-      "cache_write_tokens",
-    ) ?? 0;
+  const details = extractProviderUsageDetails([rec], rawOutTok);
+  const outTok =
+    rawOutTok !== undefined || details.reasoningSource === "exact"
+      ? details.outputTokens
+      : undefined;
   const contextTok = num(
     "contextTokens",
     "context_tokens",
@@ -653,7 +749,17 @@ function extractUsageNumbers(
   return {
     inTok,
     outTok,
-    cachedTok: Math.max(0, Math.round(cacheRead + cacheCreate)),
+    cachedTok: details.cachedTokens,
+    ...(details.cacheReadTokens !== undefined
+      ? { cacheReadTok: details.cacheReadTokens }
+      : {}),
+    ...(details.cacheWriteTokens !== undefined
+      ? { cacheWriteTok: details.cacheWriteTokens }
+      : {}),
+    cacheSplitKnown: details.cacheSplitKnown,
+    ...(details.reasoningTokens !== undefined
+      ? { reasoningTok: details.reasoningTokens, reasoningSource: "exact" as const }
+      : {}),
     contextTok,
     contextWindow,
     costUsd,
@@ -664,12 +770,16 @@ function extractModelMetricsUsage(modelMetrics: unknown): {
   inTok?: number;
   outTok?: number;
   cachedTok: number;
+  cacheReadTok?: number;
+  cacheWriteTok?: number;
+  cacheSplitKnown: boolean;
+  reasoningTok?: number;
   contextWindow?: number;
   costUsd?: number;
   model?: string;
 } {
   if (!modelMetrics || typeof modelMetrics !== "object") {
-    return { cachedTok: 0 };
+    return { cachedTok: 0, cacheSplitKnown: false };
   }
   const entries: Array<[string | undefined, unknown]> = Array.isArray(modelMetrics)
     ? modelMetrics.map((v) => [undefined, v])
@@ -680,6 +790,12 @@ function extractModelMetricsUsage(modelMetrics: unknown): {
   let inSum = 0;
   let outSum = 0;
   let cachedSum = 0;
+  let cacheReadSum = 0;
+  let cacheWriteSum = 0;
+  let hasCacheSplit = false;
+  let hasUnsplitCached = false;
+  let reasoningSum = 0;
+  let hasReasoning = false;
   let contextWindow: number | undefined;
   let costSum = 0;
   let hasCost = false;
@@ -709,6 +825,18 @@ function extractModelMetricsUsage(modelMetrics: unknown): {
       outSum += Math.max(0, Math.round(u.outTok));
     }
     cachedSum += u.cachedTok;
+    if (u.cacheSplitKnown) {
+      hasCacheSplit = true;
+      cacheReadSum += u.cacheReadTok ?? 0;
+      cacheWriteSum += u.cacheWriteTok ?? 0;
+    } else if (u.cachedTok > 0) {
+      hasUnsplitCached = true;
+    }
+    const rTok = u.reasoningTok ?? outer.reasoningTok;
+    if (rTok !== undefined) {
+      hasReasoning = true;
+      reasoningSum += rTok;
+    }
     const cost = u.costUsd ?? outer.costUsd;
     if (cost !== undefined && cost >= 0) {
       costSum += cost;
@@ -716,10 +844,16 @@ function extractModelMetricsUsage(modelMetrics: unknown): {
     }
   }
 
+  const cacheSplitKnown = hasCacheSplit && !hasUnsplitCached;
   return {
     ...(hasIn ? { inTok: inSum } : {}),
     ...(hasOut ? { outTok: outSum } : {}),
     cachedTok: cachedSum,
+    ...(cacheSplitKnown
+      ? { cacheReadTok: cacheReadSum, cacheWriteTok: cacheWriteSum }
+      : {}),
+    cacheSplitKnown,
+    ...(hasReasoning ? { reasoningTok: reasoningSum } : {}),
     ...(contextWindow !== undefined ? { contextWindow } : {}),
     ...(hasCost ? { costUsd: costSum } : {}),
     ...(model ? { model } : {}),
@@ -1645,12 +1779,23 @@ export class CopilotVSCodeAdapter implements PassiveIdeAdapter {
       inputTokens: number;
       outputTokens: number;
       cachedTokens: number;
+      cacheReadTokens: number;
+      cacheWriteTokens: number;
+      hasCacheSplit: boolean;
+      hasUnsplitCached: boolean;
+      reasoningTokens: number;
+      hasExactReasoning: boolean;
       lastTurnContext: number;
       contextWindow?: number;
       cumulativeFallback?: {
         inputTokens: number;
         outputTokens: number;
         cachedTokens: number;
+        cacheReadTokens?: number;
+        cacheWriteTokens?: number;
+        hasCacheSplit?: boolean;
+        reasoningTokens?: number;
+        hasExactReasoning?: boolean;
         costUsd?: number;
       };
       estInputChars: number;
@@ -1671,6 +1816,12 @@ export class CopilotVSCodeAdapter implements PassiveIdeAdapter {
           inputTokens: 0,
           outputTokens: 0,
           cachedTokens: 0,
+          cacheReadTokens: 0,
+          cacheWriteTokens: 0,
+          hasCacheSplit: false,
+          hasUnsplitCached: false,
+          reasoningTokens: 0,
+          hasExactReasoning: false,
           lastTurnContext: 0,
           estInputChars: 0,
           estOutputChars: 0,
@@ -1686,7 +1837,13 @@ export class CopilotVSCodeAdapter implements PassiveIdeAdapter {
     const emittedProseCompletionByAgent = new Map<string, boolean>();
     const toolSummaryMap = new Map<
       string,
-      { toolName: string; summary: string; agentId: string }
+      {
+        toolName: string;
+        summary: string;
+        agentId: string;
+        isAskTool?: boolean;
+        questionPrompt?: string;
+      }
     >();
     const subagentIdByCallId = new Map<
       string,
@@ -1802,6 +1959,18 @@ export class CopilotVSCodeAdapter implements PassiveIdeAdapter {
           acc.inputTokens += norm.freshIn;
           acc.outputTokens += norm.outTok;
           acc.cachedTokens += norm.cachedTok;
+          if (u.cacheSplitKnown) {
+            acc.hasCacheSplit = true;
+            acc.cacheReadTokens += u.cacheReadTok ?? 0;
+            acc.cacheWriteTokens += u.cacheWriteTok ?? 0;
+          } else if (norm.cachedTok > 0) {
+            acc.hasUnsplitCached = true;
+          }
+          const rTok = u.reasoningTok ?? dataMeta.reasoningTok;
+          if (rTok !== undefined) {
+            acc.hasExactReasoning = true;
+            acc.reasoningTokens += rTok;
+          }
           if (norm.turnContext !== undefined) {
             acc.lastTurnContext = norm.turnContext;
           }
@@ -1831,6 +2000,20 @@ export class CopilotVSCodeAdapter implements PassiveIdeAdapter {
         const cumCached = mm && (mm.inTok !== undefined || mm.outTok !== undefined)
           ? mm.cachedTok
           : u.cachedTok;
+        const cumSplitKnown =
+          mm && (mm.inTok !== undefined || mm.outTok !== undefined)
+            ? mm.cacheSplitKnown
+            : u.cacheSplitKnown;
+        const cumCacheRead =
+          mm && (mm.inTok !== undefined || mm.outTok !== undefined)
+            ? mm.cacheReadTok
+            : u.cacheReadTok;
+        const cumCacheWrite =
+          mm && (mm.inTok !== undefined || mm.outTok !== undefined)
+            ? mm.cacheWriteTok
+            : u.cacheWriteTok;
+        const cumReasoning =
+          mm?.reasoningTok ?? u.reasoningTok ?? dataMeta.reasoningTok;
         const cumCost = mm?.costUsd ?? u.costUsd;
         if (cumIn !== undefined || cumOut !== undefined) {
           const norm = normalizeCopilotUsage({
@@ -1842,6 +2025,16 @@ export class CopilotVSCodeAdapter implements PassiveIdeAdapter {
             inputTokens: norm.freshIn,
             outputTokens: norm.outTok,
             cachedTokens: norm.cachedTok,
+            ...(cumSplitKnown
+              ? {
+                  cacheReadTokens: cumCacheRead ?? 0,
+                  cacheWriteTokens: cumCacheWrite ?? 0,
+                  hasCacheSplit: true,
+                }
+              : {}),
+            ...(cumReasoning !== undefined
+              ? { reasoningTokens: cumReasoning, hasExactReasoning: true }
+              : {}),
             ...(cumCost !== undefined && cumCost >= 0 ? { costUsd: cumCost } : {}),
           };
         }
@@ -1861,6 +2054,18 @@ export class CopilotVSCodeAdapter implements PassiveIdeAdapter {
         acc.inputTokens += norm.freshIn;
         acc.outputTokens += norm.outTok;
         acc.cachedTokens += norm.cachedTok;
+        if (u.cacheSplitKnown) {
+          acc.hasCacheSplit = true;
+          acc.cacheReadTokens += u.cacheReadTok ?? 0;
+          acc.cacheWriteTokens += u.cacheWriteTok ?? 0;
+        } else if (norm.cachedTok > 0) {
+          acc.hasUnsplitCached = true;
+        }
+        const rTok = u.reasoningTok ?? dataMeta.reasoningTok;
+        if (rTok !== undefined) {
+          acc.hasExactReasoning = true;
+          acc.reasoningTokens += rTok;
+        }
         if (norm.turnContext !== undefined) {
           acc.lastTurnContext = norm.turnContext;
         }
@@ -2013,9 +2218,13 @@ export class CopilotVSCodeAdapter implements PassiveIdeAdapter {
         acc.currTurnProseChars += msgText.length + reasoning.length;
         acc.currTurnChars += msgText.length + reasoning.length;
         if (reasoning) {
+          const inlineReasoning = reasoning.slice(0, THINKING_INLINE_MAX);
           emit({
             kind: "thinking_start",
             summary: cleanHumanSummary(reasoning, 100) || "Thinking…",
+            payload: { body: inlineReasoning, isThought: true },
+            fullBody: reasoning,
+            inlineBody: inlineReasoning,
           });
         }
         const toolReqs = Array.isArray(d.toolRequests) ? d.toolRequests : [];
@@ -2025,7 +2234,7 @@ export class CopilotVSCodeAdapter implements PassiveIdeAdapter {
             emit({
               kind: "thinking_start",
               summary: cleanHumanSummary(msgText, 140) || "Thinking…",
-              payload: { body: inlineBody },
+              payload: { body: inlineBody, isPreToolProse: true },
               fullBody: msgText,
               inlineBody,
             });
@@ -2048,7 +2257,8 @@ export class CopilotVSCodeAdapter implements PassiveIdeAdapter {
             const lowTool = tname.toLowerCase();
             const isBoardMut = isBoardMutationToolCall(tname, args);
             const isMsgTool = isMessageToolName(lowTool);
-            const isAskTool = isCopilotAskTool(lowTool);
+            const isAskTool =
+              isCopilotAskTool(lowTool) && !isStudioDirectAskTool(lowTool);
             const parsedQuestions = isAskTool
               ? normalizePendingQuestions(args, { defaultAllowCustomInput: true })
               : [];
@@ -2058,8 +2268,20 @@ export class CopilotVSCodeAdapter implements PassiveIdeAdapter {
                   120,
                 ) || "Waiting for user answer"
               : summarizeToolCall(tname, args);
+            const questionPrompt = isAskTool
+              ? parsedQuestions
+                  .map((q) => q.question.trim())
+                  .filter(Boolean)
+                  .join(" / ")
+                  .slice(0, 500) || sum
+              : undefined;
             acc.currTurnChars += sum.length;
-            toolSummaryMap.set(callId, { toolName: tname, summary: sum, agentId });
+            toolSummaryMap.set(callId, {
+              toolName: tname,
+              summary: sum,
+              agentId,
+              ...(isAskTool ? { isAskTool: true, questionPrompt } : {}),
+            });
             const msgInfo = isMsgTool ? extractMessagePayload(args) : undefined;
             emit({
               epoch: epoch + (ti + (msgText ? 1 : 0)) * 0.0001,
@@ -2133,7 +2355,8 @@ export class CopilotVSCodeAdapter implements PassiveIdeAdapter {
         const lowTool = tname.toLowerCase();
         const isBoardMut = isBoardMutationToolCall(tname, args);
         const isMsgTool = isMessageToolName(lowTool);
-        const isAskTool = isCopilotAskTool(lowTool);
+        const isAskTool =
+              isCopilotAskTool(lowTool) && !isStudioDirectAskTool(lowTool);
         const parsedQuestions = isAskTool
           ? normalizePendingQuestions(args, { defaultAllowCustomInput: true })
           : [];
@@ -2143,11 +2366,23 @@ export class CopilotVSCodeAdapter implements PassiveIdeAdapter {
               120,
             ) || "Waiting for user answer"
           : summarizeToolCall(tname, args);
+        const questionPrompt = isAskTool
+          ? parsedQuestions
+              .map((q) => q.question.trim())
+              .filter(Boolean)
+              .join(" / ")
+              .slice(0, 500) || sum
+          : undefined;
         acc.currTurnChars += sum.length;
         const selfDaemon = isSelfDaemonCommand(
           sum + " " + JSON.stringify(args),
         );
-        toolSummaryMap.set(callId, { toolName: tname, summary: sum, agentId });
+        toolSummaryMap.set(callId, {
+          toolName: tname,
+          summary: sum,
+          agentId,
+          ...(isAskTool ? { isAskTool: true, questionPrompt } : {}),
+        });
         const msgInfo = isMsgTool ? extractMessagePayload(args) : undefined;
         emit({
           kind: isMsgTool
@@ -2205,6 +2440,46 @@ export class CopilotVSCodeAdapter implements PassiveIdeAdapter {
             ...(!isErr ? { routineEnd: true } : {}),
           },
         });
+        const isAsk = Boolean(
+          prev?.isAskTool ||
+            (tname &&
+              isCopilotAskTool(tname.toLowerCase()) &&
+              !isStudioDirectAskTool(tname.toLowerCase())),
+        );
+        if (isAsk && !isErr) {
+          const rawOutput = formatToolOutput(d.result);
+          const answerText = extractCopilotAnswerText(
+            rawOutput || d.result,
+          );
+          if (answerText) {
+            const askingAgentId = prev?.agentId ?? agentId;
+            const answerCallId = callId
+              ? `${callId}:answer`
+              : `${idx}:${tname ?? "ask"}:answer`;
+            const cleanAns =
+              cleanHumanSummary(answerText, 130) || answerText.slice(0, 130);
+            const inlineBody = answerText.slice(0, 1400);
+            emit({
+              epoch: epoch + 0.0002,
+              kind: "user_input",
+              toolCallId: answerCallId,
+              overrideAgentId: askingAgentId,
+              targetAgentId: askingAgentId,
+              summary: `Human: ${cleanAns}`,
+              payload: {
+                isHumanAnswer: true,
+                ...(callId ? { questionToolCallId: callId } : {}),
+                ...(prev?.questionPrompt
+                  ? { questionPrompt: prev.questionPrompt }
+                  : {}),
+                targetAgentId: askingAgentId,
+                body: inlineBody,
+              },
+              fullBody: answerText,
+              inlineBody,
+            });
+          }
+        }
       } else if (
         rtype === "subagent.started" ||
         rtype === "subagent.start"
@@ -2404,6 +2679,17 @@ export class CopilotVSCodeAdapter implements PassiveIdeAdapter {
         acc.inputTokens = acc.cumulativeFallback.inputTokens;
         acc.outputTokens = acc.cumulativeFallback.outputTokens;
         acc.cachedTokens = acc.cumulativeFallback.cachedTokens;
+        if (acc.cumulativeFallback.hasCacheSplit) {
+          acc.hasCacheSplit = true;
+          acc.cacheReadTokens = acc.cumulativeFallback.cacheReadTokens ?? 0;
+          acc.cacheWriteTokens = acc.cumulativeFallback.cacheWriteTokens ?? 0;
+        } else if (acc.cachedTokens > 0) {
+          acc.hasUnsplitCached = true;
+        }
+        if (acc.cumulativeFallback.hasExactReasoning) {
+          acc.hasExactReasoning = true;
+          acc.reasoningTokens = acc.cumulativeFallback.reasoningTokens ?? 0;
+        }
         if (
           acc.costUsd === undefined &&
           acc.cumulativeFallback.costUsd !== undefined
@@ -2423,6 +2709,7 @@ export class CopilotVSCodeAdapter implements PassiveIdeAdapter {
       const contextTokens = acc.hasExact
         ? acc.lastTurnContext
         : Math.round((acc.priorBoundedProseChars + acc.currTurnChars) / 4);
+      const hasSplit = acc.hasExact && acc.hasCacheSplit && !acc.hasUnsplitCached;
       const usageDelta: UsageDelta = {
         model: acc.model,
         modelSource: acc.model ? "exact" : "unknown",
@@ -2430,6 +2717,18 @@ export class CopilotVSCodeAdapter implements PassiveIdeAdapter {
         inputTokens,
         outputTokens,
         cachedTokens,
+        ...(hasSplit
+          ? {
+              cacheReadTokens: acc.cacheReadTokens,
+              cacheWriteTokens: acc.cacheWriteTokens,
+            }
+          : {}),
+        ...(acc.hasExact && acc.hasExactReasoning
+          ? {
+              reasoningTokens: Math.min(outputTokens, acc.reasoningTokens),
+              reasoningSource: "exact" as const,
+            }
+          : {}),
         contextTokens,
         ...(acc.contextWindow !== undefined
           ? { contextWindow: acc.contextWindow }
@@ -2522,6 +2821,12 @@ export class CopilotVSCodeAdapter implements PassiveIdeAdapter {
       inputTokens: number;
       outputTokens: number;
       cachedTokens: number;
+      cacheReadTokens: number;
+      cacheWriteTokens: number;
+      hasCacheSplit: boolean;
+      hasUnsplitCached: boolean;
+      reasoningTokens: number;
+      hasExactReasoning: boolean;
       lastTurnContext: number;
       contextWindow?: number;
       estInputChars: number;
@@ -2540,6 +2845,12 @@ export class CopilotVSCodeAdapter implements PassiveIdeAdapter {
           inputTokens: 0,
           outputTokens: 0,
           cachedTokens: 0,
+          cacheReadTokens: 0,
+          cacheWriteTokens: 0,
+          hasCacheSplit: false,
+          hasUnsplitCached: false,
+          reasoningTokens: 0,
+          hasExactReasoning: false,
           lastTurnContext: 0,
           contextWindow: selectedModelContextWindow,
           estInputChars: 0,
@@ -2623,10 +2934,11 @@ export class CopilotVSCodeAdapter implements PassiveIdeAdapter {
           (typeof req.completionTokens === "number"
             ? req.completionTokens
             : undefined);
-        const rawCached =
-          directUsage.cachedTok > 0
-            ? directUsage.cachedTok
-            : metaFields.cachedTok;
+        const cacheSource =
+          directUsage.cachedTok > 0 || directUsage.cacheSplitKnown
+            ? directUsage
+            : metaFields;
+        const rawCached = cacheSource.cachedTok;
         const rawCtx = directUsage.contextTok ?? metaFields.contextTok;
         const norm = normalizeCopilotUsage({
           inTok: rawIn,
@@ -2638,6 +2950,18 @@ export class CopilotVSCodeAdapter implements PassiveIdeAdapter {
         acc.inputTokens += norm.freshIn;
         acc.outputTokens += norm.outTok;
         acc.cachedTokens += norm.cachedTok;
+        if (cacheSource.cacheSplitKnown) {
+          acc.hasCacheSplit = true;
+          acc.cacheReadTokens += cacheSource.cacheReadTok ?? 0;
+          acc.cacheWriteTokens += cacheSource.cacheWriteTok ?? 0;
+        } else if (norm.cachedTok > 0) {
+          acc.hasUnsplitCached = true;
+        }
+        const rTok = directUsage.reasoningTok ?? metaFields.reasoningTok;
+        if (rTok !== undefined) {
+          acc.hasExactReasoning = true;
+          acc.reasoningTokens += rTok;
+        }
         if (norm.turnContext !== undefined) {
           acc.lastTurnContext = norm.turnContext;
         }
@@ -2660,6 +2984,17 @@ export class CopilotVSCodeAdapter implements PassiveIdeAdapter {
           acc.inputTokens += norm.freshIn;
           acc.outputTokens += norm.outTok;
           acc.cachedTokens += norm.cachedTok;
+          if (ru.cacheSplitKnown) {
+            acc.hasCacheSplit = true;
+            acc.cacheReadTokens += ru.cacheReadTok ?? 0;
+            acc.cacheWriteTokens += ru.cacheWriteTok ?? 0;
+          } else if (norm.cachedTok > 0) {
+            acc.hasUnsplitCached = true;
+          }
+          if (ru.reasoningTok !== undefined) {
+            acc.hasExactReasoning = true;
+            acc.reasoningTokens += ru.reasoningTok;
+          }
           if (norm.turnContext !== undefined) {
             acc.lastTurnContext = norm.turnContext;
           }
@@ -2787,6 +3122,43 @@ export class CopilotVSCodeAdapter implements PassiveIdeAdapter {
         }
       };
 
+      const emitChatAnswer = (
+        stepEpoch: number,
+        callId: string,
+        questions: PendingQuestionItem[],
+        qTitle: string,
+        rawAnswerData: unknown,
+        pastTenseMsg: string,
+      ): void => {
+        const answerText = extractCopilotAnswerText(rawAnswerData, pastTenseMsg);
+        if (!answerText) return;
+        const questionPrompt =
+          questions
+            .map((q) => q.question.trim())
+            .filter(Boolean)
+            .join(" / ")
+            .slice(0, 500) || qTitle;
+        const cleanAns =
+          cleanHumanSummary(answerText, 130) || answerText.slice(0, 130);
+        const inlineBody = answerText.slice(0, 1400);
+        emit({
+          epoch: stepEpoch + 0.006,
+          kind: "user_input",
+          toolCallId: `${callId}:answer`,
+          targetAgentId: agentId,
+          summary: `Human: ${cleanAns}`,
+          payload: {
+            isHumanAnswer: true,
+            questionToolCallId: callId,
+            questionPrompt,
+            targetAgentId: agentId,
+            body: inlineBody,
+          },
+          fullBody: answerText,
+          inlineBody,
+        });
+      };
+
       // 1. User prompt
       const promptText = req.message?.text?.trim() ?? "";
       if (promptText) {
@@ -2823,13 +3195,18 @@ export class CopilotVSCodeAdapter implements PassiveIdeAdapter {
             typeof item.generatedTitle === "string"
               ? item.generatedTitle.trim()
               : "";
-          const inlineBody = thinkText ? thinkText.slice(0, 1000) : "";
+          const inlineBody = thinkText
+            ? thinkText.slice(0, THINKING_INLINE_MAX)
+            : "";
           emit({
             epoch: stepEpoch,
             kind: "thinking_start",
             summary:
               cleanHumanSummary(genTitle || thinkText, 120) || "Thinking…",
-            ...(inlineBody ? { payload: { body: inlineBody } } : {}),
+            payload: {
+              ...(inlineBody ? { body: inlineBody } : {}),
+              isThought: true,
+            },
             ...(thinkText ? { fullBody: thinkText, inlineBody } : {}),
           });
         } else if (rkind === "prepareToolInvocation") {
@@ -2976,7 +3353,10 @@ export class CopilotVSCodeAdapter implements PassiveIdeAdapter {
                   : {}),
               });
             }
-          } else if (isCopilotAskTool(lowTool)) {
+          } else if (
+            isCopilotAskTool(lowTool) &&
+            !isStudioDirectAskTool(lowTool)
+          ) {
             const mergedQs = reqQuestionAnalysis.mergedAskQuestions.get(i);
             const askQs =
               mergedQs && mergedQs.length > 0
@@ -3013,6 +3393,24 @@ export class CopilotVSCodeAdapter implements PassiveIdeAdapter {
                 toolCallId: callId,
                 summary: `Answered: ${qTitle.slice(0, 80)}`,
               });
+              let mergedCarouselData: unknown;
+              for (const [
+                carIdx,
+                askIdx,
+              ] of reqQuestionAnalysis.mergedCarouselToAskIdx.entries()) {
+                if (askIdx === i && responses[carIdx]?.data !== undefined) {
+                  mergedCarouselData = responses[carIdx]!.data;
+                  break;
+                }
+              }
+              emitChatAnswer(
+                stepEpoch,
+                callId,
+                askQs,
+                qTitle,
+                item.data ?? mergedCarouselData ?? item.resultDetails,
+                extractMessageText(item.pastTenseMessage),
+              );
             }
           } else {
             const needsApproval =
@@ -3128,6 +3526,14 @@ export class CopilotVSCodeAdapter implements PassiveIdeAdapter {
               toolCallId: callId,
               summary: `Answered: ${qTitle.slice(0, 80)}`,
             });
+            emitChatAnswer(
+              stepEpoch,
+              callId,
+              carouselQs,
+              qTitle,
+              item.data ?? item.resultDetails,
+              extractMessageText(item.pastTenseMessage),
+            );
           }
         } else if (rkind === "textEditGroup") {
           const callId = `${req.requestId ?? rIdx}:${i}:edit`;
@@ -3222,6 +3628,7 @@ export class CopilotVSCodeAdapter implements PassiveIdeAdapter {
       const contextTokens = acc.hasExact
         ? acc.lastTurnContext
         : Math.round((acc.priorBoundedProseChars + acc.latestTurnChars) / 4);
+      const hasSplit = acc.hasExact && acc.hasCacheSplit && !acc.hasUnsplitCached;
       const usageDelta: UsageDelta = {
         model: acc.model,
         modelSource: acc.model ? "exact" : "unknown",
@@ -3229,6 +3636,18 @@ export class CopilotVSCodeAdapter implements PassiveIdeAdapter {
         inputTokens,
         outputTokens,
         cachedTokens,
+        ...(hasSplit
+          ? {
+              cacheReadTokens: acc.cacheReadTokens,
+              cacheWriteTokens: acc.cacheWriteTokens,
+            }
+          : {}),
+        ...(acc.hasExact && acc.hasExactReasoning
+          ? {
+              reasoningTokens: Math.min(outputTokens, acc.reasoningTokens),
+              reasoningSource: "exact" as const,
+            }
+          : {}),
         contextTokens,
         ...(acc.contextWindow !== undefined
           ? { contextWindow: acc.contextWindow }
@@ -3283,21 +3702,6 @@ export class CopilotVSCodeAdapter implements PassiveIdeAdapter {
     >();
     const usedSubagentSlugs = new Set<string>();
     let fallbackEpoch = mtimeMs / 1000 - Math.max(rows.length, 1);
-
-    const formatToolOutput = (val: unknown): string => {
-      if (val === undefined || val === null) return "";
-      if (typeof val === "string") return val;
-      if (typeof val === "object") {
-        const rec = val as Record<string, unknown>;
-        if (typeof rec.content === "string") return rec.content;
-        try {
-          return JSON.stringify(val, null, 2);
-        } catch {
-          return String(val);
-        }
-      }
-      return String(val);
-    };
 
     for (let idx = 0; idx < rows.length; idx++) {
       const row = rows[idx]!;
@@ -3459,7 +3863,10 @@ export class CopilotVSCodeAdapter implements PassiveIdeAdapter {
           if (!existingRef.inputPreview && Object.keys(args).length > 0) {
             existingRef.inputPreview = capChatText(JSON.stringify(args), 4096);
           }
-        } else if (isCopilotAskTool(lowTool)) {
+        } else if (
+            isCopilotAskTool(lowTool) &&
+            !isStudioDirectAskTool(lowTool)
+          ) {
           if (!seenAskCallIds.has(callId)) {
             seenAskCallIds.add(callId);
             const qs = normalizePendingQuestions(args, {
@@ -3882,7 +4289,10 @@ export class CopilotVSCodeAdapter implements PassiveIdeAdapter {
               subagentId: subId,
               subagentLabel: subLabel,
             });
-          } else if (isCopilotAskTool(lowTool)) {
+          } else if (
+            isCopilotAskTool(lowTool) &&
+            !isStudioDirectAskTool(lowTool)
+          ) {
             const mergedQs = reqQuestionAnalysis.mergedAskQuestions.get(i);
             const askQs =
               mergedQs && mergedQs.length > 0

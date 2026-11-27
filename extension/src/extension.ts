@@ -1,4 +1,8 @@
 import * as vscode from "vscode";
+import {
+  registerAskHumanTool,
+  type LanguageModelToolApiLike,
+} from "./askHumanTool";
 import { registerTerminalPath, syncCliShims } from "./cliShim";
 import { registerMcpProvider } from "./mcpProvider";
 import { ModelSyncManager, type LanguageModelApiLike } from "./modelSync";
@@ -51,9 +55,16 @@ export function activate(context: vscode.ExtensionContext): void {
   const mcpDisposable = registerMcpProvider(manager, output);
   context.subscriptions.push(mcpDisposable);
 
-  const lmApi = (vscode as unknown as { lm?: LanguageModelApiLike }).lm;
+  const lmApi = (
+    vscode as unknown as {
+      lm?: LanguageModelApiLike & LanguageModelToolApiLike;
+    }
+  ).lm;
   const modelSync = new ModelSyncManager(manager, output, lmApi);
   context.subscriptions.push(modelSync);
+
+  const askHumanDisposable = registerAskHumanTool(manager, output, lmApi);
+  context.subscriptions.push(askHumanDisposable);
 
   const openView = async (
     view: StudioViewName,

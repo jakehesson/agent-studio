@@ -28,6 +28,7 @@ import {
   MANAGED_BEGIN,
   MANAGED_END,
   mapCapabilitiesToAntigravity,
+  mapCapabilitiesToClaudeCode,
   mapCapabilitiesToCopilotVsCode,
   mergeJsonKeyScoped,
   mergeManagedMarkdownBlock,
@@ -546,6 +547,25 @@ describe("Multi-IDE Compiler (Golden Fixtures & Orchestrator Read-Only)", () => 
       splitFrontmatter(vscLearnSkillRaw).frontmatter ?? "",
     ) as Record<string, unknown>;
     assert.equal(vscLearnSkillFm["disable-model-invocation"], true);
+
+    // Verify ask_user capability mappings & shared rules across all 3 IDEs
+    const agyAsk = mapCapabilitiesToAntigravity(["read", "ask_user"]);
+    assert.equal(agyAsk.inheritMcp, true);
+    assert.ok(agyAsk.tools.includes("ask_question"));
+
+    const ccAsk = mapCapabilitiesToClaudeCode(["read", "ask_user"]);
+    assert.ok(ccAsk.includes("AskUserQuestion"));
+    assert.ok(ccAsk.includes("mcp__agent-studio__ask_human"));
+
+    const vscAsk = mapCapabilitiesToCopilotVsCode(["read", "ask_user"]);
+    assert.ok(vscAsk.includes("agent_studio_ask_human"));
+
+    const agyRules = fs.readFileSync(path.join(agyPluginDir, "rules", "AGENTS.md"), "utf8");
+    assert.match(agyRules, /ask_human/);
+    assert.match(agyRules, /agent_studio_ask_human/);
+    assert.ok(
+      fs.readFileSync(path.join(repo, "CLAUDE.md"), "utf8").includes("ask_human"),
+    );
 
     // Verify always-on Token & Context Discipline rules appear in all 3 IDE rules files
     assert.ok(
@@ -1285,7 +1305,13 @@ describe("CLI Init, Global Install & Doctor", () => {
     const copilotAgentFm = parseYaml(
       splitFrontmatter(fs.readFileSync(copilotAgentPath, "utf8")).frontmatter ?? "",
     ) as Record<string, unknown>;
-    assert.deepEqual(copilotAgentFm.tools, ["read", "search", "edit", "execute"]);
+    assert.deepEqual(copilotAgentFm.tools, [
+      "read",
+      "search",
+      "edit",
+      "execute",
+      "agent_studio_ask_human",
+    ]);
     assert.equal(copilotAgentFm["user-invocable"], true);
     assert.equal(copilotAgentFm["disable-model-invocation"], false);
 

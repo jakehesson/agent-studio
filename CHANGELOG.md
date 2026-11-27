@@ -5,6 +5,37 @@ All notable changes to **Agent Studio** will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.15.0] - 2026-11-26
+
+> Released with the QA gate overridden at the user's request (QA rerun skipped).
+
+### Added
+- **Direct In-Messages-UI Human Answering (`S1-77`):**
+  - Added the Studio-owned `ask_human` MCP tool and the VS Code `agent_studio_ask_human` Language Model tool, so agents can ask questions that the user answers directly in Agent Studio.
+  - Added **Send Answer** and a two-step **Cancel** in the Messages tab and Chat Drawer.
+  - Added the `PromptBridge` with HTTP routes `/api/prompts*` and `/api/health`, a docked prompt tray with multi-prompt tabs, and MCP App `app_answer_prompt` / `app_cancel_prompt`.
+  - Added a fail-open `preToolUse` redirect of `vscode_askQuestions` to `ask_human` when Studio is open on that workspace (opt out with `AGENT_STUDIO_DISABLE_ASK_REDIRECT=1`).
+  - Added a shared team rule preferring `ask_human`.
+
+### Changed
+- Antigravity `notify_user(BlockedOnUser)` is no longer treated as `blockingToolCall`.
+- `ask_human` runs off the serial MCP queue with progress keepalives and cancellation.
+- `team-setup` on Antigravity now inherits MCP.
+- A server bound to `0.0.0.0` rejects non-loopback `Host` headers on `/api/prompts*`.
+
+### Fixed
+- Removed the duplicate passive Copilot "Copy & Focus IDE" card for `ask_human`.
+- Fixed light-theme `.btn-secondary:hover` contrast.
+- Fixed the prompt tray clipping on short screens.
+- Cards now lock after a remote answer, cancel, or expiry.
+- Prompts are no longer hidden when a session has no agents.
+
+### Security
+- Added a Host/Origin guard on `/api/prompts*` against DNS rebinding, with no wildcard CORS.
+- Added strict `vscode-webview://` origin validation.
+- Prompt IDs reject raw `..` and encoded traversal.
+- Active and terminal prompt counts are bounded.
+
 ## [0.14.0] - 2026-11-26
 
 ### Added

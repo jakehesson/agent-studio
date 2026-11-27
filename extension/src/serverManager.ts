@@ -197,7 +197,12 @@ export class ServerManager implements vscode.Disposable {
     baseUrl: string,
     view?: StudioView,
     projectId?: string,
-    opts?: { embed?: boolean; sessionId?: string },
+    opts?: {
+      embed?: boolean;
+      sessionId?: string;
+      agentId?: string;
+      focusQuestion?: boolean;
+    },
   ): string {
     const resolvedProject = projectId ?? this.detectWorkspaceProjectId();
     return buildScopedViewUrl({
@@ -205,6 +210,8 @@ export class ServerManager implements vscode.Disposable {
       view,
       projectId: resolvedProject,
       sessionId: opts?.sessionId,
+      agentId: opts?.agentId,
+      focusQuestion: opts?.focusQuestion,
       embed: opts?.embed,
       hostIde: this.detectHostIde(),
       workspaceRoot: this.getNormalizedWorkspaceRoot(),

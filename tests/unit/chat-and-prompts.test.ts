@@ -277,7 +277,7 @@ describe("S1-66: Pending Human Prompts, Per-Agent Chat Transcripts, /api/chat & 
     const nPrompt = notifySnap.agents.find((a) => a.id === "root")?.pendingPrompt;
     assert.ok(nPrompt);
     assert.equal(nPrompt.kind, "question");
-    assert.equal(nPrompt.blockingToolCall, true);
+    assert.equal(nPrompt.blockingToolCall, false);
     assert.equal(nPrompt.questions[0]?.type, "text");
     assert.match(nPrompt.questions[0]?.question ?? "", /approve the implementation plan/i);
   });
@@ -1492,5 +1492,645 @@ describe("S1-66: Pending Human Prompts, Per-Agent Chat Transcripts, /api/chat & 
     const agyChat = await agyAdapter.parseChat(agyDisc, { agentId: "root" });
     const cmdAst = agyChat.find((m) => m.role === "assistant" && m.tools?.[0]?.toolName === "run_command");
     assert.equal(cmdAst?.tools?.[0]?.output, "All 110 tests passed");
+  });
+
+  it("S1-76: extracts human question replies (Antigravity Path A+B, Claude AskUserQuestion, Copilot events+chatSessions) and bounded self-thoughts (isThought, <= 800 inline + EventBodyStore)", async () => {
+    const longThink = "THOUGHT_START " + "T".repeat(950) + " THOUGHT_END";
+    const longAnswer = "ANS_START " + "A".repeat(1600) + " ANS_END";
+
+    // 1. Antigravity Path A (GENERIC answer), Path B (USER_INPUT answer), and PLANNER_RESPONSE thinking
+    const agyBrain = path.join(tmpDir, "s176-agy-brain");
+    const agyCid = "55555555-aaaa-bbbb-cccc-555555555555";
+    await fs.mkdir(path.join(agyBrain, agyCid, ".system_generated", "logs"), {
+      recursive: true,
+    });
+    const agyRows = [
+      {
+        step_index: 0,
+        type: "USER_INPUT",
+        created_at: "2026-11-26T15:00:00Z",
+        content: "Start S1-76",
+      },
+      {
+        step_index: 1,
+        type: "SYSTEM_MESSAGE",
+        created_at: "2026-11-26T15:00:01Z",
+        content: "Incoming wake message",
+      },
+      {
+        step_index: 2,
+        type: "PLANNER_RESPONSE",
+        created_at: "2026-11-26T15:00:02Z",
+        thinking: longThink,
+        content: "Asking Path A question.",
+        tool_calls: [
+          {
+            name: "ask_question",
+            args: {
+              questions: [{ question: "Which mode should we use?", options: ["Fast", "Safe"] }],
+            },
+          },
+        ],
+      },
+      {
+        step_index: 3,
+        type: "GENERIC",
+        status: "DONE",
+        created_at: "2026-11-26T15:00:04Z",
+        content: JSON.stringify({ answers: { "Which mode should we use?": longAnswer } }),
+      },
+      {
+        step_index: 4,
+        type: "PLANNER_RESPONSE",
+        created_at: "2026-11-26T15:00:06Z",
+        tool_calls: [
+          {
+            name: "notify_user",
+            args: { Message: '"Approve deploy?"', BlockedOnUser: '"true"' },
+          },
+        ],
+      },
+      {
+        step_index: 5,
+        type: "USER_INPUT",
+        created_at: "2026-11-26T15:00:08Z",
+        content: "Approved, deploy now",
+      },
+      {
+        step_index: 6,
+        type: "PLANNER_RESPONSE",
+        created_at: "2026-11-26T15:00:10Z",
+        thinking: "Finalizing without tools.",
+        content: "Deployment completed.",
+      },
+    ];
+    await fs.writeFile(
+      path.join(agyBrain, agyCid, ".system_generated", "logs", "transcript.jsonl"),
+      agyRows.map((r) => JSON.stringify(r)).join("\n") + "\n",
+      "utf8",
+    );
+
+    const agyAdapter = new AntigravityAdapter({ brainDir: agyBrain });
+    const [agyDisc] = await agyAdapter.discoverSessions();
+    assert.ok(agyDisc);
+    const agyBodies = new Map<string, string>();
+    const agyEvents = await agyAdapter.parseSession(agyDisc, {
+      onFullBody: (id, body) => agyBodies.set(id, body),
+    });
+
+    const agyThoughts = agyEvents.filter((e) => e.kind === "thinking_start");
+    const sysThought = agyThoughts.find((e) => e.summary.includes("Incoming wake"));
+    assert.ok(sysThought);
+    assert.equal(sysThought.payload?.isThought, undefined, "SYSTEM_MESSAGE thinking_start must not set isThought");
+
+    const plannerThoughts = agyThoughts.filter((e) => e.payload?.isThought === true);
+    assert.equal(plannerThoughts.length, 2, "emits isThought for PLANNER_RESPONSE with and without tool_calls");
+    assert.equal(String(plannerThoughts[0]!.payload?.body).length, 800);
+    assert.equal(plannerThoughts[0]!.bodyTruncated, true);
+    assert.equal(agyBodies.get(plannerThoughts[0]!.id), longThink);
+    const firstAskStart = agyEvents.find((e) => e.kind === "tool_start" && e.toolName === "ask_question")!;
+    assert.ok(plannerThoughts[0]!.epoch < firstAskStart.epoch, "thinking_start precedes row tool calls");
+
+    const agyAnswers = agyEvents.filter(
+      (e) => e.kind === "user_input" && e.payload?.isHumanAnswer === true,
+    );
+    assert.equal(agyAnswers.length, 2, "captures both Path A GENERIC and Path B USER_INPUT human answers");
+    const pathAAns = agyAnswers[0]!;
+    assert.equal(pathAAns.toolCallId, `${firstAskStart.toolCallId}:answer`);
+    assert.equal(pathAAns.payload?.questionToolCallId, firstAskStart.toolCallId);
+    assert.match(String(pathAAns.payload?.questionPrompt), /Which mode/);
+    assert.equal(String(pathAAns.payload?.body).length, 1400);
+    assert.equal(pathAAns.bodyTruncated, true);
+    assert.ok(agyBodies.get(pathAAns.id)?.includes(longAnswer));
+
+    const notifyEv = agyEvents.find((e) => e.kind === "message" && e.toolName === "notify_user")!;
+    const pathBAns = agyAnswers[1]!;
+    assert.equal(pathBAns.toolCallId, `${notifyEv.toolCallId}:answer`);
+    assert.equal(pathBAns.payload?.questionToolCallId, notifyEv.toolCallId);
+    assert.match(String(pathBAns.payload?.questionPrompt), /Approve deploy/);
+    assert.equal(pathBAns.payload?.body, "Approved, deploy now");
+
+    const agySnap = buildSessionSnapshot(agyEvents, {
+      sessionId: agyCid,
+      ide: "antigravity",
+      nowEpochSec: Date.parse("2026-11-26T15:00:12Z") / 1000,
+    });
+    assert.equal(agySnap.waitingOn, null);
+    assert.equal(agySnap.pendingPrompts?.length ?? 0, 0);
+
+    // 2. Claude Code: AskUserQuestion tool_result + thinking block cap
+    const ccDir = path.join(tmpDir, "s176-claude");
+    const ccProj = path.join(ccDir, "C--Projects-S176");
+    const ccSid = "dddd1111-2222-3333-4444-555566667777";
+    await fs.mkdir(ccProj, { recursive: true });
+    const ccRows = [
+      {
+        type: "user",
+        uuid: "cu0",
+        sessionId: ccSid,
+        cwd: "C:\\Projects\\S176",
+        timestamp: "2026-11-26T15:10:00Z",
+        message: { role: "user", content: "Check options" },
+      },
+      {
+        type: "assistant",
+        uuid: "ca1",
+        sessionId: ccSid,
+        timestamp: "2026-11-26T15:10:01Z",
+        message: {
+          id: "cmsg1",
+          role: "assistant",
+          stop_reason: "tool_use",
+          content: [
+            { type: "thinking", thinking: longThink },
+            {
+              type: "tool_use",
+              id: "cc-ask-1",
+              name: "AskUserQuestion",
+              input: {
+                questions: [
+                  {
+                    question: "Pick deployment target?",
+                    options: [{ label: "Staging" }, { label: "Production" }],
+                  },
+                ],
+              },
+            },
+          ],
+        },
+      },
+      {
+        type: "user",
+        uuid: "cu1",
+        sessionId: ccSid,
+        timestamp: "2026-11-26T15:10:05Z",
+        toolUseResult: { answers: { "Pick deployment target?": "Staging" } },
+        message: {
+          role: "user",
+          content: [
+            {
+              type: "tool_result",
+              tool_use_id: "cc-ask-1",
+              content: "User answered Staging",
+            },
+          ],
+        },
+      },
+    ];
+    await fs.writeFile(
+      path.join(ccProj, `${ccSid}.jsonl`),
+      ccRows.map((r) => JSON.stringify(r)).join("\n") + "\n",
+      "utf8",
+    );
+
+    const ccAdapter = new ClaudeCodeAdapter({ projectsDir: ccDir });
+    const [ccDisc] = await ccAdapter.discoverSessions();
+    assert.ok(ccDisc);
+    const ccBodies = new Map<string, string>();
+    const ccEvents = await ccAdapter.parseSession(ccDisc, {
+      onFullBody: (id, body) => ccBodies.set(id, body),
+    });
+    const ccThought = ccEvents.find((e) => e.kind === "thinking_start")!;
+    assert.equal(ccThought.payload?.isThought, true);
+    assert.equal(String(ccThought.payload?.body).length, 800);
+    assert.equal(ccThought.bodyTruncated, true);
+    assert.equal(ccBodies.get(ccThought.id), longThink);
+
+    const ccAns = ccEvents.find(
+      (e) => e.kind === "user_input" && e.payload?.isHumanAnswer === true,
+    )!;
+    assert.ok(ccAns);
+    assert.equal(ccAns.toolCallId, "cc-ask-1:answer");
+    assert.equal(ccAns.payload?.questionToolCallId, "cc-ask-1");
+    assert.match(String(ccAns.payload?.questionPrompt), /Pick deployment target/);
+    assert.match(String(ccAns.payload?.body), /Staging/);
+    const ccSnap = buildSessionSnapshot(ccEvents, {
+      sessionId: ccSid,
+      ide: "claude-code",
+      nowEpochSec: Date.parse("2026-11-26T15:10:06Z") / 1000,
+    });
+    assert.equal(ccSnap.waitingOn, null);
+    assert.equal(ccSnap.pendingPrompts?.length ?? 0, 0);
+
+    // 3. VS Code Copilot: events.jsonl + chatSessions
+    const vscStorage = path.join(tmpDir, "s176-vsc");
+    const vscWs = path.join(vscStorage, "ws1");
+    const vscChatDir = path.join(vscWs, "chatSessions");
+    const vscTrDir = path.join(vscWs, "GitHub.copilot-chat", "transcripts");
+    await fs.mkdir(vscChatDir, { recursive: true });
+    await fs.mkdir(vscTrDir, { recursive: true });
+    await fs.writeFile(
+      path.join(vscWs, "workspace.json"),
+      JSON.stringify({ folder: "file:///c%3A/Projects/S176Vsc" }),
+      "utf8",
+    );
+
+    const chatMs = Date.parse("2026-11-26T15:20:00Z");
+    await fs.writeFile(
+      path.join(vscChatDir, "vsc-s176-chat.json"),
+      JSON.stringify({
+        sessionId: "vsc-s176-chat",
+        creationDate: chatMs,
+        requests: [
+          {
+            requestId: "vr1",
+            timestamp: chatMs,
+            message: { text: "Configure S1-76" },
+            response: [
+              { kind: "thinking", value: longThink },
+              {
+                kind: "toolInvocationSerialized",
+                toolId: "vscode_askQuestions",
+                toolCallId: "vsc-ask-c1",
+                isComplete: true,
+                pastTenseMessage: "Answered",
+              },
+              {
+                kind: "questionCarousel",
+                data: { "Which region?": "us-east-1" },
+                questions: [{ message: "Which region?", type: "singleSelect", options: [{ label: "us-east-1" }] }],
+              },
+              {
+                kind: "questionCarousel",
+                toolCallId: "vsc-car-2",
+                isUsed: true,
+                pastTenseMessage: "User chose dark mode",
+                questions: [{ message: "Theme?", type: "text" }],
+              },
+            ],
+            modelState: { completedAt: chatMs + 5000 },
+          },
+        ],
+      }),
+      "utf8",
+    );
+
+    await fs.writeFile(
+      path.join(vscTrDir, "tr-s176.jsonl"),
+      [
+        {
+          type: "session.start",
+          timestamp: "2026-11-26T15:25:00Z",
+          data: { sessionId: "vsc-s176-tr" },
+        },
+        {
+          type: "user.message",
+          timestamp: "2026-11-26T15:25:01Z",
+          data: { content: "Ask via events.jsonl" },
+        },
+        {
+          type: "assistant.message",
+          timestamp: "2026-11-26T15:25:02Z",
+          data: {
+            reasoningText: longThink,
+            content: "Checking with user before running.",
+            toolRequests: [
+              {
+                toolCallId: "vsc-tr-ask-1",
+                name: "ask_questions",
+                arguments: {
+                  questions: [{ question: "Proceed with cleanup?" }],
+                },
+              },
+            ],
+          },
+        },
+        {
+          type: "tool.execution_complete",
+          timestamp: "2026-11-26T15:25:06Z",
+          data: {
+            toolCallId: "vsc-tr-ask-1",
+            toolName: "ask_questions",
+            success: true,
+            result: { content: JSON.stringify({ answers: { "Proceed with cleanup?": "Yes, delete temp files" } }) },
+          },
+        },
+      ]
+        .map((r) => JSON.stringify(r))
+        .join("\n") + "\n",
+      "utf8",
+    );
+
+    const vscAdapter = new CopilotVSCodeAdapter({ storageDir: vscStorage });
+    const vscDisc = await vscAdapter.discoverSessions();
+
+    const chatSess = vscDisc.find((s) => s.sessionId === "vsc-s176-chat")!;
+    const chatBodies = new Map<string, string>();
+    const chatEvs = await vscAdapter.parseSession(chatSess, {
+      onFullBody: (id, body) => chatBodies.set(id, body),
+    });
+    const chatThink = chatEvs.find((e) => e.kind === "thinking_start")!;
+    assert.equal(chatThink.payload?.isThought, true);
+    assert.equal(String(chatThink.payload?.body).length, 800);
+    assert.equal(chatBodies.get(chatThink.id), longThink);
+    const chatAns = chatEvs.filter(
+      (e) => e.kind === "user_input" && e.payload?.isHumanAnswer === true,
+    );
+    assert.equal(chatAns.length, 2);
+    assert.match(String(chatAns[0]!.payload?.body), /us-east-1/);
+    assert.equal(chatAns[1]!.payload?.body, "User chose dark mode");
+
+    const trSess = vscDisc.find((s) => s.sessionId === "vsc-s176-tr")!;
+    const trBodies = new Map<string, string>();
+    const trEvs = await vscAdapter.parseSession(trSess, {
+      onFullBody: (id, body) => trBodies.set(id, body),
+    });
+    const trReasoning = trEvs.find(
+      (e) => e.kind === "thinking_start" && e.payload?.isThought === true,
+    )!;
+    assert.ok(trReasoning);
+    assert.equal(String(trReasoning.payload?.body).length, 800);
+    assert.equal(trBodies.get(trReasoning.id), longThink);
+    const trProse = trEvs.find(
+      (e) => e.kind === "thinking_start" && e.payload?.isPreToolProse === true,
+    )!;
+    assert.ok(trProse);
+    const trAns = trEvs.find(
+      (e) => e.kind === "user_input" && e.payload?.isHumanAnswer === true,
+    )!;
+    assert.ok(trAns);
+    assert.equal(trAns.toolCallId, "vsc-tr-ask-1:answer");
+    assert.equal(trAns.payload?.questionToolCallId, "vsc-tr-ask-1");
+    assert.match(String(trAns.payload?.body), /Yes, delete temp files/);
+  });
+
+  it("S1-77: hook-emit preToolUse redirects vscode_askquestions only when /api/health hasActiveUi === true, fails open offline, never redirects ask_human, and sets blockingToolCall: false on notify_user", async () => {
+    const wsDir = path.join(tmpDir, "hook-redirect-ws");
+    await fs.mkdir(wsDir, { recursive: true });
+    let capturedStdout = "";
+    const ingestCalls: unknown[] = [];
+
+    // 1. Offline / failed health probe -> fails open (not denied)
+    const offlineFetch = (async () => {
+      throw new Error("ECONNREFUSED");
+    }) as typeof fetch;
+    const offlineRes = await runHookEmit(
+      ["--ide", "copilot-vscode", "--event", "preToolUse", "--cwd", wsDir],
+      {
+        stdinText: JSON.stringify({
+          session_id: "cop-redir-1",
+          tool_name: "vscode_askquestions",
+          tool_use_id: "tc-1",
+          tool_input: { questions: [{ question: "Proceed?" }] },
+        }),
+        stdout: (s) => {
+          capturedStdout += s;
+        },
+        stderr: () => {},
+        fetchImpl: offlineFetch,
+      },
+    );
+    assert.equal(offlineRes.denied, false);
+    assert.equal(offlineRes.exitCode, 0);
+
+    // 2. Health probe returns hasActiveUi: false -> fails open
+    const noUiRes = await runHookEmit(
+      ["--ide", "copilot-vscode", "--event", "preToolUse", "--cwd", wsDir],
+      {
+        stdinText: JSON.stringify({
+          session_id: "cop-redir-2",
+          tool_name: "vscode_askquestions",
+          tool_use_id: "tc-2",
+          tool_input: { questions: [{ question: "Proceed?" }] },
+        }),
+        stdout: () => {},
+        stderr: () => {},
+        fetchImpl: (async (url: string | URL | Request, init?: RequestInit) => {
+          const u = String(url);
+          if (u.includes("/api/health")) {
+            return new Response(
+              JSON.stringify({ ok: true, hasActiveUi: false }),
+              { status: 200 },
+            );
+          }
+          if (u.includes("/api/ingest") && init?.body) {
+            ingestCalls.push(JSON.parse(String(init.body)));
+          }
+          return new Response(JSON.stringify({ ok: true }), { status: 202 });
+        }) as typeof fetch,
+      },
+    );
+    assert.equal(noUiRes.denied, false);
+
+    // 3. Health probe returns hasActiveUi: true -> denies vscode_askquestions with redirect guidance
+    capturedStdout = "";
+    const activeUiFetch = (async (
+      url: string | URL | Request,
+      init?: RequestInit,
+    ) => {
+      const u = String(url);
+      if (u.includes("/api/health")) {
+        return new Response(
+          JSON.stringify({ ok: true, hasActiveUi: true }),
+          { status: 200 },
+        );
+      }
+      if (u.includes("/api/ingest") && init?.body) {
+        ingestCalls.push(JSON.parse(String(init.body)));
+      }
+      return new Response(JSON.stringify({ ok: true }), { status: 202 });
+    }) as typeof fetch;
+
+    const redirectRes = await runHookEmit(
+      ["--ide", "copilot-vscode", "--event", "preToolUse", "--cwd", wsDir],
+      {
+        stdinText: JSON.stringify({
+          session_id: "cop-redir-3",
+          tool_name: "vscode_askquestions",
+          tool_use_id: "tc-3",
+          tool_input: { questions: [{ question: "Proceed?" }] },
+        }),
+        stdout: (s) => {
+          capturedStdout += s;
+        },
+        stderr: () => {},
+        fetchImpl: activeUiFetch,
+      },
+    );
+    assert.equal(redirectRes.denied, true);
+    assert.match(capturedStdout, /agent_studio_ask_human/);
+    assert.equal(redirectRes.event?.waitingReason, undefined);
+
+    // 4. AGENT_STUDIO_DISABLE_ASK_REDIRECT=1 disables redirect
+    const prevDisable = process.env.AGENT_STUDIO_DISABLE_ASK_REDIRECT;
+    process.env.AGENT_STUDIO_DISABLE_ASK_REDIRECT = "1";
+    try {
+      const disabledRes = await runHookEmit(
+        ["--ide", "copilot-vscode", "--event", "preToolUse", "--cwd", wsDir],
+        {
+          stdinText: JSON.stringify({
+            session_id: "cop-redir-4",
+            tool_name: "vscode_askquestions",
+            tool_use_id: "tc-4",
+            tool_input: { questions: [{ question: "Proceed?" }] },
+          }),
+          stdout: () => {},
+          stderr: () => {},
+          fetchImpl: activeUiFetch,
+        },
+      );
+      assert.equal(disabledRes.denied, false);
+    } finally {
+      if (prevDisable === undefined) {
+        delete process.env.AGENT_STUDIO_DISABLE_ASK_REDIRECT;
+      } else {
+        process.env.AGENT_STUDIO_DISABLE_ASK_REDIRECT = prevDisable;
+      }
+    }
+
+    // 5. Never redirect ask_human or agent_studio_ask_human even when active UI is present
+    for (const toolName of ["ask_human", "agent_studio_ask_human"]) {
+      const keepRes = await runHookEmit(
+        ["--ide", "copilot-vscode", "--event", "preToolUse", "--cwd", wsDir],
+        {
+          stdinText: JSON.stringify({
+            session_id: "cop-redir-5",
+            tool_name: toolName,
+            tool_use_id: `tc-${toolName}`,
+            tool_input: { questions: [{ question: "Direct?" }] },
+          }),
+          stdout: () => {},
+          stderr: () => {},
+          fetchImpl: activeUiFetch,
+        },
+      );
+      assert.equal(keepRes.denied, false, `${toolName} must never be redirected`);
+    }
+
+    // 6. notify_user BlockedOnUser sets blockingToolCall: false
+    const notifyRes = await runHookEmit(
+      ["--ide", "antigravity", "--event", "preToolUse", "--cwd", wsDir],
+      {
+        stdinText: JSON.stringify({
+          session_id: "agy-notify-1",
+          tool_name: "notify_user",
+          tool_use_id: "tc-notify-1",
+          tool_input: {
+            Message: "Please review plan",
+            BlockedOnUser: true,
+          },
+        }),
+        stdout: () => {},
+        stderr: () => {},
+        fetchImpl: offlineFetch,
+      },
+    );
+    assert.equal(notifyRes.denied, false);
+    assert.equal(notifyRes.event?.waitingReason, "user");
+    assert.equal(notifyRes.event?.payload?.blockingToolCall, false);
+  });
+
+  it("S1-77 fix: passive Copilot ask_human emits no blocking prompt, and a direct-reply bridge prompt supersedes matching passive prompts", async () => {
+    const ws = path.join(tmpDir, "cop-direct-ws");
+    await fs.mkdir(ws, { recursive: true });
+    const copHome = path.join(tmpDir, "cop-direct-home");
+    const sessDir = path.join(copHome, "session-state", "cop-direct");
+    await fs.mkdir(sessDir, { recursive: true });
+    await fs.writeFile(path.join(sessDir, "workspace.yaml"), `cwd: ${ws}\n`, "utf8");
+    const nowIso = new Date().toISOString();
+    await fs.writeFile(
+      path.join(sessDir, "events.jsonl"),
+      [
+        {
+          type: "tool.execution_start",
+          timestamp: nowIso,
+          data: {
+            toolCallId: "tc-direct-1",
+            toolName: "agent_studio_ask_human",
+            arguments: { questions: [{ question: "Direct ask?" }] },
+          },
+        },
+      ]
+        .map((e) => JSON.stringify(e))
+        .join("\n") + "\n",
+      "utf8",
+    );
+
+    // Adapter alone: Studio's own ask tool is NOT a passive blocking prompt.
+    const adapter = new CopilotVSCodeAdapter({
+      storageDir: path.join(tmpDir, "cop-direct-storage"),
+      copilotHomeDir: copHome,
+    });
+    const disc = await adapter.discoverSessions();
+    const matched = disc.find((s) => s.sessionId === "cop-direct");
+    assert.ok(matched);
+    assert.equal(matched.pendingQuestionCount ?? 0, 0);
+
+    const agg = new TelemetryAggregator({
+      brainDir: path.join(tmpDir, "cd-brain"),
+      claudeDir: path.join(tmpDir, "cd-claude"),
+      vscodeDir: path.join(tmpDir, "cd-vscode"),
+      copilotHomeDir: copHome,
+      includeGlobalTelemetryFile: false,
+      extraWorkspaces: [ws],
+    });
+    try {
+      const before = await agg.getSessionSnapshot("cop-direct", {
+        ide: "copilot-vscode",
+        workspace: ws,
+      });
+      assert.ok(
+        !(before.snapshot.pendingPrompts ?? []).some((p) => p.blockingToolCall),
+        "no passive blockingToolCall prompt for agent_studio_ask_human",
+      );
+
+      // Inject a passive (transcript-derived) prompt on root, then create the bridge prompt.
+      const nowSec = Date.now() / 1000;
+      agg.ingest([
+        {
+          id: "ev-passive-ask",
+          ts: new Date(nowSec * 1000).toISOString(),
+          epoch: nowSec,
+          ide: "copilot-vscode",
+          sessionId: "cop-direct",
+          workspacePath: ws,
+          agentId: "root",
+          kind: "tool_start",
+          toolName: "vscode_askQuestions",
+          toolCallId: "tc-passive-1",
+          targetAgentId: "human",
+          waitingReason: "user",
+          status: "running",
+          summary: "Passive question",
+          payload: {
+            questions: [{ question: "Passive?" }],
+            promptKind: "question",
+            blockingToolCall: true,
+          },
+        },
+      ]);
+      const created = await agg.promptBridge.createPrompt({
+        questions: [{ question: "Direct ask?" }],
+        sessionId: "cop-direct",
+        workspacePath: ws,
+        ide: "copilot-vscode",
+        agentId: "root",
+        toolCallId: "tc-direct-1",
+        toolName: "agent_studio_ask_human",
+        promptSource: "studio-vscode-lm",
+        timeoutMs: 600_000,
+      });
+      assert.equal(created.ok, true);
+      if (!created.ok) return;
+
+      const after = await agg.getSessionSnapshot("cop-direct", {
+        ide: "copilot-vscode",
+        workspace: ws,
+      });
+      const prompts = after.snapshot.pendingPrompts ?? [];
+      assert.equal(prompts.length, 1, JSON.stringify(prompts.map((p) => p.id)));
+      assert.equal(prompts[0]?.id, created.prompt.id);
+      assert.equal(prompts[0]?.directReply, true);
+      const root = after.snapshot.agents.find((a) => a.isRoot);
+      assert.equal(root?.pendingPrompt?.id, created.prompt.id);
+      for (const ag of after.snapshot.agents) {
+        assert.ok(
+          !ag.pendingPrompt || ag.pendingPrompt.directReply,
+          `agent ${ag.id} must not keep a superseded passive prompt`,
+        );
+      }
+    } finally {
+      agg.dispose();
+    }
   });
 });

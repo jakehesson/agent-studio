@@ -1,4 +1,15 @@
 /* Global App Shell, Context Bar, Tabs, Pills, Buttons, and Native Bottom Sheet */
+:root {
+  --panel-elevated: #0a101d;
+  --shadow-elevated: 0 18px 48px rgba(0, 0, 0, 0.55);
+  --thinking-bg: rgba(168, 85, 247, 0.1);
+  --thinking-border: rgba(192, 132, 252, 0.34);
+  --thinking-text: #e9d5ff;
+  --human-accent: #10b981;
+  --human-bg: rgba(16, 185, 129, 0.11);
+  --human-border: rgba(16, 185, 129, 0.38);
+}
+
 [hidden] {
   display: none !important;
 }
@@ -846,7 +857,109 @@ input[type="text"] {
   padding: 0;
 }
 
-/* Cover-Screen Bottom Nav (Hidden on tablet/desktop) */
+/* Foldable & Cover-Screen Bottom Nav (Hidden on desktop >= 1021px) */
 .cover-bottom-nav {
   display: none;
+}
+
+/* Dedicated IDE Side-Tab Agent Chat View (?view=chat) */
+.app-shell[data-active-view="chat"] .context-bar,
+.app-shell[data-active-view="chat"] .cover-bottom-nav {
+  display: none !important;
+}
+
+.app-shell[data-active-view="chat"] .view-host,
+.app-shell[data-active-view="chat"] .view-panel[data-panel="chat"] {
+  flex: 1 1 auto;
+  min-height: 0;
+  height: 100dvh;
+  max-height: 100dvh;
+  padding: 0;
+  margin: 0;
+  overflow: hidden;
+}
+
+/* Resizable Split-Panel Separator */
+.panel-resizer {
+  position: relative;
+  width: 12px;
+  min-height: 44px;
+  align-self: stretch;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  cursor: col-resize;
+  touch-action: none;
+  user-select: none;
+  flex-shrink: 0;
+  border-radius: 6px;
+  z-index: 4;
+}
+
+.panel-resizer[hidden],
+.panel-resizer.is-no-room {
+  display: none;
+}
+
+.panel-resizer::before {
+  content: "";
+  position: absolute;
+  top: 4px;
+  bottom: 4px;
+  left: 50%;
+  width: 2px;
+  transform: translateX(-50%);
+  border-radius: 99px;
+  background: var(--border-strong);
+  pointer-events: none;
+  transition: width 120ms ease, background-color 120ms ease;
+}
+
+.panel-resizer-pill {
+  position: relative;
+  z-index: 1;
+  width: 2px;
+  height: 28px;
+  border-radius: 99px;
+  background: var(--slate);
+  opacity: 0.55;
+  pointer-events: none;
+  transition: width 120ms ease, height 120ms ease, background-color 120ms ease, opacity 120ms ease;
+}
+
+.panel-resizer:hover::before,
+.panel-resizer:focus-visible::before,
+.panel-resizer[data-dragging="true"]::before {
+  width: 3px;
+  background: var(--cyan);
+}
+
+.panel-resizer:hover .panel-resizer-pill,
+.panel-resizer:focus-visible .panel-resizer-pill,
+.panel-resizer[data-dragging="true"] .panel-resizer-pill {
+  width: 4px;
+  height: 36px;
+  opacity: 1;
+  background: var(--sky);
+}
+
+.panel-resizer:focus-visible {
+  outline: 2px solid var(--sky);
+  outline-offset: -1px;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .panel-resizer::before,
+  .panel-resizer-pill {
+    transition: none;
+  }
+}
+
+body[data-resizing="panels"] {
+  cursor: col-resize !important;
+  user-select: none;
+}
+
+body[data-resizing="panels"] iframe {
+  pointer-events: none;
 }

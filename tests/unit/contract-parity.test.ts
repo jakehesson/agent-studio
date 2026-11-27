@@ -24,12 +24,20 @@ import {
   type FeedbackDiagnostics,
 } from "../../src/server/feedback.js";
 import {
+  PendingHumanPromptSchema,
+  PromptSourceSchema,
+  PromptStatusSchema,
+} from "../../src/schema/telemetry.js";
+import {
   inferContextWindow as coreInferContextWindow,
   type IdeSource,
+  type PendingHumanPrompt as CorePendingHumanPrompt,
 } from "../../src/telemetry/types.js";
+import type { PendingHumanPrompt as WebPendingHumanPrompt } from "../../web/src/types.js";
 
 interface WebSnapshotContract {
   inferContextWindow(model?: string, ide?: IdeSource): number;
+  normalizePendingHumanPrompt(raw: unknown): WebPendingHumanPrompt | null;
 }
 
 interface WebFeedbackUrlContract {
@@ -488,6 +496,61 @@ describe("Cross-Package Contract Parity", () => {
         assert.equal(extFeedback.validateFeedbackExternalUrl(prefill.url).ok, true);
         assert.equal(webFeedbackUrl.isAllowedFeedbackNewIssueUrl(prefill.url), true);
         assert.equal(webFeedbackUrl.isAllowedFeedbackIssueUrl(prefill.url), true);
+      }
+    });
+  });
+
+  describe("PendingHumanPrompt contract parity (src/schema/telemetry.ts vs web/src/state/snapshot.ts)", () => {
+    it("accepts and preserves all core PendingHumanPromptSchema fields, PromptSource, and PromptStatus enums in web normalizer", () => {
+      for (const promptSource of PromptSourceSchema.options) {
+        for (const status of PromptStatusSchema.options) {
+          const corePayload: CorePendingHumanPrompt = {
+            id: `p-${promptSource}-${status}`,
+            toolCallId: "tc-1",
+            toolName: "ask_human",
+            agentId: "fe-1",
+            agentLabel: "Frontend",
+            kind: "question",
+            title: "Verify parity",
+            summary: "Check fields",
+            questions: [
+              {
+                id: "q1",
+                header: "Choice",
+                question: "Pick one",
+                type: "single_select",
+                options: [{ id: "o1", label: "A", recommended: true }],
+                allowCustomInput: true,
+                defaultValue: "A",
+              },
+            ],
+            ts: "2026-11-27T00:00:00Z",
+            blockingToolCall: false,
+            directReply: promptSource !== "native",
+            promptSource,
+            status,
+            answerText: status === "answered" ? "A" : undefined,
+            answers: status === "answered" ? { q1: "A" } : undefined,
+            expiresAt: "2026-11-27T00:10:00Z",
+            sessionId: "sess-parity",
+            workspacePath: "/work/repo",
+            ide: "antigravity",
+          };
+
+          const parsed = PendingHumanPromptSchema.parse(corePayload);
+          const webNorm = webSnapshot.normalizePendingHumanPrompt(parsed);
+          assert.ok(webNorm);
+          assert.equal(webNorm.id, parsed.id);
+          assert.equal(webNorm.directReply, parsed.directReply);
+          assert.equal(webNorm.promptSource, promptSource);
+          assert.equal(webNorm.status, status);
+          assert.equal(webNorm.answerText, parsed.answerText);
+          assert.deepEqual(webNorm.answers, parsed.answers);
+          assert.equal(webNorm.expiresAt, parsed.expiresAt);
+          assert.equal(webNorm.sessionId, parsed.sessionId);
+          assert.equal(webNorm.workspacePath, parsed.workspacePath);
+          assert.equal(webNorm.ide, parsed.ide);
+        }
       }
     });
   });

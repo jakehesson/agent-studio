@@ -22,6 +22,10 @@ export interface PromptDraftState {
 const promptDraftStore = new Map<string, PromptDraftState>();
 let cardInstanceSeq = 0;
 
+export function clearPromptDraft(promptId: string): void {
+  promptDraftStore.delete(promptId);
+}
+
 export interface QuestionCardOptions {
   prompt: PendingHumanPrompt;
   sessionId?: string;
@@ -29,6 +33,7 @@ export interface QuestionCardOptions {
   showHeader?: boolean;
   getCapabilities: () => ReplyCapabilities;
   onReply: (req: ReplyToHostRequest) => Promise<ReplyToHostResult>;
+  onCancel?: (promptId: string, reason?: string) => Promise<ReplyToHostResult>;
   onOpenChat?: (agentId: string) => void;
 }
 
@@ -63,7 +68,8 @@ export function getEffectiveQuestions(
 
 function ensureDraft(
   prompt: PendingHumanPrompt,
-  questions: PendingQuestionItem[]
+  questions: PendingQuestionItem[],
+  persist = true
 ): PromptDraftState {
   let state = promptDraftStore.get(prompt.id);
   if (!state) {
@@ -91,7 +97,7 @@ function ensureDraft(
         };
       }
     });
-    promptDraftStore.set(prompt.id, state);
+    if (persist) promptDraftStore.set(prompt.id, state);
   }
   if (state.activeIdx >= questions.length) {
     state.activeIdx = Math.max(0, questions.length - 1);
@@ -159,10 +165,43 @@ export function formatPromptAnswerText(
   return lines.join("\n");
 }
 
+export function buildStructuredAnswers(
+  questions: PendingQuestionItem[],
+  state: PromptDraftState
+): Record<string, string | string[]> {
+  const out: Record<string, string | string[]> = {};
+  questions.forEach((q, idx) => {
+    const draft = state.answers[idx];
+    if (!draft) return;
+    const baseKey = (q.id || q.header || q.question || `q_${idx + 1}`).trim() || `q_${idx + 1}`;
+    const key = Object.prototype.hasOwnProperty.call(out, baseKey)
+      ? `${baseKey}_${idx + 1}`
+      : baseKey;
+    if (q.type === "multi_select") {
+      const items = [...draft.selected];
+      const custom = draft.customText.trim();
+      if (draft.customOpen && custom) items.push(custom);
+      if (items.length > 0) {
+        out[key] = items;
+      }
+      return;
+    }
+    const textVal = getQuestionAnswerText(q, draft);
+    if (textVal) {
+      out[key] = textVal;
+    }
+  });
+  return out;
+}
+
 export function getPrimaryActionMeta(
   caps: ReplyCapabilities,
-  blockingToolCall: boolean
+  blockingToolCall: boolean,
+  directReply = false
 ): { label: string; showSecondaryCopy: boolean } {
+  if (directReply) {
+    return { label: "Send Answer", showSecondaryCopy: false };
+  }
   if (caps.isMcpApp && caps.canSendMessage && !blockingToolCall) {
     return { label: "Send Answer to Chat", showSecondaryCopy: true };
   }
@@ -183,6 +222,8 @@ export function computePromptStructureFingerprint(
     id: prompt.id,
     kind: prompt.kind,
     blocking: prompt.blockingToolCall,
+    directReply: Boolean(prompt.directReply),
+    status: prompt.status ?? "pending",
     questions: prompt.questions,
     options: prompt.options,
     caps,
@@ -213,7 +254,15 @@ export class QuestionCard {
   private statusText = "";
   private statusTone: "ok" | "warn" | "err" = "ok";
   private sending = false;
+  private canceling = false;
+  private cancelConfirmOpen = false;
+  private resolvedState: "answered" | "canceled" | null = null;
+  private showErrorActions = false;
+  private errorAllowRetry = false;
+  private lastFailedAction: "reply" | "cancel" | null = null;
+  private lastFailedAnswerText = "";
   private statusTimer: number | null = null;
+  private renderedResolved = false;
 
   constructor(container: HTMLElement, opts: QuestionCardOptions) {
     this.container = container;
@@ -226,6 +275,9 @@ export class QuestionCard {
     if (this.statusTimer != null) {
       window.clearTimeout(this.statusTimer);
       this.statusTimer = null;
+    }
+    if (this.isResolved()) {
+      clearPromptDraft(this.opts.prompt.id);
     }
   }
 
@@ -245,11 +297,103 @@ export class QuestionCard {
     first?.focus({ preventScroll: false });
   }
 
+  private isResolved(): boolean {
+    const st = this.opts.prompt.status;
+    return (
+      this.resolvedState !== null ||
+      st === "answered" ||
+      st === "canceled" ||
+      st === "expired"
+    );
+  }
+
+  private captureActiveControl(): {
+    selector: string;
+    selStart: number | null;
+    selEnd: number | null;
+  } | null {
+    const activeEl = typeof document !== "undefined" ? document.activeElement : null;
+    if (
+      !activeEl ||
+      !this.container.contains(activeEl) ||
+      !(activeEl instanceof HTMLElement)
+    ) {
+      return null;
+    }
+    if (
+      activeEl instanceof HTMLTextAreaElement ||
+      activeEl.hasAttribute("data-qc-custom-input")
+    ) {
+      const ta = activeEl as HTMLTextAreaElement;
+      return {
+        selector: "[data-qc-custom-input]",
+        selStart: typeof ta.selectionStart === "number" ? ta.selectionStart : null,
+        selEnd: typeof ta.selectionEnd === "number" ? ta.selectionEnd : null,
+      };
+    }
+    if (
+      activeEl instanceof HTMLInputElement &&
+      activeEl.dataset.qcOption !== undefined
+    ) {
+      return {
+        selector: `[data-qc-option="${activeEl.dataset.qcOption}"]`,
+        selStart: null,
+        selEnd: null,
+      };
+    }
+    if (activeEl.dataset.qcStep !== undefined) {
+      return {
+        selector: `[data-qc-step="${activeEl.dataset.qcStep}"]`,
+        selStart: null,
+        selEnd: null,
+      };
+    }
+    const attrs = [
+      "data-qc-custom-toggle",
+      "data-qc-prev",
+      "data-qc-next",
+      "data-qc-copy",
+      "data-qc-cancel",
+      "data-qc-cancel-confirm-yes",
+      "data-qc-cancel-keep",
+      "data-qc-retry",
+      "data-qc-error-copy",
+      "data-qc-open-chat",
+    ];
+    for (const attr of attrs) {
+      if (activeEl.hasAttribute(attr)) {
+        return { selector: `[${attr}]`, selStart: null, selEnd: null };
+      }
+    }
+    if (activeEl.classList.contains("qc-primary-btn")) {
+      return { selector: ".qc-primary-btn", selStart: null, selEnd: null };
+    }
+    return null;
+  }
+
+  private focusErrorCopy(): void {
+    const btn = this.container.querySelector<HTMLElement>("[data-qc-error-copy]");
+    btn?.focus({ preventScroll: false });
+  }
+
   private render(force: boolean): void {
+    if (!force && (this.sending || this.canceling)) {
+      return;
+    }
     const prompt = this.opts.prompt;
     const caps = this.opts.getCapabilities();
     const nextStructFp = computePromptStructureFingerprint(prompt, caps);
     const nextMetaFp = computePromptMetaFingerprint(prompt);
+
+    if (!force && this.isResolved()) {
+      // Already rendered into the locked/resolved state: freeze the card.
+      if (this.renderedResolved) return;
+      // Remote pending -> answered/canceled/expired transition: render once into the locked state.
+      this.structureFingerprint = nextStructFp;
+      this.metaFingerprint = nextMetaFp;
+      this.renderInner(false);
+      return;
+    }
 
     if (!force && nextStructFp === this.structureFingerprint) {
       if (nextMetaFp === this.metaFingerprint) {
@@ -262,19 +406,11 @@ export class QuestionCard {
       const titleEl = this.container.querySelector<HTMLElement>(".qc-title");
       if (titleEl && prompt.title) titleEl.textContent = cleanSummaryText(prompt.title);
       const summaryEl = this.container.querySelector<HTMLElement>(".qc-summary");
-      if (summaryEl) summaryEl.textContent = cleanSummaryText(prompt.summary ?? "");
-      return;
-    }
-
-    const activeEl = document.activeElement;
-    const isInteractingInside =
-      Boolean(activeEl) && this.container.contains(activeEl);
-    if (
-      !force &&
-      isInteractingInside &&
-      activeEl instanceof HTMLTextAreaElement &&
-      this.structureFingerprint !== ""
-    ) {
+      if (summaryEl) {
+        const cleanSum = cleanSummaryText(prompt.summary ?? "");
+        summaryEl.textContent = cleanSum;
+        summaryEl.hidden = !cleanSum;
+      }
       return;
     }
 
@@ -284,10 +420,14 @@ export class QuestionCard {
   }
 
   private renderInner(restoreFocusSelector: string | false): void {
+    const captured =
+      restoreFocusSelector === false ? this.captureActiveControl() : null;
     const prompt = this.opts.prompt;
     const caps = this.opts.getCapabilities();
     const questions = getEffectiveQuestions(prompt);
-    const draft = ensureDraft(prompt, questions);
+    const resolvedNow = this.isResolved();
+    this.renderedResolved = resolvedNow;
+    const draft = ensureDraft(prompt, questions, !resolvedNow);
     const activeIdx = draft.activeIdx;
     const activeQ = questions[activeIdx] ?? questions[0]!;
     const activeAns = draft.answers[activeIdx] ?? {
@@ -299,8 +439,16 @@ export class QuestionCard {
     const answeredCount = questions.filter((q, idx) =>
       isQuestionAnswered(q, draft.answers[idx])
     ).length;
-    const actionMeta = getPrimaryActionMeta(caps, prompt.blockingToolCall);
+    const isDirectReply = prompt.directReply === true;
+    const actionMeta = getPrimaryActionMeta(
+      caps,
+      prompt.blockingToolCall,
+      isDirectReply
+    );
     const showHeader = this.opts.showHeader !== false;
+    const isLocked = this.sending || this.canceling || this.isResolved();
+    const showCancel = isDirectReply && Boolean(this.opts.onCancel);
+    const cleanSummary = cleanSummaryText(prompt.summary ?? "");
 
     const tabsHtml =
       questions.length > 1
@@ -356,6 +504,7 @@ export class QuestionCard {
                     value="${escHtml(opt.label)}"
                     data-qc-option="${oIdx}"
                     ${checked ? "checked" : ""}
+                    ${isLocked ? "disabled" : ""}
                   />
                   <span class="qc-option-body">
                     <span class="qc-option-top">
@@ -378,6 +527,7 @@ export class QuestionCard {
                     data-qc-custom-toggle
                     aria-expanded="${activeAns.customOpen ? "true" : "false"}"
                     aria-controls="${escHtml(customId)}"
+                    ${isLocked ? "disabled" : ""}
                   >
                     ${activeAns.customOpen ? "▾ Hide custom reply" : "+ Other / Custom reply"}
                   </button>
@@ -402,15 +552,19 @@ export class QuestionCard {
               rows="${this.opts.compact ? 2 : 3}"
               placeholder="Type your response…"
               data-qc-custom-input
+              ${isLocked ? "disabled" : ""}
             >${escHtml(activeAns.customText)}</textarea>
           </div>
         `
         : "";
 
     const previewText = formatPromptAnswerText(questions, draft);
+    const statusRole = this.statusTone === "err" ? "alert" : "status";
+    const statusLive = this.statusTone === "err" ? "assertive" : "polite";
+    const copyFallbackText = this.lastFailedAnswerText || previewText;
 
     this.container.innerHTML = `
-      <form class="qc-card ${prompt.kind === "approval" ? "is-approval" : ""} ${this.opts.compact ? "is-compact" : ""}" data-qc-form>
+      <form class="qc-card ${prompt.kind === "approval" ? "is-approval" : ""} ${isDirectReply ? "is-direct-reply" : ""} ${this.opts.compact ? "is-compact" : ""} ${this.isResolved() ? "is-resolved" : ""}" data-qc-form>
         ${
           showHeader
             ? `
@@ -420,6 +574,7 @@ export class QuestionCard {
                     <span aria-hidden="true">?</span>
                     <span>${prompt.kind === "approval" ? "Approval Needed" : "Needs Input"}</span>
                   </span>
+                  ${isDirectReply ? `<span class="qc-direct-pill">Direct Reply</span>` : ""}
                   <span class="qc-agent-name">${escHtml(prompt.agentLabel || prompt.agentId)}</span>
                 </div>
                 ${
@@ -436,7 +591,7 @@ export class QuestionCard {
             ? `<div class="qc-title">${escHtml(cleanSummaryText(prompt.title))}</div>`
             : ""
         }
-        ${prompt.summary ? `<div class="qc-summary">${escHtml(cleanSummaryText(prompt.summary))}</div>` : ""}
+        <div class="qc-summary" ${cleanSummary ? "" : "hidden"}>${escHtml(cleanSummary)}</div>
 
         ${tabsHtml}
 
@@ -453,15 +608,15 @@ export class QuestionCard {
           questions.length > 1
             ? `
               <div class="qc-nav-row">
-                <button type="button" class="btn-ghost btn-sm" data-qc-prev ${activeIdx <= 0 ? "disabled" : ""}>← Prev</button>
-                <button type="button" class="btn-ghost btn-sm" data-qc-next ${activeIdx >= questions.length - 1 ? "disabled" : ""}>Next →</button>
+                <button type="button" class="btn-ghost btn-sm" data-qc-prev ${activeIdx <= 0 || isLocked ? "disabled" : ""}>← Prev</button>
+                <button type="button" class="btn-ghost btn-sm" data-qc-next ${activeIdx >= questions.length - 1 || isLocked ? "disabled" : ""}>Next →</button>
               </div>
             `
             : ""
         }
 
         ${
-          prompt.blockingToolCall
+          prompt.blockingToolCall && !isDirectReply
             ? `<div class="qc-blocking-note" role="note">Active tool prompt requires confirming in your IDE chat</div>`
             : ""
         }
@@ -470,24 +625,72 @@ export class QuestionCard {
           <button
             type="submit"
             class="btn-primary btn-sm qc-primary-btn"
-            ${this.sending ? "disabled aria-busy=\"true\"" : ""}
+            ${isLocked ? "disabled" : ""}
+            ${this.sending ? 'aria-busy="true"' : ""}
           >${this.sending ? "Sending…" : escHtml(actionMeta.label)}</button>
           ${
             actionMeta.showSecondaryCopy
-              ? `<button type="button" class="btn-secondary btn-sm qc-copy-btn" data-qc-copy>Copy</button>`
+              ? `<button type="button" class="btn-secondary btn-sm qc-copy-btn" data-qc-copy ${isLocked ? "disabled" : ""}>Copy</button>`
               : ""
           }
           <span class="qc-ready-chip" data-qc-ready ${previewText ? "" : "hidden"} title="${escHtml(previewText)}">Ready</span>
+          ${
+            showCancel
+              ? `<button type="button" class="btn-ghost btn-sm qc-cancel-btn" data-qc-cancel ${isLocked ? "disabled" : ""}>Cancel</button>`
+              : ""
+          }
         </div>
 
-        <div class="qc-status ${this.statusText ? `is-${this.statusTone}` : ""}" role="status" aria-live="polite" ${this.statusText ? "" : "hidden"}>${escHtml(this.statusText)}</div>
+        ${
+          showCancel
+            ? `
+              <div class="qc-cancel-confirm" data-qc-cancel-confirm role="group" aria-label="Confirm cancel prompt" ${this.cancelConfirmOpen && !this.isResolved() ? "" : "hidden"}>
+                <span class="qc-cancel-prompt">Cancel prompt?</span>
+                <button type="button" class="btn-secondary btn-sm qc-cancel-confirm-btn" data-qc-cancel-confirm-yes ${isLocked ? "disabled" : ""} ${this.canceling ? 'aria-busy="true"' : ""}>${this.canceling ? "Canceling…" : "Confirm"}</button>
+                <button type="button" class="btn-ghost btn-sm qc-cancel-keep-btn" data-qc-cancel-keep ${isLocked ? "disabled" : ""}>Keep</button>
+              </div>
+            `
+            : ""
+        }
+
+        <div class="qc-status ${this.statusText ? `is-${this.statusTone}` : ""}" role="${statusRole}" aria-live="${statusLive}" ${this.statusText ? "" : "hidden"}>
+          <span class="qc-status-msg" data-qc-status-msg>${escHtml(this.statusText)}</span>
+          <div class="qc-error-actions" data-qc-error-actions ${this.showErrorActions ? "" : "hidden"}>
+            ${
+              this.errorAllowRetry
+                ? `<button type="button" class="btn-secondary btn-sm qc-retry-btn" data-qc-retry ${this.sending || this.canceling ? "disabled" : ""}>Retry</button>`
+                : ""
+            }
+            ${
+              copyFallbackText
+                ? `<button type="button" class="btn-ghost btn-sm qc-error-copy-btn" data-qc-error-copy>Copy Answer</button>`
+                : ""
+            }
+          </div>
+        </div>
       </form>
     `;
 
     this.bindDomEvents(questions, draft);
 
-    if (restoreFocusSelector) {
-      this.container.querySelector<HTMLElement>(restoreFocusSelector)?.focus({ preventScroll: true });
+    const targetSelector =
+      restoreFocusSelector !== false ? restoreFocusSelector : captured?.selector || "";
+    if (targetSelector) {
+      const targetEl = this.container.querySelector<HTMLElement>(targetSelector);
+      targetEl?.focus({ preventScroll: true });
+      if (
+        restoreFocusSelector === false &&
+        captured &&
+        targetEl instanceof HTMLTextAreaElement &&
+        captured.selStart !== null &&
+        captured.selEnd !== null
+      ) {
+        try {
+          targetEl.setSelectionRange(captured.selStart, captured.selEnd);
+        } catch {
+          // Ignore selection errors on unsupported elements
+        }
+      }
     }
   }
 
@@ -571,9 +774,6 @@ export class QuestionCard {
 
     this.container.querySelector("[data-qc-custom-toggle]")?.addEventListener("click", () => {
       ans.customOpen = !ans.customOpen;
-      if (ans.customOpen && activeQ.type === "single_select") {
-        // Keep radio selection unless user clears or types; focusing custom textarea helps immediately
-      }
       this.renderInner(ans.customOpen ? "[data-qc-custom-input]" : "[data-qc-custom-toggle]");
     });
 
@@ -598,6 +798,45 @@ export class QuestionCard {
 
     this.container.querySelector("[data-qc-copy]")?.addEventListener("click", () => {
       void this.handleCopyOnly(questions, draft);
+    });
+
+    this.container.querySelector("[data-qc-cancel]")?.addEventListener("click", () => {
+      if (this.sending || this.canceling || this.isResolved()) return;
+      this.cancelConfirmOpen = true;
+      this.renderInner("[data-qc-cancel-keep]");
+    });
+
+    this.container.querySelector("[data-qc-cancel-keep]")?.addEventListener("click", () => {
+      if (this.canceling || this.isResolved()) return;
+      this.cancelConfirmOpen = false;
+      this.renderInner("[data-qc-cancel]");
+    });
+
+    this.container.querySelector("[data-qc-cancel-confirm-yes]")?.addEventListener("click", () => {
+      void this.handleCancel(questions, draft);
+    });
+
+    this.container.querySelector("[data-qc-retry]")?.addEventListener("click", () => {
+      if (this.lastFailedAction === "cancel") {
+        void this.handleCancel(questions, draft);
+      } else {
+        void this.handleSubmit(questions, draft);
+      }
+    });
+
+    const errorCopyBtn = this.container.querySelector<HTMLButtonElement>("[data-qc-error-copy]");
+    errorCopyBtn?.addEventListener("click", () => {
+      const text = this.lastFailedAnswerText || formatPromptAnswerText(questions, draft);
+      if (!text) return;
+      void copyTextSafe(text).then((ok) => {
+        if (!document.contains(errorCopyBtn)) return;
+        errorCopyBtn.textContent = ok ? "Copied ✓" : "Copy failed";
+        window.setTimeout(() => {
+          if (document.contains(errorCopyBtn)) {
+            errorCopyBtn.textContent = "Copy Answer";
+          }
+        }, 1600);
+      });
     });
 
     const form = this.container.querySelector<HTMLFormElement>("[data-qc-form]");
@@ -648,26 +887,45 @@ export class QuestionCard {
     });
   }
 
-  private showStatus(msg: string, tone: "ok" | "warn" | "err"): void {
+  private setStatus(
+    msg: string,
+    tone: "ok" | "warn" | "err",
+    opts?: { persist?: boolean; showActions?: boolean; allowRetry?: boolean }
+  ): void {
     this.statusText = msg;
     this.statusTone = tone;
-    const statusEl = this.container.querySelector<HTMLElement>(".qc-status");
-    if (statusEl) {
-      statusEl.textContent = msg;
-      statusEl.className = `qc-status is-${tone}`;
-      statusEl.hidden = !msg;
-    }
+    this.showErrorActions = Boolean(opts?.showActions);
+    this.errorAllowRetry = Boolean(opts?.allowRetry);
+
     if (this.statusTimer != null) {
       window.clearTimeout(this.statusTimer);
+      this.statusTimer = null;
     }
-    if (msg) {
+
+    const statusEl = this.container.querySelector<HTMLElement>(".qc-status");
+    const msgEl = this.container.querySelector<HTMLElement>("[data-qc-status-msg]");
+    const actionsEl = this.container.querySelector<HTMLElement>("[data-qc-error-actions]");
+    if (statusEl) {
+      statusEl.className = `qc-status ${msg ? `is-${tone}` : ""}`.trim();
+      statusEl.setAttribute("role", tone === "err" ? "alert" : "status");
+      statusEl.setAttribute("aria-live", tone === "err" ? "assertive" : "polite");
+      statusEl.hidden = !msg;
+    }
+    if (msgEl) {
+      msgEl.textContent = msg;
+    }
+    if (actionsEl) {
+      actionsEl.hidden = !this.showErrorActions;
+    }
+
+    if (msg && !opts?.persist) {
       this.statusTimer = window.setTimeout(() => {
+        if (this.isResolved() || this.showErrorActions) return;
         this.statusText = "";
         const el = this.container.querySelector<HTMLElement>(".qc-status");
-        if (el) {
-          el.textContent = "";
-          el.hidden = true;
-        }
+        const mEl = this.container.querySelector<HTMLElement>("[data-qc-status-msg]");
+        if (mEl) mEl.textContent = "";
+        if (el) el.hidden = true;
       }, 4500);
     }
   }
@@ -678,36 +936,100 @@ export class QuestionCard {
   ): Promise<void> {
     const text = formatPromptAnswerText(questions, draft);
     if (!text) {
-      this.showStatus("Select an option or enter a reply first.", "warn");
+      this.setStatus("Select an option or enter a reply first.", "warn");
       this.focusPrimaryControl();
       return;
     }
     const ok = await copyTextSafe(text);
-    this.showStatus(
+    this.setStatus(
       ok ? "Copied answer to clipboard." : "Could not copy automatically — please copy manually.",
       ok ? "ok" : "err"
     );
+  }
+
+  private async handleCancel(
+    questions: PendingQuestionItem[],
+    draft: PromptDraftState
+  ): Promise<void> {
+    if (this.sending || this.canceling || this.isResolved() || !this.opts.onCancel) return;
+    this.canceling = true;
+    this.lastFailedAction = null;
+    this.lastFailedAnswerText = formatPromptAnswerText(questions, draft);
+    this.renderInner(false);
+
+    try {
+      const res = await this.opts.onCancel(this.opts.prompt.id);
+      this.canceling = false;
+      if (res.ok) {
+        this.cancelConfirmOpen = false;
+        this.resolvedState = "canceled";
+        clearPromptDraft(this.opts.prompt.id);
+        this.setStatus(
+          res.message || "Canceled — agent unblocked",
+          "ok",
+          { persist: true }
+        );
+        this.renderInner(false);
+        return;
+      }
+
+      if (res.conflict) {
+        this.cancelConfirmOpen = false;
+        this.resolvedState = res.status === "canceled" ? "canceled" : "answered";
+        this.setStatus(res.message || "Already resolved", "err", {
+          persist: true,
+          showActions: Boolean(this.lastFailedAnswerText),
+          allowRetry: false,
+        });
+        this.renderInner(false);
+        this.focusErrorCopy();
+        return;
+      }
+
+      this.lastFailedAction = "cancel";
+      this.setStatus(res.message || "Failed to cancel prompt.", "err", {
+        persist: true,
+        showActions: true,
+        allowRetry: true,
+      });
+      this.renderInner("[data-qc-retry]");
+    } catch (err) {
+      this.canceling = false;
+      this.lastFailedAction = "cancel";
+      this.setStatus(
+        err instanceof Error ? err.message : "Failed to cancel prompt.",
+        "err",
+        {
+          persist: true,
+          showActions: true,
+          allowRetry: true,
+        }
+      );
+      this.renderInner("[data-qc-retry]");
+    }
   }
 
   private async handleSubmit(
     questions: PendingQuestionItem[],
     draft: PromptDraftState
   ): Promise<void> {
-    if (this.sending) return;
+    if (this.sending || this.canceling || this.isResolved()) return;
     const text = formatPromptAnswerText(questions, draft);
     if (!text) {
-      this.showStatus("Select an option or enter a reply first.", "warn");
+      this.setStatus("Select an option or enter a reply first.", "warn");
       this.focusPrimaryControl();
       return;
     }
 
+    const isDirectReply = this.opts.prompt.directReply === true;
+    const structuredAnswers = buildStructuredAnswers(questions, draft);
+
     this.sending = true;
-    const btn = this.container.querySelector<HTMLButtonElement>(".qc-primary-btn");
-    if (btn) {
-      btn.disabled = true;
-      btn.setAttribute("aria-busy", "true");
-      btn.textContent = "Sending…";
-    }
+    this.cancelConfirmOpen = false;
+    this.lastFailedAction = null;
+    this.lastFailedAnswerText = text;
+    this.setStatus("", "ok");
+    this.renderInner(false);
 
     try {
       const res = await this.opts.onReply({
@@ -716,31 +1038,58 @@ export class QuestionCard {
         promptId: this.opts.prompt.id,
         text,
         blockingToolCall: this.opts.prompt.blockingToolCall,
+        directReply: isDirectReply,
+        promptSource: this.opts.prompt.promptSource,
+        answers: structuredAnswers,
       });
-      this.showStatus(
-        res.message || (res.ok ? "Answer ready." : "Unable to send answer."),
-        res.ok ? "ok" : "err"
-      );
-    } catch (err) {
-      const copied = await copyTextSafe(text);
-      this.showStatus(
-        copied
-          ? "Direct send failed — answer copied to clipboard."
-          : err instanceof Error
-            ? err.message
-            : "Failed to deliver answer.",
-        copied ? "warn" : "err"
-      );
-    } finally {
       this.sending = false;
-      const caps = this.opts.getCapabilities();
-      const actionMeta = getPrimaryActionMeta(caps, this.opts.prompt.blockingToolCall);
-      const b = this.container.querySelector<HTMLButtonElement>(".qc-primary-btn");
-      if (b) {
-        b.disabled = false;
-        b.removeAttribute("aria-busy");
-        b.textContent = actionMeta.label;
+
+      if (res.ok) {
+        if (isDirectReply || res.mode === "answered") {
+          this.resolvedState = "answered";
+          clearPromptDraft(this.opts.prompt.id);
+          const agentName = this.opts.prompt.agentLabel || this.opts.prompt.agentId || "Agent";
+          this.setStatus(`Sent to ${agentName} ✓`, "ok", { persist: true });
+          this.renderInner(false);
+        } else {
+          this.setStatus(res.message || "Answer ready.", "ok");
+          this.renderInner(false);
+        }
+        return;
       }
+
+      if (res.conflict) {
+        this.resolvedState = res.status === "canceled" ? "canceled" : "answered";
+        this.setStatus(res.message || "Already resolved", "err", {
+          persist: true,
+          showActions: true,
+          allowRetry: false,
+        });
+        this.renderInner(false);
+        this.focusErrorCopy();
+        return;
+      }
+
+      this.lastFailedAction = "reply";
+      this.setStatus(res.message || "Unable to send answer.", "err", {
+        persist: true,
+        showActions: true,
+        allowRetry: true,
+      });
+      this.renderInner("[data-qc-retry]");
+    } catch (err) {
+      this.sending = false;
+      this.lastFailedAction = "reply";
+      this.setStatus(
+        err instanceof Error ? err.message : "Failed to deliver answer.",
+        "err",
+        {
+          persist: true,
+          showActions: true,
+          allowRetry: true,
+        }
+      );
+      this.renderInner("[data-qc-retry]");
     }
   }
 }

@@ -4,6 +4,8 @@ import type {
   AgentStatus,
   IdeSource,
   NormalizedEvent,
+  PendingQuestionItem,
+  PendingQuestionOption,
   TeamDefinitionEntry,
   TeamRosterRef,
 } from "../types.js";
@@ -12,9 +14,11 @@ import {
   classifyExternalTarget,
   cleanSummaryText,
   fmtClock,
+  fmtDuration,
   formatActorName,
   isErrorEvent,
   isRoutineToolEnd,
+  normalizeEpoch,
   truncateWords,
 } from "../utils.js";
 
@@ -115,6 +119,40 @@ export interface ToolCategoryGroup {
   events: NormalizedEvent[];
 }
 
+export interface BehindThoughtStep {
+  kind: "thought";
+  epoch: number;
+  ts: string;
+  timeLabel: string;
+  text: string;
+  event: NormalizedEvent;
+  durationLabel?: string;
+}
+
+export interface BehindToolStep {
+  kind: "tool";
+  epoch: number;
+  ts: string;
+  timeLabel: string;
+  toolName: string;
+  summary: string;
+  status: "running" | "ok" | "error" | "denied";
+  durationSec?: number;
+  durationLabel?: string;
+  inputPreview?: string;
+  outputPreview?: string;
+  event: NormalizedEvent;
+  endEvent?: NormalizedEvent;
+}
+
+export type BehindStep = BehindThoughtStep | BehindToolStep;
+
+export interface BehindSummary {
+  thoughtCount: number;
+  toolCount: number;
+  durationLabel?: string;
+}
+
 export interface SmsMessageItem {
   kind: "message";
   event: NormalizedEvent;
@@ -124,11 +162,20 @@ export interface SmsMessageItem {
   routeLabel: string;
   timeLabel: string;
   text: string;
+  fullMarkdownText: string;
   tools: string[];
   toolGroups: ToolCategoryGroup[];
   runId?: string;
   hasFullBody: boolean;
   accentColor: string;
+  isHumanAnswer?: boolean;
+  replyToEntryId?: string;
+  replyToQuote?: string;
+  replyToActorLabel?: string;
+  questions?: PendingQuestionItem[];
+  chosenAnswerText?: string;
+  behindSteps: BehindStep[];
+  behindSummary: BehindSummary;
 }
 
 export interface SmsToolBurstItem {
@@ -436,7 +483,14 @@ export function resolveCommEndpoints(
   if (!isCommunicationEvent(ev)) return null;
 
   if (ev.kind === "user_input") {
-    const actor = normalizeEndpointId(ev.agentId) || rootId || "root";
+    const rawActor = normalizeEndpointId(ev.agentId);
+    const actor =
+      rawActor && rawActor !== "ext:human"
+        ? rawActor
+        : normalizeEndpointId(ev.targetAgentId) || rootId || "root";
+    if (ev.payload?.isHumanAnswer === true) {
+      return { fromId: "ext:human", toId: actor };
+    }
     const parentId = normalizeEndpointId(ev.parentAgentId || agentParentMap.get(actor));
     const isSub = Boolean(rootId && actor !== rootId && parentId);
     if (!isSub) {
@@ -1080,7 +1134,219 @@ export function resolveActorAccentColor(opts: {
   return "#6366f1";
 }
 
-export function extractSmsStream(opts: {
+function toEpochMs(epoch: number): number {
+  return epoch > 1e12 ? epoch : epoch * 1000;
+}
+
+function formatSubDuration(seconds: number): string {
+  if (!Number.isFinite(seconds) || seconds < 0) return "";
+  if (seconds < 1) return `${Math.max(1, Math.round(seconds * 1000))}ms`;
+  if (seconds < 60) return `${seconds.toFixed(1).replace(/\.0$/, "")}s`;
+  return fmtDuration(seconds);
+}
+
+function extractFullMessageMarkdown(ev: NormalizedEvent): string {
+  const p = ev.payload;
+  const fromPayload =
+    (typeof p?.body === "string" && p.body.trim()) ||
+    (typeof p?.text === "string" && p.text.trim()) ||
+    (typeof p?.message === "string" && p.message.trim()) ||
+    (typeof p?.Message === "string" && p.Message.trim()) ||
+    (typeof p?.prompt === "string" && p.prompt.trim()) ||
+    "";
+  if (fromPayload) return fromPayload;
+  if (typeof ev.summary === "string" && ev.summary.trim()) {
+    return ev.summary.trim();
+  }
+  return ev.kind;
+}
+
+function isPlaceholderThoughtSummary(raw: string | undefined): boolean {
+  const s = cleanSummaryText(raw).toLowerCase();
+  return (
+    !s ||
+    s === "thinking…" ||
+    s === "thinking..." ||
+    s === "reasoning…" ||
+    s === "reasoning..." ||
+    s === "thinking"
+  );
+}
+
+function extractThoughtText(ev: NormalizedEvent): string | null {
+  const p = ev.payload;
+  const fromPayload =
+    (typeof p?.body === "string" && p.body.trim()) ||
+    (typeof p?.text === "string" && p.text.trim()) ||
+    (typeof p?.thinking === "string" && p.thinking.trim()) ||
+    (typeof p?.reasoning === "string" && p.reasoning.trim()) ||
+    "";
+  if (fromPayload) return fromPayload;
+  if (isPlaceholderThoughtSummary(ev.summary) && ev.bodyTruncated !== true) {
+    return null;
+  }
+  return (typeof ev.summary === "string" && ev.summary.trim()) || null;
+}
+
+function formatPayloadPreview(val: unknown): string | undefined {
+  if (val == null) return undefined;
+  if (typeof val === "string") {
+    const trimmed = val.trim();
+    if (!trimmed) return undefined;
+    return trimmed.length > 1200 ? `${trimmed.slice(0, 1199)}…` : trimmed;
+  }
+  if (typeof val === "number" || typeof val === "boolean") {
+    return String(val);
+  }
+  if (typeof val === "object") {
+    try {
+      const json = JSON.stringify(val, null, 2);
+      if (!json || json === "{}" || json === "[]") return undefined;
+      return json.length > 1200 ? `${json.slice(0, 1199)}…` : json;
+    } catch {
+      return undefined;
+    }
+  }
+  return undefined;
+}
+
+const TOOL_INTERNAL_KEYS = new Set([
+  "routineEnd",
+  "isError",
+  "blocker",
+  "durationMs",
+  "durationSec",
+  "toolResult",
+  "resultDetails",
+  "output",
+  "outputPreview",
+  "result",
+  "response",
+  "error",
+  "preview",
+  "bodyTruncated",
+  "bodyLength",
+  "permissionDecision",
+]);
+
+function extractToolInputPreview(ev: NormalizedEvent): string | undefined {
+  const p = ev.payload;
+  if (!p) return undefined;
+  const direct =
+    formatPayloadPreview(p.inputPreview) ??
+    formatPayloadPreview(p.toolInput) ??
+    formatPayloadPreview(p.toolArgs) ??
+    formatPayloadPreview(p.args) ??
+    formatPayloadPreview(p.input) ??
+    formatPayloadPreview(p.arguments);
+  if (direct) return direct;
+
+  const rest: Record<string, unknown> = {};
+  for (const [k, v] of Object.entries(p)) {
+    if (!TOOL_INTERNAL_KEYS.has(k) && v !== undefined) {
+      rest[k] = v;
+    }
+  }
+  return formatPayloadPreview(rest);
+}
+
+function extractToolOutputPreview(ev: NormalizedEvent): string | undefined {
+  const p = ev.payload;
+  if (!p) return undefined;
+  return (
+    formatPayloadPreview(p.outputPreview) ??
+    formatPayloadPreview(p.toolResult) ??
+    formatPayloadPreview(p.resultDetails) ??
+    formatPayloadPreview(p.output) ??
+    formatPayloadPreview(p.result) ??
+    formatPayloadPreview(p.response) ??
+    formatPayloadPreview(p.error) ??
+    formatPayloadPreview(p.preview)
+  );
+}
+
+function normalizeQuestionOption(raw: unknown): PendingQuestionOption | null {
+  if (typeof raw === "string" && raw.trim()) {
+    return { label: raw.trim() };
+  }
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return null;
+  const r = raw as Record<string, unknown>;
+  const label =
+    typeof r.label === "string"
+      ? r.label.trim()
+      : typeof r.value === "string"
+        ? r.value.trim()
+        : "";
+  if (!label) return null;
+  return {
+    id: typeof r.id === "string" ? r.id : undefined,
+    label,
+    description: typeof r.description === "string" ? r.description : undefined,
+    recommended: Boolean(r.recommended),
+  };
+}
+
+function extractQuestionsFromPayload(ev: NormalizedEvent): PendingQuestionItem[] | undefined {
+  const p = ev.payload;
+  if (!p) return undefined;
+  if (Array.isArray(p.questions) && p.questions.length > 0) {
+    const items: PendingQuestionItem[] = [];
+    for (const raw of p.questions) {
+      if (!raw || typeof raw !== "object" || Array.isArray(raw)) continue;
+      const r = raw as Record<string, unknown>;
+      const options = Array.isArray(r.options)
+        ? r.options.map(normalizeQuestionOption).filter((o): o is PendingQuestionOption => o !== null)
+        : [];
+      const rawType = r.type;
+      const type: PendingQuestionItem["type"] =
+        rawType === "multi_select" || rawType === "text" || rawType === "single_select"
+          ? rawType
+          : options.length > 0
+            ? "single_select"
+            : "text";
+      const question =
+        (typeof r.question === "string" && r.question.trim()) ||
+        (typeof r.title === "string" && r.title.trim()) ||
+        (typeof r.prompt === "string" && r.prompt.trim()) ||
+        "";
+      if (!question && options.length === 0) continue;
+      items.push({
+        id: typeof r.id === "string" ? r.id : undefined,
+        header: typeof r.header === "string" ? r.header : undefined,
+        question,
+        type,
+        options,
+        allowCustomInput: typeof r.allowCustomInput === "boolean" ? r.allowCustomInput : undefined,
+        defaultValue: typeof r.defaultValue === "string" ? r.defaultValue : undefined,
+      });
+    }
+    if (items.length > 0) return items;
+  }
+
+  if (Array.isArray(p.options) && p.options.length > 0) {
+    const options = p.options
+      .map(normalizeQuestionOption)
+      .filter((o): o is PendingQuestionOption => o !== null);
+    if (options.length > 0) {
+      const question =
+        (typeof p.question === "string" && p.question.trim()) ||
+        (typeof p.title === "string" && p.title.trim()) ||
+        (typeof p.prompt === "string" && p.prompt.trim()) ||
+        cleanSummaryText(ev.summary) ||
+        "";
+      return [
+        {
+          question,
+          type: "single_select",
+          options,
+        },
+      ];
+    }
+  }
+  return undefined;
+}
+
+export interface ExtractSmsStreamOptions {
   events: NormalizedEvent[];
   agents: AgentNodeSnapshot[];
   thread: ThreadSelection;
@@ -1088,8 +1354,22 @@ export function extractSmsStream(opts: {
   clusters?: TeamAgentCluster[];
   teamRoster?: TeamRosterRef[];
   definitions?: TeamDefinitionEntry[];
-}): SmsStreamEntry[] {
+  showRawTools?: boolean;
+}
+
+export interface SmsStreamResult {
+  entries: SmsStreamEntry[];
+  hiddenBurstCount: number;
+  hiddenToolCount: number;
+  hiddenBackgroundAgents: string[];
+}
+
+export function extractSmsStreamWithMeta(
+  opts: ExtractSmsStreamOptions,
+  options?: { showRawTools?: boolean }
+): SmsStreamResult {
   const { events, agents, thread, labelMap, clusters, teamRoster, definitions } = opts;
+  const showRawTools = options?.showRawTools ?? opts.showRawTools ?? false;
 
   const aiAgents = agents.filter((a) => (a.nodeType ?? "agent") === "agent");
   const rootAgent =
@@ -1122,19 +1402,32 @@ export function extractSmsStream(opts: {
     return resolved;
   };
 
-  // Track tool calls per agent since their previous communication bubble (for bubble tool chips)
+  // Track tool calls & thoughts per agent since their previous communication bubble
   const pendingBubbleToolsByAgent = new Map<string, NormalizedEvent[]>();
+  const pendingThoughtsByAgent = new Map<string, BehindThoughtStep[]>();
+  const pendingToolsByAgent = new Map<string, BehindToolStep[]>();
   const seenToolCallIds = new Set<string>();
+  const emittedQuestionToolCallIds = new Set<string>();
+  const commSpeakers = new Set<string>();
 
   const entries: SmsStreamEntry[] = [];
   // Accumulate tool calls per agent within each gap between SMS messages (preserves first-seen agent order)
   const gapBurstsByAgent = new Map<string, NormalizedEvent[]>();
   let seenPeerComm = false;
+  let hiddenBurstCount = 0;
+  let hiddenToolCount = 0;
+  const hiddenToolAgentSet = new Set<string>();
 
   const flushGapBursts = () => {
     if (gapBurstsByAgent.size === 0) return;
     for (const [agentId, burstEvents] of gapBurstsByAgent.entries()) {
       if (burstEvents.length === 0) continue;
+      if (!showRawTools) {
+        hiddenBurstCount += 1;
+        hiddenToolCount += burstEvents.length;
+        hiddenToolAgentSet.add(agentId);
+        continue;
+      }
       const first = burstEvents[0]!;
       const last = burstEvents[burstEvents.length - 1]!;
       const categories = buildToolCategoryGroups(burstEvents);
@@ -1160,15 +1453,158 @@ export function extractSmsStream(opts: {
     gapBurstsByAgent.clear();
   };
 
-  for (const ev of events) {
+  for (let idx = 0; idx < events.length; idx++) {
+    const ev = events[idx]!;
+    const evEpoch = normalizeEpoch(ev, idx);
+
+    if (ev.kind === "thinking_start") {
+      const actorId = normalizeEndpointId(ev.agentId) || ev.agentId;
+      if (actorId && actorId !== "ext:human") {
+        const thoughtText = extractThoughtText(ev);
+        if (thoughtText !== null) {
+          let tList = pendingThoughtsByAgent.get(actorId);
+          if (!tList) {
+            tList = [];
+            pendingThoughtsByAgent.set(actorId, tList);
+          }
+          const durSec =
+            typeof ev.payload?.durationMs === "number" && Number.isFinite(ev.payload.durationMs)
+              ? ev.payload.durationMs / 1000
+              : typeof ev.payload?.durationSec === "number" && Number.isFinite(ev.payload.durationSec)
+                ? ev.payload.durationSec
+                : undefined;
+          tList.push({
+            kind: "thought",
+            epoch: evEpoch,
+            ts: ev.ts,
+            timeLabel: fmtClock(ev.ts || ev.epoch),
+            text: thoughtText,
+            event: ev,
+            ...(durSec !== undefined ? { durationLabel: formatSubDuration(durSec) } : {}),
+          });
+        }
+      }
+      continue;
+    }
+
     const isToolStart = ev.kind === "tool_start" && !isHumanPromptToolName(ev.toolName);
     const isBoardMut = ev.kind === "board_mutation";
     const isCommTool = isCommunicationEvent(ev);
 
     if ((isToolStart && !isCommTool) || isBoardMut || ev.kind === "tool_end") {
+      const actorId = normalizeEndpointId(ev.agentId) || ev.agentId;
+
       if (isToolStart && ev.toolCallId) {
         seenToolCallIds.add(ev.toolCallId);
       }
+
+      if (actorId && actorId !== "ext:human") {
+        let stepList = pendingToolsByAgent.get(actorId);
+        if (!stepList) {
+          stepList = [];
+          pendingToolsByAgent.set(actorId, stepList);
+        }
+
+        if (isToolStart || isBoardMut) {
+          const toolName = ev.toolName || (isBoardMut ? "board_mutation" : "tool");
+          const status: BehindToolStep["status"] =
+            ev.payload?.permissionDecision === "deny"
+              ? "denied"
+              : isErrorEvent(ev)
+                ? "error"
+                : isBoardMut
+                  ? "ok"
+                  : "running";
+          stepList.push({
+            kind: "tool",
+            epoch: evEpoch,
+            ts: ev.ts,
+            timeLabel: fmtClock(ev.ts || ev.epoch),
+            toolName,
+            summary: cleanSummaryText(ev.summary) || toolName,
+            status,
+            inputPreview: extractToolInputPreview(ev),
+            outputPreview: extractToolOutputPreview(ev),
+            event: ev,
+          });
+        } else if (ev.kind === "tool_end") {
+          const isQuestionToolEnd =
+            Boolean(ev.toolCallId && emittedQuestionToolCallIds.has(ev.toolCallId)) ||
+            isHumanPromptToolName(ev.toolName);
+
+          if (!isQuestionToolEnd || isErrorEvent(ev)) {
+            let matched: BehindToolStep | undefined;
+            if (ev.toolCallId) {
+              matched = stepList.find((s) => s.event.toolCallId === ev.toolCallId);
+            }
+            if (!matched && ev.toolName) {
+              const targetTool = ev.toolName.toLowerCase();
+              matched = stepList.find(
+                (s) => s.status === "running" && s.toolName.toLowerCase() === targetTool
+              );
+            }
+            if (!matched) {
+              matched = stepList.find((s) => s.status === "running");
+            }
+
+            if (matched) {
+              matched.endEvent = ev;
+              matched.status =
+                ev.payload?.permissionDecision === "deny"
+                  ? "denied"
+                  : isErrorEvent(ev)
+                    ? "error"
+                    : "ok";
+              const explicitDurSec =
+                typeof ev.payload?.durationMs === "number" && Number.isFinite(ev.payload.durationMs)
+                  ? ev.payload.durationMs / 1000
+                  : typeof ev.payload?.durationSec === "number" && Number.isFinite(ev.payload.durationSec)
+                    ? ev.payload.durationSec
+                    : undefined;
+              const diffSec =
+                explicitDurSec !== undefined
+                  ? explicitDurSec
+                  : evEpoch > 0 && matched.epoch > 0 && evEpoch >= matched.epoch
+                    ? (toEpochMs(evEpoch) - toEpochMs(matched.epoch)) / 1000
+                    : undefined;
+              if (diffSec !== undefined && Number.isFinite(diffSec) && diffSec >= 0) {
+                matched.durationSec = diffSec;
+                matched.durationLabel = formatSubDuration(diffSec);
+              }
+              const outPrev = extractToolOutputPreview(ev);
+              if (outPrev) matched.outputPreview = outPrev;
+              const endSummary = cleanSummaryText(ev.summary);
+              if (
+                endSummary &&
+                (!matched.summary || matched.summary === matched.toolName) &&
+                !/^(Done|Finished):?\s/i.test(endSummary)
+              ) {
+                matched.summary = endSummary;
+              }
+            } else if (isErrorEvent(ev) || !isRoutineToolEnd(ev)) {
+              const toolName = ev.toolName || "tool";
+              stepList.push({
+                kind: "tool",
+                epoch: evEpoch,
+                ts: ev.ts,
+                timeLabel: fmtClock(ev.ts || ev.epoch),
+                toolName,
+                summary: cleanSummaryText(ev.summary) || toolName,
+                status:
+                  ev.payload?.permissionDecision === "deny"
+                    ? "denied"
+                    : isErrorEvent(ev)
+                      ? "error"
+                      : "ok",
+                inputPreview: extractToolInputPreview(ev),
+                outputPreview: extractToolOutputPreview(ev),
+                event: ev,
+              });
+            }
+          }
+        }
+      }
+
       if (ev.kind === "tool_end") {
         const hasErr = isErrorEvent(ev);
         if (!hasErr && (isRoutineToolEnd(ev) || (ev.toolCallId && seenToolCallIds.has(ev.toolCallId)))) {
@@ -1176,7 +1612,6 @@ export function extractSmsStream(opts: {
         }
       }
 
-      const actorId = normalizeEndpointId(ev.agentId) || ev.agentId;
       if (actorId && actorId !== "ext:human") {
         let bList = pendingBubbleToolsByAgent.get(actorId);
         if (!bList) {
@@ -1199,24 +1634,43 @@ export function extractSmsStream(opts: {
 
     if (!isCommTool) continue;
 
+    if (ev.kind === "tool_start" && isHumanPromptToolName(ev.toolName) && ev.toolCallId) {
+      emittedQuestionToolCallIds.add(ev.toolCallId);
+    }
+
+    const ep = resolveCommEndpoints(ev, rootId, parentMap);
+    const speakerId = ep?.fromId ?? (normalizeEndpointId(ev.agentId) || ev.agentId);
+    const receiverId = ep?.toId;
+
     if (!matchesThreadSelection(ev, thread, rootId, parentMap)) {
+      if (speakerId !== "ext:human") {
+        pendingBubbleToolsByAgent.delete(speakerId);
+        pendingThoughtsByAgent.delete(speakerId);
+        pendingToolsByAgent.delete(speakerId);
+      }
       continue;
     }
 
     seenPeerComm = true;
     flushGapBursts();
 
-    const ep = resolveCommEndpoints(ev, rootId, parentMap);
-    const speakerId = ep?.fromId ?? (normalizeEndpointId(ev.agentId) || ev.agentId);
-    const receiverId = ep?.toId;
+    commSpeakers.add(speakerId);
 
-    const fromLabel =
-      speakerId === "ext:human"
+    const isHumanAnswer = ev.kind === "user_input" && ev.payload?.isHumanAnswer === true;
+    const isHumanQuestion =
+      (ev.kind === "tool_start" && isHumanPromptToolName(ev.toolName)) ||
+      (ev.kind === "message" && ev.payload?.blockedOnUser === true);
+
+    const fromLabel = isHumanAnswer
+      ? "You"
+      : speakerId === "ext:human"
         ? "User"
         : formatActorName(speakerId, labelMap, ev.agentLabel);
     const toLabel = receiverId
       ? receiverId === "ext:human"
-        ? "User"
+        ? isHumanQuestion
+          ? "You"
+          : "User"
         : formatActorName(receiverId, labelMap)
       : "";
 
@@ -1226,6 +1680,35 @@ export function extractSmsStream(opts: {
     const toolGroups = buildToolCategoryGroups(agentToolEvents);
     const tools = toolGroups.map((g) => `${g.label} · ${g.count}`);
     pendingBubbleToolsByAgent.delete(speakerId);
+
+    let behindSteps: BehindStep[] = [];
+    if (speakerId !== "ext:human") {
+      const thoughts = pendingThoughtsByAgent.get(speakerId) ?? [];
+      const toolSteps = pendingToolsByAgent.get(speakerId) ?? [];
+      pendingThoughtsByAgent.delete(speakerId);
+      pendingToolsByAgent.delete(speakerId);
+      behindSteps = [...thoughts, ...toolSteps].sort((a, b) => a.epoch - b.epoch);
+    }
+
+    const thoughtCount = behindSteps.filter((s) => s.kind === "thought").length;
+    const toolCount = behindSteps.filter((s) => s.kind === "tool").length;
+    let durationLabel: string | undefined;
+    if (behindSteps.length > 0) {
+      const firstMs = toEpochMs(behindSteps[0]!.epoch);
+      const msgMs = toEpochMs(evEpoch);
+      const spanSec = msgMs > firstMs ? (msgMs - firstMs) / 1000 : 0;
+      if (spanSec >= 0.05) {
+        durationLabel = formatSubDuration(spanSec);
+      } else {
+        const summed = behindSteps.reduce(
+          (acc, s) => acc + (s.kind === "tool" && s.durationSec ? s.durationSec : 0),
+          0
+        );
+        if (summed >= 0.001) {
+          durationLabel = formatSubDuration(summed);
+        }
+      }
+    }
 
     const status = statusMap.get(speakerId);
     const mappedRole = roleMap.get(speakerId);
@@ -1237,20 +1720,75 @@ export function extractSmsStream(opts: {
         : speakerId === rootId
           ? "Orchestrator"
           : nonGenericRole || "Subagent";
-    const roleBadge =
-      ev.kind === "subagent_spawn"
-        ? `${baseRole} · DISPATCH`
-        : ev.kind === "subagent_done"
-          ? `${baseRole} · DONE`
-          : status && speakerId !== "ext:human" && speakerId !== rootId
-            ? `${baseRole} · ${status}`
-            : baseRole;
+    const roleBadge = isHumanAnswer
+      ? "Answered Question"
+      : isHumanQuestion
+        ? `${baseRole} · ASKED USER`
+        : ev.kind === "subagent_spawn"
+          ? `${baseRole} · DISPATCH`
+          : ev.kind === "subagent_done"
+            ? `${baseRole} · DONE`
+            : status && speakerId !== "ext:human" && speakerId !== rootId
+              ? `${baseRole} · ${status}`
+              : baseRole;
 
-    const rawText =
-      (typeof ev.summary === "string" && ev.summary.trim()) ||
-      (typeof ev.payload?.body === "string" && ev.payload.body.trim()) ||
-      (typeof ev.payload?.prompt === "string" && ev.payload.prompt.trim()) ||
-      ev.kind;
+    const fullMarkdownText = extractFullMessageMarkdown(ev);
+    const questions = isHumanQuestion ? extractQuestionsFromPayload(ev) : undefined;
+
+    let replyToEntryId: string | undefined;
+    let replyToQuote: string | undefined;
+    let replyToActorLabel: string | undefined;
+
+    if (isHumanAnswer) {
+      const qToolCallId =
+        typeof ev.payload?.questionToolCallId === "string"
+          ? ev.payload.questionToolCallId.trim()
+          : "";
+      let matchedQuestion: SmsMessageItem | undefined;
+
+      if (qToolCallId) {
+        for (let k = entries.length - 1; k >= 0; k--) {
+          const candidate = entries[k]!;
+          if (candidate.kind !== "message") continue;
+          const candCallId =
+            candidate.event.toolCallId ||
+            (typeof candidate.event.payload?.toolCallId === "string"
+              ? candidate.event.payload.toolCallId
+              : "");
+          if (candCallId === qToolCallId) {
+            matchedQuestion = candidate;
+            break;
+          }
+        }
+      }
+
+      if (!matchedQuestion) {
+        for (let k = entries.length - 1; k >= 0; k--) {
+          const candidate = entries[k]!;
+          if (candidate.kind !== "message") continue;
+          const isQ =
+            (candidate.event.kind === "tool_start" &&
+              isHumanPromptToolName(candidate.event.toolName)) ||
+            Boolean(candidate.questions?.length);
+          if (!isQ) continue;
+          const candAgent =
+            normalizeEndpointId(candidate.event.agentId) || candidate.event.agentId;
+          if (!receiverId || candAgent === receiverId) {
+            matchedQuestion = candidate;
+            break;
+          }
+        }
+      }
+
+      if (matchedQuestion) {
+        replyToEntryId = matchedQuestion.event.id;
+        replyToActorLabel = matchedQuestion.fromLabel;
+        const rawQuote =
+          matchedQuestion.questions?.[0]?.question || matchedQuestion.fullMarkdownText;
+        replyToQuote = truncateWords(cleanSummaryText(rawQuote), 100);
+        matchedQuestion.chosenAnswerText = fullMarkdownText;
+      }
+    }
 
     const runId =
       speakerId !== "ext:human" && speakerId !== rootId
@@ -1267,27 +1805,53 @@ export function extractSmsStream(opts: {
       roleBadge,
       routeLabel: toLabel ? `${fromLabel} → ${toLabel}` : fromLabel,
       timeLabel: fmtClock(ev.ts || ev.epoch),
-      text: truncateWords(rawText, 320),
+      text: truncateWords(fullMarkdownText, 320),
+      fullMarkdownText,
       tools,
       toolGroups,
       runId,
       hasFullBody: eventHasFullBody(ev),
-      accentColor: getAccent(speakerId),
+      accentColor: isHumanAnswer ? "#10b981" : getAccent(speakerId),
+      ...(isHumanAnswer ? { isHumanAnswer: true } : {}),
+      ...(replyToEntryId ? { replyToEntryId } : {}),
+      ...(replyToQuote ? { replyToQuote } : {}),
+      ...(replyToActorLabel ? { replyToActorLabel } : {}),
+      ...(questions ? { questions } : {}),
+      behindSteps,
+      behindSummary: {
+        thoughtCount,
+        toolCount,
+        ...(durationLabel ? { durationLabel } : {}),
+      },
     });
   }
 
   flushGapBursts();
 
-  return entries;
+  const hiddenBackgroundAgents = Array.from(hiddenToolAgentSet).filter(
+    (aid) => !commSpeakers.has(aid)
+  );
+
+  return {
+    entries,
+    hiddenBurstCount,
+    hiddenToolCount,
+    hiddenBackgroundAgents,
+  };
 }
 
-export function extractSmsMessages(opts: {
-  events: NormalizedEvent[];
-  agents: AgentNodeSnapshot[];
-  thread: ThreadSelection;
-  labelMap?: Map<string, string>;
-}): SmsMessageItem[] {
-  return extractSmsStream(opts).filter(
+export function extractSmsStream(
+  opts: ExtractSmsStreamOptions,
+  options?: { showRawTools?: boolean }
+): SmsStreamEntry[] {
+  return extractSmsStreamWithMeta(opts, options).entries;
+}
+
+export function extractSmsMessages(
+  opts: ExtractSmsStreamOptions,
+  options?: { showRawTools?: boolean }
+): SmsMessageItem[] {
+  return extractSmsStreamWithMeta(opts, options).entries.filter(
     (entry): entry is SmsMessageItem => entry.kind === "message"
   );
 }

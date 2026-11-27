@@ -7,6 +7,7 @@ import {
   computeDeterministicEventId,
   computeMergeKey,
   computePendingPromptId,
+  extractProviderUsageDetails,
   formatQuestionsPreview,
   isBoardMutationToolCall,
   isSelfDaemonCommand,
@@ -36,6 +37,67 @@ import {
 } from "./project-match.js";
 
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+const THINKING_INLINE_MAX = 800;
+
+function formatAnswerValue(val: unknown): string {
+  if (val === null || val === undefined) return "";
+  if (typeof val === "string") return val.trim();
+  if (typeof val === "number" || typeof val === "boolean") return String(val);
+  if (Array.isArray(val)) {
+    return val.map(formatAnswerValue).filter(Boolean).join(", ");
+  }
+  if (typeof val === "object") {
+    const rec = val as Record<string, unknown>;
+    if (
+      typeof rec.question === "string" &&
+      (rec.answer !== undefined || rec.value !== undefined)
+    ) {
+      const a = formatAnswerValue(rec.answer ?? rec.value);
+      return a ? `${rec.question.trim()}: ${a}` : "";
+    }
+    return Object.entries(rec)
+      .map(([k, v]) => {
+        const formatted = formatAnswerValue(v);
+        if (!formatted) return "";
+        return k.trim() ? `${k.trim()}: ${formatted}` : formatted;
+      })
+      .filter(Boolean)
+      .join("\n");
+  }
+  return "";
+}
+
+function extractAntigravityAnswerText(rawContent: string): string {
+  const trimmed = rawContent.trim();
+  if (!trimmed) return "";
+  if (
+    (trimmed.startsWith("{") && trimmed.endsWith("}")) ||
+    (trimmed.startsWith("[") && trimmed.endsWith("]"))
+  ) {
+    try {
+      const parsed: unknown = JSON.parse(trimmed);
+      if (typeof parsed === "string") return parsed.trim();
+      if (Array.isArray(parsed)) {
+        const joined = parsed.map(formatAnswerValue).filter(Boolean).join("\n");
+        return joined || trimmed;
+      }
+      if (parsed && typeof parsed === "object") {
+        const rec = parsed as Record<string, unknown>;
+        for (const key of ["answers", "answer", "response", "text"]) {
+          if (rec[key] !== undefined) {
+            const unwrapped = formatAnswerValue(rec[key]);
+            if (unwrapped) return unwrapped;
+          }
+        }
+        const formattedMap = formatAnswerValue(rec);
+        if (formattedMap) return formattedMap;
+      }
+    } catch {
+      // Fallback to raw trimmed text if not valid JSON.
+    }
+  }
+  return trimmed;
+}
 const CREATED_SUBAGENT_RE =
   /Created the following subagent:\s*(\{[^}]*"conversationId"\s*:\s*"([0-9a-f-]{36})"[^}]*\})/is;
 const CANCELED_SUBAGENT_RE =
@@ -71,8 +133,14 @@ interface AntigravityRow {
   output_tokens?: number;
   cache_read_tokens?: number;
   cache_creation_tokens?: number;
+  cached_tokens?: number;
+  reasoning_tokens?: number;
+  thinking_tokens?: number;
+  thoughtsTokenCount?: number;
   token_count?: number;
-  usage?: {
+  costUsd?: number;
+  cost_usd?: number;
+  usage?: Record<string, unknown> & {
     input_tokens?: number;
     output_tokens?: number;
     cache_read_tokens?: number;
@@ -80,6 +148,12 @@ interface AntigravityRow {
     cache_creation_input_tokens?: number;
     prompt_tokens?: number;
     completion_tokens?: number;
+  };
+  usageMetadata?: Record<string, unknown> & {
+    promptTokenCount?: number;
+    candidatesTokenCount?: number;
+    thoughtsTokenCount?: number;
+    cachedContentTokenCount?: number;
   };
   metadata?: {
     model?: string;
@@ -581,9 +655,16 @@ export class AntigravityAdapter implements PassiveIdeAdapter {
       exactInput: number;
       exactOutput: number;
       exactCached: number;
+      exactCacheRead: number;
+      exactCacheWrite: number;
+      hasCacheSplit: boolean;
+      hasUnsplitCached: boolean;
+      exactReasoning: number;
+      hasExactReasoning: boolean;
       lastTurnContext: number;
       estInputChars: number;
       estOutputChars: number;
+      costUsd?: number;
     }
     const agentUsageAcc = new Map<string, AgentUsageAcc>();
     const ensureUsageAcc = (aid: string): AgentUsageAcc => {
@@ -595,6 +676,12 @@ export class AntigravityAdapter implements PassiveIdeAdapter {
           exactInput: 0,
           exactOutput: 0,
           exactCached: 0,
+          exactCacheRead: 0,
+          exactCacheWrite: 0,
+          hasCacheSplit: false,
+          hasUnsplitCached: false,
+          exactReasoning: 0,
+          hasExactReasoning: false,
           lastTurnContext: 0,
           estInputChars: 0,
           estOutputChars: 0,
@@ -743,6 +830,8 @@ export class AntigravityAdapter implements PassiveIdeAdapter {
         toolName: string;
         summary: string;
         isSelfDaemon: boolean;
+        questionPrompt?: string;
+        blockedOnUser?: boolean;
       }> = [];
       const openChatToolRefs: Array<{
         ref: ChatToolCallRef;
@@ -809,7 +898,9 @@ export class AntigravityAdapter implements PassiveIdeAdapter {
               ? row.usage.input_tokens
               : typeof row.usage?.prompt_tokens === "number"
                 ? row.usage.prompt_tokens
-                : undefined;
+                : typeof row.usageMetadata?.promptTokenCount === "number"
+                  ? row.usageMetadata.promptTokenCount
+                  : undefined;
         const rOut =
           typeof row.output_tokens === "number"
             ? row.output_tokens
@@ -817,27 +908,61 @@ export class AntigravityAdapter implements PassiveIdeAdapter {
               ? row.usage.output_tokens
               : typeof row.usage?.completion_tokens === "number"
                 ? row.usage.completion_tokens
-                : undefined;
-        const rCached =
-          (typeof row.cache_read_tokens === "number" ? row.cache_read_tokens : 0) +
-          (typeof row.cache_creation_tokens === "number" ? row.cache_creation_tokens : 0) +
-          (typeof row.usage?.cache_read_tokens === "number" ? row.usage.cache_read_tokens : 0) +
-          (typeof row.usage?.cache_read_input_tokens === "number"
-            ? row.usage.cache_read_input_tokens
-            : 0) +
-          (typeof row.usage?.cache_creation_input_tokens === "number"
-            ? row.usage.cache_creation_input_tokens
-            : 0);
+                : typeof row.usageMetadata?.candidatesTokenCount === "number"
+                  ? row.usageMetadata.candidatesTokenCount
+                  : undefined;
+        const usageDetails = extractProviderUsageDetails(
+          [
+            row as unknown as Record<string, unknown>,
+            row.usage as Record<string, unknown> | undefined,
+            row.usageMetadata as Record<string, unknown> | undefined,
+          ],
+          rOut,
+        );
 
-        if (rIn !== undefined || rOut !== undefined || typeof row.token_count === "number") {
+        if (
+          rIn !== undefined ||
+          rOut !== undefined ||
+          typeof row.token_count === "number" ||
+          usageDetails.reasoningSource === "exact"
+        ) {
           acc.hasExact = true;
-          const inTok = Math.max(0, Math.round(rIn ?? (rOut === undefined ? (row.token_count ?? 0) : 0)));
-          const outTok = Math.max(0, Math.round(rOut ?? 0));
-          const cachedTok = Math.max(0, Math.round(rCached));
+          const inTok = Math.max(
+            0,
+            Math.round(
+              rIn ?? (rOut === undefined && usageDetails.outputTokens === 0 ? (row.token_count ?? 0) : 0),
+            ),
+          );
+          const outTok = usageDetails.outputTokens;
+          const cachedTok = usageDetails.cachedTokens;
           acc.exactInput += inTok;
           acc.exactOutput += outTok;
           acc.exactCached += cachedTok;
+          if (usageDetails.cacheSplitKnown) {
+            acc.hasCacheSplit = true;
+            acc.exactCacheRead += usageDetails.cacheReadTokens ?? 0;
+            acc.exactCacheWrite += usageDetails.cacheWriteTokens ?? 0;
+          } else if (cachedTok > 0) {
+            acc.hasUnsplitCached = true;
+          }
+          if (usageDetails.reasoningTokens !== undefined) {
+            acc.hasExactReasoning = true;
+            acc.exactReasoning += usageDetails.reasoningTokens;
+          }
           acc.lastTurnContext = inTok + cachedTok;
+        }
+        const rawCost =
+          typeof row.costUsd === "number"
+            ? row.costUsd
+            : typeof row.cost_usd === "number"
+              ? row.cost_usd
+              : typeof row.usage?.costUsd === "number"
+                ? (row.usage.costUsd as number)
+                : typeof row.usage?.cost_usd === "number"
+                  ? (row.usage.cost_usd as number)
+                  : undefined;
+        if (typeof rawCost === "number" && Number.isFinite(rawCost) && rawCost >= 0) {
+          acc.costUsd = (acc.costUsd ?? 0) + rawCost;
         }
 
         // Accumulate char-based fallback estimation for transcripts without exact token fields
@@ -1009,6 +1134,13 @@ export class AntigravityAdapter implements PassiveIdeAdapter {
 
         // 2. USER_INPUT -> user_input event
         if (rtype === "USER_INPUT" && content.trim()) {
+          const openAsk = [...openToolCalls]
+            .reverse()
+            .find(
+              (tc) =>
+                tc.toolName === "ask_question" ||
+                (tc.toolName === "notify_user" && tc.blockedOnUser),
+            );
           pruneStaleNotify();
           const clean = cleanHumanSummary(content, 130);
           if (clean) {
@@ -1019,8 +1151,24 @@ export class AntigravityAdapter implements PassiveIdeAdapter {
                 agentId: senderId,
                 targetAgentId: senderId,
                 kind: "user_input",
+                ...(openAsk
+                  ? { toolCallId: `${openAsk.toolCallId}:answer` }
+                  : {}),
                 summary: `Human: ${clean}`,
-                payload: { body: inlineBody, conv: cid },
+                payload: {
+                  body: inlineBody,
+                  conv: cid,
+                  ...(openAsk
+                    ? {
+                        isHumanAnswer: true,
+                        questionToolCallId: openAsk.toolCallId,
+                        ...(openAsk.questionPrompt
+                          ? { questionPrompt: openAsk.questionPrompt }
+                          : {}),
+                        targetAgentId: senderId,
+                      }
+                    : {}),
+                },
                 fullBody: content,
                 inlineBody,
               }),
@@ -1128,6 +1276,41 @@ export class AntigravityAdapter implements PassiveIdeAdapter {
                 },
               }),
             );
+            if (
+              !isErr &&
+              (finished.toolName === "ask_question" ||
+                (finished.toolName === "notify_user" && finished.blockedOnUser)) &&
+              content.trim()
+            ) {
+              const answerText = extractAntigravityAnswerText(content);
+              if (answerText) {
+                const cleanAns =
+                  cleanHumanSummary(answerText, 130) || answerText.slice(0, 130);
+                const inlineBody = answerText.slice(0, 1400);
+                rawEvents.push(
+                  makeEvent({
+                    epoch: epoch + 0.0002,
+                    agentId: senderId,
+                    targetAgentId: senderId,
+                    kind: "user_input",
+                    toolCallId: `${finished.toolCallId}:answer`,
+                    summary: `Human: ${cleanAns}`,
+                    payload: {
+                      isHumanAnswer: true,
+                      questionToolCallId: finished.toolCallId,
+                      ...(finished.questionPrompt
+                        ? { questionPrompt: finished.questionPrompt }
+                        : {}),
+                      targetAgentId: senderId,
+                      body: inlineBody,
+                      conv: cid,
+                    },
+                    fullBody: answerText,
+                    inlineBody,
+                  }),
+                );
+              }
+            }
           } else if (rstatus === "ERROR") {
             rawEvents.push(
               makeEvent({
@@ -1173,6 +1356,25 @@ export class AntigravityAdapter implements PassiveIdeAdapter {
         }
 
         // 5. PLANNER_RESPONSE tool calls & prose/thinking
+        const plannerThinking =
+          rtype === "PLANNER_RESPONSE" && typeof row.thinking === "string"
+            ? row.thinking.trim()
+            : "";
+        if (plannerThinking) {
+          const inlineThink = plannerThinking.slice(0, THINKING_INLINE_MAX);
+          rawEvents.push(
+            makeEvent({
+              epoch: epoch - 0.0002,
+              agentId: senderId,
+              kind: "thinking_start",
+              summary: cleanHumanSummary(plannerThinking, 120) || "Thinking…",
+              payload: { body: inlineThink, isThought: true, conv: cid },
+              fullBody: plannerThinking,
+              inlineBody: inlineThink,
+            }),
+          );
+        }
+
         if (toolCalls.length > 0) {
           pruneStaleNotify();
           const turnTools: ChatToolCallRef[] = [];
@@ -1392,7 +1594,7 @@ export class AntigravityAdapter implements PassiveIdeAdapter {
                             cleanHumanSummary(firstLine, 120) ||
                             "Message from agent",
                           promptKind: "question",
-                          blockingToolCall: true,
+                          blockingToolCall: false,
                         }
                       : {}),
                   },
@@ -1406,6 +1608,8 @@ export class AntigravityAdapter implements PassiveIdeAdapter {
                   toolName: tname,
                   summary: notifySummary,
                   isSelfDaemon: false,
+                  questionPrompt: body.trim().slice(0, 500) || notifySummary,
+                  blockedOnUser: true,
                 });
               }
               if (includeChat) {
@@ -1457,11 +1661,21 @@ export class AntigravityAdapter implements PassiveIdeAdapter {
                   },
                 }),
               );
+              const questionPrompt =
+                parsedQuestions
+                  .map((q) => q.question.trim())
+                  .filter(Boolean)
+                  .join(" / ")
+                  .slice(0, 500) ||
+                qSummary ||
+                "Asked user a question";
               openToolCalls.push({
                 toolCallId,
                 toolName: tname,
                 summary: qSummary || "Asked user a question",
                 isSelfDaemon: false,
+                questionPrompt,
+                blockedOnUser: true,
               });
               if (includeChat) {
                 const qText = formatQuestionsPreview(
@@ -1567,7 +1781,7 @@ export class AntigravityAdapter implements PassiveIdeAdapter {
             }
             chatMessages.push(...deferredSpecialChatMsgs);
           }
-        } else if (rtype === "PLANNER_RESPONSE" && (content.trim() || (includeChat && typeof row.thinking === "string" && row.thinking.trim()))) {
+        } else if (rtype === "PLANNER_RESPONSE" && (content.trim() || plannerThinking)) {
           pruneStaleNotify();
           if (content.trim()) {
             // Clean assistant yield without tool calls
@@ -1630,6 +1844,9 @@ export class AntigravityAdapter implements PassiveIdeAdapter {
       } else if (ev.targetAgentId && UUID_RE.test(ev.targetAgentId)) {
         ev.targetAgentId = `agent-${ev.targetAgentId.slice(0, 6)}`;
       }
+      if (ev.payload?.isHumanAnswer && ev.payload.targetAgentId) {
+        ev.payload.targetAgentId = ev.targetAgentId ?? ev.agentId;
+      }
     }
 
     // Resolve inherited child models & attach finalized per-agent UsageDelta totals
@@ -1659,6 +1876,7 @@ export class AntigravityAdapter implements PassiveIdeAdapter {
       const contextTokens = acc.hasExact
         ? acc.lastTurnContext
         : inputTokens + outputTokens;
+      const hasSplit = acc.hasExact && acc.hasCacheSplit && !acc.hasUnsplitCached;
       const usageDelta: UsageDelta = {
         model: acc.model,
         modelSource: acc.model ? acc.modelSource : "unknown",
@@ -1666,6 +1884,19 @@ export class AntigravityAdapter implements PassiveIdeAdapter {
         inputTokens,
         outputTokens,
         cachedTokens,
+        ...(hasSplit
+          ? {
+              cacheReadTokens: acc.exactCacheRead,
+              cacheWriteTokens: acc.exactCacheWrite,
+            }
+          : {}),
+        ...(acc.hasExact && acc.hasExactReasoning
+          ? {
+              reasoningTokens: Math.min(outputTokens, acc.exactReasoning),
+              reasoningSource: "exact" as const,
+            }
+          : {}),
+        ...(acc.costUsd !== undefined ? { costUsd: acc.costUsd } : {}),
         contextTokens,
         isTotal: true,
       };

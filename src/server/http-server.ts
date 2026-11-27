@@ -51,6 +51,12 @@ import {
   type TeamManifest,
 } from "../schema/team.js";
 import {
+  PromptBridgeAnswerSchema,
+  PromptBridgeCancelSchema,
+  PromptBridgeCreateSchema,
+} from "../schema/telemetry.js";
+import { pathMatchesRoot } from "../telemetry/adapters/project-match.js";
+import {
   TelemetryAggregator,
   clearTeamDetailsCache,
   computeDeterministicEventId,
@@ -75,6 +81,8 @@ import {
 } from "./feedback.js";
 
 const MAX_INGEST_BODY_BYTES = 512 * 1024;
+const MAX_PROMPT_ANSWER_BYTES = 64 * 1024;
+const MAX_PROMPT_CANCEL_BYTES = 8 * 1024;
 const MAX_MODEL_BODY_BYTES = 512 * 1024;
 const SSE_DEBOUNCE_MS = 150;
 const SSE_HEARTBEAT_MS = 1500;
@@ -277,6 +285,129 @@ function sendBytes(
   res.end(body);
 }
 
+function normalizeHostname(raw: string): string {
+  const low = raw.trim().toLowerCase();
+  return low.startsWith("[") && low.endsWith("]") ? low.slice(1, -1) : low;
+}
+
+function isLoopbackHostname(raw: string): boolean {
+  const h = normalizeHostname(raw);
+  return (
+    h === "localhost" ||
+    h === "::1" ||
+    h === "127.0.0.1" ||
+    /^127\.\d{1,3}\.\d{1,3}\.\d{1,3}$/.test(h)
+  );
+}
+
+/** Extract the hostname portion (brackets stripped) of a Host header. */
+function hostHeaderHostname(hostHeader: string): string {
+  const low = hostHeader.trim().toLowerCase();
+  if (low.startsWith("[")) {
+    const end = low.indexOf("]");
+    return end > 0 ? low.slice(1, end) : low;
+  }
+  return low.split(":")[0] ?? "";
+}
+
+function checkPromptOrigin(
+  req: IncomingMessage,
+  bindHost = "127.0.0.1",
+): {
+  allowed: boolean;
+  origin?: string;
+} {
+  // 1. Host header guard (DNS rebinding): Host must be loopback or the
+  //    configured non-loopback bind host.
+  const reqHostHeader =
+    typeof req.headers.host === "string"
+      ? req.headers.host.trim().toLowerCase()
+      : "";
+  const bindName = normalizeHostname(bindHost);
+  const bindIsLoopback = isLoopbackHostname(bindName);
+  let hostAllowed = true;
+  if (reqHostHeader) {
+    const reqHostname = hostHeaderHostname(reqHostHeader);
+    hostAllowed =
+      isLoopbackHostname(reqHostname) ||
+      (!bindIsLoopback && bindName !== "" && reqHostname === bindName);
+  }
+  if (!hostAllowed) {
+    return { allowed: false };
+  }
+
+  // 2. Origin guard.
+  const rawOrigin = req.headers.origin;
+  if (!rawOrigin || typeof rawOrigin !== "string") {
+    return { allowed: true };
+  }
+  const trimmed = rawOrigin.trim();
+  if (!trimmed) {
+    return { allowed: true };
+  }
+  if (trimmed.toLowerCase() === "null") {
+    return { allowed: false };
+  }
+  let parsed: URL;
+  try {
+    parsed = new URL(trimmed);
+  } catch {
+    return { allowed: false };
+  }
+  if (parsed.protocol === "vscode-webview:") {
+    if (
+      parsed.hostname &&
+      (parsed.pathname === "/" || parsed.pathname === "") &&
+      !parsed.username &&
+      !parsed.password &&
+      !parsed.search &&
+      !parsed.hash
+    ) {
+      return { allowed: true, origin: trimmed };
+    }
+    return { allowed: false };
+  }
+  if (parsed.protocol !== "http:" && parsed.protocol !== "https:") {
+    return { allowed: false };
+  }
+  if (isLoopbackHostname(parsed.hostname)) {
+    return { allowed: true, origin: trimmed };
+  }
+  // Non-loopback Origin: only when it exactly matches the (already validated) Host.
+  if (reqHostHeader && parsed.host.toLowerCase() === reqHostHeader) {
+    return { allowed: true, origin: trimmed };
+  }
+  return { allowed: false };
+}
+
+function sendPromptJson(
+  res: ServerResponse,
+  status: number,
+  body: unknown,
+  allowedOrigin?: string,
+): void {
+  const extraHeaders: Record<string, string> | undefined = allowedOrigin
+    ? {
+        "Access-Control-Allow-Origin": allowedOrigin,
+        Vary: "Origin",
+      }
+    : undefined;
+  sendBytes(
+    res,
+    status,
+    "application/json; charset=utf-8",
+    JSON.stringify(body),
+    extraHeaders,
+  );
+}
+
+function isValidPromptIdSegment(id: string): boolean {
+  if (!id || id.includes("/") || id.includes("\\") || id.includes("..")) {
+    return false;
+  }
+  return true;
+}
+
 async function readJsonBody(
   req: IncomingMessage,
   maxBytes = MAX_INGEST_BODY_BYTES,
@@ -475,6 +606,7 @@ export function createStudioServer(
   const webDir = options.webDir ?? defaultWebDir();
   const extraMockupDirs = options.extraMockupDirs ?? [];
   const sseClients = new Set<SseClient>();
+  let boundHost = options.host ?? "127.0.0.1";
 
   let debounceTimer: NodeJS.Timeout | null = null;
   let heartbeatTimer: NodeJS.Timeout | null = null;
@@ -538,6 +670,10 @@ export function createStudioServer(
   aggregator.pushBus.on("ingest", () => {
     broadcastDebounced();
   });
+  const onPromptChange = (): void => {
+    broadcastDebounced();
+  };
+  aggregator.promptBridge.on("change", onPromptChange);
 
   const findMockupById = async (id: string): Promise<MockupEntry | null> => {
     const entries = await scanMockupEntries({
@@ -628,17 +764,425 @@ export function createStudioServer(
       }
     });
 
+    const rawPathOnly = (req.url ?? "/").split("?")[0] ?? "/";
+    const reqMethodUpper = (req.method ?? "GET").toUpperCase();
+    // Prompt id extracted from the RAW path (before URL normalization) so
+    // dot-segments / encoded separators can never retarget another prompt.
+    let rawPromptId: string | undefined;
+    if (rawPathOnly.startsWith("/api/prompts/")) {
+      const rawRest = rawPathOnly.slice("/api/prompts/".length);
+      const lowRest = rawRest.toLowerCase();
+      if (
+        rawRest.includes("..") ||
+        rawRest.includes("\\") ||
+        lowRest.includes("%2f") ||
+        lowRest.includes("%5c") ||
+        lowRest.includes("%2e%2e")
+      ) {
+        sendPromptJson(res, 400, { ok: false, error: "Invalid prompt id" });
+        return;
+      }
+      let rawIdSeg = rawRest;
+      if (reqMethodUpper === "POST") {
+        if (rawRest.endsWith("/answer")) {
+          rawIdSeg = rawRest.slice(0, -"/answer".length);
+        } else if (rawRest.endsWith("/cancel")) {
+          rawIdSeg = rawRest.slice(0, -"/cancel".length);
+        }
+      }
+      let decodedPromptSeg: string;
+      try {
+        decodedPromptSeg = decodeURIComponent(rawIdSeg);
+      } catch {
+        sendPromptJson(res, 400, { ok: false, error: "Malformed URL path" });
+        return;
+      }
+      if (reqMethodUpper !== "OPTIONS") {
+        if (!isValidPromptIdSegment(decodedPromptSeg)) {
+          sendPromptJson(res, 400, { ok: false, error: "Invalid prompt id" });
+          return;
+        }
+        rawPromptId = decodedPromptSeg;
+      }
+    }
+
     const url = new URL(req.url ?? "/", "http://127.0.0.1");
-    const pathname = decodeURIComponent(url.pathname);
+    let pathname: string;
+    try {
+      pathname = decodeURIComponent(url.pathname);
+    } catch {
+      sendJson(res, 400, { ok: false, error: "Malformed URL path" });
+      return;
+    }
     const method = (req.method ?? "GET").toUpperCase();
 
     if (method === "OPTIONS") {
+      if (pathname === "/api/prompts" || pathname.startsWith("/api/prompts/")) {
+        const originCheck = checkPromptOrigin(req, boundHost);
+        if (!originCheck.allowed) {
+          sendPromptJson(res, 403, { ok: false, error: "Forbidden origin" });
+          return;
+        }
+        res.writeHead(204, {
+          ...(originCheck.origin
+            ? {
+                "Access-Control-Allow-Origin": originCheck.origin,
+                Vary: "Origin",
+              }
+            : {}),
+          "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
+          "Access-Control-Allow-Headers": "Content-Type",
+        });
+        res.end();
+        return;
+      }
       res.writeHead(204, {
         "Access-Control-Allow-Origin": "*",
         "Access-Control-Allow-Methods": "GET, POST, PUT, PATCH, OPTIONS",
         "Access-Control-Allow-Headers": "Content-Type",
       });
       res.end();
+      return;
+    }
+
+    // 0. GET /api/health (pure in-memory liveness + workspace SSE matching)
+    if (method === "GET" && pathname === "/api/health") {
+      const workspaceParam = url.searchParams.get("workspace")?.trim() || undefined;
+      let openSseClients = 0;
+      let matchingSseClients = 0;
+      let wsProjectId: string | null | undefined;
+      const resolveWsProjectId = (): string | null => {
+        if (wsProjectId === undefined) {
+          try {
+            wsProjectId = workspaceParam
+              ? loadTeamManifest(path.resolve(workspaceParam)).project.id
+              : null;
+          } catch {
+            wsProjectId = null;
+          }
+        }
+        return wsProjectId;
+      };
+      for (const client of sseClients) {
+        if (client.res.writableEnded || client.res.destroyed) continue;
+        openSseClients++;
+        let matches = false;
+        if (!workspaceParam) {
+          matches = true;
+        } else if (client.workspace) {
+          matches =
+            pathMatchesRoot(workspaceParam, client.workspace) ||
+            pathMatchesRoot(client.workspace, workspaceParam);
+        } else if (client.project && client.project.toLowerCase() !== "all") {
+          const pid = resolveWsProjectId();
+          matches =
+            (pid !== null && client.project === pid) ||
+            pathMatchesRoot(workspaceParam, client.project);
+        }
+        if (matches) {
+          matchingSseClients++;
+        }
+      }
+      sendJson(res, 200, {
+        ok: true,
+        sseClients: openSseClients,
+        matchingSseClients,
+        hasActiveUi: matchingSseClients > 0,
+        activePromptCount: aggregator.promptBridge.getActiveCount(),
+      });
+      return;
+    }
+
+    // 0b. Direct Human Prompt Bridge (/api/prompts*)
+    if (method === "GET" && pathname === "/api/prompts") {
+      const listOriginCheck = checkPromptOrigin(req, boundHost);
+      if (!listOriginCheck.allowed) {
+        sendPromptJson(res, 403, { ok: false, error: "Forbidden origin" });
+        return;
+      }
+      const prompts = aggregator.promptBridge.listPending({
+        sessionId: url.searchParams.get("session")?.trim() || undefined,
+        ide: url.searchParams.get("ide")?.trim() || undefined,
+        project: url.searchParams.get("project")?.trim() || undefined,
+        workspace: url.searchParams.get("workspace")?.trim() || undefined,
+      });
+      sendPromptJson(res, 200, { ok: true, prompts }, listOriginCheck.origin);
+      return;
+    }
+
+    if (method === "POST" && pathname === "/api/prompts") {
+      const originCheck = checkPromptOrigin(req, boundHost);
+      if (!originCheck.allowed) {
+        sendPromptJson(res, 403, { ok: false, error: "Forbidden origin" });
+        return;
+      }
+      let body: unknown;
+      try {
+        body = await readJsonBody(req, MAX_INGEST_BODY_BYTES);
+      } catch (err) {
+        const code = err instanceof Error ? err.message : "";
+        if (code === "PAYLOAD_TOO_LARGE") {
+          sendPromptJson(
+            res,
+            413,
+            { ok: false, error: "Payload exceeds 512 KB limit" },
+            originCheck.origin,
+          );
+          return;
+        }
+        sendPromptJson(
+          res,
+          400,
+          { ok: false, error: "Invalid JSON payload" },
+          originCheck.origin,
+        );
+        return;
+      }
+      const parsed = PromptBridgeCreateSchema.safeParse(body);
+      if (!parsed.success) {
+        sendPromptJson(
+          res,
+          400,
+          {
+            ok: false,
+            error: parsed.error.issues
+              .map((i) => `${i.path.join(".") || "body"}: ${i.message}`)
+              .join("; "),
+          },
+          originCheck.origin,
+        );
+        return;
+      }
+      const created = await aggregator.promptBridge.createPrompt(parsed.data);
+      if (!created.ok) {
+        sendPromptJson(
+          res,
+          created.statusCode,
+          { ok: false, error: created.error },
+          originCheck.origin,
+        );
+        return;
+      }
+      sendPromptJson(
+        res,
+        201,
+        { ok: true, prompt: created.prompt },
+        originCheck.origin,
+      );
+      return;
+    }
+
+    if (method === "POST" && pathname.startsWith("/api/prompts/")) {
+      const originCheck = checkPromptOrigin(req, boundHost);
+      if (!originCheck.allowed) {
+        sendPromptJson(res, 403, { ok: false, error: "Forbidden origin" });
+        return;
+      }
+      const isAnswer = pathname.endsWith("/answer");
+      const isCancel = !isAnswer && pathname.endsWith("/cancel");
+      if (isAnswer || isCancel) {
+        const rawId = rawPromptId ?? "";
+        if (!isValidPromptIdSegment(rawId)) {
+          sendPromptJson(
+            res,
+            400,
+            { ok: false, error: "Invalid prompt id" },
+            originCheck.origin,
+          );
+          return;
+        }
+        const maxBytes = isAnswer
+          ? MAX_PROMPT_ANSWER_BYTES
+          : MAX_PROMPT_CANCEL_BYTES;
+        let body: unknown;
+        try {
+          body = await readJsonBody(req, maxBytes);
+        } catch (err) {
+          const code = err instanceof Error ? err.message : "";
+          if (code === "PAYLOAD_TOO_LARGE") {
+            sendPromptJson(
+              res,
+              413,
+              {
+                ok: false,
+                error: isAnswer
+                  ? "Payload exceeds 64 KB limit"
+                  : "Payload exceeds 8 KB limit",
+              },
+              originCheck.origin,
+            );
+            return;
+          }
+          sendPromptJson(
+            res,
+            400,
+            { ok: false, error: "Invalid JSON payload" },
+            originCheck.origin,
+          );
+          return;
+        }
+
+        if (isAnswer) {
+          const parsed = PromptBridgeAnswerSchema.safeParse(body);
+          if (!parsed.success) {
+            sendPromptJson(
+              res,
+              400,
+              {
+                ok: false,
+                error: parsed.error.issues
+                  .map((i) => `${i.path.join(".") || "body"}: ${i.message}`)
+                  .join("; "),
+              },
+              originCheck.origin,
+            );
+            return;
+          }
+          const result = aggregator.promptBridge.answerPrompt(
+            rawId,
+            parsed.data,
+          );
+          if (!result.ok) {
+            if (result.notFound) {
+              sendPromptJson(
+                res,
+                404,
+                { ok: false, error: "Prompt not found" },
+                originCheck.origin,
+              );
+              return;
+            }
+            sendPromptJson(
+              res,
+              409,
+              {
+                ok: false,
+                conflict: true,
+                status: result.status,
+                error: `Prompt already ${result.status}`,
+                prompt: result.prompt,
+              },
+              originCheck.origin,
+            );
+            return;
+          }
+          sendPromptJson(
+            res,
+            200,
+            { ok: true, prompt: result.prompt },
+            originCheck.origin,
+          );
+          return;
+        }
+
+        const parsed = PromptBridgeCancelSchema.safeParse(body);
+        if (!parsed.success) {
+          sendPromptJson(
+            res,
+            400,
+            {
+              ok: false,
+              error: parsed.error.issues
+                .map((i) => `${i.path.join(".") || "body"}: ${i.message}`)
+                .join("; "),
+            },
+            originCheck.origin,
+          );
+          return;
+        }
+        const result = aggregator.promptBridge.cancelPrompt(
+          rawId,
+          parsed.data.reason,
+        );
+        if (!result.ok) {
+          if (result.notFound) {
+            sendPromptJson(
+              res,
+              404,
+              { ok: false, error: "Prompt not found" },
+              originCheck.origin,
+            );
+            return;
+          }
+          sendPromptJson(
+            res,
+            409,
+            {
+              ok: false,
+              conflict: true,
+              status: result.status,
+              error: `Prompt already ${result.status}`,
+              prompt: result.prompt,
+            },
+            originCheck.origin,
+          );
+          return;
+        }
+        sendPromptJson(
+          res,
+          200,
+          { ok: true, prompt: result.prompt },
+          originCheck.origin,
+        );
+        return;
+      }
+    }
+
+    if (method === "GET" && pathname.startsWith("/api/prompts/")) {
+      const originCheck = checkPromptOrigin(req, boundHost);
+      if (!originCheck.allowed) {
+        sendPromptJson(res, 403, { ok: false, error: "Forbidden origin" });
+        return;
+      }
+      const rawId = rawPromptId ?? "";
+      if (!isValidPromptIdSegment(rawId)) {
+        sendPromptJson(
+          res,
+          400,
+          { ok: false, error: "Invalid prompt id" },
+          originCheck.origin,
+        );
+        return;
+      }
+      const rawWait = url.searchParams.get("waitMs");
+      const parsedWait = rawWait !== null ? Number.parseInt(rawWait, 10) : 0;
+      const waitMs = Number.isFinite(parsedWait)
+        ? Math.max(0, Math.min(30_000, parsedWait))
+        : 0;
+      let prompt = aggregator.promptBridge.getPrompt(rawId);
+      if (!prompt) {
+        sendPromptJson(
+          res,
+          404,
+          { ok: false, error: "Prompt not found" },
+          originCheck.origin,
+        );
+        return;
+      }
+      if (waitMs > 0 && prompt.status === "pending") {
+        const ac = new AbortController();
+        const onClose = (): void => ac.abort();
+        req.on("close", onClose);
+        try {
+          prompt = await aggregator.promptBridge.waitForResolution(
+            rawId,
+            waitMs,
+            ac.signal,
+          );
+        } finally {
+          req.off("close", onClose);
+        }
+      }
+      if (!prompt) {
+        sendPromptJson(
+          res,
+          404,
+          { ok: false, error: "Prompt not found" },
+          originCheck.origin,
+        );
+        return;
+      }
+      sendPromptJson(res, 200, { ok: true, prompt }, originCheck.origin);
       return;
     }
 
@@ -672,6 +1216,43 @@ export function createStudioServer(
         ...payload.snapshot,
         sessions: payload.sessions,
         board_projects: payload.boardProjects,
+      });
+      return;
+    }
+
+    // 2a. GET /api/telemetry/breakdown
+    if (method === "GET" && pathname === "/api/telemetry/breakdown") {
+      const rawWindow = url.searchParams.get("window")?.trim() || "session";
+      if (
+        rawWindow !== "session" &&
+        rawWindow !== "24h" &&
+        rawWindow !== "7d" &&
+        rawWindow !== "all"
+      ) {
+        sendJson(res, 400, {
+          ok: false,
+          error: `Invalid window "${rawWindow}". Expected session, 24h, 7d, or all.`,
+        });
+        return;
+      }
+      const result = await aggregator.getUsageBreakdown({
+        ide: url.searchParams.get("ide") ?? undefined,
+        project: url.searchParams.get("project") ?? undefined,
+        workspace: url.searchParams.get("workspace") ?? undefined,
+        multiOnly: parseBoolParam(url.searchParams.get("multiOnly")),
+        sessionId:
+          url.searchParams.get("session") ??
+          url.searchParams.get("sessionId") ??
+          undefined,
+        agentId:
+          url.searchParams.get("agent") ??
+          url.searchParams.get("agentId") ??
+          undefined,
+        window: rawWindow,
+      });
+      sendJson(res, 200, {
+        ok: true,
+        ...result,
       });
       return;
     }
@@ -1570,6 +2151,7 @@ export function createStudioServer(
       server.once("error", reject);
       server.listen(port, host, () => {
         server.off("error", reject);
+        boundHost = host;
         resolve();
       });
     });
@@ -1595,6 +2177,8 @@ export function createStudioServer(
   };
 
   const close = async (): Promise<void> => {
+    aggregator.promptBridge.off("change", onPromptChange);
+    aggregator.dispose();
     if (debounceTimer) {
       clearTimeout(debounceTimer);
       debounceTimer = null;

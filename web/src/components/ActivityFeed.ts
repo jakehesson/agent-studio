@@ -1,5 +1,7 @@
+import { fetchEventBody } from "../api.js";
 import {
-  extractSmsStream,
+  extractSmsStreamWithMeta,
+  type SmsMessageItem,
   type SmsStreamEntry,
   type TeamAgentCluster,
   type ThreadSelection,
@@ -16,6 +18,7 @@ import type {
 import {
   classifyEventReadable,
   cleanSummaryText,
+  copyTextSafe,
   escHtml,
   fmtClock,
   fmtTokens,
@@ -25,7 +28,7 @@ import {
   isRoutineToolEnd,
   truncateWords,
 } from "../utils.js";
-import { renderInlineMarkdown } from "../utils/markdown.js";
+import { renderMarkdown } from "../utils/markdown.js";
 import { QuestionCard } from "./QuestionCard.js";
 import { UsageDashboard } from "./UsageDashboard.js";
 
@@ -34,6 +37,7 @@ export type FeedMode = "summary" | "detailed";
 
 const FEED_MODE_STORAGE_KEY = "agent-studio:feed-mode";
 const FEED_FILTER_STORAGE_KEY = "agent-studio:feed-filter";
+const SMS_RAW_TOOLS_STORAGE_KEY = "agent-studio:sms-raw-tools";
 
 const ALL_THREAD: ThreadSelection = {
   key: "all",
@@ -42,15 +46,31 @@ const ALL_THREAD: ThreadSelection = {
   route: "All Session Messages",
 };
 
+export interface FeedSessionContext {
+  sessionId?: string;
+  ide?: string;
+  project?: string;
+  workspace?: string;
+}
+
 export interface ActivityFeedCallbacks {
   onSelectEvent: (event: NormalizedEvent) => void;
   onSelectAgent?: (agentId: string) => void;
   onOpenReader?: (event: NormalizedEvent) => void;
+  onOpenBehind?: (
+    entry: SmsMessageItem,
+    allWithBehind: SmsMessageItem[],
+    triggerEl: HTMLElement
+  ) => void;
   onThreadChange?: (threadKey: string | null) => void;
   onCoverBackToTopology?: () => void;
   onOpenChat?: (agentId: string) => void;
+  embedMode?: boolean;
+  mcpAppMode?: boolean;
+  getSessionContext?: () => FeedSessionContext;
   getReplyCapabilities?: () => ReplyCapabilities;
   onReplyToHost?: (req: ReplyToHostRequest) => Promise<ReplyToHostResult>;
+  onCancelPrompt?: (promptId: string, reason?: string) => Promise<ReplyToHostResult>;
 }
 
 const FILTER_TABS: Array<{ id: FeedFilter; label: string }> = [
@@ -112,6 +132,80 @@ function saveMode(mode: FeedMode): void {
   }
 }
 
+function loadSavedRawTools(): boolean {
+  try {
+    return window.sessionStorage.getItem(SMS_RAW_TOOLS_STORAGE_KEY) === "true";
+  } catch {
+    return false;
+  }
+}
+
+function saveRawTools(show: boolean): void {
+  try {
+    window.sessionStorage.setItem(SMS_RAW_TOOLS_STORAGE_KEY, show ? "true" : "false");
+  } catch {
+    // Ignore storage restrictions
+  }
+}
+
+function decodeFileUriToPath(uri: string): string {
+  const raw = uri.trim();
+  if (!/^file:/i.test(raw)) return raw;
+  try {
+    const parsed = new URL(raw);
+    let pathname = decodeURIComponent(parsed.pathname);
+    if (/^\/[A-Za-z]:/.test(pathname)) {
+      pathname = pathname.slice(1);
+    }
+    if (parsed.host && parsed.host !== "localhost") {
+      return `//${parsed.host}${pathname}`;
+    }
+    return pathname || raw;
+  } catch {
+    return raw.replace(/^file:\/\//i, "");
+  }
+}
+
+function isOptionChosenByAnswer(optionLabel: string, chosenAnswerText?: string): boolean {
+  if (!chosenAnswerText) return false;
+  const optNorm = optionLabel.trim().toLowerCase();
+  const ansNorm = chosenAnswerText.trim().toLowerCase();
+  if (!optNorm || !ansNorm) return false;
+  if (ansNorm === optNorm) return true;
+  if (
+    ansNorm.startsWith(`${optNorm} `) ||
+    ansNorm.startsWith(`${optNorm}:`) ||
+    ansNorm.startsWith(`${optNorm}\n`) ||
+    ansNorm.startsWith(`${optNorm}—`) ||
+    ansNorm.startsWith(`${optNorm}-`)
+  ) {
+    return true;
+  }
+  const strippedAns = ansNorm.replace(/^\*\*|\*\*$/g, "").trim();
+  if (strippedAns === optNorm || strippedAns.startsWith(`${optNorm} `) || strippedAns.startsWith(`${optNorm}:`)) {
+    return true;
+  }
+  if (optNorm.length >= 4 && ansNorm.includes(optNorm)) {
+    return true;
+  }
+  return false;
+}
+
+function formatBehindSummaryChip(m: SmsMessageItem): string {
+  const { thoughtCount, toolCount, durationLabel } = m.behindSummary;
+  const parts: string[] = [];
+  if (thoughtCount > 0) {
+    parts.push(`${thoughtCount} ${thoughtCount === 1 ? "thought" : "thoughts"}`);
+  }
+  if (toolCount > 0) {
+    parts.push(`${toolCount} ${toolCount === 1 ? "tool" : "tools"}`);
+  }
+  if (durationLabel) {
+    parts.push(durationLabel);
+  }
+  return parts.join(" · ");
+}
+
 function isPlaceholderThinking(ev: NormalizedEvent): boolean {
   if (ev.kind !== "thinking_start") return false;
   const s = cleanSummaryText(ev.summary).toLowerCase();
@@ -155,7 +249,20 @@ function extractShortTargetLabel(ev: NormalizedEvent): string {
   return truncateWords(summary || ev.toolName || "file", 28);
 }
 
+function smsPromptDomSuffix(promptId: string): string {
+  return promptId.replace(/[^A-Za-z0-9_-]/g, "_");
+}
+
+export function smsPromptTabDomId(promptId: string): string {
+  return `sms-prompt-tab-${smsPromptDomSuffix(promptId)}`;
+}
+
+export function smsPromptPanelDomId(promptId: string): string {
+  return `sms-prompt-panel-${smsPromptDomSuffix(promptId)}`;
+}
+
 export class ActivityFeed {
+  private static readonly MAX_CACHED_BODIES = 64;
   private container: HTMLElement;
   private cb: ActivityFeedCallbacks;
   private filter: FeedFilter = loadSavedFilter();
@@ -174,8 +281,17 @@ export class ActivityFeed {
 
   private activeThread: ThreadSelection = ALL_THREAD;
   private selectedRunId = "all";
+  private showRawTools: boolean = loadSavedRawTools();
+  private inspectedEventId: string | null = null;
+  private embedMode = false;
+  private mcpAppMode = false;
   private expandedBursts = new Set<string>();
   private expandedBubbleTools = new Set<string>();
+  private expandedMessageIds = new Set<string>();
+  private fetchedBodiesByEventId = new Map<string, string>();
+  private loadingBodyEventIds = new Set<string>();
+  private sessionResetSeq = 0;
+  private latestSmsMessages: SmsMessageItem[] = [];
   private drawerScrollTops = new Map<string, number>();
   private isNearBottom = true;
   private unseenCount = 0;
@@ -186,19 +302,30 @@ export class ActivityFeed {
   private lastPendingHtml = "";
   private lastListHtml = "";
   private lastListContextKey = "";
+  private smsPromptDockCollapsed = false;
+  private activeSmsPromptId: string | null = null;
+  private lastSmsTabsKey = "";
 
   private smsPillBarEl: HTMLElement;
+  private rawToolsToggleBtn: HTMLButtonElement;
   private runFilterBarEl: HTMLElement;
   private feedListEl: HTMLElement;
   private smsBodyWrapEl: HTMLElement;
   private smsBodyEl: HTMLElement;
   private smsStreamItemsEl: HTMLElement;
+  private smsPromptDockEl: HTMLElement;
+  private smsPromptToggleBtn: HTMLButtonElement;
+  private smsPromptBadgeTextEl: HTMLElement;
+  private smsPromptTitleEl: HTMLElement;
+  private smsPromptTabsEl: HTMLElement;
   private smsInlinePromptsEl: HTMLElement;
   private jumpLatestBtn: HTMLButtonElement;
 
   constructor(container: HTMLElement, cb: ActivityFeedCallbacks) {
     this.container = container;
     this.cb = cb;
+    this.embedMode = Boolean(cb.embedMode);
+    this.mcpAppMode = Boolean(cb.mcpAppMode);
 
     this.container.innerHTML = `
       <div class="card-head">
@@ -244,7 +371,14 @@ export class ActivityFeed {
           <span class="pill status" data-active-pill-route>All Session Messages</span>
           <span class="role-meta sms-pill-hint" data-active-pill-hint>SMS view in Messages tab</span>
         </div>
-        <div class="run-top-right">
+        <div class="run-top-right sms-bar-actions">
+          <button
+            type="button"
+            class="subtle-toggle-pill"
+            data-raw-tools-toggle
+            aria-pressed="${this.showRawTools ? "true" : "false"}"
+            title="Show or hide raw background tool steps in the Messages stream"
+          >Raw tool steps: ${this.showRawTools ? "Shown" : "Hidden"}</button>
           <button type="button" class="btn-ghost" data-clear-pill hidden>✕ Show All Messages</button>
         </div>
       </div>
@@ -253,18 +387,41 @@ export class ActivityFeed {
       <div class="sms-body-wrap" data-sms-body-wrap hidden>
         <div class="sms-body" data-sms-body aria-live="polite">
           <div class="sms-stream-items" data-sms-stream-items></div>
-          <div class="sms-inline-prompts" data-sms-inline-prompts hidden></div>
         </div>
         <button type="button" class="jump-latest-btn" data-jump-latest hidden>↓ Jump to latest</button>
       </div>
+      <section class="sms-prompt-dock" data-sms-prompt-dock aria-label="Waiting agent prompts" hidden>
+        <div class="sms-prompt-dock-header">
+          <button
+            type="button"
+            class="sms-prompt-dock-toggle"
+            data-sms-prompt-toggle
+            aria-expanded="true"
+          >
+            <span class="sms-prompt-pill"><span aria-hidden="true">?</span> <span data-sms-prompt-badge-text>Waiting on you</span></span>
+            <span class="sms-prompt-dock-title" data-sms-prompt-title></span>
+            <span class="sms-prompt-chevron" aria-hidden="true">▾</span>
+          </button>
+        </div>
+        <div class="sms-prompt-tabs" data-sms-prompt-tabs role="tablist" aria-label="Waiting agent prompts" hidden></div>
+        <div class="sms-inline-prompts" data-sms-inline-prompts></div>
+      </section>
     `;
 
     this.smsPillBarEl = this.container.querySelector("[data-sms-pill-bar]") as HTMLElement;
+    this.rawToolsToggleBtn = this.container.querySelector(
+      "[data-raw-tools-toggle]"
+    ) as HTMLButtonElement;
     this.runFilterBarEl = this.container.querySelector("[data-run-filter-bar]") as HTMLElement;
     this.feedListEl = this.container.querySelector("[data-feed-list]") as HTMLElement;
     this.smsBodyWrapEl = this.container.querySelector("[data-sms-body-wrap]") as HTMLElement;
     this.smsBodyEl = this.container.querySelector("[data-sms-body]") as HTMLElement;
     this.smsStreamItemsEl = this.container.querySelector("[data-sms-stream-items]") as HTMLElement;
+    this.smsPromptDockEl = this.container.querySelector("[data-sms-prompt-dock]") as HTMLElement;
+    this.smsPromptToggleBtn = this.container.querySelector("[data-sms-prompt-toggle]") as HTMLButtonElement;
+    this.smsPromptBadgeTextEl = this.container.querySelector("[data-sms-prompt-badge-text]") as HTMLElement;
+    this.smsPromptTitleEl = this.container.querySelector("[data-sms-prompt-title]") as HTMLElement;
+    this.smsPromptTabsEl = this.container.querySelector("[data-sms-prompt-tabs]") as HTMLElement;
     this.smsInlinePromptsEl = this.container.querySelector("[data-sms-inline-prompts]") as HTMLElement;
     this.jumpLatestBtn = this.container.querySelector("[data-jump-latest]") as HTMLButtonElement;
 
@@ -327,6 +484,13 @@ export class ActivityFeed {
       });
     });
 
+    this.rawToolsToggleBtn.addEventListener("click", () => {
+      this.showRawTools = !this.showRawTools;
+      saveRawTools(this.showRawTools);
+      this.rawToolsToggleBtn.setAttribute("aria-pressed", this.showRawTools ? "true" : "false");
+      this.renderSmsStream(false, true);
+    });
+
     this.container.querySelector("[data-clear-pill]")?.addEventListener("click", () => {
       this.activeThread = ALL_THREAD;
       this.selectedRunId = "all";
@@ -355,10 +519,63 @@ export class ActivityFeed {
       this.syncJumpLatestBtn();
     });
 
+    this.smsPromptToggleBtn.addEventListener("click", () => {
+      this.smsPromptDockCollapsed = !this.smsPromptDockCollapsed;
+      const hasMulti = this.smsPromptTabsEl.childElementCount > 1;
+      this.syncSmsPromptDockVisibility(hasMulti);
+    });
+
+    this.smsPromptTabsEl.addEventListener("click", (e) => {
+      const btn = (e.target as Element | null)?.closest<HTMLButtonElement>("[data-sms-prompt-tab]");
+      if (!btn) return;
+      const promptId = btn.dataset.smsPromptTab;
+      if (!promptId || promptId === this.activeSmsPromptId) return;
+      this.activeSmsPromptId = promptId;
+      this.reconcileInlineSmsPrompts(this.activeThread);
+      const nextBtn = this.smsPromptTabsEl.querySelector<HTMLButtonElement>(
+        `[data-sms-prompt-tab="${CSS.escape(promptId)}"]`
+      );
+      nextBtn?.focus({ preventScroll: true });
+      nextBtn?.scrollIntoView({ block: "nearest", inline: "nearest" });
+    });
+
+    this.smsPromptTabsEl.addEventListener("keydown", (e) => {
+      const tabs = Array.from(
+        this.smsPromptTabsEl.querySelectorAll<HTMLButtonElement>("[data-sms-prompt-tab]")
+      );
+      if (tabs.length <= 1) return;
+      const curIdx = tabs.findIndex((t) => t.dataset.smsPromptTab === this.activeSmsPromptId);
+      let nextIdx: number | null = null;
+      if (e.key === "ArrowRight") {
+        nextIdx = ((curIdx >= 0 ? curIdx : 0) + 1) % tabs.length;
+      } else if (e.key === "ArrowLeft") {
+        nextIdx = ((curIdx >= 0 ? curIdx : 0) - 1 + tabs.length) % tabs.length;
+      } else if (e.key === "Home") {
+        nextIdx = 0;
+      } else if (e.key === "End") {
+        nextIdx = tabs.length - 1;
+      }
+      if (nextIdx !== null) {
+        e.preventDefault();
+        const targetTab = tabs[nextIdx];
+        const nextId = targetTab?.dataset.smsPromptTab;
+        if (nextId) {
+          this.activeSmsPromptId = nextId;
+          this.reconcileInlineSmsPrompts(this.activeThread);
+          const refreshed = this.smsPromptTabsEl.querySelector<HTMLButtonElement>(
+            `[data-sms-prompt-tab="${CSS.escape(nextId)}"]`
+          );
+          refreshed?.focus({ preventScroll: true });
+          refreshed?.scrollIntoView({ block: "nearest", inline: "nearest" });
+        }
+      }
+    });
+
     this.jumpLatestBtn.addEventListener("click", () => {
+      const reduced = window.matchMedia("(prefers-reduced-motion: reduce)").matches;
       this.smsBodyEl.scrollTo({
         top: this.smsBodyEl.scrollHeight,
-        behavior: "smooth",
+        behavior: reduced ? "auto" : "smooth",
       });
       this.isNearBottom = true;
       this.unseenCount = 0;
@@ -411,16 +628,223 @@ export class ActivityFeed {
         return;
       }
 
-      const readBtn = target.closest<HTMLButtonElement>("[data-sms-read]");
-      if (!readBtn) return;
-      const evId = readBtn.dataset.smsRead;
-      if (!evId) return;
-      const ev = this.events.find((x) => x.id === evId);
-      if (ev) {
-        this.selectedEventId = ev.id;
-        this.cb.onOpenReader?.(ev);
+      const jumpBtn = target.closest<HTMLButtonElement>("[data-jump-msg]");
+      if (jumpBtn) {
+        const targetId = jumpBtn.dataset.jumpMsg;
+        if (targetId) {
+          const targetBubble = this.smsStreamItemsEl.querySelector<HTMLElement>(
+            `[data-sms-ev-id="${CSS.escape(targetId)}"]`
+          );
+          if (targetBubble) {
+            const reduced = window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+            targetBubble.scrollIntoView({
+              behavior: reduced ? "auto" : "smooth",
+              block: "center",
+            });
+            targetBubble.setAttribute("tabindex", "-1");
+            targetBubble.focus({ preventScroll: true });
+            targetBubble.classList.remove("is-jump-flash");
+            void targetBubble.offsetWidth;
+            targetBubble.classList.add("is-jump-flash");
+          }
+        }
+        return;
+      }
+
+      const toggleBodyBtn = target.closest<HTMLButtonElement>("[data-toggle-body]");
+      if (toggleBodyBtn) {
+        const evId = toggleBodyBtn.dataset.toggleBody;
+        if (evId) {
+          const nextExpanded = !this.expandedMessageIds.has(evId);
+          if (nextExpanded) {
+            this.expandedMessageIds.add(evId);
+            const msgItem = this.latestSmsMessages.find((m) => m.event.id === evId);
+            if (
+              msgItem?.event.bodyTruncated === true &&
+              !this.fetchedBodiesByEventId.has(evId) &&
+              !this.loadingBodyEventIds.has(evId)
+            ) {
+              void this.lazyFetchFullMessageBody(msgItem.event);
+            }
+          } else {
+            this.expandedMessageIds.delete(evId);
+          }
+          this.renderSmsStream(false, true);
+          const nextBtn = this.smsStreamItemsEl.querySelector<HTMLButtonElement>(
+            `[data-toggle-body="${CSS.escape(evId)}"]`
+          );
+          nextBtn?.focus({ preventScroll: true });
+        }
+        return;
+      }
+
+      const behindBtn = target.closest<HTMLButtonElement>("[data-open-behind]");
+      if (behindBtn) {
+        const evId = behindBtn.dataset.openBehind;
+        if (evId) {
+          const entry = this.latestSmsMessages.find((m) => m.event.id === evId);
+          if (entry && entry.behindSteps.length > 0) {
+            const allWithBehind = this.latestSmsMessages.filter(
+              (m) => m.behindSteps.length > 0
+            );
+            this.cb.onOpenBehind?.(entry, allWithBehind, behindBtn);
+          }
+        }
+        return;
+      }
+
+      const codeCopyBtn = target.closest<HTMLButtonElement>("[data-code-copy]");
+      if (codeCopyBtn) {
+        const block = codeCopyBtn.closest(".reader-code-block");
+        const codeEl = block?.querySelector("code");
+        const codeText = codeEl?.textContent ?? "";
+        if (codeText) {
+          void this.handleCopyButton(codeCopyBtn, codeText, "Copy");
+        }
+        return;
+      }
+
+      const fileChip = target.closest<HTMLButtonElement>(".reader-file-chip");
+      if (fileChip) {
+        void this.handleFileChipClick(fileChip);
       }
     });
+  }
+
+  public setRuntimeScope(scope: { embedMode?: boolean; mcpAppMode?: boolean }): void {
+    if (typeof scope.embedMode === "boolean") {
+      this.embedMode = scope.embedMode;
+    }
+    if (typeof scope.mcpAppMode === "boolean") {
+      this.mcpAppMode = scope.mcpAppMode;
+    }
+  }
+
+  public setInspectedEventId(evId: string | null): void {
+    if (this.inspectedEventId === evId) return;
+    this.inspectedEventId = evId;
+    this.syncInspectedHighlight();
+  }
+
+  private syncInspectedHighlight(): void {
+    this.smsStreamItemsEl
+      .querySelectorAll<HTMLElement>(".bubble[data-sms-ev-id]")
+      .forEach((bubble) => {
+        const id = bubble.dataset.smsEvId ?? "";
+        const isInsp = Boolean(this.inspectedEventId && id === this.inspectedEventId);
+        bubble.classList.toggle("is-inspected", isInsp);
+        const btn = bubble.querySelector<HTMLButtonElement>("[data-open-behind]");
+        if (btn) {
+          btn.setAttribute("aria-expanded", isInsp ? "true" : "false");
+          const cta = btn.querySelector(".behind-cta");
+          if (cta) cta.textContent = isInsp ? "Inspecting →" : "Trace →";
+        }
+      });
+  }
+
+  private cacheFetchedBody(evId: string, body: string): void {
+    if (this.fetchedBodiesByEventId.has(evId)) {
+      this.fetchedBodiesByEventId.delete(evId);
+    }
+    this.fetchedBodiesByEventId.set(evId, body);
+    if (this.fetchedBodiesByEventId.size > ActivityFeed.MAX_CACHED_BODIES) {
+      const oldestKey = this.fetchedBodiesByEventId.keys().next().value;
+      if (oldestKey !== undefined) {
+        this.fetchedBodiesByEventId.delete(oldestKey);
+      }
+    }
+  }
+
+  private async lazyFetchFullMessageBody(ev: NormalizedEvent): Promise<void> {
+    const evId = ev.id;
+    const ctx = this.cb.getSessionContext?.() ?? {};
+    const sessionId = ev.sessionId || this.sessionId || ctx.sessionId || "";
+    if (!evId || !sessionId) return;
+
+    const reqSeq = this.sessionResetSeq;
+    const reqSessionId = sessionId;
+    this.loadingBodyEventIds.add(evId);
+    try {
+      const res = await fetchEventBody({
+        sessionId,
+        eventId: evId,
+        ide: ev.ide || ctx.ide,
+        project: ev.projectId || ctx.project,
+        workspace: ev.workspacePath || ctx.workspace,
+      });
+      if (reqSeq !== this.sessionResetSeq) return;
+      const activeSession = this.sessionId || this.cb.getSessionContext?.()?.sessionId || "";
+      if (activeSession && reqSessionId !== activeSession) return;
+      if (res.ok && typeof res.body === "string" && res.body.trim()) {
+        this.cacheFetchedBody(evId, res.body.trim());
+      }
+    } catch {
+      // Graceful fallback when body fetch is unavailable (e.g. offline/MCP App)
+    } finally {
+      this.loadingBodyEventIds.delete(evId);
+      if (reqSeq === this.sessionResetSeq && this.filter === "messages") {
+        this.renderSmsStream(false, true);
+      }
+    }
+  }
+
+  private async handleCopyButton(
+    btn: HTMLButtonElement,
+    text: string,
+    defaultLabel: string
+  ): Promise<void> {
+    const ok = await copyTextSafe(text);
+    btn.textContent = ok ? "Copied ✓" : "Copy failed";
+    btn.classList.toggle("copied", ok);
+    window.setTimeout(() => {
+      if (document.contains(btn)) {
+        btn.textContent = defaultLabel;
+        btn.classList.remove("copied");
+      }
+    }, 1500);
+  }
+
+  private async handleFileChipClick(chip: HTMLButtonElement): Promise<void> {
+    const uri = chip.dataset.fileUri ?? "";
+    if (!uri) return;
+    const startLineRaw = chip.dataset.startLine;
+    const endLineRaw = chip.dataset.endLine;
+    const startLine = startLineRaw ? Number.parseInt(startLineRaw, 10) : undefined;
+    const endLine = endLineRaw ? Number.parseInt(endLineRaw, 10) : undefined;
+    const origHtml = chip.dataset.origHtml ?? chip.innerHTML;
+    chip.dataset.origHtml = origHtml;
+
+    if (this.embedMode && !this.mcpAppMode && window.parent !== window) {
+      window.parent.postMessage(
+        {
+          type: "agentStudio.openFile",
+          uri,
+          ...(Number.isFinite(startLine) ? { startLine } : {}),
+          ...(Number.isFinite(endLine) ? { endLine } : {}),
+        },
+        "*"
+      );
+      chip.classList.add("is-feedback");
+      chip.textContent = "Opened beside ✓";
+      window.setTimeout(() => {
+        if (document.contains(chip)) {
+          chip.classList.remove("is-feedback");
+          chip.innerHTML = origHtml;
+        }
+      }, 1500);
+      return;
+    }
+
+    const decoded = decodeFileUriToPath(uri);
+    const ok = await copyTextSafe(decoded);
+    chip.classList.toggle("is-feedback", ok);
+    chip.textContent = ok ? "Copied path ✓" : "Copy failed";
+    window.setTimeout(() => {
+      if (document.contains(chip)) {
+        chip.classList.remove("is-feedback");
+        chip.innerHTML = origHtml;
+      }
+    }, 1500);
   }
 
   private syncFilterTabs(): void {
@@ -482,14 +906,24 @@ export class ActivityFeed {
     this.syncSelectedHighlight();
   }
 
+  public getBehindInspectableMessages(): SmsMessageItem[] {
+    return this.latestSmsMessages.filter((m) => m.behindSteps.length > 0);
+  }
+
   public resetScroll(): void {
+    this.sessionResetSeq += 1;
     this.lastListContextKey = "";
     this.lastSmsContextKey = "";
     this.lastSmsHtml = "";
     this.activeThread = ALL_THREAD;
     this.selectedRunId = "all";
+    this.inspectedEventId = null;
     this.expandedBursts.clear();
     this.expandedBubbleTools.clear();
+    this.expandedMessageIds.clear();
+    this.fetchedBodiesByEventId.clear();
+    this.loadingBodyEventIds.clear();
+    this.latestSmsMessages = [];
     this.drawerScrollTops.clear();
     this.isNearBottom = true;
     this.unseenCount = 0;
@@ -538,7 +972,14 @@ export class ActivityFeed {
     if (labelMap) this.labelMap = labelMap;
     if (agents) this.agents = agents;
     if (clusters) this.clusters = clusters;
-    if (sessionId !== undefined) this.sessionId = sessionId;
+    if (sessionId !== undefined) {
+      if (this.sessionId && sessionId !== this.sessionId) {
+        this.sessionResetSeq += 1;
+        this.fetchedBodiesByEventId.clear();
+        this.loadingBodyEventIds.clear();
+      }
+      this.sessionId = sessionId;
+    }
     this.sessionUsage = sessionUsage;
     this.renderPending();
     this.renderList();
@@ -547,7 +988,7 @@ export class ActivityFeed {
   private renderPending(): void {
     const bar = this.container.querySelector<HTMLElement>("[data-pending-bar]");
     if (!bar) return;
-    if (this.pendingPrompts.length === 0) {
+    if (this.filter === "messages" || this.pendingPrompts.length === 0) {
       if (!bar.hidden || this.lastPendingHtml !== "") {
         bar.hidden = true;
         bar.innerHTML = "";
@@ -770,21 +1211,103 @@ export class ActivityFeed {
     }
 
     const m = entry;
-    const openGroups = m.toolGroups.filter((g) =>
-      this.expandedBubbleTools.has(`${m.event.id}|${g.extId}`)
-    );
+    const isInspected = Boolean(this.inspectedEventId && m.event.id === this.inspectedEventId);
+    const cachedBody = this.fetchedBodiesByEventId.get(m.event.id);
+    const displayMd =
+      cachedBody && cachedBody.length > m.fullMarkdownText.length
+        ? cachedBody
+        : m.fullMarkdownText;
+    const lineCount = displayMd.split(/\r?\n/).length;
+    const isLong = lineCount > 6 || displayMd.length > 360 || m.event.bodyTruncated === true;
+    const isExpanded = this.expandedMessageIds.has(m.event.id);
+    const isClamped = isLong && !isExpanded;
+    const isFetchingBody = this.loadingBodyEventIds.has(m.event.id);
+    const renderedMd = renderMarkdown(displayMd, { enableFileLinks: true });
+
+    const replyQuoteHtml = m.replyToEntryId
+      ? `<button
+          type="button"
+          class="reply-quote-ref"
+          data-jump-msg="${escHtml(m.replyToEntryId)}"
+          title="Jump to question bubble"
+        >
+          <strong>↳ Re: ${escHtml(m.replyToActorLabel || "Agent")}:</strong>
+          <span class="reply-quote-text">&ldquo;${escHtml(m.replyToQuote || "")}&rdquo;</span>
+        </button>`
+      : "";
+
+    const optionItems = (m.questions ?? []).flatMap((q) => q.options ?? []);
+    const optionsHtml =
+      optionItems.length > 0
+        ? `<div class="question-options-list" aria-label="Question options">
+            ${optionItems
+              .map((opt) => {
+                const chosen = isOptionChosenByAnswer(opt.label, m.chosenAnswerText);
+                return `<div class="q-option-pill ${chosen ? "is-chosen" : ""}">
+                  <span class="q-check" aria-hidden="true">${chosen ? "✓" : ""}</span>
+                  <span>${escHtml(opt.label)}</span>
+                  ${chosen ? `<span class="q-chosen-tag">Selected by user</span>` : ""}
+                </div>`;
+              })
+              .join("")}
+          </div>`
+        : "";
+
+    const behindSummaryText = formatBehindSummaryChip(m);
+    const behindBarHtml =
+      m.behindSteps.length > 0
+        ? `<button
+            type="button"
+            class="behind-bar"
+            data-open-behind="${escHtml(m.event.id)}"
+            aria-expanded="${isInspected ? "true" : "false"}"
+          >
+            <span class="behind-summary">
+              <span class="behind-spark" aria-hidden="true">✦</span>
+              <span>Behind this response</span>
+              ${behindSummaryText ? `<span class="behind-meta-chip">· ${escHtml(behindSummaryText)}</span>` : ""}
+            </span>
+            <span class="behind-cta">${isInspected ? "Inspecting →" : "Trace →"}</span>
+          </button>`
+        : "";
+
+    const openGroups =
+      this.showRawTools && m.behindSteps.length === 0
+        ? m.toolGroups.filter((g) =>
+            this.expandedBubbleTools.has(`${m.event.id}|${g.extId}`)
+          )
+        : [];
     const drawerKey = `msg:${m.event.id}`;
 
     return `
-      <article class="bubble ${m.dir}" data-sms-ev-id="${escHtml(m.event.id)}" style="--bubble-accent:${escHtml(m.accentColor)}">
+      <article
+        class="bubble ${m.dir}${m.isHumanAnswer ? " is-human" : ""}${isInspected ? " is-inspected" : ""}"
+        data-sms-ev-id="${escHtml(m.event.id)}"
+        style="--bubble-accent:${escHtml(m.accentColor)}"
+      >
         ${showRouteBadge ? `<span class="bubble-route">${escHtml(m.routeLabel)}</span>` : ""}
         <div class="bubble-head">
           <span class="bubble-sender">${escHtml(m.fromLabel)} <span class="bubble-role">${escHtml(m.roleBadge)}</span></span>
           <span>${escHtml(m.timeLabel)}</span>
         </div>
-        <div class="bubble-text">${renderInlineMarkdown(m.text)}</div>
+        ${replyQuoteHtml}
+        <div class="bubble-body-container">
+          <div class="bubble-text reader-md ${isClamped ? "is-clamped" : ""}">${renderedMd.html}</div>
+          ${
+            isLong
+              ? `<button
+                  type="button"
+                  class="show-more-btn"
+                  data-toggle-body="${escHtml(m.event.id)}"
+                  aria-expanded="${isExpanded ? "true" : "false"}"
+                >${isFetchingBody ? "Loading full message…" : isExpanded ? "Show less ▴" : "Show more ▾"}</button>`
+              : ""
+          }
+        </div>
+        ${optionsHtml}
+        ${behindBarHtml}
         ${
-          m.toolGroups.length > 0 || m.hasFullBody
+          this.showRawTools && m.behindSteps.length === 0 && m.toolGroups.length > 0
             ? `<div class="bubble-foot">
                 <div class="bubble-tools">${m.toolGroups
                   .map((g) => {
@@ -794,11 +1317,6 @@ export class ActivityFeed {
                     return `<button type="button" class="tool-badge tool-badge-btn ${catHasErr ? "has-error" : ""} ${isChipOpen ? "is-expanded" : ""}" data-bubble-tools-toggle="${escHtml(chipKey)}" aria-expanded="${isChipOpen ? "true" : "false"}">${escHtml(g.label)} · ${g.count} <span aria-hidden="true">${isChipOpen ? "▾" : "▸"}</span></button>`;
                   })
                   .join("")}</div>
-                ${
-                  m.hasFullBody
-                    ? `<button type="button" class="read-full-btn" data-sms-read="${escHtml(m.event.id)}">Read full →</button>`
-                    : ""
-                }
               </div>`
             : ""
         }
@@ -892,39 +1410,68 @@ export class ActivityFeed {
       this.runFilterBarEl.innerHTML = "";
     }
 
-    const streamEntries = extractSmsStream({
-      events: this.events,
-      agents: this.agents,
-      thread: effectiveThread,
-      labelMap: this.labelMap,
-      clusters: this.clusters,
-    });
-    const msgCount = streamEntries.filter((e) => e.kind === "message").length;
+    const streamResult = extractSmsStreamWithMeta(
+      {
+        events: this.events,
+        agents: this.agents,
+        thread: effectiveThread,
+        labelMap: this.labelMap,
+        clusters: this.clusters,
+      },
+      { showRawTools: this.showRawTools }
+    );
+    const streamEntries = streamResult.entries;
+    this.latestSmsMessages = streamEntries.filter(
+      (e): e is SmsMessageItem => e.kind === "message"
+    );
+
+    const msgCount = this.latestSmsMessages.length;
     const burstCount = streamEntries.filter((e) => e.kind === "tool_burst").length;
+    const hiddenSuffix =
+      !this.showRawTools && streamResult.hiddenToolCount > 0
+        ? ` (${streamResult.hiddenToolCount})`
+        : "";
+    this.rawToolsToggleBtn.setAttribute("aria-pressed", this.showRawTools ? "true" : "false");
+    this.rawToolsToggleBtn.textContent = this.showRawTools
+      ? "Raw tool steps: Shown"
+      : `Raw tool steps: Hidden${hiddenSuffix}`;
+    this.rawToolsToggleBtn.title = this.showRawTools
+      ? "Hide raw background tool strips from Messages stream"
+      : `${streamResult.hiddenToolCount} background tool events folded behind responses — click to show raw steps`;
+
     const burstSuffix =
       burstCount > 0 ? ` · ${burstCount} tool ${burstCount === 1 ? "burst" : "bursts"}` : "";
 
     if (hintEl) {
-      hintEl.textContent = hasSpecificPill
-        ? `${msgCount} ${msgCount === 1 ? "msg" : "msgs"} in thread${burstSuffix}`
-        : `${msgCount} total msgs${burstSuffix} · chronological`;
+      hintEl.textContent = this.showRawTools
+        ? `${msgCount} ${msgCount === 1 ? "msg" : "msgs"}${burstSuffix} · raw audit`
+        : hasSpecificPill
+          ? `${msgCount} ${msgCount === 1 ? "msg" : "msgs"} in thread · trace behind responses`
+          : `${msgCount} total msgs · conversation only`;
     }
     if (countEl) {
       countEl.textContent = `${msgCount} ${msgCount === 1 ? "msg" : "msgs"}${burstCount > 0 ? ` · ${burstCount} ${burstCount === 1 ? "burst" : "bursts"}` : ""}`;
-      countEl.title = `Showing ${msgCount} SMS messages and ${burstCount} grouped tool bursts`;
+      countEl.title = this.showRawTools
+        ? `Showing ${msgCount} SMS messages and ${burstCount} grouped tool bursts`
+        : `Showing ${msgCount} SMS messages (${streamResult.hiddenToolCount} raw tool steps folded behind responses)`;
     }
 
-    const contextKey = `${effectiveThread.key}|${this.selectedRunId}`;
+    const contextKey = `${effectiveThread.key}|${this.selectedRunId}|${this.showRawTools ? "raw" : "clean"}`;
     const dividerLabel =
       effectiveThread.kind === "all"
         ? "All Session Messages · Chronological Stream"
         : `${effectiveThread.route} · Conversation Thread`;
 
+    const emptyNotice =
+      !this.showRawTools && streamResult.hiddenToolCount > 0
+        ? `No conversation messages for this selection (${streamResult.hiddenToolCount} background tool steps hidden — toggle "Raw tool steps" above to inspect).`
+        : "No messages recorded for this selection yet.";
+
     const html = `
       <div class="sms-day-divider">${escHtml(dividerLabel)}</div>
       ${
         streamEntries.length === 0
-          ? `<div class="sms-day-divider">No messages recorded for this selection yet.</div>`
+          ? `<div class="sms-day-divider">${escHtml(emptyNotice)}</div>`
           : streamEntries
               .map((entry) =>
                 this.renderSmsStreamEntryHtml(entry, effectiveThread.kind === "all")
@@ -1024,6 +1571,7 @@ export class ActivityFeed {
     this.smsPillBarEl.hidden = true;
     this.runFilterBarEl.hidden = true;
     this.smsBodyWrapEl.hidden = true;
+    this.smsPromptDockEl.hidden = true;
     listEl.hidden = false;
 
     if (this.filter === "usage") {
@@ -1186,6 +1734,17 @@ export class ActivityFeed {
     return true;
   }
 
+  private syncSmsPromptDockVisibility(hasMultiple: boolean): void {
+    this.smsPromptToggleBtn.setAttribute(
+      "aria-expanded",
+      this.smsPromptDockCollapsed ? "false" : "true"
+    );
+    const chev = this.smsPromptToggleBtn.querySelector(".sms-prompt-chevron");
+    if (chev) chev.textContent = this.smsPromptDockCollapsed ? "▸" : "▾";
+    this.smsPromptTabsEl.hidden = this.smsPromptDockCollapsed || !hasMultiple;
+    this.smsInlinePromptsEl.hidden = this.smsPromptDockCollapsed;
+  }
+
   private reconcileInlineSmsPrompts(thread: ThreadSelection): void {
     const matching = this.pendingPrompts.filter((p) =>
       this.matchesThreadPrompt(p, thread)
@@ -1201,11 +1760,66 @@ export class ActivityFeed {
     }
 
     if (matching.length === 0) {
-      this.smsInlinePromptsEl.hidden = true;
+      this.smsPromptDockEl.hidden = true;
+      this.activeSmsPromptId = null;
+      this.lastSmsTabsKey = "";
+      this.smsPromptTabsEl.hidden = true;
+      this.smsPromptTabsEl.innerHTML = "";
       return;
     }
 
-    this.smsInlinePromptsEl.hidden = false;
+    if (!this.activeSmsPromptId || !activeIds.has(this.activeSmsPromptId)) {
+      this.activeSmsPromptId = matching[0]!.id;
+    }
+    const activePrompt =
+      matching.find((p) => p.id === this.activeSmsPromptId) ?? matching[0]!;
+
+    const hasMultiple = matching.length > 1;
+    this.smsPromptDockEl.hidden = false;
+    this.smsPromptBadgeTextEl.textContent = hasMultiple
+      ? `Waiting (${matching.length})`
+      : "Waiting on you";
+    this.smsPromptTitleEl.textContent = cleanSummaryText(activePrompt.title);
+
+    if (hasMultiple) {
+      const nextTabsKey =
+        matching
+          .map(
+            (p) =>
+              `${p.id}:${formatActorName(p.agentId, this.labelMap, p.agentLabel)}:${Boolean(p.directReply)}`
+          )
+          .join("|") + `|${activePrompt.id}`;
+      if (nextTabsKey !== this.lastSmsTabsKey) {
+        this.lastSmsTabsKey = nextTabsKey;
+        this.smsPromptTabsEl.innerHTML = matching
+          .map((p) => {
+            const isSel = p.id === activePrompt.id;
+            const label = formatActorName(p.agentId, this.labelMap, p.agentLabel);
+            return `
+              <button
+                type="button"
+                role="tab"
+                class="sms-prompt-tab ${p.directReply ? "is-direct-reply" : ""}"
+                data-sms-prompt-tab="${escHtml(p.id)}"
+                id="${smsPromptTabDomId(p.id)}"
+                aria-controls="${smsPromptPanelDomId(p.id)}"
+                aria-selected="${isSel ? "true" : "false"}"
+                tabindex="${isSel ? "0" : "-1"}"
+                title="${escHtml(cleanSummaryText(p.title))}"
+              >
+                <span>${escHtml(label)}</span>
+              </button>
+            `;
+          })
+          .join("");
+      }
+    } else if (this.lastSmsTabsKey !== "") {
+      this.lastSmsTabsKey = "";
+      this.smsPromptTabsEl.innerHTML = "";
+    }
+
+    this.syncSmsPromptDockVisibility(hasMultiple);
+
     const getCaps =
       this.cb.getReplyCapabilities ??
       (() => ({ canSendMessage: false, isMcpApp: false, isEmbed: false }));
@@ -1218,8 +1832,10 @@ export class ActivityFeed {
       }));
 
     for (const prompt of matching) {
+      const isVisible = prompt.id === activePrompt.id;
       const existing = this.inlineQuestionCards.get(prompt.id);
       if (existing) {
+        existing.wrap.hidden = !isVisible;
         existing.card.update({
           prompt,
           sessionId: this.sessionId,
@@ -1227,11 +1843,16 @@ export class ActivityFeed {
           showHeader: true,
           getCapabilities: getCaps,
           onReply,
+          onCancel: this.cb.onCancelPrompt,
           onOpenChat: (aid) => this.cb.onOpenChat?.(aid),
         });
       } else {
         const wrap = document.createElement("div");
         wrap.className = "sms-inline-prompt-item";
+        wrap.id = smsPromptPanelDomId(prompt.id);
+        wrap.setAttribute("role", "tabpanel");
+        wrap.setAttribute("aria-labelledby", smsPromptTabDomId(prompt.id));
+        wrap.hidden = !isVisible;
         this.smsInlinePromptsEl.appendChild(wrap);
         const card = new QuestionCard(wrap, {
           prompt,
@@ -1240,6 +1861,7 @@ export class ActivityFeed {
           showHeader: true,
           getCapabilities: getCaps,
           onReply,
+          onCancel: this.cb.onCancelPrompt,
           onOpenChat: (aid) => this.cb.onOpenChat?.(aid),
         });
         this.inlineQuestionCards.set(prompt.id, { wrap, card });

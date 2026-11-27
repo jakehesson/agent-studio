@@ -105,6 +105,7 @@ export function mapCapabilitiesToAntigravity(
         break;
       case "ask_user":
         tools.push("ask_question");
+        inheritMcp = true;
         break;
       case "mcp_board":
       case "mcp_testrun":
@@ -147,7 +148,7 @@ export function mapCapabilitiesToClaudeCode(
         tools.push("Agent");
         break;
       case "ask_user":
-        tools.push("AskUserQuestion");
+        tools.push("AskUserQuestion", "mcp__agent-studio__ask_human");
         break;
       case "mcp_board":
         tools.push("mcp__agent-studio__board", "mcp__agent-studio__projects");
@@ -208,7 +209,7 @@ export function mapCapabilitiesToCopilotVsCode(
         );
         break;
       case "ask_user":
-        // VS Code Copilot uses native runtime ask_user / chat confirmation; no explicit tool entry required.
+        tools.push("agent_studio_ask_human");
         break;
       case "mcp_board":
         tools.push("agent-studio/*");

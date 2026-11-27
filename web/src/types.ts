@@ -188,6 +188,10 @@ export interface PendingQuestionItem {
   defaultValue?: string;
 }
 
+export type PromptSource = "native" | "studio-mcp" | "studio-vscode-lm";
+
+export type PromptStatus = "pending" | "answered" | "canceled" | "expired";
+
 export interface PendingHumanPrompt {
   id: string;
   toolCallId?: string;
@@ -201,6 +205,15 @@ export interface PendingHumanPrompt {
   options?: Array<{ label: string; recommended?: boolean }>;
   ts?: string;
   blockingToolCall: boolean;
+  directReply?: boolean;
+  promptSource?: PromptSource;
+  status?: PromptStatus;
+  answerText?: string;
+  answers?: Record<string, unknown>;
+  expiresAt?: string;
+  sessionId?: string;
+  workspacePath?: string;
+  ide?: IdeSource;
 }
 
 export type ChatMessageRole =
@@ -253,12 +266,17 @@ export interface ReplyToHostRequest {
   promptId?: string;
   text: string;
   blockingToolCall: boolean;
+  directReply?: boolean;
+  promptSource?: PromptSource;
+  answers?: Record<string, string | string[]>;
 }
 
 export interface ReplyToHostResult {
   ok: boolean;
-  mode: "sent" | "prefilled" | "copied" | "focused_copied" | "error";
+  mode: "sent" | "prefilled" | "copied" | "focused_copied" | "answered" | "canceled" | "error";
   message: string;
+  conflict?: boolean;
+  status?: PromptStatus;
 }
 
 export interface ReplyCapabilities {
@@ -769,7 +787,7 @@ export interface TeamDetailsResponse {
   server_time: string;
 }
 
-export type PrimaryView = "studio" | "team" | "board" | "mockups" | "doctor";
+export type PrimaryView = "studio" | "team" | "board" | "mockups" | "doctor" | "chat";
 export type CoverPane = "studio" | "feed" | "team" | "board" | "mockups" | "doctor";
 export type ConnectionState = "connecting" | "live" | "reconnecting" | "offline";
 

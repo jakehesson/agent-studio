@@ -28,6 +28,7 @@ import {
   type ResolvedProject,
 } from "../board/index.js";
 import { buildDoctorReport } from "../cli/commands/doctor.js";
+import { loadTeamManifest } from "../compiler/index.js";
 import {
   BOARD_ITEM_TYPES,
   BOARD_STATES,
@@ -44,12 +45,17 @@ import {
   EVENT_KINDS,
   IDE_SOURCES,
   NormalizedEventSchema,
+  PromptBridgeAnswerSchema,
+  PromptBridgeCancelSchema,
+  PromptBridgeCreateSchema,
   type EventKind,
   type IdeSource,
   type NormalizedEvent,
+  type PendingHumanPrompt,
 } from "../schema/telemetry.js";
 import {
   DEFAULT_CONTEXT_THRESHOLDS,
+  DEFAULT_PROMPT_TTL_MS,
   TelemetryAggregator,
   computeDeterministicEventId,
   discoverTeamDetailsCached,
@@ -98,7 +104,7 @@ function resolveServerVersion(): string {
   } catch {
     // Fall through to default version
   }
-  return "0.14.0";
+  return "0.15.0";
 }
 
 export const MCP_PROTOCOL_VERSION = "2024-11-05";
@@ -153,6 +159,27 @@ export interface McpServerOptions {
   cwd?: string;
   sessionId?: string;
   aggregator?: TelemetryAggregator;
+  signal?: AbortSignal;
+  /** Host IDE inferred from MCP `initialize` `clientInfo.name` (default `ide`). */
+  clientIde?: IdeSource;
+}
+
+export function mapMcpClientNameToIde(
+  name: string | undefined,
+): IdeSource | undefined {
+  const low = name?.trim().toLowerCase() ?? "";
+  if (!low) return undefined;
+  if (low.includes("antigravity")) return "antigravity";
+  if (low.includes("claude")) return "claude-code";
+  if (
+    low.includes("copilot") ||
+    low.includes("vscode") ||
+    low.includes("vs code") ||
+    low.includes("visual studio code")
+  ) {
+    return "copilot-vscode";
+  }
+  return undefined;
 }
 
 interface JsonRpcRequest {
@@ -471,23 +498,27 @@ export const MCP_TOOLS = [
   {
     name: "telemetry",
     description:
-      "Emit live normalized telemetry events or explicit agent handoffs to <projectRoot>/.agent-studio/telemetry.jsonl.",
+      "Emit live normalized telemetry events or explicit agent handoffs to <projectRoot>/.agent-studio/telemetry.jsonl, or query token & credit breakdowns (op=breakdown).",
     inputSchema: {
       type: "object",
       properties: {
         op: {
           type: "string",
-          enum: ["emit", "handoff"],
+          enum: ["emit", "handoff", "breakdown"],
           description: "Telemetry operation.",
         },
         project: { type: "string", description: "Project ID or workspace path." },
+        workspace: {
+          type: "string",
+          description: "Workspace path filter (for op=breakdown).",
+        },
         sessionId: { type: "string", description: "Session UUID or identifier." },
         ide: {
           type: "string",
           enum: [...IDE_SOURCES],
-          description: "Source IDE (default mcp).",
+          description: "Source IDE (default mcp for emit/handoff; optional filter for breakdown).",
         },
-        agentId: { type: "string", description: "Emitting agent ID/slug." },
+        agentId: { type: "string", description: "Emitting or filtered agent ID/slug." },
         agentLabel: { type: "string", description: "Display label for agent." },
         parentAgentId: { type: "string", description: "Parent coordinator agent ID." },
         targetAgentId: {
@@ -500,13 +531,25 @@ export const MCP_TOOLS = [
           description: "Normalized event kind (for op=emit, default message).",
         },
         toolName: { type: "string", description: "Optional tool name." },
-        summary: { type: "string", description: "Human-readable event summary." },
+        summary: {
+          type: "string",
+          description: "Human-readable event summary (required for op=emit/handoff).",
+        },
         payload: {
           type: "object",
           description: "Additional structured metadata.",
         },
+        window: {
+          type: "string",
+          enum: ["session", "24h", "7d", "all"],
+          description: "Aggregation window (for op=breakdown, default session).",
+        },
+        multiOnly: {
+          type: "boolean",
+          description: "Only include multi-agent sessions (for op=breakdown).",
+        },
       },
-      required: ["op", "summary"],
+      required: ["op"],
     },
   },
   {
@@ -546,6 +589,76 @@ export const MCP_TOOLS = [
           { type: "global", title: "Agent Studio" },
         ],
       },
+    },
+  },
+  {
+    name: "ask_human",
+    description:
+      "Ask the human user one or more structured or free-text questions directly in the Agent Studio Messages UI and wait for their reply. Falls back cleanly with fallbackRequired: true if Agent Studio UI is offline.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        title: {
+          type: "string",
+          description: "Short prompt title (<=140 chars).",
+        },
+        summary: {
+          type: "string",
+          description: "Optional concise context summary (<=500 chars).",
+        },
+        kind: {
+          type: "string",
+          enum: ["question", "approval"],
+          description: "Prompt kind (default question).",
+        },
+        questions: {
+          type: "array",
+          minItems: 1,
+          maxItems: 10,
+          description: "1 to 10 structured or free-text questions.",
+          items: {
+            type: "object",
+            properties: {
+              id: { type: "string" },
+              header: { type: "string" },
+              question: { type: "string" },
+              type: {
+                type: "string",
+                enum: ["single_select", "multi_select", "text"],
+              },
+              options: {
+                type: "array",
+                items: {
+                  type: "object",
+                  properties: {
+                    id: { type: "string" },
+                    label: { type: "string" },
+                    description: { type: "string" },
+                    recommended: { type: "boolean" },
+                  },
+                  required: ["label"],
+                },
+              },
+              allowCustomInput: { type: "boolean" },
+              defaultValue: { type: "string" },
+            },
+            required: ["question"],
+          },
+        },
+        agentId: { type: "string" },
+        agentLabel: { type: "string" },
+        sessionId: { type: "string" },
+        project: { type: "string" },
+        workspace: { type: "string" },
+        ide: { type: "string", enum: [...IDE_SOURCES] },
+        timeoutSeconds: {
+          type: "number",
+          minimum: 5,
+          maximum: 1800,
+          description: "Seconds to wait before timing out (default 600).",
+        },
+      },
+      required: ["questions"],
     },
   },
   {
@@ -677,6 +790,44 @@ export const MCP_TOOLS = [
         sessionId: { type: "string" },
         summary: { type: "string" },
       },
+    },
+    _meta: {
+      ui: {
+        visibility: ["app"],
+      },
+    },
+  },
+  {
+    name: "app_answer_prompt",
+    description:
+      "App-only data bridge submitting a user answer to a pending ask_human prompt.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        promptId: { type: "string" },
+        answerText: { type: "string" },
+        answers: { type: "object" },
+        responder: { type: "string" },
+      },
+      required: ["promptId", "answerText"],
+    },
+    _meta: {
+      ui: {
+        visibility: ["app"],
+      },
+    },
+  },
+  {
+    name: "app_cancel_prompt",
+    description:
+      "App-only data bridge canceling a pending ask_human prompt.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        promptId: { type: "string" },
+        reason: { type: "string" },
+      },
+      required: ["promptId"],
     },
     _meta: {
       ui: {
@@ -1363,11 +1514,150 @@ async function executeTestrunTool(
   return { content: [{ type: "text", text: finalText }] };
 }
 
+function formatBreakdownMarkdown(result: {
+  scope: {
+    window: string;
+    sessionCount: number;
+    sessionIds: string[];
+    agentId?: string;
+  };
+  summary: {
+    totalTokens: number;
+    inputTokens: number;
+    outputTokens: number;
+    cachedTokens: number;
+    usageSource: string;
+  };
+  breakdown: {
+    composition: {
+      uncachedInputTokens: number;
+      cacheReadTokens: number;
+      cacheWriteTokens: number;
+      nonReasoningOutputTokens: number;
+      reasoningTokens: number;
+      totalTokens: number;
+      freshTokens: number;
+      cacheHitRate: number;
+      effectiveMultiplier: number;
+    };
+    byCategory: Array<{
+      label: string;
+      totalTokens: number;
+      sharePercent: number;
+      credits: number;
+      costUsd: number;
+    }>;
+    byAgent: Array<{
+      agentId: string;
+      label: string;
+      model: string;
+      tier: string;
+      totalTokens: number;
+      credits: number;
+      costUsd: number;
+    }>;
+    insights: Array<{
+      severity: string;
+      title: string;
+      recommendation: string;
+    }>;
+    totals: {
+      costUsd: number;
+      costSource: string;
+      credits: number;
+      premiumRequests?: number;
+      turns: number;
+    };
+  };
+}): string {
+  const { scope, breakdown } = result;
+  const c = breakdown.composition;
+  const t = breakdown.totals;
+  const lines: string[] = [
+    `## Token & Credit Breakdown (${scope.window}, ${scope.sessionCount} session${scope.sessionCount === 1 ? "" : "s"}${scope.agentId ? `, agent: ${scope.agentId}` : ""})`,
+    "",
+    `- **Total Tokens:** ${c.totalTokens.toLocaleString()} (${c.freshTokens.toLocaleString()} fresh, ${c.effectiveMultiplier}x context multiplier)`,
+    `- **Composition:** ${c.uncachedInputTokens.toLocaleString()} uncached in | ${c.cacheReadTokens.toLocaleString()} cache read | ${c.cacheWriteTokens.toLocaleString()} cache write | ${c.nonReasoningOutputTokens.toLocaleString()} output | ${c.reasoningTokens.toLocaleString()} reasoning (${c.cacheHitRate}% cache hit rate)`,
+    `- **Cost & Credits:** $${t.costUsd.toFixed(4)} USD (${t.costSource}) · **${t.credits.toFixed(1)} compute credits**${t.premiumRequests !== undefined ? ` · ${t.premiumRequests} Copilot premium requests` : ""} · ${t.turns} turns`,
+  ];
+
+  if (breakdown.byCategory.length > 0) {
+    lines.push("", "### Top Work Categories");
+    for (const cat of breakdown.byCategory.slice(0, 5)) {
+      lines.push(
+        `- **${cat.label}:** ${cat.totalTokens.toLocaleString()} tok (${cat.sharePercent}%) · ${cat.credits.toFixed(1)} cr ($${cat.costUsd.toFixed(4)})`,
+      );
+    }
+  }
+
+  if (breakdown.byAgent.length > 0) {
+    lines.push("", "### Agents");
+    for (const ag of breakdown.byAgent.slice(0, 6)) {
+      lines.push(
+        `- **${ag.label}** (\`${ag.agentId}\`, ${ag.model} [${ag.tier}]): ${ag.totalTokens.toLocaleString()} tok · ${ag.credits.toFixed(1)} cr`,
+      );
+    }
+  }
+
+  if (breakdown.insights.length > 0) {
+    lines.push("", "### Efficiency Insights");
+    for (const ins of breakdown.insights) {
+      lines.push(`- [${ins.severity}] **${ins.title}:** ${ins.recommendation}`);
+    }
+  }
+
+  return lines.join("\n");
+}
+
 async function executeTelemetryTool(
   args: Record<string, unknown>,
   options: McpServerOptions,
 ): Promise<McpToolCallResult> {
   const op = str(args.op);
+  if (op === "breakdown") {
+    const rawWindow = str(args.window) ?? "session";
+    if (
+      rawWindow !== "session" &&
+      rawWindow !== "24h" &&
+      rawWindow !== "7d" &&
+      rawWindow !== "all"
+    ) {
+      throw new Error(
+        `Invalid window "${rawWindow}". Expected session, 24h, 7d, or all.`,
+      );
+    }
+    const rawProj = str(args.project);
+    const workspaceFilter = str(args.workspace);
+    const projectFilter =
+      rawProj && rawProj.toLowerCase() === "all"
+        ? undefined
+        : rawProj ?? (!workspaceFilter ? options.defaultProject : undefined);
+    const ideFilter = str(args.ide);
+    const sessionFilter = str(args.sessionId);
+    const agentFilter = str(args.agentId);
+    const multiOnly =
+      typeof args.multiOnly === "boolean" ? args.multiOnly : undefined;
+
+    const aggregator = options.aggregator ?? getMcpAggregator();
+    const result = await aggregator.getUsageBreakdown({
+      ide: ideFilter,
+      project: projectFilter,
+      workspace: workspaceFilter,
+      sessionId: sessionFilter,
+      agentId: agentFilter,
+      window: rawWindow,
+      multiOnly,
+    });
+    const structuredContent: Record<string, unknown> = {
+      ok: true,
+      ...result,
+    };
+    return {
+      content: [{ type: "text", text: formatBreakdownMarkdown(result) }],
+      structuredContent,
+    };
+  }
+
   const summary = str(args.summary);
   if (!summary) {
     throw new Error("telemetry requires non-empty summary");
@@ -1537,6 +1827,7 @@ async function executeAppGetStateTool(
   options: McpServerOptions,
 ): Promise<McpToolCallResult> {
   const aggregator = options.aggregator ?? getMcpAggregator();
+  aggregator.touchMcpAppClient();
   const ide = str(args.ide);
   const project = str(args.project) ?? options.defaultProject;
   const workspace = str(args.workspace);
@@ -1550,8 +1841,83 @@ async function executeAppGetStateTool(
     multiOnly,
   });
 
+  const snapshot: Record<string, unknown> = { ...payload.snapshot };
+
+  if (process.env.AGENT_STUDIO_MCP_NO_HTTP !== "1" && !options.aggregator) {
+    try {
+      const qs = new URLSearchParams();
+      if (ide) qs.set("ide", ide);
+      if (project) qs.set("project", project);
+      if (workspace) qs.set("workspace", workspace);
+      const res = await fetch(
+        `${getStudioHttpBaseUrl()}/api/prompts?${qs.toString()}`,
+        { signal: AbortSignal.timeout(80) },
+      );
+      if (res.ok) {
+        const data = (await res.json()) as { prompts?: PendingHumanPrompt[] };
+        const httpPrompts = Array.isArray(data.prompts) ? data.prompts : [];
+        if (httpPrompts.length > 0) {
+          const existing = Array.isArray(snapshot.pendingPrompts)
+            ? [...(snapshot.pendingPrompts as PendingHumanPrompt[])]
+            : [];
+          const byId = new Map(existing.map((p) => [p.id, p]));
+          const snapSid =
+            typeof snapshot.sessionId === "string" ? snapshot.sessionId : "";
+          for (const hp of httpPrompts) {
+            if (
+              !hp.sessionId ||
+              !snapSid ||
+              hp.sessionId === snapSid ||
+              hp.sessionId.startsWith("prompt-")
+            ) {
+              byId.set(hp.id, hp);
+            }
+          }
+          if (byId.size > 0) {
+            const merged = [...byId.values()];
+            snapshot.pendingPrompts = merged;
+            if (snapshot.status !== "BLOCKED") {
+              snapshot.status = "WAITING";
+            }
+            snapshot.waitingOn = snapshot.waitingOn ?? "user";
+            snapshot.waiting_on = snapshot.waiting_on ?? "user";
+            snapshot.is_waiting = true;
+            if (Array.isArray(payload.snapshot.agents)) {
+              const agents = payload.snapshot.agents.map((a) => ({ ...a }));
+              const httpIds = new Set(httpPrompts.map((p) => p.id));
+              for (const prompt of merged) {
+                if (!httpIds.has(prompt.id)) continue;
+                const targetAg =
+                  agents.find((a) => a.id === prompt.agentId) ??
+                  agents.find((a) => a.isRoot);
+                if (
+                  targetAg &&
+                  (!targetAg.pendingPrompt ||
+                    targetAg.pendingPrompt.id === prompt.id ||
+                    (!targetAg.pendingPrompt.directReply && prompt.directReply))
+                ) {
+                  targetAg.pendingPrompt = prompt;
+                  if (
+                    targetAg.status !== "BLOCKED" &&
+                    targetAg.status !== "WAITING"
+                  ) {
+                    targetAg.status = "WAITING";
+                    targetAg.state = "waiting";
+                  }
+                }
+              }
+              snapshot.agents = agents;
+            }
+          }
+        }
+      }
+    } catch {
+      // HTTP server offline or timed out within 80ms; return local state cleanly.
+    }
+  }
+
   const structuredContent: Record<string, unknown> = {
-    ...payload.snapshot,
+    ...snapshot,
     sessions: payload.sessions,
     board_projects: payload.boardProjects,
   };
@@ -1624,6 +1990,8 @@ async function executeAppGetChatTool(
   args: Record<string, unknown>,
   options: McpServerOptions,
 ): Promise<McpToolCallResult> {
+  const aggregator = options.aggregator ?? getMcpAggregator();
+  aggregator.touchMcpAppClient();
   const session = str(args.session);
   if (!session) {
     const errPayload: Record<string, unknown> = {
@@ -1637,7 +2005,6 @@ async function executeAppGetChatTool(
     };
   }
 
-  const aggregator = options.aggregator ?? getMcpAggregator();
   const chatRes = await aggregator.getAgentChat({
     sessionId: session,
     agentId: str(args.agent) ?? "root",
@@ -1661,6 +2028,38 @@ async function executeAppGetChatTool(
   }
 
   const structuredContent = chatRes as unknown as Record<string, unknown>;
+  if (
+    process.env.AGENT_STUDIO_MCP_NO_HTTP !== "1" &&
+    !options.aggregator &&
+    (!chatRes.pendingPrompt || !chatRes.pendingPrompt.directReply)
+  ) {
+    try {
+      const qs = new URLSearchParams();
+      qs.set("session", session);
+      const chatIde = str(args.ide);
+      const chatWs = str(args.workspace);
+      if (chatIde) qs.set("ide", chatIde);
+      if (chatWs) qs.set("workspace", chatWs);
+      const res = await fetch(
+        `${getStudioHttpBaseUrl()}/api/prompts?${qs.toString()}`,
+        { signal: AbortSignal.timeout(80) },
+      );
+      if (res.ok) {
+        const data = (await res.json()) as { prompts?: PendingHumanPrompt[] };
+        const httpPrompts = Array.isArray(data.prompts) ? data.prompts : [];
+        const match = httpPrompts.find(
+          (p) =>
+            (!p.sessionId || p.sessionId === chatRes.sessionId) &&
+            p.agentId === chatRes.agentId,
+        );
+        if (match) {
+          structuredContent.pendingPrompt = match;
+        }
+      }
+    } catch {
+      // HTTP server offline or timed out; return local chat cleanly.
+    }
+  }
   return {
     content: [
       {
@@ -1861,6 +2260,565 @@ async function executeAppSendTestEventTool(
   };
 }
 
+function getStudioHttpBaseUrl(): string {
+  const port = process.env.AGENT_STUDIO_PORT?.trim() || "8767";
+  return `http://127.0.0.1:${port}`;
+}
+
+function createCombinedSignal(
+  parentSignal: AbortSignal | undefined,
+  timeoutMs: number,
+): { signal: AbortSignal; cleanup: () => void } {
+  const ac = new AbortController();
+  let timer: NodeJS.Timeout | null = null;
+  const onAbort = (): void => {
+    ac.abort(parentSignal?.reason ?? "aborted");
+  };
+  if (parentSignal) {
+    if (parentSignal.aborted) {
+      ac.abort(parentSignal.reason ?? "aborted");
+    } else {
+      parentSignal.addEventListener("abort", onAbort, { once: true });
+    }
+  }
+  if (Number.isFinite(timeoutMs) && timeoutMs > 0) {
+    timer = setTimeout(() => {
+      ac.abort("timeout");
+    }, timeoutMs);
+    timer.unref();
+  }
+  return {
+    signal: ac.signal,
+    cleanup: () => {
+      if (timer) {
+        clearTimeout(timer);
+        timer = null;
+      }
+      parentSignal?.removeEventListener("abort", onAbort);
+    },
+  };
+}
+
+function formatResolvedAskHumanResult(
+  prompt: PendingHumanPrompt,
+): McpToolCallResult {
+  if (prompt.status === "answered") {
+    const answerText = prompt.answerText ?? "";
+    const structuredContent: Record<string, unknown> = {
+      ok: true,
+      status: "answered",
+      promptId: prompt.id,
+      answerText,
+      ...(prompt.answers !== undefined ? { answers: prompt.answers } : {}),
+    };
+    return {
+      content: [{ type: "text", text: answerText }],
+      structuredContent,
+    };
+  }
+  const status = prompt.status ?? "canceled";
+  const msg = `Human prompt ${status} (promptId=${prompt.id}).`;
+  return {
+    isError: true,
+    content: [{ type: "text", text: msg }],
+    structuredContent: {
+      ok: false,
+      status,
+      promptId: prompt.id,
+    },
+  };
+}
+
+async function cancelHttpPromptBestEffort(
+  baseUrl: string,
+  promptId: string,
+  reason: string,
+): Promise<void> {
+  try {
+    await fetch(`${baseUrl}/api/prompts/${encodeURIComponent(promptId)}/cancel`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ reason }),
+      signal: AbortSignal.timeout(1000),
+    });
+  } catch {
+    // Best-effort cancel when HTTP server is offline or unreachable.
+  }
+}
+
+function inferLocalProjectId(workspace: string): string | undefined {
+  const root = path.resolve(workspace);
+  if (fsSync.existsSync(path.join(root, ".agent-team", "team.yaml"))) {
+    try {
+      const id = loadTeamManifest(root).project.id;
+      if (id?.trim()) return id.trim();
+    } catch {
+      // fall through to board.json
+    }
+  }
+  const boardPath = path.join(root, "pipeline", "board.json");
+  if (fsSync.existsSync(boardPath)) {
+    try {
+      const parsed = JSON.parse(fsSync.readFileSync(boardPath, "utf8")) as {
+        project?: unknown;
+      };
+      if (typeof parsed.project === "string" && parsed.project.trim()) {
+        return parsed.project.trim();
+      }
+    } catch {
+      // ignore malformed board
+    }
+  }
+  return undefined;
+}
+
+async function executeAskHumanTool(
+  args: Record<string, unknown>,
+  options: McpServerOptions,
+): Promise<McpToolCallResult> {
+  const timeoutSeconds = num(args.timeoutSeconds);
+  const rawTimeoutMs =
+    timeoutSeconds !== undefined
+      ? Math.round(timeoutSeconds * 1000)
+      : DEFAULT_PROMPT_TTL_MS;
+  const workspaceArg = str(args.workspace) ?? options.cwd ?? process.cwd();
+  const explicitProject = str(args.project);
+  const resolvedWorkspace = workspaceArg;
+  // Only infer a project from local workspace markers — never the global
+  // defaultProject (which may belong to an unrelated repo).
+  const projectArg =
+    explicitProject ?? inferLocalProjectId(resolvedWorkspace);
+
+  const parsedInput = PromptBridgeCreateSchema.safeParse({
+    ...(str(args.title) ? { title: str(args.title) } : {}),
+    ...(str(args.summary) ? { summary: str(args.summary) } : {}),
+    ...(args.kind === "question" || args.kind === "approval"
+      ? { kind: args.kind }
+      : {}),
+    questions: args.questions,
+    ...(str(args.agentId) ? { agentId: str(args.agentId) } : {}),
+    ...(str(args.agentLabel) ? { agentLabel: str(args.agentLabel) } : {}),
+    ...(str(args.sessionId) ?? options.sessionId
+      ? { sessionId: str(args.sessionId) ?? options.sessionId }
+      : {}),
+    ...(resolvedWorkspace ? { workspacePath: resolvedWorkspace } : {}),
+    ...(projectArg ? { projectId: projectArg } : {}),
+    ...(args.ide !== undefined &&
+    (IDE_SOURCES as readonly string[]).includes(String(args.ide))
+      ? { ide: args.ide as IdeSource }
+      : options.clientIde
+        ? { ide: options.clientIde }
+        : {}),
+    toolName: "ask_human",
+    promptSource: "studio-mcp",
+    timeoutMs: rawTimeoutMs,
+  });
+
+  if (!parsedInput.success) {
+    const errText = parsedInput.error.issues
+      .map((i) => `${i.path.join(".") || "arguments"}: ${i.message}`)
+      .join("; ");
+    return {
+      isError: true,
+      content: [{ type: "text", text: `Invalid ask_human arguments: ${errText}` }],
+      structuredContent: { ok: false, error: errText },
+    };
+  }
+
+  const input = parsedInput.data;
+  const deadlineMs = Date.now() + input.timeoutMs;
+  const useHttp =
+    process.env.AGENT_STUDIO_MCP_NO_HTTP !== "1" && !options.aggregator;
+
+  if (useHttp) {
+    const baseUrl = getStudioHttpBaseUrl();
+    const createProbe = createCombinedSignal(options.signal, 250);
+    let createRes: Response | null = null;
+    let httpOffline = false;
+    try {
+      createRes = await fetch(`${baseUrl}/api/prompts`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(input),
+        signal: createProbe.signal,
+      });
+    } catch {
+      httpOffline = true;
+    } finally {
+      createProbe.cleanup();
+    }
+
+    if (options.signal?.aborted) {
+      // If the POST already landed, best-effort cancel the orphaned prompt.
+      if (!httpOffline && createRes && createRes.ok) {
+        try {
+          const orphan = (await createRes.json()) as {
+            prompt?: { id?: unknown };
+          };
+          const orphanId =
+            typeof orphan.prompt?.id === "string" ? orphan.prompt.id : undefined;
+          if (orphanId) {
+            await cancelHttpPromptBestEffort(baseUrl, orphanId, "cancelled");
+          }
+        } catch {
+          // ignore unreadable body
+        }
+      }
+      return {
+        isError: true,
+        content: [{ type: "text", text: "ask_human cancelled before submission." }],
+        structuredContent: { ok: false, status: "canceled" },
+      };
+    }
+
+    if (!httpOffline && createRes) {
+      let createJson: { ok?: boolean; error?: string; prompt?: PendingHumanPrompt } = {};
+      try {
+        createJson = (await createRes.json()) as typeof createJson;
+      } catch {
+        createJson = {};
+      }
+      if (!createRes.ok || !createJson.prompt) {
+        const errMsg =
+          createJson.error || `HTTP ${createRes.status} creating prompt`;
+        return {
+          isError: true,
+          content: [{ type: "text", text: errMsg }],
+          structuredContent: {
+            ok: false,
+            statusCode: createRes.status,
+            error: errMsg,
+          },
+        };
+      }
+
+      const promptId = createJson.prompt.id;
+      let latestPrompt: PendingHumanPrompt = createJson.prompt;
+
+      while (latestPrompt.status === "pending") {
+        if (options.signal?.aborted) {
+          await cancelHttpPromptBestEffort(baseUrl, promptId, "cancelled");
+          return {
+            isError: true,
+            content: [{ type: "text", text: `Prompt canceled (promptId=${promptId}).` }],
+            structuredContent: { ok: false, status: "canceled", promptId },
+          };
+        }
+        const remainingMs = deadlineMs - Date.now();
+        if (remainingMs <= 0) {
+          await cancelHttpPromptBestEffort(baseUrl, promptId, "timeout");
+          return {
+            isError: true,
+            content: [{ type: "text", text: `Prompt expired (promptId=${promptId}).` }],
+            structuredContent: { ok: false, status: "expired", promptId },
+          };
+        }
+
+        const waitSlice = Math.min(20_000, Math.max(100, remainingMs));
+        const pollSig = createCombinedSignal(options.signal, waitSlice + 5_000);
+        try {
+          const pollRes = await fetch(
+            `${baseUrl}/api/prompts/${encodeURIComponent(promptId)}?waitMs=${waitSlice}`,
+            { signal: pollSig.signal },
+          );
+          if (pollRes.status === 404) {
+            return {
+              isError: true,
+              content: [{ type: "text", text: `Prompt ${promptId} not found.` }],
+              structuredContent: { ok: false, status: "canceled", promptId },
+            };
+          }
+          if (pollRes.ok) {
+            const pollJson = (await pollRes.json()) as {
+              prompt?: PendingHumanPrompt;
+            };
+            if (pollJson.prompt) {
+              latestPrompt = pollJson.prompt;
+            }
+          }
+        } catch {
+          if (options.signal?.aborted) {
+            await cancelHttpPromptBestEffort(baseUrl, promptId, "cancelled");
+            return {
+              isError: true,
+              content: [{ type: "text", text: `Prompt canceled (promptId=${promptId}).` }],
+              structuredContent: { ok: false, status: "canceled", promptId },
+            };
+          }
+        } finally {
+          pollSig.cleanup();
+        }
+      }
+
+      return formatResolvedAskHumanResult(latestPrompt);
+    }
+  }
+
+  // HTTP offline (or AGENT_STUDIO_MCP_NO_HTTP=1 / injected aggregator)
+  const aggregator = options.aggregator ?? getMcpAggregator();
+  if (!aggregator.hasRecentMcpAppClient(15_000)) {
+    const reason =
+      "Agent Studio server is offline and no active MCP App client is attached; fall back to your native ask-user tool.";
+    return {
+      isError: true,
+      content: [{ type: "text", text: reason }],
+      structuredContent: {
+        ok: false,
+        status: "unavailable",
+        fallbackRequired: true,
+        reason,
+      },
+    };
+  }
+
+  const created = await aggregator.promptBridge.createPrompt(input);
+  if (!created.ok) {
+    return {
+      isError: true,
+      content: [{ type: "text", text: created.error }],
+      structuredContent: {
+        ok: false,
+        statusCode: created.statusCode,
+        error: created.error,
+      },
+    };
+  }
+
+  const promptId = created.prompt.id;
+  let latestPrompt: PendingHumanPrompt | null = created.prompt;
+
+  while (latestPrompt && latestPrompt.status === "pending") {
+    if (options.signal?.aborted) {
+      aggregator.promptBridge.cancelPrompt(promptId, "cancelled");
+      return {
+        isError: true,
+        content: [{ type: "text", text: `Prompt canceled (promptId=${promptId}).` }],
+        structuredContent: { ok: false, status: "canceled", promptId },
+      };
+    }
+    const remainingMs = deadlineMs - Date.now();
+    if (remainingMs <= 0) {
+      aggregator.promptBridge.cancelPrompt(promptId, "timeout");
+      return {
+        isError: true,
+        content: [{ type: "text", text: `Prompt expired (promptId=${promptId}).` }],
+        structuredContent: { ok: false, status: "expired", promptId },
+      };
+    }
+    const waitSlice = Math.min(20_000, remainingMs);
+    latestPrompt = await aggregator.promptBridge.waitForResolution(
+      promptId,
+      waitSlice,
+      options.signal,
+    );
+  }
+
+  if (!latestPrompt) {
+    return {
+      isError: true,
+      content: [{ type: "text", text: `Prompt ${promptId} not found.` }],
+      structuredContent: { ok: false, status: "canceled", promptId },
+    };
+  }
+  return formatResolvedAskHumanResult(latestPrompt);
+}
+
+async function executeAppAnswerPromptTool(
+  args: Record<string, unknown>,
+  options: McpServerOptions,
+): Promise<McpToolCallResult> {
+  const promptId = str(args.promptId);
+  if (!promptId) {
+    return {
+      isError: true,
+      content: [{ type: "text", text: "Missing promptId" }],
+      structuredContent: { ok: false, error: "Missing promptId" },
+    };
+  }
+  const parsed = PromptBridgeAnswerSchema.safeParse({
+    answerText: args.answerText,
+    ...(args.answers !== undefined ? { answers: args.answers } : {}),
+    ...(str(args.responder) ? { responder: str(args.responder) } : {}),
+  });
+  if (!parsed.success) {
+    const errMsg = parsed.error.issues
+      .map((i) => `${i.path.join(".") || "arguments"}: ${i.message}`)
+      .join("; ");
+    return {
+      isError: true,
+      content: [{ type: "text", text: errMsg }],
+      structuredContent: { ok: false, error: errMsg },
+    };
+  }
+
+  const useHttp =
+    process.env.AGENT_STUDIO_MCP_NO_HTTP !== "1" && !options.aggregator;
+  if (useHttp) {
+    try {
+      const res = await fetch(
+        `${getStudioHttpBaseUrl()}/api/prompts/${encodeURIComponent(promptId)}/answer`,
+        {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(parsed.data),
+          signal: AbortSignal.timeout(1000),
+        },
+      );
+      const data = (await res.json().catch(() => ({}))) as Record<
+        string,
+        unknown
+      >;
+      if (res.status !== 404) {
+        if (res.ok) {
+          return {
+            content: [{ type: "text", text: `Answered prompt ${promptId}.` }],
+            structuredContent: { ok: true, prompt: data.prompt },
+          };
+        }
+        return {
+          isError: true,
+          content: [
+            {
+              type: "text",
+              text:
+                typeof data.error === "string"
+                  ? data.error
+                  : `HTTP ${res.status} answering prompt`,
+            },
+          ],
+          structuredContent: { ok: false, ...data },
+        };
+      }
+    } catch {
+      // HTTP offline; fall back to local promptBridge.
+    }
+  }
+
+  const aggregator = options.aggregator ?? getMcpAggregator();
+  const res = aggregator.promptBridge.answerPrompt(promptId, parsed.data);
+  if (!res.ok) {
+    if (res.notFound) {
+      return {
+        isError: true,
+        content: [{ type: "text", text: "Prompt not found" }],
+        structuredContent: { ok: false, error: "Prompt not found" },
+      };
+    }
+    return {
+      isError: true,
+      content: [{ type: "text", text: `Prompt already ${res.status}` }],
+      structuredContent: {
+        ok: false,
+        conflict: true,
+        status: res.status,
+        error: `Prompt already ${res.status}`,
+        prompt: res.prompt,
+      },
+    };
+  }
+  return {
+    content: [{ type: "text", text: `Answered prompt ${promptId}.` }],
+    structuredContent: { ok: true, prompt: res.prompt },
+  };
+}
+
+async function executeAppCancelPromptTool(
+  args: Record<string, unknown>,
+  options: McpServerOptions,
+): Promise<McpToolCallResult> {
+  const promptId = str(args.promptId);
+  if (!promptId) {
+    return {
+      isError: true,
+      content: [{ type: "text", text: "Missing promptId" }],
+      structuredContent: { ok: false, error: "Missing promptId" },
+    };
+  }
+  const parsed = PromptBridgeCancelSchema.safeParse({
+    ...(str(args.reason) ? { reason: str(args.reason) } : {}),
+  });
+  if (!parsed.success) {
+    const errMsg = parsed.error.issues
+      .map((i) => `${i.path.join(".") || "arguments"}: ${i.message}`)
+      .join("; ");
+    return {
+      isError: true,
+      content: [{ type: "text", text: errMsg }],
+      structuredContent: { ok: false, error: errMsg },
+    };
+  }
+
+  const useHttp =
+    process.env.AGENT_STUDIO_MCP_NO_HTTP !== "1" && !options.aggregator;
+  if (useHttp) {
+    try {
+      const res = await fetch(
+        `${getStudioHttpBaseUrl()}/api/prompts/${encodeURIComponent(promptId)}/cancel`,
+        {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(parsed.data),
+          signal: AbortSignal.timeout(1000),
+        },
+      );
+      const data = (await res.json().catch(() => ({}))) as Record<
+        string,
+        unknown
+      >;
+      if (res.status !== 404) {
+        if (res.ok) {
+          return {
+            content: [{ type: "text", text: `Canceled prompt ${promptId}.` }],
+            structuredContent: { ok: true, prompt: data.prompt },
+          };
+        }
+        return {
+          isError: true,
+          content: [
+            {
+              type: "text",
+              text:
+                typeof data.error === "string"
+                  ? data.error
+                  : `HTTP ${res.status} canceling prompt`,
+            },
+          ],
+          structuredContent: { ok: false, ...data },
+        };
+      }
+    } catch {
+      // HTTP offline; fall back to local promptBridge.
+    }
+  }
+
+  const aggregator = options.aggregator ?? getMcpAggregator();
+  const res = aggregator.promptBridge.cancelPrompt(promptId, parsed.data.reason);
+  if (!res.ok) {
+    if (res.notFound) {
+      return {
+        isError: true,
+        content: [{ type: "text", text: "Prompt not found" }],
+        structuredContent: { ok: false, error: "Prompt not found" },
+      };
+    }
+    return {
+      isError: true,
+      content: [{ type: "text", text: `Prompt already ${res.status}` }],
+      structuredContent: {
+        ok: false,
+        conflict: true,
+        status: res.status,
+        error: `Prompt already ${res.status}`,
+        prompt: res.prompt,
+      },
+    };
+  }
+  return {
+    content: [{ type: "text", text: `Canceled prompt ${promptId}.` }],
+    structuredContent: { ok: true, prompt: res.prompt },
+  };
+}
+
 export async function dispatchToolCall(
   name: string,
   args: Record<string, unknown>,
@@ -1878,6 +2836,8 @@ export async function dispatchToolCall(
         return await executeTelemetryTool(args, options);
       case "open_studio":
         return await executeOpenStudioTool(args, options);
+      case "ask_human":
+        return await executeAskHumanTool(args, options);
       case "app_get_state":
         return await executeAppGetStateTool(args, options);
       case "app_get_event_body":
@@ -1892,6 +2852,10 @@ export async function dispatchToolCall(
         return await executeAppGetDoctorTool(args, options);
       case "app_send_test_event":
         return await executeAppSendTestEventTool(args, options);
+      case "app_answer_prompt":
+        return await executeAppAnswerPromptTool(args, options);
+      case "app_cancel_prompt":
+        return await executeAppCancelPromptTool(args, options);
       default:
         return {
           isError: true,
@@ -1960,6 +2924,18 @@ export async function handleJsonRpcMessage(
         msg.params && typeof msg.params.protocolVersion === "string"
           ? msg.params.protocolVersion
           : MCP_PROTOCOL_VERSION;
+      const clientInfo =
+        msg.params &&
+        typeof msg.params.clientInfo === "object" &&
+        msg.params.clientInfo !== null
+          ? (msg.params.clientInfo as { name?: unknown })
+          : undefined;
+      const clientIde = mapMcpClientNameToIde(
+        typeof clientInfo?.name === "string" ? clientInfo.name : undefined,
+      );
+      if (clientIde) {
+        options.clientIde = clientIde;
+      }
       return {
         jsonrpc: "2.0",
         id,
@@ -2083,39 +3059,145 @@ export async function startMcpStdioServer(
   });
 
   let queue: Promise<void> = Promise.resolve();
+  const inFlightRequests = new Map<string, AbortController>();
+  const activeTasks = new Set<Promise<void>>();
+  let stdinClosed = false;
 
-  const writeResponse = (resp: JsonRpcResponse): void => {
-    process.stdout.write(JSON.stringify(resp) + "\n");
+  const writeLine = (payload: unknown): void => {
+    process.stdout.write(JSON.stringify(payload) + "\n");
   };
 
   rl.on("line", (line) => {
     const trimmed = line.trim();
     if (!trimmed) return;
 
-    queue = queue.then(async () => {
-      let parsed: JsonRpcRequest;
-      try {
-        parsed = JSON.parse(trimmed) as JsonRpcRequest;
-      } catch (err) {
-        const errMsg = err instanceof Error ? err.message : String(err);
-        writeResponse({
+    let parsed: JsonRpcRequest;
+    try {
+      parsed = JSON.parse(trimmed) as JsonRpcRequest;
+    } catch (err) {
+      const errMsg = err instanceof Error ? err.message : String(err);
+      queue = queue.then(() => {
+        writeLine({
           jsonrpc: "2.0",
           id: null,
           error: { code: -32700, message: `Parse error: ${errMsg}` },
         });
-        return;
-      }
+      });
+      return;
+    }
 
+    if (parsed.method === "notifications/cancelled") {
+      const reqId = parsed.params?.requestId;
+      if (reqId !== undefined && reqId !== null) {
+        const ac = inFlightRequests.get(String(reqId));
+        if (ac) {
+          ac.abort(
+            typeof parsed.params?.reason === "string"
+              ? parsed.params.reason
+              : "cancelled",
+          );
+        }
+      }
+      return;
+    }
+
+    const isOffQueueAskHuman =
+      parsed.method === "tools/call" &&
+      parsed.params?.name === "ask_human" &&
+      parsed.id !== undefined;
+
+    if (isOffQueueAskHuman) {
+      const reqKey = String(parsed.id);
+      const ac = new AbortController();
+      inFlightRequests.set(reqKey, ac);
+      const outerSignal = options.signal;
+      const onOuterAbort = (): void => {
+        ac.abort(outerSignal?.reason ?? "aborted");
+      };
+      if (outerSignal) {
+        if (outerSignal.aborted) {
+          onOuterAbort();
+        } else {
+          outerSignal.addEventListener("abort", onOuterAbort, { once: true });
+        }
+      }
+      const meta =
+        parsed.params &&
+        typeof parsed.params._meta === "object" &&
+        parsed.params._meta !== null &&
+        !Array.isArray(parsed.params._meta)
+          ? (parsed.params._meta as Record<string, unknown>)
+          : undefined;
+      const progressToken =
+        meta &&
+        (typeof meta.progressToken === "string" ||
+          typeof meta.progressToken === "number")
+          ? meta.progressToken
+          : undefined;
+      let progressTick = 0;
+      const progressTimer =
+        progressToken !== undefined
+          ? setInterval(() => {
+              if (ac.signal.aborted || stdinClosed) return;
+              progressTick++;
+              writeLine({
+                jsonrpc: "2.0",
+                method: "notifications/progress",
+                params: {
+                  progressToken,
+                  progress: progressTick,
+                  message: "Waiting for user answer in Agent Studio…",
+                },
+              });
+            }, 20_000)
+          : null;
+      progressTimer?.unref();
+
+      const task = (async () => {
+        try {
+          const resp = await handleJsonRpcMessage(parsed, {
+            ...options,
+            signal: ac.signal,
+          });
+          if (resp !== null && !ac.signal.aborted && !stdinClosed) {
+            writeLine(resp);
+          }
+        } catch (err) {
+          const errMsg = err instanceof Error ? err.message : String(err);
+          process.stderr.write(`[agent-studio mcp] internal error: ${errMsg}\n`);
+          if (!ac.signal.aborted && !stdinClosed) {
+            writeLine({
+              jsonrpc: "2.0",
+              id: parsed.id ?? null,
+              error: { code: -32603, message: `Internal error: ${errMsg}` },
+            });
+          }
+        } finally {
+          if (progressTimer) {
+            clearInterval(progressTimer);
+          }
+          outerSignal?.removeEventListener("abort", onOuterAbort);
+          inFlightRequests.delete(reqKey);
+        }
+      })();
+      activeTasks.add(task);
+      void task.finally(() => {
+        activeTasks.delete(task);
+      });
+      return;
+    }
+
+    queue = queue.then(async () => {
       try {
         const resp = await handleJsonRpcMessage(parsed, options);
         if (resp !== null) {
-          writeResponse(resp);
+          writeLine(resp);
         }
       } catch (err) {
         const errMsg = err instanceof Error ? err.message : String(err);
         process.stderr.write(`[agent-studio mcp] internal error: ${errMsg}\n`);
         if (parsed.id !== undefined) {
-          writeResponse({
+          writeLine({
             jsonrpc: "2.0",
             id: parsed.id ?? null,
             error: { code: -32603, message: `Internal error: ${errMsg}` },
@@ -2127,7 +3209,17 @@ export async function startMcpStdioServer(
 
   await new Promise<void>((resolve) => {
     rl.on("close", () => {
-      queue.finally(() => resolve());
+      stdinClosed = true;
+      for (const ac of inFlightRequests.values()) {
+        ac.abort("stdin_closed");
+      }
+      Promise.allSettled([queue, ...activeTasks]).finally(() => {
+        if (lazyAggregator) {
+          lazyAggregator.dispose();
+          lazyAggregator = null;
+        }
+        resolve();
+      });
     });
   });
 }

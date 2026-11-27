@@ -59,6 +59,126 @@
   }
 }
 
+/* Container query for narrow QuestionCard panes (< 380px): full-width Send Answer above separated Cancel/Retry row */
+@container question-card (inline-size < 380px) {
+  .qc-actions {
+    gap: 6px;
+  }
+  .qc-primary-btn {
+    flex: 1 0 100%;
+    width: 100%;
+    justify-content: center;
+  }
+  .qc-cancel-btn {
+    margin-inline-start: 0;
+  }
+  .qc-actions:has(.qc-cancel-btn) .qc-cancel-btn {
+    margin-inline-start: auto;
+  }
+  .qc-cancel-confirm {
+    justify-content: flex-start;
+  }
+  .qc-cancel-prompt {
+    flex: 1 0 100%;
+    margin-inline-end: 0;
+  }
+  .qc-error-actions {
+    width: 100%;
+  }
+}
+
+/* ==========================================================================
+   TIER 1 & TIER 2 SHARED: Z Fold 7 Open (640-1020px) & Cover (< 640px)
+   Bottom Navigation Bar + Safe-Area Clearance inside 100dvh
+   ========================================================================== */
+@media (max-width: 1020px) {
+  :root {
+    --cover-nav-h: 60px;
+  }
+
+  html {
+    scroll-padding-bottom: calc(
+      var(--cover-nav-h) + 84px + env(safe-area-inset-bottom, 0px)
+    );
+  }
+
+  .primary-tabs {
+    display: none;
+  }
+
+  .cover-bottom-nav {
+    position: fixed;
+    left: 0;
+    right: 0;
+    bottom: 0;
+    z-index: 55;
+    display: grid;
+    grid-template-columns: repeat(6, minmax(0, 1fr));
+    gap: 3px;
+    padding: 5px max(6px, env(safe-area-inset-right, 0px))
+      max(8px, env(safe-area-inset-bottom, 0px)) max(6px, env(safe-area-inset-left, 0px));
+    background: rgba(9, 13, 22, 0.97);
+    border-top: 1px solid var(--border-strong);
+    backdrop-filter: blur(8px);
+  }
+
+  .app-shell[data-hide-mockups="1"] .cover-bottom-nav {
+    grid-template-columns: repeat(5, minmax(0, 1fr));
+  }
+
+  .cover-nav-btn {
+    position: relative;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    gap: 2px;
+    min-block-size: 44px;
+    min-width: 0;
+    padding: 4px 3px;
+    border-radius: 7px;
+    border: 1px solid transparent;
+    background: transparent;
+    color: var(--muted);
+    font-size: 10.5px;
+    font-weight: 650;
+    cursor: pointer;
+    white-space: nowrap;
+    overflow: hidden;
+  }
+
+  .cover-nav-btn span:last-child {
+    max-width: 100%;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+
+  .cover-nav-btn.active {
+    background: #1a2744;
+    border-color: rgba(6, 182, 212, 0.55);
+    color: var(--text-strong);
+  }
+
+  .cover-nav-btn.active::before {
+    content: "";
+    position: absolute;
+    inset: 0 6px auto;
+    border-block-start: 2px solid var(--cyan);
+  }
+
+  .cover-nav-ico {
+    font-size: 14px;
+    line-height: 1;
+  }
+
+  .team-view,
+  .board-view,
+  .doctor-view,
+  .mockups-view {
+    padding-bottom: calc(var(--cover-nav-h) + 16px + env(safe-area-inset-bottom, 0px));
+  }
+}
+
 /* ==========================================================================
    TIER 2: Open / Unfolded (640px - 1020px, Galaxy Z Fold 7 unfolded ~700-840px)
    Preserves 2-column 1fr 1fr split inside 100dvh instead of stacking vertically!
@@ -83,12 +203,29 @@
     max-width: none;
   }
 
-  /* 1fr 1fr Topology left / Feed+Inspector right */
-  .studio-workspace {
-    grid-template-columns: 1fr 1fr;
-    gap: 12px;
+  /* 1fr 1fr Topology left / Feed+Inspector right, clearing Timeline + Bottom Nav */
+  .studio-workspace,
+  .studio-workspace.has-behind-drawer {
+    grid-template-columns: minmax(220px, var(--studio-left, 1fr)) 12px minmax(240px, 1fr);
+    gap: 12px 0;
     padding: 10px max(12px, env(safe-area-inset-right, 0px))
-      calc(82px + env(safe-area-inset-bottom, 0px)) max(12px, env(safe-area-inset-left, 0px));
+      calc(var(--cover-nav-h) + 82px + env(safe-area-inset-bottom, 0px))
+      max(12px, env(safe-area-inset-left, 0px));
+  }
+
+  [data-resizer="studio-behind"],
+  [data-resizer="reader-toc"] {
+    display: none !important;
+  }
+
+  /* Side sheet overlays the left Topology pane so Messages stay visible across the hinge */
+  .inspector-pane {
+    position: absolute;
+    top: 10px;
+    bottom: calc(var(--cover-nav-h) + 82px + env(safe-area-inset-bottom, 0px));
+    left: 12px;
+    width: calc(50% - 21px);
+    z-index: 45;
   }
 
   .stream-inspector-slot[data-inspector-state="open"] {
@@ -98,10 +235,11 @@
   }
 
   .timeline-bar {
+    bottom: calc(var(--cover-nav-h) + env(safe-area-inset-bottom, 0px));
     gap: 10px;
     min-height: 68px;
-    padding: 6px max(12px, env(safe-area-inset-right, 0px))
-      max(8px, env(safe-area-inset-bottom, 0px)) max(12px, env(safe-area-inset-left, 0px));
+    padding: 6px max(12px, env(safe-area-inset-right, 0px)) 6px
+      max(12px, env(safe-area-inset-left, 0px));
   }
 
   .tl-hint {
@@ -110,12 +248,17 @@
 
   /* Agile Board 1fr 1fr: Kanban left / Detail + Bugs + Testruns right */
   .board-split {
-    grid-template-columns: 1fr 1fr;
-    gap: 12px;
+    grid-template-columns: minmax(220px, var(--board-left, 1fr)) 12px minmax(200px, 1fr);
+    gap: 12px 0;
   }
 
   /* Mockups 1fr 1fr split */
   .mockups-view {
+    grid-template-columns: minmax(180px, var(--mockups-sidebar, 240px)) 12px minmax(300px, 1fr);
+    gap: 12px 0;
+  }
+
+  .mockups-view:has(> .panel-resizer.is-no-room) {
     grid-template-columns: 240px 1fr;
     gap: 12px;
   }
@@ -157,16 +300,26 @@
 
   .chat-drawer-head {
     padding: max(10px, env(safe-area-inset-top, 0px)) max(14px, env(safe-area-inset-right, 0px))
-      10px 14px;
+      10px max(14px, env(safe-area-inset-left, 0px));
   }
 
   .chat-body {
-    padding: 12px max(14px, env(safe-area-inset-right, 0px)) 18px 14px;
+    padding: 12px max(14px, env(safe-area-inset-right, 0px)) 18px
+      max(14px, env(safe-area-inset-left, 0px));
   }
 
   .chat-prompt-dock {
     padding-bottom: env(safe-area-inset-bottom, 0px);
     padding-right: env(safe-area-inset-right, 0px);
+    padding-left: env(safe-area-inset-left, 0px);
+  }
+
+  .sms-prompt-dock,
+  .sms-prompt-tabs,
+  .sms-inline-prompts,
+  .qc-card {
+    min-width: 0;
+    max-width: 100%;
   }
 
   .chat-wide-btn {
@@ -176,6 +329,13 @@
 
 /* Hinge / Crease-Aware Dual-Screen Support (Viewport Segments API) */
 @media (horizontal-viewport-segments: 2) {
+  .sms-prompt-dock,
+  .sms-prompt-tabs,
+  .sms-inline-prompts,
+  .qc-card {
+    min-width: 0;
+    max-width: 100%;
+  }
   .chat-drawer-dialog {
     position: fixed;
     inset: 0 auto 0 env(viewport-segment-left 1 0);
@@ -189,13 +349,27 @@
     display: none;
   }
   /* Full-viewport split shells map directly to physical display segments */
+  .panel-resizer {
+    display: none !important;
+  }
   .studio-workspace,
+  .studio-workspace.has-behind-drawer,
   .board-split,
   .mockups-view,
   .doctor-bottom-grid,
   .guide-two-col {
     grid-template-columns: env(viewport-segment-width 0 0) env(viewport-segment-width 1 0);
     gap: max(12px, calc(env(viewport-segment-left 1 0) - env(viewport-segment-right 0 0)));
+    padding-inline: 0;
+  }
+
+  .inspector-pane {
+    position: absolute;
+    top: 10px;
+    bottom: calc(var(--cover-nav-h, 0px) + 82px + env(safe-area-inset-bottom, 0px));
+    left: 8px;
+    width: calc(env(viewport-segment-width 0 0, 50%) - 16px);
+    z-index: 45;
   }
 
   /* Padded containers and modal dialogs use fractional 2-col with hinge-aware gap */
@@ -379,6 +553,16 @@
     padding-bottom: max(8px, env(safe-area-inset-bottom, 0px));
   }
 
+  .sms-prompt-dock {
+    max-height: min(46dvh, 320px);
+  }
+
+  .sms-inline-prompts {
+    overscroll-behavior: contain;
+    scroll-padding-bottom: max(16px, env(safe-area-inset-bottom, 0px));
+    padding-bottom: max(12px, env(safe-area-inset-bottom, 0px));
+  }
+
   .waiting-alert-pill {
     padding: 4px 8px;
   }
@@ -399,74 +583,46 @@
     max-height: 54dvh;
   }
 
-  /* Fixed bottom segmented view switcher: Studio | Feed | Team | Board | Mockups | Doctor */
   .cover-bottom-nav {
+    gap: 2px;
+    padding: 5px max(4px, env(safe-area-inset-right, 0px))
+      max(8px, env(safe-area-inset-bottom, 0px)) max(4px, env(safe-area-inset-left, 0px));
+  }
+
+  .cover-nav-btn {
+    padding: 4px 2px;
+    font-size: 9.5px;
+  }
+
+  /* Cover Bottom Sheet for "Behind This Response" Drawer */
+  .behind-drawer-backdrop {
+    display: block;
+    position: fixed;
+    inset: 0;
+    background: rgba(2, 6, 16, 0.72);
+    backdrop-filter: blur(2px);
+    z-index: 59;
+  }
+
+  .inspector-pane {
     position: fixed;
     left: 0;
     right: 0;
     bottom: 0;
-    z-index: 55;
-    display: grid;
-    grid-template-columns: repeat(6, minmax(0, 1fr));
-    gap: 2px;
-    padding: 5px max(4px, env(safe-area-inset-right, 0px))
-      max(8px, env(safe-area-inset-bottom, 0px)) max(4px, env(safe-area-inset-left, 0px));
-    background: rgba(9, 13, 22, 0.97);
-    border-top: 1px solid var(--border-strong);
-    backdrop-filter: blur(8px);
-  }
-
-  .app-shell[data-hide-mockups="1"] .cover-bottom-nav {
-    grid-template-columns: repeat(5, minmax(0, 1fr));
-  }
-
-  .cover-nav-btn {
-    position: relative;
-    display: flex;
-    flex-direction: column;
-    align-items: center;
-    justify-content: center;
-    gap: 2px;
-    min-block-size: 44px;
-    min-width: 0;
-    padding: 4px 2px;
-    border-radius: 7px;
-    border: 1px solid transparent;
-    background: transparent;
-    color: var(--muted);
-    font-size: 9.5px;
-    font-weight: 650;
-    cursor: pointer;
-    white-space: nowrap;
-    overflow: hidden;
-  }
-
-  .cover-nav-btn span:last-child {
-    max-width: 100%;
-    overflow: hidden;
-    text-overflow: ellipsis;
-  }
-
-  .cover-nav-btn.active {
-    background: #1a2744;
-    border-color: rgba(6, 182, 212, 0.55);
-    color: var(--text-strong);
-  }
-
-  .cover-nav-btn.active::before {
-    content: "";
-    position: absolute;
-    inset: 0 6px auto;
-    border-block-start: 2px solid var(--cyan);
-  }
-
-  .cover-nav-ico {
-    font-size: 14px;
-    line-height: 1;
+    top: auto;
+    width: auto;
+    max-height: 86dvh;
+    border-radius: 16px 16px 0 0;
+    border-left: none;
+    border-right: none;
+    border-bottom: none;
+    z-index: 60;
+    padding-bottom: env(safe-area-inset-bottom, 0px);
   }
 
   /* Live Studio switches cleanly between Topology and Feed panes on cover screen */
-  .studio-workspace {
+  .studio-workspace,
+  .studio-workspace.has-behind-drawer {
     display: flex;
     flex-direction: column;
     gap: 0;
@@ -563,7 +719,15 @@
       max(10px, env(safe-area-inset-left, 0px));
   }
 
-  .board-split,
+  .board-split {
+    grid-template-columns: 1fr;
+    gap: 12px;
+  }
+
+  .panel-resizer {
+    display: none !important;
+  }
+
   .doctor-bottom-grid,
   .ide-cards-grid,
   .guide-two-col,
@@ -635,6 +799,12 @@
   .iframe-stage {
     flex: none;
     height: 360px;
+  }
+}
+
+@media (max-width: 639px) and (pointer: coarse) {
+  :root {
+    --timeline-cover-h: 120px;
   }
 }
 
@@ -749,6 +919,11 @@
   .tl-hint {
     display: none;
   }
+  .panel-resizer::after {
+    content: "";
+    position: absolute;
+    inset: 0 -16px;
+  }
   .copy-btn,
   .guide-copy-btn {
     min-height: 44px;
@@ -801,7 +976,14 @@
   .msg-pill,
   .line-msg-pill,
   .card-msg-badge,
-  .read-full-btn,
+  .behind-bar,
+  .show-more-btn,
+  .reply-quote-ref,
+  .btn-ghost-sm,
+  .btn-primary-sm,
+  .subtle-toggle-pill,
+  .tool-step-details summary,
+  .cover-nav-btn,
   .kpi-btn,
   .run-pill,
   .jump-latest-btn,
@@ -813,8 +995,18 @@
   .tool-badge-btn,
   .split-parent-btn,
   .chat-drawer-dialog button,
+  .chat-pane-shell button,
+  .chat-search-input,
   .qc-card button,
   .qc-option,
+  .sms-prompt-dock button,
+  .sms-prompt-dock-toggle,
+  .sms-prompt-tab,
+  .qc-cancel-btn,
+  .qc-cancel-confirm-btn,
+  .qc-cancel-keep-btn,
+  .qc-retry-btn,
+  .qc-error-copy-btn,
   .card-chat-btn,
   .needs-input-badge,
   .waiting-alert-pill,
@@ -823,11 +1015,13 @@
   .insp-chat-btn,
   .insp-respond-btn,
   .chat-subagent-chip,
-  .chat-drawer-dialog summary {
+  .chat-drawer-dialog summary,
+  .chat-pane-shell summary {
     min-block-size: 44px;
     min-inline-size: 44px;
   }
-  .chat-drawer-dialog summary {
+  .chat-drawer-dialog summary,
+  .chat-pane-shell summary {
     display: flex;
     align-items: center;
   }
@@ -845,9 +1039,13 @@
   .team-detail-dialog select,
   .feedback-dialog input:not([type="checkbox"], [type="radio"]),
   .feedback-dialog textarea,
+  .chat-search-input,
   .mr-select,
   .rm-select {
     font-size: max(1rem, 1em);
+  }
+  .chat-search-input {
+    padding-right: 48px;
   }
 }
 
@@ -890,10 +1088,27 @@
   }
   .bubble.inbound,
   .bubble.outbound,
-  .bubble-route {
+  .bubble.is-human,
+  .bubble-route,
+  .behind-bar,
+  .show-more-btn,
+  .reply-quote-ref,
+  .subtle-toggle-pill,
+  .inspector-pane,
+  .thought-card,
+  .tool-step-details,
+  .q-option-pill,
+  .q-option-pill.is-chosen,
+  .tool-ok-pill,
+  .tool-err-pill,
+  .tool-run-pill {
     background: Canvas;
     color: CanvasText;
-    border-color: CanvasText;
+    border: 1px solid CanvasText;
+  }
+  .thought-card::before,
+  .tool-step-details::before {
+    forced-color-adjust: none;
   }
   .tool-strip-dot {
     background: Highlight;
@@ -907,12 +1122,46 @@
   .filter-chip[aria-pressed="true"],
   .tool-burst-row.selected,
   .tool-badge-btn.is-expanded,
+  .bubble.is-inspected,
+  .behind-bar[aria-expanded="true"],
+  .subtle-toggle-pill[aria-pressed="true"],
+  .cover-nav-btn.active,
+  .q-option-pill.is-chosen,
   .qc-option.is-checked,
   .qc-step-pill.is-active {
     outline: 2px solid Highlight;
   }
+  .behind-bar:focus-visible,
+  .show-more-btn:focus-visible,
+  .reply-quote-ref:focus-visible,
+  .subtle-toggle-pill:focus-visible,
+  .btn-ghost-sm:focus-visible,
+  .btn-primary-sm:focus-visible,
+  .tool-step-details summary:focus-visible {
+    outline: 2px solid Highlight;
+  }
   .chat-drawer-dialog,
+  .chat-pane-shell,
+  .chat-controls-bar,
+  .chat-search-input,
+  .chat-focus-ide-btn,
+  .chat-conn-pill,
+  .chat-skeleton-card,
+  .chat-tool-chip,
+  .chat-tool-pre,
+  .chat-jump-q-btn,
+  .chat-subagent-chip,
+  .jump-latest-btn,
   .qc-card,
+  .qc-card.is-direct-reply,
+  .qc-direct-pill,
+  .qc-cancel-btn,
+  .qc-cancel-confirm,
+  .qc-error-actions,
+  .qc-status,
+  .sms-prompt-dock,
+  .sms-prompt-dock-toggle,
+  .sms-prompt-tab,
   .chat-turn,
   .waiting-alert-pill,
   .needs-input-badge,
@@ -922,7 +1171,42 @@
   .pending-badge,
   .qc-waiting-badge,
   .chat-prompt-pill,
+  .sms-prompt-pill,
   .chat-question-badge {
     border: 1px solid CanvasText;
+  }
+  .sms-prompt-tab[aria-selected="true"],
+  .sms-prompt-dock-toggle:focus-visible,
+  .sms-prompt-tab:focus-visible,
+  .qc-cancel-btn:focus-visible,
+  .qc-cancel-confirm-btn:focus-visible,
+  .qc-cancel-keep-btn:focus-visible,
+  .qc-retry-btn:focus-visible,
+  .qc-error-copy-btn:focus-visible,
+  .chat-pane-shell button:focus-visible,
+  .chat-pane-shell summary:focus-visible,
+  .chat-search-input:focus-visible,
+  .chat-body:focus-visible,
+  .chat-tool-pre:focus-visible {
+    outline: 2px solid Highlight;
+  }
+  .panel-resizer::before,
+  .panel-resizer-pill {
+    background: ButtonBorder;
+    opacity: 1;
+  }
+  .panel-resizer:hover::before,
+  .panel-resizer:focus-visible::before,
+  .panel-resizer[data-dragging="true"]::before,
+  .panel-resizer:hover .panel-resizer-pill,
+  .panel-resizer:focus-visible .panel-resizer-pill,
+  .panel-resizer[data-dragging="true"] .panel-resizer-pill {
+    background: Highlight;
+  }
+  .panel-resizer:hover,
+  .panel-resizer:focus-visible,
+  .panel-resizer[data-dragging="true"] {
+    outline: 2px solid Highlight;
+    outline-offset: -1px;
   }
 }

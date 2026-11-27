@@ -1,6 +1,7 @@
 import { fetchMockups, postMockupFeedback } from "../api.js";
 import type { MockupEntry } from "../types.js";
 import { escHtml } from "../utils.js";
+import { attachPanelResizer, type PanelResizerHandle } from "../utils/panelResizer.js";
 
 type ViewportPreset = "cover" | "open" | "desktop";
 
@@ -20,10 +21,16 @@ export class MockupsView {
   private loading = false;
   private errorMsg: string | null = null;
   private feedbackStatus: string | null = null;
+  private mockupsResizer: PanelResizerHandle | null = null;
 
   constructor(root: HTMLElement) {
     this.root = root;
     this.render();
+  }
+
+  public dispose(): void {
+    this.mockupsResizer?.destroy();
+    this.mockupsResizer = null;
   }
 
   public async load(
@@ -64,6 +71,8 @@ export class MockupsView {
   }
 
   private render(): void {
+    this.mockupsResizer?.destroy();
+    this.mockupsResizer = null;
     if (this.loading && this.mockups.length === 0) {
       this.root.innerHTML = `<div class="view-placeholder">Discovering project HTML mockups…</div>`;
       return;
@@ -142,6 +151,8 @@ export class MockupsView {
               .join("")}
           </div>
         </aside>
+
+        <div class="panel-resizer" data-resizer="mockups-sidebar"><span class="panel-resizer-pill" aria-hidden="true"></span></div>
 
         <section class="card mockups-stage">
           <div class="card-head mockups-stage-head">
@@ -282,5 +293,27 @@ export class MockupsView {
       }
       updateFeedbackDock();
     });
+
+    const mockupsViewEl = this.root.querySelector<HTMLElement>(".mockups-view");
+    const mockupsResizerEl = this.root.querySelector<HTMLElement>(
+      '[data-resizer="mockups-sidebar"]'
+    );
+    const sidebarEl = this.root.querySelector<HTMLElement>(".mockups-sidebar");
+    if (mockupsViewEl && mockupsResizerEl && sidebarEl) {
+      this.mockupsResizer = attachPanelResizer({
+        id: "mockups-sidebar",
+        container: mockupsViewEl,
+        handle: mockupsResizerEl,
+        primaryPane: sidebarEl,
+        cssVar: "--mockups-sidebar",
+        persistMode: "px",
+        minLeft: 180,
+        maxLeft: 460,
+        minRight: 300,
+        hideWhenNoRoom: true,
+        ariaLabel: "Resize mockups gallery sidebar and preview stage",
+        paneLabel: "Mockups sidebar",
+      });
+    }
   }
 }

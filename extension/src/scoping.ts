@@ -1,6 +1,12 @@
 export type HostIde = "antigravity" | "copilot-vscode";
 
-export type StudioView = "studio" | "board" | "team" | "mockups" | "doctor";
+export type StudioView =
+  | "studio"
+  | "board"
+  | "team"
+  | "mockups"
+  | "doctor"
+  | "chat";
 
 export function detectHostIdeFromAppName(appName: string | undefined): HostIde {
   if (appName && /antigravity|agy/i.test(appName)) {
@@ -25,6 +31,8 @@ export interface BuildScopedViewUrlInput {
   view?: StudioView;
   projectId?: string;
   sessionId?: string;
+  agentId?: string;
+  focusQuestion?: boolean;
   openWaiting?: boolean;
   openChatAgentId?: string;
   embed?: boolean;
@@ -52,6 +60,12 @@ export function buildScopedViewUrl(input: BuildScopedViewUrlInput): string {
   }
   if (input.sessionId) {
     params.set("session", input.sessionId);
+  }
+  if (input.agentId && input.agentId.trim()) {
+    params.set("agent", input.agentId.trim());
+  }
+  if (input.focusQuestion === true) {
+    params.set("focusQuestion", "1");
   }
   if (input.openWaiting) {
     params.set("openWaiting", "1");

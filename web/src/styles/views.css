@@ -145,8 +145,8 @@
 
 .board-split {
   display: grid;
-  grid-template-columns: 1.65fr 1fr;
-  gap: 12px;
+  grid-template-columns: minmax(320px, var(--board-left, 1.65fr)) 12px minmax(260px, 1fr);
+  gap: 12px 0;
   align-items: start;
 }
 
@@ -710,8 +710,8 @@
   flex: 1;
   min-height: 0;
   display: grid;
-  grid-template-columns: 280px 1fr;
-  gap: 12px;
+  grid-template-columns: minmax(180px, var(--mockups-sidebar, 280px)) 12px minmax(300px, 1fr);
+  gap: 12px 0;
   padding: 12px max(16px, env(safe-area-inset-right, 0px)) 16px
     max(16px, env(safe-area-inset-left, 0px));
 }

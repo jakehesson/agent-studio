@@ -10,6 +10,7 @@ import {
   getIdeMeta,
 } from "../utils.js";
 import { renderMarkdown, type MarkdownHeading } from "../utils/markdown.js";
+import { attachPanelResizer, type PanelResizerHandle } from "../utils/panelResizer.js";
 
 export interface ReaderSessionContext {
   sessionId?: string;
@@ -85,6 +86,8 @@ export class CommReaderModal {
   private statusEl: HTMLElement;
   private bodyGridEl: HTMLElement;
   private tocDesktopEl: HTMLElement;
+  private tocResizerEl: HTMLElement;
+  private tocResizer: PanelResizerHandle | null = null;
   private tocDrawerEl: HTMLDetailsElement;
   private tocDrawerSummaryEl: HTMLElement;
   private tocMobileEl: HTMLElement;
@@ -132,6 +135,7 @@ export class CommReaderModal {
 
         <div class="reader-body" data-reader-body>
           <nav class="reader-toc" aria-label="Document sections" data-reader-toc hidden></nav>
+          <div class="panel-resizer" data-resizer="reader-toc" hidden><span class="panel-resizer-pill" aria-hidden="true"></span></div>
           <div class="reader-main-scroll" data-reader-scroll>
             <div class="reader-content" data-reader-content></div>
             <details class="reader-raw-drawer" data-reader-raw-drawer>
@@ -161,6 +165,7 @@ export class CommReaderModal {
     this.statusEl = dlg.querySelector("[data-reader-status]") as HTMLElement;
     this.bodyGridEl = dlg.querySelector("[data-reader-body]") as HTMLElement;
     this.tocDesktopEl = dlg.querySelector("[data-reader-toc]") as HTMLElement;
+    this.tocResizerEl = dlg.querySelector('[data-resizer="reader-toc"]') as HTMLElement;
     this.tocDrawerEl = dlg.querySelector("[data-reader-toc-drawer]") as HTMLDetailsElement;
     this.tocDrawerSummaryEl = dlg.querySelector("[data-reader-sections-toggle]") as HTMLElement;
     this.tocMobileEl = dlg.querySelector("[data-reader-toc-mobile]") as HTMLElement;
@@ -174,6 +179,19 @@ export class CommReaderModal {
     this.fullscreenBtn = dlg.querySelector("[data-reader-fullscreen]") as HTMLButtonElement;
 
     this.bindEvents();
+    this.tocResizer = attachPanelResizer({
+      id: "reader-toc",
+      container: this.bodyGridEl,
+      handle: this.tocResizerEl,
+      primaryPane: this.tocDesktopEl,
+      cssVar: "--reader-toc",
+      persistMode: "px",
+      minLeft: 180,
+      maxLeft: 380,
+      minRight: 340,
+      ariaLabel: "Resize document outline and article reader",
+      paneLabel: "Document outline",
+    });
   }
 
   private bindEvents(): void {
@@ -243,6 +261,7 @@ export class CommReaderModal {
       this.dialog.classList.toggle("is-fullscreen", this.isFullscreen);
       this.fullscreenBtn.setAttribute("aria-pressed", this.isFullscreen ? "true" : "false");
       this.fullscreenBtn.textContent = this.isFullscreen ? "Exit Fullscreen" : "Fullscreen";
+      this.tocResizer?.sync();
     });
 
     // Delegated clicks inside rendered article (code copy + IDE file chips)
@@ -314,6 +333,7 @@ export class CommReaderModal {
       this.dialog.showModal();
     }
     this.scrollEl.scrollTop = 0;
+    this.tocResizer?.sync();
 
     if (needsFetch) {
       void this.fetchFullBody();
@@ -322,6 +342,8 @@ export class CommReaderModal {
 
   public dispose(): void {
     this.openGeneration += 1;
+    this.tocResizer?.destroy();
+    this.tocResizer = null;
     this.disconnectTocObserver();
     if (this.dialog.open) {
       this.dialog.close();
@@ -460,12 +482,14 @@ export class CommReaderModal {
     const showToc = this.mode === "formatted" && this.headings.length >= 2;
     this.bodyGridEl.classList.toggle("has-toc", showToc);
     this.tocDesktopEl.hidden = !showToc;
+    this.tocResizerEl.hidden = !showToc;
     this.tocDrawerEl.hidden = !showToc;
 
     if (!showToc) {
       this.tocDesktopEl.innerHTML = "";
       this.tocMobileEl.innerHTML = "";
       this.tocDrawerSummaryEl.textContent = "Sections (0)";
+      this.tocResizer?.sync();
       return;
     }
 
@@ -483,6 +507,7 @@ export class CommReaderModal {
 
     this.tocDesktopEl.innerHTML = `<div class="reader-toc-title">On this message</div>${linksHtml}`;
     this.tocMobileEl.innerHTML = linksHtml;
+    this.tocResizer?.sync();
   }
 
   private setupTocObserver(): void {

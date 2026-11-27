@@ -7,6 +7,7 @@ import {
   computeDeterministicEventId,
   computeMergeKey,
   computePendingPromptId,
+  extractProviderUsageDetails,
   formatQuestionsPreview,
   isBoardMutationToolCall,
   isSelfDaemonCommand,
@@ -43,6 +44,48 @@ const SKIP_TYPES = new Set([
   "queue-operation",
   "attachment",
 ]);
+const THINKING_INLINE_MAX = 800;
+
+function formatClaudeAnswerValue(val: unknown): string {
+  if (val === null || val === undefined) return "";
+  if (typeof val === "string") return val.trim();
+  if (typeof val === "number" || typeof val === "boolean") return String(val);
+  if (Array.isArray(val)) {
+    return val.map(formatClaudeAnswerValue).filter(Boolean).join(", ");
+  }
+  if (typeof val === "object") {
+    return Object.entries(val as Record<string, unknown>)
+      .map(([k, v]) => {
+        const formatted = formatClaudeAnswerValue(v);
+        if (!formatted) return "";
+        return k.trim() ? `${k.trim()}: ${formatted}` : formatted;
+      })
+      .filter(Boolean)
+      .join("\n");
+  }
+  return "";
+}
+
+function extractClaudeAnswerText(
+  toolUseResult: ClaudeRow["toolUseResult"],
+  resultText: string,
+): string {
+  if (
+    toolUseResult &&
+    typeof toolUseResult === "object" &&
+    "answers" in toolUseResult &&
+    toolUseResult.answers !== undefined
+  ) {
+    const formatted = formatClaudeAnswerValue(toolUseResult.answers);
+    if (formatted) return formatted;
+  }
+  const trimmedResult = resultText.trim();
+  if (trimmedResult) return trimmedResult;
+  if (typeof toolUseResult === "string" && toolUseResult.trim()) {
+    return toolUseResult.trim();
+  }
+  return "";
+}
 
 interface ClaudeContentBlock {
   type?: string;
@@ -66,7 +109,7 @@ interface ClaudeRow {
   isSidechain?: boolean;
   agentId?: string;
   totalCostUSD?: number;
-  toolUseResult?: { agentId?: string } | string;
+  toolUseResult?: { agentId?: string; answers?: unknown; [key: string]: unknown } | string;
   message?: {
     id?: string;
     role?: string;
@@ -598,7 +641,15 @@ export class ClaudeCodeAdapter implements PassiveIdeAdapter {
       doneEvent?: EnrichedEvent;
       chatSpawnMsg?: AgentChatMessage;
     }> = [];
-    const toolSummaryMap = new Map<string, { toolName: string; summary: string }>();
+    const toolSummaryMap = new Map<
+      string,
+      {
+        toolName: string;
+        summary: string;
+        isAskQuestion?: boolean;
+        questionPrompt?: string;
+      }
+    >();
 
     interface ClaudeUsageAcc {
       model?: string;
@@ -606,6 +657,12 @@ export class ClaudeCodeAdapter implements PassiveIdeAdapter {
       inputTokens: number;
       outputTokens: number;
       cachedTokens: number;
+      cacheReadTokens: number;
+      cacheWriteTokens: number;
+      hasCacheSplit: boolean;
+      hasUnsplitCached: boolean;
+      reasoningTokens: number;
+      hasExactReasoning: boolean;
       lastTurnContext: number;
       estInputChars: number;
       estOutputChars: number;
@@ -620,6 +677,12 @@ export class ClaudeCodeAdapter implements PassiveIdeAdapter {
           inputTokens: 0,
           outputTokens: 0,
           cachedTokens: 0,
+          cacheReadTokens: 0,
+          cacheWriteTokens: 0,
+          hasCacheSplit: false,
+          hasUnsplitCached: false,
+          reasoningTokens: 0,
+          hasExactReasoning: false,
           lastTurnContext: 0,
           estInputChars: 0,
           estOutputChars: 0,
@@ -725,19 +788,26 @@ export class ClaudeCodeAdapter implements PassiveIdeAdapter {
         ) {
           acc.hasExact = true;
           const inTok = Math.max(0, Math.round(usage.input_tokens ?? 0));
-          const outTok = Math.max(0, Math.round(usage.output_tokens ?? 0));
-          const cacheRead = Math.max(
-            0,
-            Math.round(usage.cache_read_input_tokens ?? 0),
+          const details = extractProviderUsageDetails(
+            [usage as Record<string, unknown>],
+            usage.output_tokens,
           );
-          const cacheCreate = Math.max(
-            0,
-            Math.round(usage.cache_creation_input_tokens ?? 0),
-          );
-          const cachedTok = cacheRead + cacheCreate;
+          const outTok = details.outputTokens;
+          const cachedTok = details.cachedTokens;
           acc.inputTokens += inTok;
           acc.outputTokens += outTok;
           acc.cachedTokens += cachedTok;
+          if (details.cacheSplitKnown) {
+            acc.hasCacheSplit = true;
+            acc.cacheReadTokens += details.cacheReadTokens ?? 0;
+            acc.cacheWriteTokens += details.cacheWriteTokens ?? 0;
+          } else if (cachedTok > 0) {
+            acc.hasUnsplitCached = true;
+          }
+          if (details.reasoningTokens !== undefined) {
+            acc.hasExactReasoning = true;
+            acc.reasoningTokens += details.reasoningTokens;
+          }
           // Set to latest deduplicated turn (not Math.max) so /compact drops context properly
           acc.lastTurnContext = inTok + cachedTok + outTok;
         }
@@ -915,6 +985,36 @@ export class ClaudeCodeAdapter implements PassiveIdeAdapter {
                     },
                     offset: bIdx * 0.0001,
                   });
+                  if (prev?.isAskQuestion && !isErr) {
+                    const answerText = extractClaudeAnswerText(
+                      row.toolUseResult,
+                      resultText,
+                    );
+                    if (answerText) {
+                      const cleanAns =
+                        cleanHumanSummary(answerText, 130) ||
+                        answerText.slice(0, 130);
+                      const inlineBody = answerText.slice(0, 1400);
+                      emit({
+                        kind: "user_input",
+                        toolCallId: `${callId}:answer`,
+                        targetAgentId: agentId,
+                        summary: `Human: ${cleanAns}`,
+                        payload: {
+                          isHumanAnswer: true,
+                          questionToolCallId: callId,
+                          ...(prev.questionPrompt
+                            ? { questionPrompt: prev.questionPrompt }
+                            : {}),
+                          targetAgentId: agentId,
+                          body: inlineBody,
+                        },
+                        fullBody: answerText,
+                        inlineBody,
+                        offset: (bIdx + 0.5) * 0.0001,
+                      });
+                    }
+                  }
                 }
               }
             });
@@ -975,15 +1075,28 @@ export class ClaudeCodeAdapter implements PassiveIdeAdapter {
 
           blocks.forEach((block, bIdx) => {
             if (block.type === "thinking") {
-              if (includeChat && typeof block.thinking === "string" && block.thinking.trim()) {
-                chatThinkingParts.push(block.thinking.trim());
+              const thinkText =
+                typeof block.thinking === "string" ? block.thinking.trim() : "";
+              if (includeChat && thinkText) {
+                chatThinkingParts.push(thinkText);
               }
-              emit({
-                kind: "thinking_start",
-                summary:
-                  cleanHumanSummary(block.thinking ?? "", 100) || "Thinking…",
-                offset: bIdx * 0.0001,
-              });
+              if (thinkText) {
+                const inlineBody = thinkText.slice(0, THINKING_INLINE_MAX);
+                emit({
+                  kind: "thinking_start",
+                  summary: cleanHumanSummary(thinkText, 100) || "Thinking…",
+                  payload: { body: inlineBody, isThought: true },
+                  fullBody: thinkText,
+                  inlineBody,
+                  offset: bIdx * 0.0001,
+                });
+              } else {
+                emit({
+                  kind: "thinking_start",
+                  summary: "Thinking…",
+                  offset: bIdx * 0.0001,
+                });
+              }
             } else if (block.type === "text") {
               if (includeChat && typeof block.text === "string" && block.text.trim()) {
                 chatTextParts.push(block.text.trim());
@@ -1122,9 +1235,19 @@ export class ClaudeCodeAdapter implements PassiveIdeAdapter {
                       "Question for user",
                     100,
                   ) || "Question for user";
+                const questionPrompt =
+                  parsedQuestions
+                    .map((q) => q.question.trim())
+                    .filter(Boolean)
+                    .join(" / ")
+                    .slice(0, 500) ||
+                  qSummary ||
+                  "Asked user a question";
                 toolSummaryMap.set(callId, {
                   toolName: tname,
                   summary: qSummary || "Asked user a question",
+                  isAskQuestion: true,
+                  questionPrompt,
                 });
                 emit({
                   kind: "tool_start",
@@ -1395,6 +1518,7 @@ export class ClaudeCodeAdapter implements PassiveIdeAdapter {
       const contextTokens = acc.hasExact
         ? acc.lastTurnContext
         : inputTokens + outputTokens;
+      const hasSplit = acc.hasExact && acc.hasCacheSplit && !acc.hasUnsplitCached;
       const usageDelta: UsageDelta = {
         model: acc.model,
         modelSource: acc.model ? "exact" : "unknown",
@@ -1402,6 +1526,18 @@ export class ClaudeCodeAdapter implements PassiveIdeAdapter {
         inputTokens,
         outputTokens,
         cachedTokens,
+        ...(hasSplit
+          ? {
+              cacheReadTokens: acc.cacheReadTokens,
+              cacheWriteTokens: acc.cacheWriteTokens,
+            }
+          : {}),
+        ...(acc.hasExact && acc.hasExactReasoning
+          ? {
+              reasoningTokens: Math.min(outputTokens, acc.reasoningTokens),
+              reasoningSource: "exact" as const,
+            }
+          : {}),
         contextTokens,
         ...(acc.costUsd !== undefined ? { costUsd: acc.costUsd } : {}),
         isTotal: true,

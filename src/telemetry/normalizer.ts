@@ -1,16 +1,21 @@
+import type { ModelCatalogEntry, ModelIndex } from "../schema/model-index.js";
 import type {
   AgentEdgeSnapshot,
   AgentStatus,
   AgentUsageMetrics,
   IdeSource,
   ModelSource,
-  ModelUsageBucket,
   PendingHumanPrompt,
   PendingQuestionItem,
   SessionUsageSource,
   SessionUsageSummary,
   UsageSource,
 } from "../schema/telemetry.js";
+import {
+  computeEventThinkingChars,
+  computeSessionBreakdown,
+  type AgentBreakdownInput,
+} from "./breakdown.js";
 import {
   PALETTE,
   classifyExternalTool,
@@ -41,6 +46,8 @@ export const WORKING_FRESH_SEC = 12;
 export const EXTERNAL_ACTIVE_SEC = 15;
 export const ACTIVE_DECAY_SEC = 900;
 export const STALE_SESSION_SEC = 1800;
+export const THINKING_INLINE_MAX = 800;
+export const MAX_THINKING_INLINE_EVENTS = 200;
 
 const CHANNEL_FIDELITY_RANK: Record<TelemetryChannel, number> = {
   hook: 1,
@@ -377,6 +384,7 @@ export interface SnapshotBuildOptions {
     model?: string;
   }>;
   modelContextWindows?: Record<string, number>;
+  modelCatalog?: readonly ModelCatalogEntry[] | ModelIndex;
 }
 
 interface MutableAgentState {
@@ -414,6 +422,17 @@ interface MutableAgentState {
   inputTokens: number;
   outputTokens: number;
   cachedTokens: number;
+  cacheReadTokens: number;
+  cacheWriteTokens: number;
+  hasCacheSplit: boolean;
+  hasUnsplitCached: boolean;
+  reasoningTokens: number;
+  hasExactReasoning: boolean;
+  hadIsTotalUsage: boolean;
+  thinkingChars: number;
+  turnEndCount: number;
+  userInputCount: number;
+  events: EnrichedEvent[];
   contextTokens: number;
   contextWindow?: number;
   costUsd?: number;
@@ -569,9 +588,31 @@ function buildPendingPromptForEvent(
     typeof ev.payload?.blockingToolCall === "boolean"
       ? ev.payload.blockingToolCall
       : Boolean(ev.toolName);
+  const directReply = ev.payload?.directReply === true ? true : undefined;
+  const promptSource =
+    ev.payload?.promptSource === "native" ||
+    ev.payload?.promptSource === "studio-mcp" ||
+    ev.payload?.promptSource === "studio-vscode-lm"
+      ? ev.payload.promptSource
+      : undefined;
+  const promptStatus =
+    ev.payload?.promptStatus === "pending" ||
+    ev.payload?.promptStatus === "answered" ||
+    ev.payload?.promptStatus === "canceled" ||
+    ev.payload?.promptStatus === "expired"
+      ? ev.payload.promptStatus
+      : undefined;
+  const expiresAt =
+    typeof ev.payload?.expiresAt === "string" && ev.payload.expiresAt.trim()
+      ? ev.payload.expiresAt.trim()
+      : undefined;
+  const promptId =
+    typeof ev.payload?.promptId === "string" && ev.payload.promptId.trim()
+      ? ev.payload.promptId.trim()
+      : computePendingPromptId(ag.id, ev.toolCallId, ev.id);
 
   return {
-    id: computePendingPromptId(ag.id, ev.toolCallId, ev.id),
+    id: promptId,
     ...(ev.toolCallId ? { toolCallId: ev.toolCallId } : {}),
     ...(ev.toolName ? { toolName: ev.toolName } : {}),
     agentId: ag.id,
@@ -583,6 +624,13 @@ function buildPendingPromptForEvent(
     ...(options ? { options } : {}),
     ts: ev.ts,
     blockingToolCall,
+    ...(directReply !== undefined ? { directReply } : {}),
+    ...(promptSource !== undefined ? { promptSource } : {}),
+    ...(promptStatus !== undefined ? { status: promptStatus } : {}),
+    ...(expiresAt !== undefined ? { expiresAt } : {}),
+    ...(ev.sessionId ? { sessionId: ev.sessionId } : {}),
+    ...(ev.workspacePath ? { workspacePath: ev.workspacePath } : {}),
+    ...(ev.ide ? { ide: ev.ide } : {}),
   };
 }
 
@@ -1443,6 +1491,33 @@ export function buildSessionSnapshot(
     return { ...ev, epoch: ep };
   });
 
+  // Cap inline payload.body on older thinking_start events beyond the latest 200
+  // while keeping summary, bodyLength, and bodyTruncated for lazy EventBodyStore hydration.
+  let thinkingSeen = 0;
+  for (let i = events.length - 1; i >= 0; i--) {
+    const ev = events[i]!;
+    if (ev.kind === "thinking_start") {
+      thinkingSeen += 1;
+      if (
+        thinkingSeen > MAX_THINKING_INLINE_EVENTS &&
+        ev.payload &&
+        "body" in ev.payload
+      ) {
+        const { body: strippedBody, ...restPayload } = ev.payload;
+        if (
+          typeof strippedBody === "string" &&
+          strippedBody.length > (ev.summary ?? "").length
+        ) {
+          ev.bodyTruncated = true;
+          if (ev.bodyLength === undefined) {
+            ev.bodyLength = strippedBody.length;
+          }
+        }
+        ev.payload = restPayload;
+      }
+    }
+  }
+
   const primaryIde: IdeSource = opts.ide ?? events[0]?.ide ?? "unknown";
   const workspacePath =
     opts.workspacePath ?? events.find((e) => e.workspacePath)?.workspacePath;
@@ -1528,6 +1603,17 @@ export function buildSessionSnapshot(
         inputTokens: 0,
         outputTokens: 0,
         cachedTokens: 0,
+        cacheReadTokens: 0,
+        cacheWriteTokens: 0,
+        hasCacheSplit: false,
+        hasUnsplitCached: false,
+        reasoningTokens: 0,
+        hasExactReasoning: false,
+        hadIsTotalUsage: false,
+        thinkingChars: 0,
+        turnEndCount: 0,
+        userInputCount: 0,
+        events: [],
         contextTokens: 0,
         fallbackChars: 0,
         fallbackInputChars: 0,
@@ -1621,6 +1707,14 @@ export function buildSessionSnapshot(
       epoch: ev.epoch,
     });
     ag.steps += 1;
+    ag.events.push(ev);
+    if (ev.kind === "thinking_start") {
+      ag.thinkingChars += computeEventThinkingChars(ev);
+    } else if (ev.kind === "assistant_turn_end") {
+      ag.turnEndCount += 1;
+    } else if (ev.kind === "user_input") {
+      ag.userInputCount += 1;
+    }
     if (ag.firstEventEpoch === 0) ag.firstEventEpoch = ev.epoch;
     ag.lastEventEpoch = Math.max(ag.lastEventEpoch, ev.epoch);
     const FALLBACK_EVENT_CAP = 2000;
@@ -1714,7 +1808,10 @@ export function buildSessionSnapshot(
       if (
         typeof uDelta.inputTokens === "number" ||
         typeof uDelta.outputTokens === "number" ||
-        typeof uDelta.cachedTokens === "number"
+        typeof uDelta.cachedTokens === "number" ||
+        typeof uDelta.cacheReadTokens === "number" ||
+        typeof uDelta.cacheWriteTokens === "number" ||
+        typeof uDelta.reasoningTokens === "number"
       ) {
         ag.hasExplicitUsage = true;
         if (uDelta.usageSource === "exact") {
@@ -1722,11 +1819,46 @@ export function buildSessionSnapshot(
         }
         const inTok = Math.max(0, Math.round(uDelta.inputTokens ?? 0));
         const outTok = Math.max(0, Math.round(uDelta.outputTokens ?? 0));
-        const cachedTok = Math.max(0, Math.round(uDelta.cachedTokens ?? 0));
+        const hasSplitFields =
+          typeof uDelta.cacheReadTokens === "number" ||
+          typeof uDelta.cacheWriteTokens === "number";
+        const splitRead = hasSplitFields
+          ? Math.max(0, Math.round(uDelta.cacheReadTokens ?? 0))
+          : 0;
+        const splitWrite = hasSplitFields
+          ? Math.max(0, Math.round(uDelta.cacheWriteTokens ?? 0))
+          : 0;
+        const cachedTok =
+          typeof uDelta.cachedTokens === "number"
+            ? Math.max(0, Math.round(uDelta.cachedTokens))
+            : splitRead + splitWrite;
+        const hasReason = typeof uDelta.reasoningTokens === "number";
+        const reasonTok = hasReason
+          ? Math.min(outTok, Math.max(0, Math.round(uDelta.reasoningTokens!)))
+          : 0;
         if (uDelta.isTotal) {
+          ag.hadIsTotalUsage = true;
           ag.inputTokens = inTok;
           ag.outputTokens = outTok;
           ag.cachedTokens = cachedTok;
+          if (hasSplitFields) {
+            ag.hasCacheSplit = true;
+            ag.hasUnsplitCached = false;
+            ag.cacheReadTokens = splitRead;
+            ag.cacheWriteTokens = splitWrite;
+          } else {
+            ag.hasCacheSplit = false;
+            ag.hasUnsplitCached = cachedTok > 0;
+            ag.cacheReadTokens = 0;
+            ag.cacheWriteTokens = 0;
+          }
+          if (hasReason) {
+            ag.hasExactReasoning = true;
+            ag.reasoningTokens = reasonTok;
+          } else {
+            ag.hasExactReasoning = false;
+            ag.reasoningTokens = 0;
+          }
           ag.contextTokens = Math.max(
             0,
             Math.round(uDelta.contextTokens ?? inTok + outTok),
@@ -1735,6 +1867,17 @@ export function buildSessionSnapshot(
           ag.inputTokens += inTok;
           ag.outputTokens += outTok;
           ag.cachedTokens += cachedTok;
+          if (hasSplitFields) {
+            ag.hasCacheSplit = true;
+            ag.cacheReadTokens += splitRead;
+            ag.cacheWriteTokens += splitWrite;
+          } else if (cachedTok > 0) {
+            ag.hasUnsplitCached = true;
+          }
+          if (hasReason) {
+            ag.hasExactReasoning = true;
+            ag.reasoningTokens += reasonTok;
+          }
           if (
             typeof uDelta.contextTokens === "number" &&
             Number.isFinite(uDelta.contextTokens) &&
@@ -1820,6 +1963,7 @@ export function buildSessionSnapshot(
       }
 
       case "user_input": {
+        const isHumanAnswer = ev.payload?.isHumanAnswer === true;
         const isSubagentTarget =
           !ag.isRoot || Boolean(ag.parentAgentId) || Boolean(ev.parentAgentId);
 
@@ -1829,10 +1973,13 @@ export function buildSessionSnapshot(
         ag.waitingDetail = null;
         ag.openPendingPrompt = null;
         ag.hasBlocker = false;
+        if (typeof ev.payload?.questionToolCallId === "string") {
+          ag.openTools.delete(ev.payload.questionToolCallId);
+        }
         ag.isThinking = true;
         ag.thinkingSinceEpoch = ev.epoch;
 
-        if (isSubagentTarget) {
+        if (isSubagentTarget && !isHumanAnswer) {
           const cleanTask =
             cleanHumanSummary(ev.summary.replace(/^Human:\s*/i, ""), 130) ||
             "Starting task…";
@@ -1848,7 +1995,9 @@ export function buildSessionSnapshot(
         human.action = ev.summary.slice(0, 48);
         pushRecent(human, ev.ts, "USER_INPUT", ev.summary);
 
-        ag.thinkingAction = "Thinking on user prompt…";
+        ag.thinkingAction = isHumanAnswer
+          ? "Thinking on human answer…"
+          : "Thinking on user prompt…";
         ag.messagesReceived += 1;
 
         recordEdge("human", ag.id, ev.kind, ev.ts);
@@ -2414,17 +2563,12 @@ export function buildSessionSnapshot(
   let sessionInputTokens = 0;
   let sessionOutputTokens = 0;
   let sessionCachedTokens = 0;
-  let sessionCostUsd = 0;
-  let hasAnyCost = false;
   let peakContextPercent = 0;
   let peakContextTokens = 0;
   let peakContextAgentId: string | null = null;
   let exactUsageAgents = 0;
   let estimatedUsageAgents = 0;
-  const modelBuckets = new Map<
-    string,
-    { model: string; agentCount: number; totalTokens: number }
-  >();
+  const breakdownInputs: AgentBreakdownInput[] = [];
 
   for (const id of agentOrder) {
     const ag = agentMap.get(id)!;
@@ -2549,10 +2693,6 @@ export function buildSessionSnapshot(
       sessionInputTokens += inputTokens;
       sessionOutputTokens += outputTokens;
       sessionCachedTokens += cachedTokens;
-      if (ag.costUsd !== undefined) {
-        sessionCostUsd += ag.costUsd;
-        hasAnyCost = true;
-      }
       if (usageSource === "exact") {
         exactUsageAgents += 1;
       } else {
@@ -2570,17 +2710,42 @@ export function buildSessionSnapshot(
         peakContextAgentId = ag.id;
       }
 
-      const bucket = modelBuckets.get(finalModel);
-      if (bucket) {
-        bucket.agentCount += 1;
-        bucket.totalTokens += totalTokens;
-      } else {
-        modelBuckets.set(finalModel, {
-          model: finalModel,
-          agentCount: 1,
-          totalTokens,
-        });
-      }
+      const turns =
+        ag.turnEndCount > 0 || ag.userInputCount > 0
+          ? Math.max(ag.turnEndCount, ag.userInputCount)
+          : ag.steps > 0 || totalTokens > 0
+            ? 1
+            : 0;
+
+      breakdownInputs.push({
+        agentId: ag.id,
+        label: ag.label,
+        role: ag.role,
+        ide: ag.ide,
+        isRoot: ag.isRoot,
+        model: finalModel,
+        usageSource,
+        inputTokens,
+        outputTokens,
+        cachedTokens,
+        ...(ag.hasCacheSplit && !ag.hasUnsplitCached
+          ? {
+              cacheReadTokens: ag.cacheReadTokens,
+              cacheWriteTokens: ag.cacheWriteTokens,
+              hasCacheSplit: true,
+            }
+          : { hasCacheSplit: false }),
+        ...(ag.hasExactReasoning
+          ? { reasoningTokens: ag.reasoningTokens, hasExactReasoning: true }
+          : { hasExactReasoning: false }),
+        hadIsTotalUsage: ag.hadIsTotalUsage,
+        contextPercent,
+        ...(ag.costUsd !== undefined ? { costUsd: ag.costUsd } : {}),
+        toolCalls: ag.toolCalls,
+        turns,
+        thinkingChars: ag.thinkingChars,
+        events: ag.events,
+      });
     }
 
     richAgents.push({
@@ -2630,28 +2795,59 @@ export function buildSessionSnapshot(
         ? "exact"
         : "estimated";
 
-  const models: ModelUsageBucket[] = [...modelBuckets.values()]
-    .sort((a, b) => b.totalTokens - a.totalTokens || b.agentCount - a.agentCount)
-    .map((b) => ({
-      model: b.model,
-      agentCount: b.agentCount,
-      totalTokens: b.totalTokens,
-      sharePercent:
-        sessionTotalTokens > 0
-          ? Math.min(100, Math.round((b.totalTokens / sessionTotalTokens) * 1000) / 10)
-          : 0,
-    }));
+  const breakdownResult = computeSessionBreakdown({
+    agents: breakdownInputs,
+    events,
+    modelCatalog: opts.modelCatalog,
+  });
+
+  for (const agentNode of richAgents) {
+    if (!agentNode.usage) continue;
+    const extras = breakdownResult.agentExtras.get(agentNode.id);
+    if (!extras) continue;
+    Object.assign(agentNode.usage, {
+      ...(extras.cacheReadTokens !== undefined
+        ? { cacheReadTokens: extras.cacheReadTokens }
+        : {}),
+      ...(extras.cacheWriteTokens !== undefined
+        ? { cacheWriteTokens: extras.cacheWriteTokens }
+        : {}),
+      reasoningTokens: extras.reasoningTokens,
+      reasoningSource: extras.reasoningSource,
+      tier: extras.tier,
+      costUsd: extras.costUsd,
+      credits: extras.credits,
+      creditSource: extras.creditSource,
+      ...(extras.premiumMultiplier !== undefined
+        ? { premiumMultiplier: extras.premiumMultiplier }
+        : {}),
+      ...(extras.premiumRequests !== undefined
+        ? { premiumRequests: extras.premiumRequests }
+        : {}),
+      turns: extras.turns,
+      dominantCategory: extras.dominantCategory,
+    });
+  }
 
   const sessionUsage: SessionUsageSummary = {
     totalTokens: sessionTotalTokens,
     inputTokens: sessionInputTokens,
     outputTokens: sessionOutputTokens,
     cachedTokens: sessionCachedTokens,
+    cacheReadTokens: breakdownResult.sessionCacheReadTokens,
+    cacheWriteTokens: breakdownResult.sessionCacheWriteTokens,
+    reasoningTokens: breakdownResult.sessionReasoningTokens,
     peakContextPercent,
     peakContextAgentId,
     usageSource: sessionUsageSource,
-    ...(hasAnyCost ? { costUsd: Math.round(sessionCostUsd * 10000) / 10000 } : {}),
-    models,
+    costUsd: breakdownResult.sessionCostUsd,
+    credits: breakdownResult.sessionCredits,
+    creditSource: breakdownResult.sessionCreditSource,
+    ...(breakdownResult.sessionPremiumRequests !== undefined
+      ? { premiumRequests: breakdownResult.sessionPremiumRequests }
+      : {}),
+    models: breakdownResult.breakdown.byModel,
+    breakdown: breakdownResult.breakdown,
   };
 
   // Overall session status

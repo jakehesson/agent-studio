@@ -1,14 +1,18 @@
 import { createHash } from "node:crypto";
 import path from "node:path";
 import type {
+  AgentBreakdownEntry,
   AgentChatMessage,
   AgentChatResponse,
   AgentEdgeSnapshot,
   AgentNodeSnapshot,
   AgentStatus,
   AgentUsageMetrics,
+  BreakdownAttribution,
+  CategoryUsageBucket,
   ChatMessageRole,
   ChatToolCallRef,
+  EfficiencyInsight,
   EventKind,
   IdeSource,
   ModelSource,
@@ -17,23 +21,35 @@ import type {
   PendingHumanPrompt,
   PendingQuestionItem,
   PendingQuestionOption,
+  PromptSource,
+  PromptStatus,
+  ReasoningSource,
   SessionCounters,
   SessionSnapshot,
   SessionTeamRosterEntry,
+  SessionUsageBreakdown,
+  SessionUsageBreakdownTotals,
   SessionUsageSource,
   SessionUsageSummary,
+  TierUsageBucket,
+  TokenCompositionBreakdown,
   UsageSource,
+  WorkCategoryId,
 } from "../schema/telemetry.js";
 
 export type {
+  AgentBreakdownEntry,
   AgentChatMessage,
   AgentChatResponse,
   AgentEdgeSnapshot,
   AgentNodeSnapshot,
   AgentStatus,
   AgentUsageMetrics,
+  BreakdownAttribution,
+  CategoryUsageBucket,
   ChatMessageRole,
   ChatToolCallRef,
+  EfficiencyInsight,
   EventKind,
   IdeSource,
   ModelSource,
@@ -42,12 +58,20 @@ export type {
   PendingHumanPrompt,
   PendingQuestionItem,
   PendingQuestionOption,
+  PromptSource,
+  PromptStatus,
+  ReasoningSource,
   SessionCounters,
   SessionSnapshot,
   SessionTeamRosterEntry,
+  SessionUsageBreakdown,
+  SessionUsageBreakdownTotals,
   SessionUsageSource,
   SessionUsageSummary,
+  TierUsageBucket,
+  TokenCompositionBreakdown,
   UsageSource,
+  WorkCategoryId,
 };
 
 export interface UsageDelta {
@@ -57,6 +81,10 @@ export interface UsageDelta {
   inputTokens?: number;
   outputTokens?: number;
   cachedTokens?: number;
+  cacheReadTokens?: number;
+  cacheWriteTokens?: number;
+  reasoningTokens?: number;
+  reasoningSource?: ReasoningSource;
   contextTokens?: number;
   contextWindow?: number;
   costUsd?: number;
@@ -112,6 +140,153 @@ export function normalizeCopilotUsage(u: RawCopilotUsage): NormalizedCopilotUsag
     outTok,
     cachedTok,
     ...(explicitCtx !== undefined ? { turnContext: explicitCtx } : {}),
+  };
+}
+
+export interface ExtractedProviderUsageDetails {
+  cacheReadTokens?: number;
+  cacheWriteTokens?: number;
+  cachedTokens: number;
+  cacheSplitKnown: boolean;
+  outputTokens: number;
+  reasoningTokens?: number;
+  reasoningSource?: ReasoningSource;
+}
+
+function pickFiniteNumber(
+  sources: ReadonlyArray<Record<string, unknown> | undefined>,
+  keys: readonly string[],
+): number | undefined {
+  for (const src of sources) {
+    if (!src || typeof src !== "object") continue;
+    for (const k of keys) {
+      const val = src[k];
+      if (typeof val === "number" && Number.isFinite(val)) {
+        return val;
+      }
+    }
+  }
+  return undefined;
+}
+
+function pickNestedObject(
+  sources: ReadonlyArray<Record<string, unknown> | undefined>,
+  keys: readonly string[],
+): Record<string, unknown> | undefined {
+  for (const src of sources) {
+    if (!src || typeof src !== "object") continue;
+    for (const k of keys) {
+      const val = src[k];
+      if (val && typeof val === "object" && !Array.isArray(val)) {
+        return val as Record<string, unknown>;
+      }
+    }
+  }
+  return undefined;
+}
+
+/**
+ * Extracts cache read/write split vs combined cached tokens and reasoning
+ * tokens (inclusive vs Gemini separate `thoughtsTokenCount`) without double-counting.
+ */
+export function extractProviderUsageDetails(
+  sources: ReadonlyArray<Record<string, unknown> | undefined>,
+  baseOutputTokens?: number,
+): ExtractedProviderUsageDetails {
+  const promptDetails = pickNestedObject(sources, [
+    "prompt_tokens_details",
+    "promptTokensDetails",
+    "input_tokens_details",
+    "inputTokensDetails",
+  ]);
+  const completionDetails = pickNestedObject(sources, [
+    "completion_tokens_details",
+    "completionTokensDetails",
+    "output_tokens_details",
+    "outputTokensDetails",
+  ]);
+
+  const explicitRead = pickFiniteNumber(sources, [
+    "cacheReadTokens",
+    "cacheReadInputTokens",
+    "cache_read_tokens",
+    "cache_read_input_tokens",
+  ]);
+  const explicitWrite = pickFiniteNumber(sources, [
+    "cacheWriteTokens",
+    "cacheCreationInputTokens",
+    "cacheCreationTokens",
+    "cache_write_tokens",
+    "cache_creation_tokens",
+    "cache_creation_input_tokens",
+  ]);
+  const combinedCached =
+    pickFiniteNumber(sources, [
+      "cachedTokens",
+      "cachedPromptTokens",
+      "cached_tokens",
+      "cachedContentTokenCount",
+    ]) ?? pickFiniteNumber([promptDetails], ["cached_tokens", "cachedTokens"]);
+
+  let cacheReadTokens: number | undefined;
+  let cacheWriteTokens: number | undefined;
+  let cachedTokens = 0;
+  let cacheSplitKnown = false;
+
+  if (explicitRead !== undefined || explicitWrite !== undefined) {
+    cacheReadTokens = Math.max(0, Math.round(explicitRead ?? 0));
+    cacheWriteTokens = Math.max(0, Math.round(explicitWrite ?? 0));
+    cachedTokens = cacheReadTokens + cacheWriteTokens;
+    cacheSplitKnown = true;
+  } else if (combinedCached !== undefined) {
+    cachedTokens = Math.max(0, Math.round(combinedCached));
+    cacheSplitKnown = false;
+  }
+
+  const inclusiveReasoning =
+    pickFiniteNumber(sources, [
+      "reasoningTokens",
+      "reasoning_tokens",
+      "thinkingTokens",
+      "thinking_tokens",
+    ]) ??
+    pickFiniteNumber([completionDetails], ["reasoning_tokens", "reasoningTokens"]);
+
+  const separateThoughts = pickFiniteNumber(sources, [
+    "thoughtsTokenCount",
+    "thoughts_token_count",
+  ]);
+
+  const hasBaseOut =
+    typeof baseOutputTokens === "number" && Number.isFinite(baseOutputTokens);
+  let outputTokens = hasBaseOut ? Math.max(0, Math.round(baseOutputTokens)) : 0;
+  let reasoningTokens: number | undefined;
+  let reasoningSource: ReasoningSource | undefined;
+
+  if (inclusiveReasoning !== undefined) {
+    const rawR = Math.max(0, Math.round(inclusiveReasoning));
+    if (hasBaseOut) {
+      reasoningTokens = Math.min(outputTokens, rawR);
+    } else {
+      outputTokens = rawR;
+      reasoningTokens = rawR;
+    }
+    reasoningSource = "exact";
+  } else if (separateThoughts !== undefined) {
+    const thoughts = Math.max(0, Math.round(separateThoughts));
+    outputTokens = outputTokens + thoughts;
+    reasoningTokens = thoughts;
+    reasoningSource = "exact";
+  }
+
+  return {
+    ...(cacheReadTokens !== undefined ? { cacheReadTokens } : {}),
+    ...(cacheWriteTokens !== undefined ? { cacheWriteTokens } : {}),
+    cachedTokens,
+    cacheSplitKnown,
+    outputTokens,
+    ...(reasoningTokens !== undefined ? { reasoningTokens } : {}),
+    ...(reasoningSource !== undefined ? { reasoningSource } : {}),
   };
 }
 
@@ -613,6 +788,10 @@ const HUMAN_TOOL_SET = new Set([
   "askquestions",
   "questioncarousel",
   "elicitationserialized",
+  "ask_human",
+  "agent_studio_ask_human",
+  "mcp__agent-studio__ask_human",
+  "agent-studio/ask_human",
 ]);
 
 export interface ExternalToolClassification {

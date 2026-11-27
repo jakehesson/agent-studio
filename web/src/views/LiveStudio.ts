@@ -1,13 +1,20 @@
 import { ActivityFeed } from "../components/ActivityFeed.js";
 import { AgentChatDrawer } from "../components/AgentChatDrawer.js";
+import { shouldRouteChatToHostTab } from "../components/AgentChatPane.js";
+import { BehindResponseDrawer } from "../components/BehindResponseDrawer.js";
 import { CommReaderModal } from "../components/CommReaderModal.js";
 import { PayloadInspector } from "../components/PayloadInspector.js";
 import { TimelineScrubber } from "../components/TimelineScrubber.js";
 import { TopologySvg } from "../components/TopologySvg.js";
 import { buildSnapshot } from "../state/snapshot.js";
 import { buildTopologyModel } from "../state/topologyGrouping.js";
+import {
+  attachStudioWorkspaceResizers,
+  type PanelResizerHandle,
+} from "../utils/panelResizer.js";
 import type {
   AgentNodeSnapshot,
+  ConnectionState,
   NormalizedEvent,
   ReplyCapabilities,
   ReplyToHostRequest,
@@ -16,11 +23,18 @@ import type {
   TeamDefinitionEntry,
   TeamRosterRef,
 } from "../types.js";
+import { formatActorName } from "../utils.js";
 
 export interface LiveStudioCallbacks {
   onCoverSubPaneChange?: (pane: "topology" | "feed") => void;
   getReplyCapabilities?: () => ReplyCapabilities;
   onReplyToHost?: (req: ReplyToHostRequest) => Promise<ReplyToHostResult>;
+  onCancelPrompt?: (promptId: string, reason?: string) => Promise<ReplyToHostResult>;
+  onOpenChat?: (
+    agentId: string,
+    focusQuestion?: boolean,
+    meta?: { agentLabel?: string; sessionId?: string; ide?: string }
+  ) => void;
 }
 
 export class LiveStudioView {
@@ -32,6 +46,10 @@ export class LiveStudioView {
   private scrubber: TimelineScrubber;
   private readerModal: CommReaderModal;
   private chatDrawer: AgentChatDrawer;
+  private behindDrawer: BehindResponseDrawer;
+  private studioResizers: PanelResizerHandle;
+  private workspaceEl: HTMLElement;
+  private inspectorSlotEl: HTMLElement;
 
   private snapshot: SessionSnapshot | null = null;
   private fallbackTeamRoster: TeamRosterRef[] | undefined = undefined;
@@ -41,6 +59,8 @@ export class LiveStudioView {
   private selectedEventId: string | null = null;
   private lastAnimatedEventId: string | null = null;
   private coverSubPane: "topology" | "feed" = "topology";
+  private embedMode = false;
+  private getReplyCapabilities: () => ReplyCapabilities;
 
   constructor(root: HTMLElement, cb: LiveStudioCallbacks = {}) {
     this.root = root;
@@ -48,21 +68,35 @@ export class LiveStudioView {
     this.root.innerHTML = `
       <div class="studio-workspace" data-studio-workspace data-cover-pane="topology">
         <section class="card pane-topology" data-pane-topology aria-label="Topology mesh"></section>
+        <div class="panel-resizer" data-resizer="studio-main"><span class="panel-resizer-pill" aria-hidden="true"></span></div>
         <section class="card pane-stream" data-pane-stream aria-label="Activity stream and payload inspector">
           <div class="stream-feed-slot" data-feed-slot></div>
           <div class="stream-inspector-slot" data-inspector-slot></div>
         </section>
+        <div class="panel-resizer" data-resizer="studio-behind" hidden><span class="panel-resizer-pill" aria-hidden="true"></span></div>
+        <div class="behind-drawer-backdrop" data-behind-backdrop hidden></div>
+        <aside class="inspector-pane" data-behind-drawer hidden></aside>
       </div>
       <div class="timeline-bar" data-timeline-bar role="region" aria-label="Session timeline scrubber"></div>
     `;
 
+    this.workspaceEl = this.root.querySelector("[data-studio-workspace]") as HTMLElement;
     const topoEl = this.root.querySelector("[data-pane-topology]") as HTMLElement;
+    const streamEl = this.root.querySelector("[data-pane-stream]") as HTMLElement;
+    const mainResizerEl = this.root.querySelector('[data-resizer="studio-main"]') as HTMLElement;
+    const behindResizerEl = this.root.querySelector('[data-resizer="studio-behind"]') as HTMLElement;
     const feedEl = this.root.querySelector("[data-feed-slot]") as HTMLElement;
     const inspEl = this.root.querySelector("[data-inspector-slot]") as HTMLElement;
+    this.inspectorSlotEl = inspEl;
+    const behindDrawerEl = this.root.querySelector("[data-behind-drawer]") as HTMLElement;
+    const behindBackdropEl = this.root.querySelector("[data-behind-backdrop]") as HTMLElement;
     const tlEl = this.root.querySelector("[data-timeline-bar]") as HTMLElement;
 
     this.topology = new TopologySvg(topoEl, {
       onSelectAgent: (agentId) => {
+        if (this.behindDrawer.isOpen()) {
+          this.behindDrawer.close(false);
+        }
         this.selectedAgentId = agentId;
         this.feed.setAgentFilter(agentId);
         if (agentId) {
@@ -93,6 +127,7 @@ export class LiveStudioView {
         return false;
       }
     })();
+    this.embedMode = embedMode;
 
     const getSessionContext = () => {
       let sp: URLSearchParams | null = null;
@@ -125,6 +160,7 @@ export class LiveStudioView {
         isMcpApp: false,
         isEmbed: embedMode,
       }));
+    this.getReplyCapabilities = getReplyCapabilities;
     const onReplyToHost =
       this.cb.onReplyToHost ??
       (async (req: ReplyToHostRequest): Promise<ReplyToHostResult> => ({
@@ -133,11 +169,37 @@ export class LiveStudioView {
         message: `Reply handler unavailable for ${req.agentId}`,
       }));
 
+    this.behindDrawer = new BehindResponseDrawer({
+      drawerEl: behindDrawerEl,
+      backdropEl: behindBackdropEl,
+      embedMode,
+      mcpAppMode: getReplyCapabilities().isMcpApp,
+      getSessionContext,
+      onOpenChat: (agentId) => {
+        this.openChat(agentId);
+      },
+      onStepChange: (entry) => {
+        this.feed.setInspectedEventId(entry.event.id);
+      },
+      onClose: () => {
+        this.workspaceEl.classList.remove("has-behind-drawer");
+        this.inspectorSlotEl.hidden = false;
+        this.feed.setInspectedEventId(null);
+        this.studioResizers.sync();
+      },
+    });
+
     this.chatDrawer = new AgentChatDrawer({
+      embedMode,
+      mcpAppMode: getReplyCapabilities().isMcpApp,
       getSessionContext,
       getReplyCapabilities,
       onReplyToHost,
+      onCancelPrompt: this.cb.onCancelPrompt,
       onOpenInspector: (agentId) => {
+        if (this.behindDrawer.isOpen()) {
+          this.behindDrawer.close(false);
+        }
         this.selectedAgentId = agentId;
         this.selectedEventId = null;
         this.topology.setSelectedAgent(agentId);
@@ -151,7 +213,13 @@ export class LiveStudioView {
     });
 
     this.feed = new ActivityFeed(feedEl, {
+      embedMode,
+      mcpAppMode: getReplyCapabilities().isMcpApp,
+      getSessionContext,
       onSelectEvent: (ev) => {
+        if (this.behindDrawer.isOpen()) {
+          this.behindDrawer.close(false);
+        }
         this.selectedEventId = ev.id;
         this.inspector.renderEvent(ev, {
           openSheet: this.isCoverScreen(),
@@ -159,6 +227,9 @@ export class LiveStudioView {
         });
       },
       onSelectAgent: (agentId) => {
+        if (this.behindDrawer.isOpen()) {
+          this.behindDrawer.close(false);
+        }
         this.selectedAgentId = agentId;
         this.selectedEventId = null;
         this.topology.setSelectedAgent(agentId);
@@ -171,8 +242,33 @@ export class LiveStudioView {
         this.feed.setSelectedEvent(ev.id);
         this.readerModal.open(ev, { labelMap: this.agentLabelMap });
       },
+      onOpenBehind: (entry, allWithBehind, triggerEl) => {
+        if (
+          this.behindDrawer.isOpen() &&
+          this.behindDrawer.getCurrentEventId() === entry.event.id
+        ) {
+          this.behindDrawer.close(true);
+          return;
+        }
+        this.selectedEventId = null;
+        this.feed.setSelectedEvent(null);
+        if (this.selectedAgentId) {
+          this.selectedAgentId = null;
+          this.topology.setSelectedAgent(null);
+          this.feed.setAgentFilter(null);
+        }
+        this.inspector.renderEmpty();
+        this.inspectorSlotEl.hidden = true;
+        this.workspaceEl.classList.add("has-behind-drawer");
+        this.feed.setInspectedEventId(entry.event.id);
+        this.behindDrawer.open(entry, allWithBehind, triggerEl);
+        this.studioResizers.sync();
+      },
       onThreadChange: (threadKey) => {
         this.topology.setActiveThreadKey(threadKey);
+        if (threadKey === null && this.behindDrawer.isOpen()) {
+          this.behindDrawer.close(false);
+        }
       },
       onCoverBackToTopology: () => {
         this.setCoverSubPane("topology");
@@ -183,6 +279,7 @@ export class LiveStudioView {
       },
       getReplyCapabilities,
       onReplyToHost,
+      onCancelPrompt: this.cb.onCancelPrompt,
     });
 
     this.inspector = new PayloadInspector(inspEl, {
@@ -208,15 +305,37 @@ export class LiveStudioView {
         this.renderFromCursor(true);
       },
     });
+
+    this.studioResizers = attachStudioWorkspaceResizers({
+      workspace: this.workspaceEl,
+      mainHandle: mainResizerEl,
+      behindHandle: behindResizerEl,
+      topologyPane: topoEl,
+      streamPane: streamEl,
+      behindPane: behindDrawerEl,
+    });
   }
 
   public dispose(): void {
+    this.studioResizers.destroy();
+    this.behindDrawer.dispose();
     this.chatDrawer.dispose();
     this.feed.dispose();
     this.readerModal.dispose();
     this.topology.dispose();
     this.inspector.dispose();
     this.scrubber.dispose();
+  }
+
+  public setConnectionState(status: ConnectionState): void {
+    this.chatDrawer.setConnectionState(status);
+  }
+
+  public setChatRuntimeScope(scope: { embedMode?: boolean; mcpAppMode?: boolean }): void {
+    if (typeof scope.embedMode === "boolean") this.embedMode = scope.embedMode;
+    this.chatDrawer.setRuntimeScope(scope);
+    this.behindDrawer.setRuntimeScope(scope);
+    this.feed.setRuntimeScope(scope);
   }
 
   public openChat(agentId: string, focusQuestion = false): boolean {
@@ -231,6 +350,26 @@ export class LiveStudioView {
       messagesSent: 0,
       messagesReceived: 0,
     };
+
+    const caps = this.getReplyCapabilities();
+    if (
+      this.cb.onOpenChat &&
+      shouldRouteChatToHostTab({
+        embedMode: caps.isEmbed || this.embedMode,
+        mcpAppMode: caps.isMcpApp,
+        hasParent: typeof window !== "undefined" && window.parent !== window,
+      })
+    ) {
+      const resolvedIde =
+        found.ide && found.ide !== "unknown" ? found.ide : snap.ide;
+      this.cb.onOpenChat(agentId, focusQuestion, {
+        agentLabel: formatActorName(found.id, this.agentLabelMap, found.label),
+        sessionId: snap.sessionId,
+        ide: resolvedIde,
+      });
+      return true;
+    }
+
     const effectiveDefinitions =
       snap.definitions && snap.definitions.length > 0
         ? snap.definitions
@@ -264,6 +403,12 @@ export class LiveStudioView {
     const ws = this.root.querySelector("[data-studio-workspace]");
     ws?.setAttribute("data-cover-pane", pane);
     if (pane === "topology") {
+      if (
+        this.behindDrawer.isOpen() &&
+        window.matchMedia("(max-width: 1020px) and (min-width: 640px)").matches
+      ) {
+        this.behindDrawer.close(false);
+      }
       window.requestAnimationFrame(() => this.topology.refreshLayout());
     }
   }
@@ -296,6 +441,7 @@ export class LiveStudioView {
       this.selectedAgentId = null;
       this.selectedEventId = null;
       this.lastAnimatedEventId = null;
+      this.behindDrawer.resetSession();
       this.chatDrawer.close();
       this.topology.resetSessionState();
       this.feed.setAgentFilter(null);
@@ -406,7 +552,8 @@ export class LiveStudioView {
       );
       this.feed.update(
         slicedEvents,
-        [],
+        // Live with an empty roster must still surface pending prompts (history scrubbing stays empty).
+        isHistory ? [] : snap.pendingPrompts ?? [],
         this.agentLabelMap,
         reconstructed.agents,
         reconstructed.usage,
@@ -416,6 +563,10 @@ export class LiveStudioView {
       if (animateHead && reconstructed.activeEvent) {
         this.topology.animatePacket(reconstructed.activeEvent);
       }
+    }
+
+    if (this.behindDrawer.isOpen()) {
+      this.behindDrawer.refreshEntries(this.feed.getBehindInspectableMessages());
     }
 
     if (this.selectedAgentId) {

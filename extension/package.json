@@ -3,7 +3,7 @@
   "displayName": "Agent Studio — Multi-Agent Monitor & Agile Board",
   "description": "IDE-agnostic live multi-agent topology monitor, QA-gated Agile Board, Agent Team inspector, and Setup/Doctor studio for VS Code and Antigravity.",
   "publisher": "agent-studio",
-  "version": "0.14.0",
+  "version": "0.15.0",
   "license": "MIT",
   "author": "Jake Hesson",
   "repository": {
@@ -139,6 +139,131 @@
       {
         "id": "agent-studio.mcp",
         "label": "Agent Studio Agile Board & Telemetry MCP"
+      }
+    ],
+    "languageModelTools": [
+      {
+        "name": "agent_studio_ask_human",
+        "toolReferenceName": "agent_studio_ask_human",
+        "canBeReferencedInPrompt": true,
+        "displayName": "Ask Human (Agent Studio)",
+        "modelDescription": "Ask the human user 1 to 10 structured questions (single_select, multi_select, or free-text) or request approval directly in the Agent Studio Messages UI, waiting for their direct reply. Prefer this when Agent Studio is active; if Agent Studio is offline or unavailable, fall back to native vscode_askQuestions or ask in chat.",
+        "userDescription": "Ask clarifying questions or request approval directly inside the Agent Studio Messages UI.",
+        "inputSchema": {
+          "type": "object",
+          "required": [
+            "questions"
+          ],
+          "properties": {
+            "title": {
+              "type": "string",
+              "maxLength": 140,
+              "description": "Short title for the question card in Agent Studio Messages."
+            },
+            "summary": {
+              "type": "string",
+              "maxLength": 500,
+              "description": "Optional concise context or rationale shown below the title."
+            },
+            "kind": {
+              "type": "string",
+              "enum": [
+                "question",
+                "approval"
+              ],
+              "description": "Prompt category ('question' or 'approval'). Defaults to 'question'."
+            },
+            "questions": {
+              "type": "array",
+              "minItems": 1,
+              "maxItems": 10,
+              "description": "1 to 10 questions to present to the user.",
+              "items": {
+                "type": "object",
+                "required": [
+                  "question",
+                  "type",
+                  "options"
+                ],
+                "properties": {
+                  "id": {
+                    "type": "string",
+                    "description": "Optional stable question identifier."
+                  },
+                  "header": {
+                    "type": "string",
+                    "description": "Optional short section header or tag for the question."
+                  },
+                  "question": {
+                    "type": "string",
+                    "minLength": 1,
+                    "description": "The question text presented to the user."
+                  },
+                  "type": {
+                    "type": "string",
+                    "enum": [
+                      "single_select",
+                      "multi_select",
+                      "text"
+                    ],
+                    "description": "Input control type."
+                  },
+                  "options": {
+                    "type": "array",
+                    "description": "Selectable choices (use [] for pure text questions).",
+                    "items": {
+                      "type": "object",
+                      "required": [
+                        "label"
+                      ],
+                      "properties": {
+                        "id": {
+                          "type": "string"
+                        },
+                        "label": {
+                          "type": "string",
+                          "minLength": 1
+                        },
+                        "description": {
+                          "type": "string"
+                        },
+                        "recommended": {
+                          "type": "boolean"
+                        }
+                      }
+                    }
+                  },
+                  "allowCustomInput": {
+                    "type": "boolean",
+                    "description": "Allow the user to enter custom text alongside predefined options."
+                  },
+                  "defaultValue": {
+                    "type": "string",
+                    "description": "Optional pre-selected option or default text value."
+                  }
+                }
+              }
+            },
+            "agentId": {
+              "type": "string",
+              "description": "Optional originating agent identifier."
+            },
+            "agentLabel": {
+              "type": "string",
+              "description": "Optional human-readable originating agent label."
+            },
+            "sessionId": {
+              "type": "string",
+              "description": "Optional Agent Studio session ID to attribute this prompt to."
+            },
+            "timeoutSeconds": {
+              "type": "number",
+              "minimum": 5,
+              "maximum": 1800,
+              "description": "Maximum seconds to wait for a human response (5-1800, default 600)."
+            }
+          }
+        }
       }
     ]
   },

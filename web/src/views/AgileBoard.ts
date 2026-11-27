@@ -7,6 +7,7 @@ import type {
   TestrunRecord,
 } from "../types.js";
 import { escHtml, fmtContextWindow, fmtTokens, trunc } from "../utils.js";
+import { attachPanelResizer, type PanelResizerHandle } from "../utils/panelResizer.js";
 
 const KANBAN_COLUMNS: Array<{ state: BoardState; label: string; accent: string }> = [
   { state: "ready", label: "Ready", accent: "#64748b" },
@@ -33,11 +34,17 @@ export class AgileBoardView {
   private data: BoardApiResponse | null = null;
   private loading = false;
   private errorMsg: string | null = null;
+  private boardResizer: PanelResizerHandle | null = null;
 
   constructor(root: HTMLElement, cb: AgileBoardCallbacks) {
     this.root = root;
     this.cb = cb;
     this.render();
+  }
+
+  public dispose(): void {
+    this.boardResizer?.destroy();
+    this.boardResizer = null;
   }
 
   public async load(projectId: string, workspace?: string): Promise<void> {
@@ -65,6 +72,8 @@ export class AgileBoardView {
   }
 
   private render(): void {
+    this.boardResizer?.destroy();
+    this.boardResizer = null;
     const prevScrollTop = this.root.querySelector<HTMLElement>(".board-view")?.scrollTop ?? 0;
     const prevKanbanLeft = this.root.querySelector<HTMLElement>(".kanban-scroll")?.scrollLeft ?? 0;
 
@@ -232,6 +241,8 @@ export class AgileBoardView {
             </div>
           </div>
 
+          <div class="panel-resizer" data-resizer="board-split"><span class="panel-resizer-pill" aria-hidden="true"></span></div>
+
           <aside class="board-side-col">
             ${
               selectedItem
@@ -309,6 +320,25 @@ export class AgileBoardView {
     if (boardViewEl && prevScrollTop > 0) boardViewEl.scrollTop = prevScrollTop;
     const kanbanScrollEl = this.root.querySelector<HTMLElement>(".kanban-scroll");
     if (kanbanScrollEl && prevKanbanLeft > 0) kanbanScrollEl.scrollLeft = prevKanbanLeft;
+
+    const splitEl = this.root.querySelector<HTMLElement>(".board-split");
+    const splitResizerEl = this.root.querySelector<HTMLElement>('[data-resizer="board-split"]');
+    const mainColEl = this.root.querySelector<HTMLElement>(".board-main-col");
+    if (splitEl && splitResizerEl && mainColEl) {
+      this.boardResizer = attachPanelResizer({
+        id: "board-split",
+        container: splitEl,
+        handle: splitResizerEl,
+        primaryPane: mainColEl,
+        cssVar: "--board-left",
+        persistMode: "ratio",
+        minLeft: 320,
+        minRight: 260,
+        relaxBelowWidth: 680,
+        ariaLabel: "Resize Kanban board and details sidebar",
+        paneLabel: "Kanban board",
+      });
+    }
   }
 
   private renderKanbanCard(item: BoardItem, selected: boolean): string {
