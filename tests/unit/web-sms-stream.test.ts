@@ -664,3 +664,350 @@ describe("Web SMS Stream & Behind-Response Correlation", () => {
     assert.equal(msgs[1]!.fromLabel, "You");
   });
 });
+
+describe("LiveStudio Payload Inspector visibility on Messages screen (S1-80)", () => {
+  it("hides inspectorSlotEl on Messages, skips renderEvent/renderAgent, closes modal, and keeps it hidden when BehindResponseDrawer closes", () => {
+    const bag = globalThis as unknown as Record<string, unknown>;
+    const origWindow = bag.window;
+    const origDocument = bag.document;
+
+    class FakeClassList {
+      private set = new Set<string>();
+      add(...tokens: string[]) {
+        for (const t of tokens) this.set.add(t);
+      }
+      remove(...tokens: string[]) {
+        for (const t of tokens) this.set.delete(t);
+      }
+      toggle(token: string, force?: boolean) {
+        if (force === undefined) {
+          if (this.set.has(token)) {
+            this.set.delete(token);
+            return false;
+          }
+          this.set.add(token);
+          return true;
+        }
+        if (force) this.set.add(token);
+        else this.set.delete(token);
+        return force;
+      }
+      contains(token: string) {
+        return this.set.has(token);
+      }
+    }
+
+    class FakeSlotEl {
+      public hidden = false;
+      public innerHTML = "";
+      public classList = new FakeClassList();
+      public attrs = new Map<string, string>();
+      setAttribute(k: string, v: string) {
+        this.attrs.set(k, v);
+      }
+      getAttribute(k: string) {
+        return this.attrs.get(k) ?? null;
+      }
+    }
+
+    const slotMap = new Map<string, FakeSlotEl>();
+    const getSlot = (sel: string) => {
+      let el = slotMap.get(sel);
+      if (!el) {
+        el = new FakeSlotEl();
+        slotMap.set(sel, el);
+      }
+      return el;
+    };
+
+    const fakeRoot = {
+      innerHTML: "",
+      querySelector: (sel: string) => getSlot(sel),
+    };
+
+    bag.window = {
+      location: { search: "" },
+      matchMedia: () => ({ matches: false }),
+      requestAnimationFrame: (fn: () => void) => {
+        fn();
+        return 1;
+      },
+    };
+    bag.document = {
+      createElement: () => new FakeSlotEl(),
+    };
+
+    type FeedFilter = "all" | "messages" | "board" | "errors" | "usage";
+    let initialFilter: FeedFilter = "messages";
+
+    let feedCb: {
+      onSelectEvent: (ev: NormalizedEvent) => void;
+      onSelectAgent?: (agentId: string) => void;
+      onOpenBehind?: (entry: SmsMessageItem, all: SmsMessageItem[], triggerEl: unknown) => void;
+      onFilterChange?: (filter: FeedFilter) => void;
+      onThreadChange?: (threadKey: string | null) => void;
+    } | null = null;
+    let feedFilter: FeedFilter = initialFilter;
+
+    let behindCb: {
+      onClose?: (restoreFocus: boolean, lastEventId: string | null) => void;
+    } | null = null;
+    let behindOpen = false;
+    let behindEventId: string | null = null;
+
+    let topoCb: {
+      onSelectAgent: (agentId: string | null) => void;
+      onSelectThread?: (sel: ThreadSelection, opts?: { forceOpen?: boolean; promptAgentId?: string }) => void;
+    } | null = null;
+
+    const inspectorCalls = {
+      closeModal: 0,
+      renderEvent: 0,
+      renderAgent: 0,
+      renderEmpty: 0,
+    };
+
+    class FakeActivityFeed {
+      constructor(_el: unknown, cb: NonNullable<typeof feedCb>) {
+        feedCb = cb;
+        feedFilter = initialFilter;
+      }
+      getFilter() {
+        return feedFilter;
+      }
+      setFilterForTest(next: FeedFilter) {
+        feedFilter = next;
+        feedCb?.onFilterChange?.(next);
+      }
+      openMessagesForAgent() {
+        feedFilter = "messages";
+        feedCb?.onThreadChange?.("all");
+        feedCb?.onFilterChange?.("messages");
+      }
+      openThread(sel: ThreadSelection) {
+        feedFilter = "messages";
+        feedCb?.onThreadChange?.(sel.key);
+        feedCb?.onFilterChange?.("messages");
+        return true;
+      }
+      setAgentFilter(agentId: string | null) {
+        if (agentId !== null && feedFilter === "messages") {
+          feedFilter = "all";
+          feedCb?.onThreadChange?.(null);
+          feedCb?.onFilterChange?.("all");
+        }
+      }
+      setSelectedEvent() {}
+      setInspectedEventId() {}
+      setRuntimeScope() {}
+      getBehindInspectableMessages() {
+        return [];
+      }
+      update() {}
+      resetScroll() {}
+      dispose() {}
+    }
+
+    class FakeBehindResponseDrawer {
+      constructor(opts: NonNullable<typeof behindCb>) {
+        behindCb = opts;
+      }
+      isOpen() {
+        return behindOpen;
+      }
+      getCurrentEventId() {
+        return behindEventId;
+      }
+      open(entry: SmsMessageItem) {
+        behindOpen = true;
+        behindEventId = entry.event.id;
+      }
+      close(restoreFocus = false) {
+        const prev = behindEventId;
+        behindOpen = false;
+        behindEventId = null;
+        behindCb?.onClose?.(restoreFocus, prev);
+      }
+      refreshEntries() {}
+      resetSession() {
+        behindOpen = false;
+        behindEventId = null;
+      }
+      setRuntimeScope() {}
+      dispose() {}
+    }
+
+    class FakePayloadInspector {
+      closeModal() {
+        inspectorCalls.closeModal += 1;
+      }
+      renderEvent() {
+        inspectorCalls.renderEvent += 1;
+      }
+      renderAgent() {
+        inspectorCalls.renderAgent += 1;
+      }
+      renderEmpty() {
+        inspectorCalls.renderEmpty += 1;
+      }
+      dispose() {}
+    }
+
+    class FakeTopologySvg {
+      constructor(_el: unknown, cb: NonNullable<typeof topoCb>) {
+        topoCb = cb;
+      }
+      setSelectedAgent() {}
+      setActiveThreadKey() {}
+      render() {}
+      animatePacket() {}
+      refreshLayout() {}
+      resetSessionState() {}
+      dispose() {}
+    }
+
+    class FakeCommReaderModal {
+      open() {}
+      dispose() {}
+    }
+
+    class FakeTimelineScrubber {
+      getState() {
+        return { cursor: 0, liveTail: true };
+      }
+      updateEvents() {}
+      snapLive() {}
+      dispose() {}
+    }
+
+    try {
+      const webSnapshot = loadTranspiledTsModule<Record<string, unknown>>(
+        "web/src/state/snapshot.ts",
+        (specifier) => {
+          if (specifier === "../utils.js") return webUtils;
+          throw new Error(`Unexpected import ${specifier} in snapshot.ts`);
+        }
+      );
+      const { LiveStudioView } = loadTranspiledTsModule<{
+        LiveStudioView: new (root: unknown) => {
+          setSnapshot(snap: unknown): void;
+          openWaitingMessages(agentId?: string): boolean;
+          dispose(): void;
+        };
+      }>("web/src/views/LiveStudio.ts", (specifier) => {
+        if (specifier === "../components/ActivityFeed.js") return { ActivityFeed: FakeActivityFeed };
+        if (specifier === "../components/BehindResponseDrawer.js") {
+          return { BehindResponseDrawer: FakeBehindResponseDrawer };
+        }
+        if (specifier === "../components/CommReaderModal.js") {
+          return { CommReaderModal: FakeCommReaderModal };
+        }
+        if (specifier === "../components/PayloadInspector.js") {
+          return { PayloadInspector: FakePayloadInspector };
+        }
+        if (specifier === "../components/TimelineScrubber.js") {
+          return { TimelineScrubber: FakeTimelineScrubber };
+        }
+        if (specifier === "../components/TopologySvg.js") {
+          return { TopologySvg: FakeTopologySvg };
+        }
+        if (specifier === "../state/snapshot.js") return webSnapshot;
+        if (specifier === "../state/topologyGrouping.js") return topologyGrouping;
+        if (specifier === "../utils/panelResizer.js") {
+          return { attachStudioWorkspaceResizers: () => ({ sync() {}, destroy() {} }) };
+        }
+        throw new Error(`Unexpected import ${specifier} in LiveStudio.ts`);
+      });
+
+      const studio = new LiveStudioView(fakeRoot);
+      const inspectorSlot = getSlot("[data-inspector-slot]");
+
+      // 1. Initial boot restored on "messages": inspector slot hidden immediately
+      assert.equal(inspectorSlot.hidden, true);
+
+      const sampleEvent: NormalizedEvent = {
+        id: "ev-tool-1",
+        ts: "2026-11-26T18:55:00.000Z",
+        epoch: 1795719300,
+        ide: "antigravity",
+        sessionId: "sess-1",
+        agentId: "root",
+        kind: "tool_start",
+        toolName: "read_file",
+        summary: "Read file",
+      };
+      const sampleSnap = {
+        sessionId: "sess-1",
+        ide: "antigravity",
+        status: "WORKING",
+        agents: makeAgents(),
+        edges: [],
+        events: [sampleEvent],
+        pendingPrompts: [],
+      };
+
+      // 2. Selecting an event (e.g. .tool-burst-row) on Messages closes modal & skips renderEvent
+      feedCb!.onSelectEvent(sampleEvent);
+      assert.equal(inspectorCalls.closeModal, 1);
+      assert.equal(inspectorCalls.renderEvent, 0);
+      assert.equal(inspectorSlot.hidden, true);
+
+      // 3. Live snapshot update while on Messages must not render selected event in inspector
+      studio.setSnapshot(sampleSnap);
+      assert.equal(inspectorCalls.renderEvent, 0);
+      assert.equal(inspectorCalls.renderAgent, 0);
+      assert.equal(inspectorSlot.hidden, true);
+
+      // 4. Opening and closing BehindResponseDrawer while on Messages keeps inspector hidden
+      const behindEntry: SmsMessageItem = {
+        kind: "message",
+        event: sampleEvent,
+        dir: "inbound",
+        fromLabel: "Coordinator",
+        roleBadge: "Orchestrator",
+        routeLabel: "Coordinator → You",
+        timeLabel: "18:55",
+        text: "Hello",
+        fullMarkdownText: "Hello",
+        behindSteps: [],
+        behindSummary: { thoughtCount: 0, toolCount: 0 },
+      };
+      feedCb!.onOpenBehind?.(behindEntry, [behindEntry], {});
+      assert.equal(behindOpen, true);
+      assert.equal(inspectorSlot.hidden, true);
+
+      behindCb!.onClose?.(false, sampleEvent.id);
+      behindOpen = false;
+      assert.equal(inspectorSlot.hidden, true, "inspectorSlot must stay hidden after Behind drawer closes on Messages");
+
+      // 5. Switching to "all" (Events) restores inspector visibility & allows selecting events/agents
+      feedFilter = "all";
+      feedCb!.onFilterChange?.("all");
+      assert.equal(inspectorSlot.hidden, false);
+
+      feedCb!.onSelectEvent(sampleEvent);
+      assert.equal(inspectorCalls.renderEvent, 1);
+
+      // 6. Selecting an agent on "all", then switching to Messages closes modal & hides inspector
+      topoCb!.onSelectAgent("root");
+      assert.equal(inspectorCalls.renderAgent, 1);
+
+      const closeCountBeforeMsg = inspectorCalls.closeModal;
+      studio.openWaitingMessages("root");
+      assert.equal(feedFilter, "messages");
+      assert.equal(inspectorSlot.hidden, true);
+      assert.equal(inspectorCalls.closeModal, closeCountBeforeMsg + 1);
+
+      // 7. Switching back to "all" via onFilterChange re-renders selected agent if still selected
+      feedFilter = "all";
+      feedCb!.onFilterChange?.("all");
+      assert.equal(inspectorSlot.hidden, false);
+      assert.equal(inspectorCalls.renderAgent, 2);
+
+      studio.dispose();
+    } finally {
+      bag.window = origWindow;
+      bag.document = origDocument;
+    }
+  });
+});

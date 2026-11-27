@@ -34,7 +34,6 @@ export interface QuestionCardOptions {
   getCapabilities: () => ReplyCapabilities;
   onReply: (req: ReplyToHostRequest) => Promise<ReplyToHostResult>;
   onCancel?: (promptId: string, reason?: string) => Promise<ReplyToHostResult>;
-  onOpenChat?: (agentId: string) => void;
 }
 
 export function getEffectiveQuestions(
@@ -358,7 +357,6 @@ export class QuestionCard {
       "data-qc-cancel-keep",
       "data-qc-retry",
       "data-qc-error-copy",
-      "data-qc-open-chat",
     ];
     for (const attr of attrs) {
       if (activeEl.hasAttribute(attr)) {
@@ -577,11 +575,6 @@ export class QuestionCard {
                   ${isDirectReply ? `<span class="qc-direct-pill">Direct Reply</span>` : ""}
                   <span class="qc-agent-name">${escHtml(prompt.agentLabel || prompt.agentId)}</span>
                 </div>
-                ${
-                  this.opts.onOpenChat
-                    ? `<button type="button" class="btn-ghost qc-chat-link" data-qc-open-chat>Open Chat</button>`
-                    : ""
-                }
               </div>
             `
             : ""
@@ -698,7 +691,6 @@ export class QuestionCard {
     questions: PendingQuestionItem[],
     draft: PromptDraftState
   ): void {
-    const prompt = this.opts.prompt;
     const activeIdx = draft.activeIdx;
     const activeQ = questions[activeIdx] ?? questions[0]!;
     const ans = draft.answers[activeIdx] ?? {
@@ -707,11 +699,6 @@ export class QuestionCard {
       customText: "",
     };
     draft.answers[activeIdx] = ans;
-
-    this.container.querySelector("[data-qc-open-chat]")?.addEventListener("click", (e) => {
-      e.stopPropagation();
-      this.opts.onOpenChat?.(prompt.agentId);
-    });
 
     this.container.querySelectorAll<HTMLButtonElement>("[data-qc-step]").forEach((btn) => {
       btn.addEventListener("click", () => {

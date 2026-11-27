@@ -21,7 +21,6 @@ export interface BehindResponseDrawerOptions {
   embedMode?: boolean;
   mcpAppMode?: boolean;
   getSessionContext?: () => BehindSessionContext;
-  onOpenChat?: (agentId: string) => void;
   onStepChange?: (entry: SmsMessageItem) => void;
   onClose?: (restoreFocus: boolean, lastEventId: string | null) => void;
 }
@@ -57,19 +56,6 @@ function formatBehindCountSummary(entry: SmsMessageItem): string {
     parts.push(durationLabel);
   }
   return parts.join(" · ");
-}
-
-function resolveSpeakerAgentId(entry: SmsMessageItem): string | null {
-  const ev = entry.event;
-  const raw =
-    ev.kind === "subagent_done" && ev.targetAgentId && ev.targetAgentId !== ev.agentId
-      ? ev.targetAgentId
-      : ev.agentId;
-  const trimmed = (raw ?? "").trim();
-  if (!trimmed || trimmed === "human" || trimmed === "ext:human" || trimmed.startsWith("ext:")) {
-    return null;
-  }
-  return trimmed;
 }
 
 export class BehindResponseDrawer {
@@ -141,15 +127,6 @@ export class BehindResponseDrawer {
             this.render();
             this.opts.onStepChange?.(next);
           }
-        }
-        return;
-      }
-
-      const chatBtn = target.closest<HTMLButtonElement>("[data-behind-open-chat]");
-      if (chatBtn) {
-        const aid = chatBtn.dataset.behindOpenChat;
-        if (aid) {
-          this.opts.onOpenChat?.(aid);
         }
         return;
       }
@@ -543,7 +520,6 @@ export class BehindResponseDrawer {
     this.drawerEl.hidden = false;
     this.backdropEl.hidden = false;
 
-    const speakerAgentId = resolveSpeakerAgentId(entry);
     const countSummary = formatBehindCountSummary(entry);
 
     this.drawerEl.innerHTML = `
@@ -594,17 +570,6 @@ export class BehindResponseDrawer {
           <span>response sent · ${escHtml(entry.timeLabel)}</span>
         </div>
       </div>
-      ${
-        speakerAgentId
-          ? `<div class="inspector-foot">
-              <button
-                type="button"
-                class="btn-primary-sm"
-                data-behind-open-chat="${escHtml(speakerAgentId)}"
-              >Open ${escHtml(entry.fromLabel)} Chat ↗</button>
-            </div>`
-          : ""
-      }
     `;
 
     if (prevScrollTop > 0) {

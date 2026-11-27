@@ -7,18 +7,10 @@ import {
   fetchTeam,
   StudioStreamClient,
 } from "./api.js";
-import {
-  AgentChatPane,
-  buildOpenChatTabPayload,
-  parseChatViewRouteParams,
-  shouldAcceptChatSnapshot,
-  shouldRouteChatToHostTab,
-} from "./components/AgentChatPane.js";
 import { ContextBar } from "./components/ContextBar.js";
 import { FeedbackDialog } from "./components/FeedbackDialog.js";
 import { normalizeServerSnapshot } from "./state/snapshot.js";
 import type {
-  AgentNodeSnapshot,
   ConnectionState,
   CoverPane,
   DiscoveredSessionSummary,
@@ -26,7 +18,6 @@ import type {
   FeedbackDiagnostics,
   HostIde,
   IdeFilter,
-  IdeSource,
   PrimaryView,
   RegisteredProject,
   ReplyCapabilities,
@@ -37,7 +28,7 @@ import type {
   TeamRosterEntry,
   TeamRosterRef,
 } from "./types.js";
-import { copyTextSafe, formatActorName } from "./utils.js";
+import { copyTextSafe } from "./utils.js";
 import { AgileBoardView } from "./views/AgileBoard.js";
 import { DoctorView } from "./views/Doctor.js";
 import { LiveStudioView } from "./views/LiveStudio.js";
@@ -102,19 +93,12 @@ export class AgentStudioApp {
   private boardView: AgileBoardView;
   private mockupsView: MockupsView;
   private doctorView: DoctorView;
-  private chatPane: AgentChatPane;
   private stream: StudioStreamClient;
 
   private panels: Record<PrimaryView, HTMLElement>;
   private bottomNav: HTMLElement;
   private shellEl: HTMLElement;
-  private pendingOpenChatAgentId: string | null = null;
   private pendingOpenWaiting = false;
-  private pinnedChatSessionId = "";
-  private pinnedChatAgentId = "";
-  private pinnedChatAgentLabel = "";
-  private pinnedChatFocusQuestion = false;
-  private chatStreamStarted = false;
   private pendingReplyResolvers = new Map<
     string,
     (res: { ok?: boolean; mode?: string; message?: string } | null) => void
@@ -148,7 +132,6 @@ export class AgentStudioApp {
           <div class="view-panel" data-panel="board" role="tabpanel" aria-label="Agile Board" hidden></div>
           <div class="view-panel" data-panel="mockups" role="tabpanel" aria-label="Mockups" hidden></div>
           <div class="view-panel" data-panel="doctor" role="tabpanel" aria-label="Doctor" hidden></div>
-          <section class="view-panel" data-panel="chat" aria-label="Agent Chat" hidden></section>
         </main>
 
         <nav class="cover-bottom-nav" data-cover-nav aria-label="Mobile navigation">
@@ -178,7 +161,6 @@ export class AgentStudioApp {
       board: mountEl.querySelector('[data-panel="board"]') as HTMLElement,
       mockups: mountEl.querySelector('[data-panel="mockups"]') as HTMLElement,
       doctor: mountEl.querySelector('[data-panel="doctor"]') as HTMLElement,
-      chat: mountEl.querySelector('[data-panel="chat"]') as HTMLElement,
     };
 
     this.contextBar = new ContextBar(ctxEl, this.getContextState(), {
@@ -241,7 +223,7 @@ export class AgentStudioApp {
         if (this.activeView !== "studio") {
           this.setView("studio");
         }
-        this.studioView.openChat(agentId, true);
+        this.studioView.openWaitingMessages(agentId);
       },
     });
 
@@ -266,9 +248,6 @@ export class AgentStudioApp {
       onReplyToHost: (req) => this.sendReplyToHost(req),
       onCancelPrompt: (promptId, reason) =>
         this.cancelPendingPromptFromUi(promptId, reason),
-      onOpenChat: (agentId, focusQuestion, meta) => {
-        this.openHostChatTab(agentId, focusQuestion, meta);
-      },
     });
     this.teamView = new TeamView(this.panels.team);
 
@@ -289,58 +268,11 @@ export class AgentStudioApp {
       onOpenTeam: () => this.setView("team"),
     });
 
-    this.chatPane = new AgentChatPane(this.panels.chat, {
-      mode: "panel",
-      headingId: "chatPanelTitle",
-      embedMode: this.embedMode,
-      mcpAppMode: this.mcpAppMode,
-      getSessionContext: () => ({
-        sessionId: this.pinnedChatSessionId || this.selectedSessionId || undefined,
-        ide: this.resolveChatIde(this.pinnedChatAgentId),
-        project: this.selectedProject || undefined,
-        workspace: this.lockedWorkspace || undefined,
-      }),
-      getReplyCapabilities: () => this.getReplyCapabilities(),
-      onReplyToHost: (req) => this.sendReplyToHost(req),
-      onCancelPrompt: (promptId, reason) =>
-        this.cancelPendingPromptFromUi(promptId, reason),
-      onReconnect: () => this.stream.reconnectNow(),
-      onSwitchAgent: (subId, subLabel) => {
-        const sessionId = this.pinnedChatSessionId || this.selectedSessionId || "";
-        if (
-          shouldRouteChatToHostTab({
-            embedMode: this.embedMode,
-            mcpAppMode: this.mcpAppMode,
-            hasParent: typeof window !== "undefined" && window.parent !== window,
-          })
-        ) {
-          window.parent.postMessage(
-            buildOpenChatTabPayload({
-              sessionId,
-              agentId: subId,
-              agentLabel: subLabel || this.resolveAgentLabel(subId),
-              ide: this.resolveChatIde(subId),
-              focusQuestion: false,
-            }),
-            "*"
-          );
-          return;
-        }
-        this.pinnedChatAgentId = subId;
-        this.pinnedChatAgentLabel = subLabel ?? "";
-        this.pinnedChatFocusQuestion = false;
-        this.openChatPanelAgent(sessionId, subId, subLabel, false);
-        this.syncUrlState();
-      },
-    });
-
     this.stream = new StudioStreamClient({
       onState: (snap) => this.handleIncomingSnapshot(snap),
       onStatus: (status) => {
         this.connection = status;
         this.refreshContextBar();
-        this.chatPane.setConnectionState(status);
-        this.studioView.setConnectionState(status);
       },
     });
 
@@ -357,24 +289,6 @@ export class AgentStudioApp {
         this.setView(this.normalizeAllowedView(opts.initialView));
       } else {
         this.refreshContextBar();
-      }
-    }
-    if (this.activeView === "chat") {
-      if (this.pinnedChatSessionId && this.pinnedChatAgentId) {
-        this.openChatPanelAgent(
-          this.pinnedChatSessionId,
-          this.pinnedChatAgentId,
-          this.pinnedChatAgentLabel || undefined,
-          this.pinnedChatFocusQuestion
-        );
-      } else {
-        this.chatPane.renderEmptyContext(
-          "No agent conversation selected",
-          "Click Chat on any agent in Live Studio to inspect its conversation here."
-        );
-      }
-      if (typeof window !== "undefined" && window.parent !== window) {
-        window.parent.postMessage({ type: "agentStudio:chatTabReady" }, "*");
       }
     }
     void this.bootstrap();
@@ -425,8 +339,7 @@ export class AgentStudioApp {
       });
       this.teamView.setEmbedScope(scope);
       this.doctorView.setEmbedScope(scope);
-      this.chatPane.setRuntimeScope({ embedMode: this.embedMode, mcpAppMode: this.mcpAppMode });
-      this.studioView.setChatRuntimeScope({ embedMode: this.embedMode, mcpAppMode: this.mcpAppMode });
+      this.studioView.setRuntimeScope({ embedMode: this.embedMode, mcpAppMode: this.mcpAppMode });
       this.refreshContextBar();
       this.stream.updateParams({
         session: this.selectedSessionId,
@@ -459,13 +372,10 @@ export class AgentStudioApp {
   public setConnectionNotice(status: ConnectionState): void {
     this.connection = status;
     this.refreshContextBar();
-    this.chatPane.setConnectionState(status);
-    this.studioView.setConnectionState(status);
   }
 
   private normalizeAllowedView(raw: string): PrimaryView {
     const low = raw.toLowerCase();
-    if (low === "chat") return "chat";
     if (low === "team") return "team";
     if (low === "board") return "board";
     if (low === "doctor") return "doctor";
@@ -516,9 +426,7 @@ export class AgentStudioApp {
         ? this.studioView.getCoverSubPane() === "feed"
           ? "feed"
           : "studio"
-        : allowedView === "chat"
-          ? "studio"
-          : allowedView);
+        : allowedView);
 
     this.shellEl.setAttribute("data-active-view", allowedView);
 
@@ -652,24 +560,6 @@ export class AgentStudioApp {
   }
 
   private handleIncomingSnapshot(snap: SessionSnapshot): void {
-    if (this.activeView === "chat") {
-      if (
-        !shouldAcceptChatSnapshot({
-          pinnedSessionId: this.pinnedChatSessionId,
-          snapshotSessionId: snap.sessionId,
-        })
-      ) {
-        return;
-      }
-      this.lastSnapshot = snap;
-      const labelMap = new Map<string, string>();
-      for (const a of snap.agents) {
-        if (a.id && a.label) labelMap.set(a.id, a.label);
-      }
-      this.chatPane.notifySnapshot(snap, snap.agents, labelMap, snap.definitions);
-      return;
-    }
-
     if (snap.boardProjects) this.mergeProjects(snap.boardProjects);
     if (Array.isArray(snap.sessions)) {
       const prevSelected = this.selectedSessionId
@@ -728,101 +618,6 @@ export class AgentStudioApp {
     this.processPendingOpenActions(snap);
   }
 
-  private resolveChatIde(agentId?: string): IdeSource {
-    if (agentId && this.lastSnapshot) {
-      const found = this.lastSnapshot.agents.find((a) => a.id === agentId);
-      if (found?.ide && found.ide !== "unknown") return found.ide;
-    }
-    if (this.lastSnapshot?.ide && this.lastSnapshot.ide !== "unknown") {
-      return this.lastSnapshot.ide;
-    }
-    if (this.lockedIde) return this.lockedIde;
-    if (this.ideFilter !== "all") return this.ideFilter;
-    return "unknown";
-  }
-
-  private resolveAgentLabel(agentId: string): string {
-    const labelMap = new Map<string, string>();
-    if (this.lastSnapshot) {
-      for (const a of this.lastSnapshot.agents) {
-        if (a.id && a.label) labelMap.set(a.id, a.label);
-      }
-    }
-    const found = this.lastSnapshot?.agents.find((a) => a.id === agentId);
-    return formatActorName(agentId, labelMap, found?.label);
-  }
-
-  private openHostChatTab(
-    agentId: string,
-    focusQuestion = false,
-    meta?: { agentLabel?: string; sessionId?: string; ide?: string }
-  ): void {
-    if (
-      !shouldRouteChatToHostTab({
-        embedMode: this.embedMode,
-        mcpAppMode: this.mcpAppMode,
-        hasParent: typeof window !== "undefined" && window.parent !== window,
-      })
-    ) {
-      return;
-    }
-    const payload = buildOpenChatTabPayload({
-      sessionId: meta?.sessionId || this.selectedSessionId || this.lastSnapshot?.sessionId || "",
-      agentId,
-      agentLabel: meta?.agentLabel || this.resolveAgentLabel(agentId),
-      ide: meta?.ide || this.resolveChatIde(agentId),
-      focusQuestion,
-    });
-    window.parent.postMessage(payload, "*");
-  }
-
-  private openChatPanelAgent(
-    sessionId: string,
-    agentId: string,
-    agentLabel?: string,
-    focusQuestion = false
-  ): void {
-    if (!sessionId || !agentId) {
-      this.chatPane.renderEmptyContext(
-        "No agent conversation selected",
-        "Click Chat on any agent in Live Studio to inspect its conversation here."
-      );
-      return;
-    }
-    const snap =
-      this.lastSnapshot && this.lastSnapshot.sessionId === sessionId
-        ? this.lastSnapshot
-        : null;
-    const labelMap = new Map<string, string>();
-    if (snap) {
-      for (const a of snap.agents) {
-        if (a.id && a.label) labelMap.set(a.id, a.label);
-      }
-    }
-    if (agentLabel) {
-      labelMap.set(agentId, agentLabel);
-    }
-    const liveAgent: AgentNodeSnapshot = snap?.agents.find((a) => a.id === agentId) ?? {
-      id: agentId,
-      label: agentLabel || agentId,
-      ide: this.resolveChatIde(agentId),
-      status: "IDLE",
-      toolCalls: 0,
-      messagesSent: 0,
-      messagesReceived: 0,
-    };
-    const definition = snap?.definitions?.find(
-      (d) => d.id === liveAgent.id || d.name === liveAgent.label
-    );
-    this.chatPane.openAgent({
-      sessionId,
-      agent: liveAgent,
-      labelMap,
-      definition,
-      focusQuestion,
-    });
-  }
-
   private bindHostFocusMessages(): void {
     if (typeof window === "undefined") return;
     window.addEventListener("message", (event: MessageEvent) => {
@@ -847,75 +642,14 @@ export class AgentStudioApp {
         return;
       }
 
-      if (rec.type === "agentStudio:showAgentChat") {
-        if (!this.embedMode || this.mcpAppMode) return;
-        const nextSession =
-          typeof rec.sessionId === "string" ? rec.sessionId.trim() : "";
-        const nextAgent =
-          typeof rec.agentId === "string" ? rec.agentId.trim() : "";
-        const nextLabel =
-          typeof rec.agentLabel === "string" ? rec.agentLabel.trim() : undefined;
-        const focusQuestion = Boolean(rec.focusQuestion);
-
-        if (this.activeView !== "chat") {
-          this.setView("chat");
-        }
-
-        if (!nextSession || !nextAgent) {
-          this.pinnedChatSessionId = nextSession;
-          this.pinnedChatAgentId = nextAgent;
-          this.pinnedChatAgentLabel = nextLabel ?? "";
-          this.pinnedChatFocusQuestion = focusQuestion;
-          this.chatPane.renderEmptyContext(
-            "No agent conversation selected",
-            "Click Chat on any agent in Live Studio to inspect its conversation here."
-          );
-          this.syncUrlState();
-          return;
-        }
-
-        const sessionChanged = nextSession !== this.pinnedChatSessionId;
-        this.pinnedChatSessionId = nextSession;
-        this.selectedSessionId = nextSession;
-        this.pinnedChatAgentId = nextAgent;
-        this.pinnedChatAgentLabel = nextLabel ?? "";
-        this.pinnedChatFocusQuestion = focusQuestion;
-        this.syncUrlState();
-
-        if (sessionChanged) {
-          this.lastSnapshot = null;
-          this.stream.updateParams({
-            session: nextSession,
-            ide: this.ideFilter,
-            project: this.selectedProject,
-            workspace: this.lockedWorkspace || undefined,
-          });
-          if (!this.chatStreamStarted) {
-            this.chatStreamStarted = true;
-            this.stream.connect();
-          }
-          void this.loadCurrentSnapshot();
-        }
-
-        this.openChatPanelAgent(nextSession, nextAgent, nextLabel, focusQuestion);
-        return;
-      }
-
-      if (!this.embedMode || this.activeView === "chat") return;
+      if (!this.embedMode) return;
       if (rec.type !== "agentStudio:focusSession") return;
 
       const nextSession =
         typeof rec.sessionId === "string" ? rec.sessionId.trim() : "";
-      const nextChatAgent =
-        typeof rec.openChatAgentId === "string"
-          ? rec.openChatAgentId.trim()
-          : "";
       const openWaiting = Boolean(rec.openWaiting);
 
-      if (nextChatAgent) {
-        this.pendingOpenChatAgentId = nextChatAgent;
-        this.pendingOpenWaiting = false;
-      } else if (openWaiting) {
+      if (openWaiting) {
         this.pendingOpenWaiting = true;
       }
 
@@ -947,27 +681,16 @@ export class AgentStudioApp {
   }
 
   private processPendingOpenActions(snap: SessionSnapshot): void {
-    if (this.pendingOpenChatAgentId) {
-      const targetId = this.pendingOpenChatAgentId;
-      this.pendingOpenChatAgentId = null;
-      this.pendingOpenWaiting = false;
-      if (this.activeView !== "studio") {
-        this.setView("studio");
-      }
-      this.studioView.openChat(targetId, true);
-      return;
-    }
-
     if (this.pendingOpenWaiting) {
-      const hasWaiting =
-        (snap.pendingPrompts?.length ?? 0) > 0 ||
-        snap.agents.some((a) => Boolean(a.pendingPrompt));
-      if (hasWaiting) {
+      const firstWaitingAgentId =
+        snap.pendingPrompts?.[0]?.agentId ??
+        snap.agents.find((a) => Boolean(a.pendingPrompt))?.id;
+      if (firstWaitingAgentId) {
         this.pendingOpenWaiting = false;
         if (this.activeView !== "studio") {
           this.setView("studio");
         }
-        this.studioView.openFirstWaitingChat();
+        this.studioView.openWaitingMessages(firstWaitingAgentId);
       } else if (snap.sessionId && snap.agents.length > 0) {
         this.pendingOpenWaiting = false;
       }
@@ -1121,7 +844,7 @@ export class AgentStudioApp {
           {
             type: "agentStudio:replyToAgent",
             requestId,
-            sessionId: req.sessionId || this.pinnedChatSessionId || this.selectedSessionId || "",
+            sessionId: req.sessionId || this.selectedSessionId || "",
             agentId: req.agentId,
             promptId: req.promptId,
             text,
@@ -1267,24 +990,6 @@ export class AgentStudioApp {
   }
 
   private async bootstrap(): Promise<void> {
-    if (this.activeView === "chat") {
-      if (this.pinnedChatSessionId) {
-        this.stream.updateParams({
-          session: this.pinnedChatSessionId,
-          ide: this.ideFilter,
-          project: this.selectedProject,
-          workspace: this.lockedWorkspace || undefined,
-        });
-        await this.loadCurrentSnapshot();
-        this.chatStreamStarted = true;
-        this.stream.connect();
-      } else {
-        this.connection = "offline";
-        this.chatPane.setConnectionState("idle", "No session");
-      }
-      return;
-    }
-
     // In MCP App mode, keep initial calls lean (max 2 concurrent) — loadCurrentSnapshot already returns sessions & boardProjects
     if (this.mcpAppMode) {
       await this.loadCurrentSnapshot();
@@ -1327,29 +1032,23 @@ export class AgentStudioApp {
 
   private restoreFromUrl(): void {
     let sp: URLSearchParams;
-    let search = "";
     try {
-      search = window.location.search;
-      sp = new URLSearchParams(search);
+      sp = new URLSearchParams(window.location.search);
     } catch {
       return;
     }
-    const route = parseChatViewRouteParams(search);
-    this.embedMode = route.embed;
+    const embedRaw = (sp.get("embed") ?? "").trim().toLowerCase();
+    this.embedMode = embedRaw === "1" || embedRaw === "true";
 
     const v = sp.get("view") as PrimaryView | null;
-    const p = route.project;
-    const ws = route.workspace;
-    const ide = route.ide as IdeFilter;
-    const sess = route.session;
-    const openChat = sp.get("openChat");
+    const p = (sp.get("project") ?? "").trim();
+    const ws = (sp.get("workspace") ?? "").trim();
+    const ide = (sp.get("ide") ?? "").trim() as IdeFilter;
+    const sess = (sp.get("session") ?? "").trim();
     const openWaiting = sp.get("openWaiting");
 
     if (p) this.selectedProject = p;
     if (ws) this.lockedWorkspace = ws;
-    if (openChat && openChat.trim()) {
-      this.pendingOpenChatAgentId = openChat.trim();
-    }
     if (openWaiting === "1" || openWaiting === "true") {
       this.pendingOpenWaiting = true;
     }
@@ -1372,23 +1071,11 @@ export class AgentStudioApp {
     });
     this.teamView.setEmbedScope(scope);
     this.doctorView.setEmbedScope(scope);
-    this.chatPane.setRuntimeScope({
-      embedMode: this.embedMode,
-      mcpAppMode: this.mcpAppMode,
-    });
-    this.studioView.setChatRuntimeScope({
+    this.studioView.setRuntimeScope({
       embedMode: this.embedMode,
       mcpAppMode: this.mcpAppMode,
     });
     this.refreshContextBar();
-
-    if (route.isChatView) {
-      this.pinnedChatSessionId = route.session;
-      this.pinnedChatAgentId = route.agent;
-      this.pinnedChatFocusQuestion = route.focusQuestion;
-      this.setView("chat");
-      return;
-    }
 
     if (
       v === "studio" ||
@@ -1411,15 +1098,7 @@ export class AgentStudioApp {
       if (this.lockedWorkspace) sp.set("workspace", this.lockedWorkspace);
       const effectiveIde = this.lockedIde ?? this.ideFilter;
       if (effectiveIde !== "all") sp.set("ide", effectiveIde);
-      const effectiveSession =
-        this.activeView === "chat"
-          ? this.pinnedChatSessionId || this.selectedSessionId
-          : this.selectedSessionId;
-      if (effectiveSession) sp.set("session", effectiveSession);
-      if (this.activeView === "chat") {
-        if (this.pinnedChatAgentId) sp.set("agent", this.pinnedChatAgentId);
-        if (this.pinnedChatFocusQuestion) sp.set("focusQuestion", "1");
-      }
+      if (this.selectedSessionId) sp.set("session", this.selectedSessionId);
       const qs = sp.toString();
       const nextUrl = `${window.location.pathname}${qs ? `?${qs}` : ""}`;
       window.history.replaceState(null, "", nextUrl);

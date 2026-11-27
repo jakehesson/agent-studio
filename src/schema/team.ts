@@ -101,6 +101,9 @@ export const WorkflowModelRoutingSchema = z
   .passthrough();
 export type WorkflowModelRouting = z.infer<typeof WorkflowModelRoutingSchema>;
 
+export const HumanQuestionsModeSchema = z.enum(["studio-mcp", "native-ide"]);
+export type HumanQuestionsMode = z.infer<typeof HumanQuestionsModeSchema>;
+
 export const WorkflowConfigSchema = z
   .object({
     boardPath: z.string().min(1).default("pipeline/board.json"),
@@ -121,6 +124,7 @@ export const WorkflowConfigSchema = z
     copilotHarness: CopilotHarnessSchema.optional(),
     modelRouting: WorkflowModelRoutingSchema.optional(),
     contextThresholds: ContextThresholdsSchema.optional(),
+    humanQuestions: HumanQuestionsModeSchema.default("studio-mcp"),
   })
   .passthrough();
 export type WorkflowConfig = z.infer<typeof WorkflowConfigSchema>;

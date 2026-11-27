@@ -5,6 +5,28 @@ All notable changes to **Agent Studio** will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.16.0] - 2026-11-26
+
+### Added
+- **Canonical `ask_human` Templates & Orchestrator `humanQuestions` Toggle (`S1-81`):**
+  - Added `workflow.humanQuestions: "studio-mcp" | "native-ide"` (defaulting to `"studio-mcp"`) across `WorkflowConfigSchema`, `.agent-team/team.yaml`, and blueprint templates (`src/templates/`), branching compiled shared team rules and orchestrator prompts across Antigravity, Claude Code, and VS Code Copilot.
+  - Added a **Human Questions** pill toggle (`Studio Direct (ask_human)` vs `Native IDE`) in the Web Studio Team view, `PATCH /api/team/routing`, and `agent-studio models set-questions <studio-mcp|native-ide> [--sync]`, plus `hook-emit` `preToolUse` bypass when set to `native-ide`.
+- **Messages Stream Redesign & Behind-This-Response Drawer (`S1-76`):**
+  - Added paired human question reply bubbles (`You Answered Question`), multi-line inline Markdown previews with `Show more / Show less`, and the `Behind this response` side-sheet drawer (`BehindResponseDrawer`) showing chronological thoughts and tool steps with Galaxy Z Fold 7 cover and unfolded hinge layouts.
+- **Horizontally Resizable Main Panels (`S1-79`):**
+  - Added accessible pointer and keyboard (`role="separator"`, Arrow keys, Home/End, double-click reset) horizontal split resizing (`web/src/utils/panelResizer.ts`) with `localStorage` persistence across Live Studio, Agile Board, Mockups, and CommReader while preserving Galaxy Z Fold 7 cover and unfolded layouts.
+
+### Changed
+- **Drop Redundant Chat Feature & Hide Payload Inspector on Messages (`S1-80`):**
+  - Removed the redundant Agent Chat drawer/pane (`AgentChatDrawer`, `AgentChatPane`, `/api/chat`, `/api/sessions/:id/chat`, `app_get_chat`, `openChat`) across Web Studio, IDE extension, and MCP server while preserving all `Messages` and `ask_human` Q&A flows.
+  - Hidden the Payload Inspector pane on the `Messages` screen across desktop, unfolded foldable, and cover viewports so the conversation stream has full width.
+- **Antigravity `ask_human` Guardrail & Native Card Copy (`BUG-32`):**
+  - Hardened shared team rules and orchestrator/team-setup prompts to strictly mandate `call_mcp_tool ask_human` (with subagent `EnableMCPTools: true` or coordinator relay) rather than falling back to native `ask_question`, and updated native `QuestionCard` button copy to `Copy & Focus IDE to Answer`.
+
+### Fixed
+- **Unmatched `/api/*` 404 JSON Guard (`BUG-33`):**
+  - Returned HTTP `404` JSON for unmatched `GET /api/*` routes (including removed `/api/chat` and `/api/sessions/:id/chat`) before the SPA HTML fallback (`serveStaticWeb`).
+
 ## [0.15.0] - 2026-11-26
 
 > Released with the QA gate overridden at the user's request (QA rerun skipped).

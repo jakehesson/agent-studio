@@ -19,142 +19,9 @@ import type { ServerManager } from "./serverManager";
 
 export type StudioViewName = StudioView;
 
-const CONTROL_CHAR_RE = /[\x00-\x1f\x7f]/;
-const CONTROL_CHAR_GLOBAL_RE = /[\x00-\x1f\x7f]/g;
-
-export interface OpenChatTabMessage {
-  sessionId: string;
-  agentId: string;
-  agentLabel?: string;
-  focusQuestion: boolean;
-}
-
-export interface AgentChatTabTarget {
-  sessionId: string;
-  agentId: string;
-  agentLabel?: string;
-  focusQuestion?: boolean;
-}
-
-export function validateOpenChatTabMessage(
-  raw: unknown,
-): OpenChatTabMessage | null {
-  if (!raw || typeof raw !== "object" || Array.isArray(raw)) {
-    return null;
-  }
-  const obj = raw as Record<string, unknown>;
-  if (typeof obj.sessionId !== "string" || typeof obj.agentId !== "string") {
-    return null;
-  }
-  if (
-    CONTROL_CHAR_RE.test(obj.sessionId) ||
-    CONTROL_CHAR_RE.test(obj.agentId)
-  ) {
-    return null;
-  }
-  const sessionId = obj.sessionId.trim();
-  const agentId = obj.agentId.trim();
-  if (
-    sessionId.length === 0 ||
-    sessionId.length > 256 ||
-    agentId.length === 0 ||
-    agentId.length > 256
-  ) {
-    return null;
-  }
-
-  let agentLabel: string | undefined;
-  if (typeof obj.agentLabel === "string") {
-    const cleaned = obj.agentLabel
-      .replace(CONTROL_CHAR_GLOBAL_RE, "")
-      .trim()
-      .slice(0, 120)
-      .trim();
-    if (cleaned.length > 0) {
-      agentLabel = cleaned;
-    }
-  }
-
-  return {
-    sessionId,
-    agentId,
-    ...(agentLabel !== undefined ? { agentLabel } : {}),
-    focusQuestion: obj.focusQuestion === true,
-  };
-}
-
-export interface FocusIdeChatResult {
-  type: "agentStudio:focusIdeChatResult";
-  requestId: string;
-  ok: boolean;
-  message: string;
-}
-
-export async function handleFocusIdeChat(
-  rawRequestId: unknown,
-  deps: Pick<ReplyBridgeDeps, "getCommands" | "executeCommand">,
-): Promise<FocusIdeChatResult> {
-  const requestId =
-    typeof rawRequestId === "string" && rawRequestId.trim().length <= 256
-      ? rawRequestId.trim()
-      : "";
-
-  let chatCommandAvailable = false;
-  try {
-    const commands = await deps.getCommands(true);
-    chatCommandAvailable =
-      Array.isArray(commands) &&
-      commands.includes("workbench.action.chat.open");
-  } catch {
-    chatCommandAvailable = false;
-  }
-
-  if (chatCommandAvailable) {
-    try {
-      await deps.executeCommand("workbench.action.chat.open");
-      return {
-        type: "agentStudio:focusIdeChatResult",
-        requestId,
-        ok: true,
-        message: "Focused IDE chat.",
-      };
-    } catch {
-      // Fall through to unavailable response
-    }
-  }
-
-  return {
-    type: "agentStudio:focusIdeChatResult",
-    requestId,
-    ok: false,
-    message: "IDE chat command is not available in this host.",
-  };
-}
-
-export function formatAgentChatPanelTitle(
-  agentLabel?: string,
-  agentId?: string,
-): string {
-  const cleanLabel =
-    typeof agentLabel === "string"
-      ? agentLabel.replace(CONTROL_CHAR_GLOBAL_RE, "").trim()
-      : "";
-  const cleanId =
-    typeof agentId === "string"
-      ? agentId.replace(CONTROL_CHAR_GLOBAL_RE, "").trim()
-      : "";
-  const label = cleanLabel || cleanId || "Agent";
-  const full = `Chat: ${label}`;
-  if (full.length <= 48) {
-    return full;
-  }
-  return `${full.slice(0, 47).trimEnd()}…`;
-}
-
 export interface StudioPanelOpenOptions {
   sessionId?: string;
   openWaiting?: boolean;
-  openChatAgentId?: string;
 }
 
 export const REPLY_MAX_TEXT_BYTES = 32 * 1024;
@@ -390,10 +257,6 @@ interface SharedWebviewMessage {
   requestId?: unknown;
   payload?: unknown;
   url?: unknown;
-  sessionId?: unknown;
-  agentId?: unknown;
-  agentLabel?: unknown;
-  focusQuestion?: unknown;
   text?: unknown;
   blockingToolCall?: unknown;
 }
@@ -463,7 +326,6 @@ async function handleOpenFileMessage(msg: {
 async function handleSharedWebviewMessage(
   msg: SharedWebviewMessage,
   panel: vscode.WebviewPanel,
-  serverManager: ServerManager,
 ): Promise<boolean> {
   if (msg?.type === "openExternal") {
     await vscode.commands.executeCommand("agentStudio.openInBrowser");
@@ -475,23 +337,6 @@ async function handleSharedWebviewMessage(
       startLine: msg.startLine,
       endLine: msg.endLine,
     });
-    return true;
-  }
-  if (msg?.type === "agentStudio:openChatTab") {
-    const checked = validateOpenChatTabMessage(msg);
-    if (checked) {
-      await AgentChatPanel.createOrShow(serverManager, checked);
-    }
-    return true;
-  }
-  if (msg?.type === "agentStudio:focusIdeChat") {
-    const reply = await handleFocusIdeChat(msg.requestId, {
-      getCommands: async (filterInternal) =>
-        await vscode.commands.getCommands(filterInternal),
-      executeCommand: async (command, ...args) =>
-        await vscode.commands.executeCommand(command, ...args),
-    });
-    void panel.webview.postMessage(reply);
     return true;
   }
   if (msg?.type === "agentStudio:feedbackStatusRequest") {
@@ -715,15 +560,9 @@ function renderEmbeddedIframeHtml(opts: {
             data.type === "agentStudio:submitFeedbackResult" ||
             data.type === "agentStudio:feedbackSubmitResult" ||
             data.type === "agentStudio:focusSession" ||
-            data.type === "agentStudio:showAgentChat" ||
-            data.type === "agentStudio:focusIdeChatResult" ||
             data.type === "agentStudio:replyResult")
         ) {
-          if (
-            (data.type === "agentStudio:focusSession" ||
-              data.type === "agentStudio:showAgentChat") &&
-            !loaded
-          ) {
+          if (data.type === "agentStudio:focusSession" && !loaded) {
             pendingFocusMessage = data;
           } else {
             frame.contentWindow.postMessage(data, expectedOrigin);
@@ -738,23 +577,6 @@ function renderEmbeddedIframeHtml(opts: {
           uri: data.uri,
           startLine: typeof data.startLine === "number" ? data.startLine : undefined,
           endLine: typeof data.endLine === "number" ? data.endLine : undefined,
-        });
-      } else if (data.type === "agentStudio:openChatTab") {
-        vscode.postMessage({
-          type: "agentStudio:openChatTab",
-          sessionId: typeof data.sessionId === "string" ? data.sessionId : "",
-          agentId: typeof data.agentId === "string" ? data.agentId : "",
-          ...(typeof data.agentLabel === "string" ? { agentLabel: data.agentLabel } : {}),
-          focusQuestion: data.focusQuestion === true,
-        });
-      } else if (data.type === "agentStudio:chatTabReady") {
-        vscode.postMessage({
-          type: "agentStudio:chatTabReady",
-        });
-      } else if (data.type === "agentStudio:focusIdeChat") {
-        vscode.postMessage({
-          type: "agentStudio:focusIdeChat",
-          requestId: typeof data.requestId === "string" ? data.requestId : "",
         });
       } else if (data.type === "agentStudio:feedbackStatusRequest") {
         vscode.postMessage({
@@ -786,313 +608,6 @@ function renderEmbeddedIframeHtml(opts: {
 </html>`;
 }
 
-function normalizeAgentChatTarget(
-  target: AgentChatTabTarget,
-): OpenChatTabMessage {
-  const cleanLabel =
-    typeof target.agentLabel === "string"
-      ? target.agentLabel
-          .replace(CONTROL_CHAR_GLOBAL_RE, "")
-          .trim()
-          .slice(0, 120)
-          .trim()
-      : "";
-  return {
-    sessionId: target.sessionId.trim(),
-    agentId: target.agentId.trim(),
-    ...(cleanLabel ? { agentLabel: cleanLabel } : {}),
-    focusQuestion: target.focusQuestion === true,
-  };
-}
-
-export class AgentChatPanel {
-  public static currentPanel: AgentChatPanel | undefined;
-  public static readonly viewType = "agentStudio.chatPanel";
-  private static pendingCreate: Promise<void> | undefined;
-  private static latestCreateTarget: OpenChatTabMessage | undefined;
-
-  private readonly panel: vscode.WebviewPanel;
-  private readonly disposables: vscode.Disposable[] = [];
-  private currentTarget: OpenChatTabMessage;
-  private pendingTarget: OpenChatTabMessage | null = null;
-  private iframeReady = false;
-  private currentResolvedUrl = "";
-  private currentBaseOrigin = "";
-  private currentOnline = false;
-  private isDisposed = false;
-  private opSeq = 0;
-
-  private constructor(
-    panel: vscode.WebviewPanel,
-    private readonly serverManager: ServerManager,
-    initialTarget: OpenChatTabMessage,
-  ) {
-    this.panel = panel;
-    this.currentTarget = initialTarget;
-    this.panel.onDidDispose(() => this.dispose(), null, this.disposables);
-    if (typeof this.serverManager.onStatusChanged === "function") {
-      this.disposables.push(
-        this.serverManager.onStatusChanged((status) => {
-          if (this.isDisposed) return;
-          const wasOnline = this.currentOnline;
-          if (!wasOnline && status.online) {
-            void this.render(this.currentTarget, { force: true });
-          } else if (!status.online) {
-            this.currentOnline = false;
-          }
-        }),
-      );
-    }
-    this.panel.webview.onDidReceiveMessage(
-      async (msg: SharedWebviewMessage) => {
-        if (this.isDisposed) return;
-        if (msg?.type === "retry") {
-          await this.serverManager.ensureRunning(true);
-          if (this.isDisposed) return;
-          await this.render(this.currentTarget, { force: true });
-          return;
-        }
-        if (msg?.type === "agentStudio:chatTabReady") {
-          this.iframeReady = true;
-          if (this.pendingTarget) {
-            const next = this.pendingTarget;
-            this.pendingTarget = null;
-            await this.postShowAgentChat(next);
-          }
-          return;
-        }
-        await handleSharedWebviewMessage(msg, this.panel, this.serverManager);
-      },
-      null,
-      this.disposables,
-    );
-  }
-
-  private reserveTarget(target: OpenChatTabMessage): number {
-    this.currentTarget = target;
-    return ++this.opSeq;
-  }
-
-  public static async createOrShow(
-    serverManager: ServerManager,
-    target: AgentChatTabTarget,
-  ): Promise<void> {
-    const normalized = normalizeAgentChatTarget(target);
-    AgentChatPanel.latestCreateTarget = normalized;
-
-    if (
-      AgentChatPanel.currentPanel &&
-      !AgentChatPanel.currentPanel.isDisposed
-    ) {
-      const current = AgentChatPanel.currentPanel;
-      const seq = current.reserveTarget(normalized);
-      current.panel.title = formatAgentChatPanelTitle(
-        normalized.agentLabel,
-        normalized.agentId,
-      );
-      current.panel.reveal(
-        current.panel.viewColumn ?? vscode.ViewColumn.Beside,
-        false,
-      );
-      await serverManager.ensureRunning(true);
-      if (current.isDisposed || seq !== current.opSeq) {
-        return;
-      }
-      await current.applyTargetWithSeq(normalized, seq);
-      return;
-    }
-
-    if (AgentChatPanel.pendingCreate) {
-      await AgentChatPanel.pendingCreate;
-      return;
-    }
-
-    const createPromise = (async () => {
-      await serverManager.ensureRunning(true);
-
-      const finalTarget = AgentChatPanel.latestCreateTarget ?? normalized;
-      if (
-        AgentChatPanel.currentPanel &&
-        !AgentChatPanel.currentPanel.isDisposed
-      ) {
-        const existing = AgentChatPanel.currentPanel;
-        const seq = existing.reserveTarget(finalTarget);
-        existing.panel.title = formatAgentChatPanelTitle(
-          finalTarget.agentLabel,
-          finalTarget.agentId,
-        );
-        existing.panel.reveal(
-          existing.panel.viewColumn ?? vscode.ViewColumn.Beside,
-          false,
-        );
-        await existing.applyTargetWithSeq(finalTarget, seq);
-        return;
-      }
-
-      const panel = vscode.window.createWebviewPanel(
-        AgentChatPanel.viewType,
-        formatAgentChatPanelTitle(
-          finalTarget.agentLabel,
-          finalTarget.agentId,
-        ),
-        { viewColumn: vscode.ViewColumn.Beside, preserveFocus: false },
-        {
-          enableScripts: true,
-          retainContextWhenHidden: true,
-        },
-      );
-
-      const instance = new AgentChatPanel(panel, serverManager, finalTarget);
-      AgentChatPanel.currentPanel = instance;
-      const seq = instance.reserveTarget(finalTarget);
-      await instance.renderWithSeq(finalTarget, seq, { force: true });
-    })();
-
-    AgentChatPanel.pendingCreate = createPromise;
-    try {
-      await createPromise;
-    } finally {
-      if (AgentChatPanel.pendingCreate === createPromise) {
-        AgentChatPanel.pendingCreate = undefined;
-      }
-    }
-  }
-
-  private async postShowAgentChat(target: OpenChatTabMessage): Promise<void> {
-    if (this.isDisposed) return;
-    await this.panel.webview.postMessage({
-      type: "agentStudio:showAgentChat",
-      sessionId: target.sessionId,
-      agentId: target.agentId,
-      ...(target.agentLabel !== undefined
-        ? { agentLabel: target.agentLabel }
-        : {}),
-      focusQuestion: target.focusQuestion === true,
-    });
-  }
-
-  public async showTarget(target: AgentChatTabTarget): Promise<void> {
-    if (this.isDisposed) return;
-    const normalized = normalizeAgentChatTarget(target);
-    const seq = this.reserveTarget(normalized);
-    await this.applyTargetWithSeq(normalized, seq);
-  }
-
-  private async applyTargetWithSeq(
-    normalized: OpenChatTabMessage,
-    seq: number,
-  ): Promise<void> {
-    if (this.isDisposed || seq !== this.opSeq) return;
-    const status = this.serverManager.getStatus();
-    const rawTargetUrl = this.serverManager.buildViewUrl(
-      status.online ? status.localBaseUrl : status.browserBaseUrl,
-      "chat",
-      undefined,
-      {
-        embed: true,
-        sessionId: normalized.sessionId,
-        agentId: normalized.agentId,
-        focusQuestion: normalized.focusQuestion,
-      },
-    );
-    const { expectedOrigin } = await resolveExternalPanelUrl(rawTargetUrl);
-    if (this.isDisposed || seq !== this.opSeq) return;
-
-    if (
-      !status.online ||
-      !this.currentOnline ||
-      !this.currentResolvedUrl ||
-      !expectedOrigin ||
-      expectedOrigin !== this.currentBaseOrigin
-    ) {
-      await this.renderWithSeq(normalized, seq, { force: true });
-      return;
-    }
-
-    this.currentTarget = normalized;
-    if (this.iframeReady) {
-      await this.postShowAgentChat(normalized);
-    } else {
-      this.pendingTarget = normalized;
-    }
-  }
-
-  public async render(
-    target: AgentChatTabTarget,
-    opts?: { force?: boolean },
-  ): Promise<void> {
-    if (this.isDisposed) return;
-    const normalized = normalizeAgentChatTarget(target);
-    const seq = this.reserveTarget(normalized);
-    await this.renderWithSeq(normalized, seq, opts);
-  }
-
-  private async renderWithSeq(
-    normalized: OpenChatTabMessage,
-    seq: number,
-    opts?: { force?: boolean },
-  ): Promise<void> {
-    if (this.isDisposed || seq !== this.opSeq) return;
-    const status = this.serverManager.getStatus();
-    const rawTargetUrl = this.serverManager.buildViewUrl(
-      status.online ? status.localBaseUrl : status.browserBaseUrl,
-      "chat",
-      undefined,
-      {
-        embed: true,
-        sessionId: normalized.sessionId,
-        agentId: normalized.agentId,
-        focusQuestion: normalized.focusQuestion,
-      },
-    );
-    const { resolvedUrl, expectedOrigin } =
-      await resolveExternalPanelUrl(rawTargetUrl);
-    if (this.isDisposed || seq !== this.opSeq) return;
-
-    if (
-      !opts?.force &&
-      this.currentResolvedUrl &&
-      resolvedUrl === this.currentResolvedUrl &&
-      status.online === this.currentOnline
-    ) {
-      return;
-    }
-
-    this.iframeReady = false;
-    this.pendingTarget = null;
-    this.currentTarget = normalized;
-    this.currentResolvedUrl = resolvedUrl;
-    this.currentBaseOrigin = expectedOrigin;
-    this.currentOnline = status.online;
-
-    const title = formatAgentChatPanelTitle(
-      normalized.agentLabel,
-      normalized.agentId,
-    );
-    this.panel.title = title;
-    this.panel.webview.html = renderEmbeddedIframeHtml({
-      title,
-      resolvedUrl,
-      expectedOrigin,
-      online: status.online,
-    });
-  }
-
-  public dispose(): void {
-    if (this.isDisposed) return;
-    this.isDisposed = true;
-    this.opSeq++;
-    this.pendingTarget = null;
-    if (AgentChatPanel.currentPanel === this) {
-      AgentChatPanel.currentPanel = undefined;
-    }
-    this.panel.dispose();
-    while (this.disposables.length > 0) {
-      this.disposables.pop()?.dispose();
-    }
-  }
-}
-
 export class StudioPanel {
   public static currentPanel: StudioPanel | undefined;
   private readonly panel: vscode.WebviewPanel;
@@ -1117,7 +632,7 @@ export class StudioPanel {
           await this.render(this.currentView, this.currentSessionId, { force: true });
           return;
         }
-        await handleSharedWebviewMessage(msg, this.panel, this.serverManager);
+        await handleSharedWebviewMessage(msg, this.panel);
       },
       null,
       this.disposables,
@@ -1142,8 +657,7 @@ export class StudioPanel {
       const status = serverManager.getStatus();
       const hasFocusTarget =
         openOptions.sessionId !== undefined ||
-        openOptions.openWaiting !== undefined ||
-        openOptions.openChatAgentId !== undefined;
+        openOptions.openWaiting !== undefined;
       if (
         hasFocusTarget &&
         current.currentResolvedUrl &&
@@ -1180,9 +694,6 @@ export class StudioPanel {
       type: "agentStudio:focusSession",
       ...(opts.sessionId !== undefined ? { sessionId: opts.sessionId } : {}),
       ...(opts.openWaiting !== undefined ? { openWaiting: opts.openWaiting } : {}),
-      ...(opts.openChatAgentId !== undefined
-        ? { openChatAgentId: opts.openChatAgentId }
-        : {}),
     });
   }
 
@@ -1212,7 +723,6 @@ export class StudioPanel {
     );
     const rawTargetUrl = appendDeepLinkParams(baseTargetUrl, {
       openWaiting: openOpts.openWaiting,
-      openChatAgentId: openOpts.openChatAgentId,
     });
 
     const { resolvedUrl, expectedOrigin } =

@@ -2,13 +2,10 @@ import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import {
-  capChatText,
   cleanHumanSummary,
   computeDeterministicEventId,
   computeMergeKey,
-  computePendingPromptId,
   extractProviderUsageDetails,
-  formatQuestionsPreview,
   isBoardMutationToolCall,
   isSelfDaemonCommand,
   normalizePendingQuestions,
@@ -19,12 +16,9 @@ import {
   summarizeToolCall,
   toIsoUtc,
   type AdapterHealth,
-  type AgentChatMessage,
   type AgentStatus,
-  type ChatToolCallRef,
   type DiscoveredSession,
   type EnrichedEvent,
-  type ParseChatOptions,
   type ParseSessionOptions,
   type PassiveIdeAdapter,
   type UsageDelta,
@@ -557,29 +551,8 @@ export class ClaudeCodeAdapter implements PassiveIdeAdapter {
     session: DiscoveredSession,
     opts?: ParseSessionOptions,
   ): Promise<EnrichedEvent[]> {
-    const res = await this.parseSessionInternal(session, opts);
-    return res.events;
-  }
-
-  async parseChat(
-    session: DiscoveredSession,
-    opts?: ParseChatOptions,
-  ): Promise<AgentChatMessage[]> {
-    const res = await this.parseSessionInternal(session, { includeChat: true });
-    const reqAgent = opts?.agentId?.trim();
-    const filtered = reqAgent
-      ? res.chatMessages.filter((m) => m.agentId === reqAgent)
-      : res.chatMessages;
-    filtered.sort((a, b) => a.epoch - b.epoch);
-    return filtered;
-  }
-
-  private async parseSessionInternal(
-    session: DiscoveredSession,
-    opts?: ParseSessionOptions & { includeChat?: boolean },
-  ): Promise<{ events: EnrichedEvent[]; chatMessages: AgentChatMessage[] }> {
     const mainRows = await readClaudeJsonl(session.filePath);
-    if (mainRows.length === 0) return { events: [], chatMessages: [] };
+    if (mainRows.length === 0) return [];
 
     const knownProjects = getKnownProjects();
     const allWorkspaces = [...session.workspaces];
@@ -597,25 +570,7 @@ export class ClaudeCodeAdapter implements PassiveIdeAdapter {
         knownProjects,
       ) ?? session.projectId;
 
-    const includeChat = Boolean(opts?.includeChat);
     const events: EnrichedEvent[] = [];
-    const chatMessages: AgentChatMessage[] = [];
-    const chatToolRefById = new Map<string, ChatToolCallRef>();
-    const seenChatToolUseIds = new Set<string>();
-    const lastAssistantByMsgId = new Map<string, AgentChatMessage>();
-    const assistantProseByMsgId = new Map<string, string>();
-    const mergeStreamingText = (
-      prev: string | undefined,
-      next: string,
-    ): string => {
-      const a = (prev ?? "").trim();
-      const b = next.trim();
-      if (!a) return b;
-      if (!b) return a;
-      if (a === b || a.includes(b)) return a;
-      if (b.startsWith(a) || b.includes(a)) return b;
-      return `${a}\n\n${b}`;
-    };
     const spawnToolUseMap = new Map<
       string,
       {
@@ -627,7 +582,6 @@ export class ClaudeCodeAdapter implements PassiveIdeAdapter {
         matchedFromResult?: string;
         spawnEvent?: EnrichedEvent;
         doneEvent?: EnrichedEvent;
-        chatSpawnMsg?: AgentChatMessage;
       }
     >();
     const spawnRecords: Array<{
@@ -639,7 +593,6 @@ export class ClaudeCodeAdapter implements PassiveIdeAdapter {
       matchedFromResult?: string;
       spawnEvent?: EnrichedEvent;
       doneEvent?: EnrichedEvent;
-      chatSpawnMsg?: AgentChatMessage;
     }> = [];
     const toolSummaryMap = new Map<
       string,
@@ -915,15 +868,6 @@ export class ClaudeCodeAdapter implements PassiveIdeAdapter {
                           block.content as ClaudeContentBlock[],
                         ).trim()
                       : "";
-                if (includeChat) {
-                  const ref = chatToolRefById.get(callId);
-                  if (ref) {
-                    ref.status = isErr ? "error" : "ok";
-                    if (resultText) {
-                      ref.output = capChatText(resultText);
-                    }
-                  }
-                }
                 if (spawnInfo) {
                   const turAgent =
                     row.toolUseResult &&
@@ -1030,16 +974,6 @@ export class ClaudeCodeAdapter implements PassiveIdeAdapter {
                 inlineBody,
               });
             }
-            if (includeChat && txt) {
-              chatMessages.push({
-                id: `chat:cc:${agentId}:${i}:user`,
-                ts: toIsoUtc(epoch),
-                epoch,
-                agentId,
-                role: "user",
-                text: capChatText(txt),
-              });
-            }
           } else if (typeof content === "string" && content.trim()) {
             const inlineBody = content.slice(0, 1400);
             emit({
@@ -1050,36 +984,16 @@ export class ClaudeCodeAdapter implements PassiveIdeAdapter {
               fullBody: content,
               inlineBody,
             });
-            if (includeChat) {
-              chatMessages.push({
-                id: `chat:cc:${agentId}:${i}:user`,
-                ts: toIsoUtc(epoch),
-                epoch,
-                agentId,
-                role: "user",
-                text: capChatText(content.trim()),
-              });
-            }
           }
         } else if (rtype === "assistant") {
           const content = row.message?.content;
           const blocks = Array.isArray(content) ? content : [];
           let hasToolUse = false;
-          const chatThinkingParts: string[] = [];
-          const chatTextParts: string[] = [];
-          const chatTurnTools: ChatToolCallRef[] = [];
-          const chatSpecialMsgs: AgentChatMessage[] = [];
-          if (typeof content === "string" && content.trim()) {
-            chatTextParts.push(content.trim());
-          }
 
           blocks.forEach((block, bIdx) => {
             if (block.type === "thinking") {
               const thinkText =
                 typeof block.thinking === "string" ? block.thinking.trim() : "";
-              if (includeChat && thinkText) {
-                chatThinkingParts.push(thinkText);
-              }
               if (thinkText) {
                 const inlineBody = thinkText.slice(0, THINKING_INLINE_MAX);
                 emit({
@@ -1097,17 +1011,11 @@ export class ClaudeCodeAdapter implements PassiveIdeAdapter {
                   offset: bIdx * 0.0001,
                 });
               }
-            } else if (block.type === "text") {
-              if (includeChat && typeof block.text === "string" && block.text.trim()) {
-                chatTextParts.push(block.text.trim());
-              }
             } else if (block.type === "tool_use") {
               hasToolUse = true;
               const tname = block.name ?? "tool";
               const input = block.input ?? {};
               const callId = block.id ?? `${row.uuid ?? i}:${bIdx}`;
-              const isNewChatTool = !seenChatToolUseIds.has(callId);
-              if (includeChat) seenChatToolUseIds.add(callId);
 
               if (tname === "Agent" || tname === "Task") {
                 const subType = String(
@@ -1161,27 +1069,12 @@ export class ClaudeCodeAdapter implements PassiveIdeAdapter {
                     : {}),
                   offset: bIdx * 0.0001,
                 });
-                let chatSpawnMsg: AgentChatMessage | undefined;
-                if (includeChat && isNewChatTool) {
-                  chatSpawnMsg = {
-                    id: `chat:cc:${agentId}:${i}:sub:${bIdx}`,
-                    ts: toIsoUtc(epoch + (bIdx + 1) * 0.0001),
-                    epoch: epoch + (bIdx + 1) * 0.0001,
-                    agentId,
-                    role: "subagent",
-                    text: capChatText(rawPrompt.trim() || `Spawned ${subLabel}`),
-                    subagentId: subId,
-                    subagentLabel: subLabel,
-                  };
-                  chatSpecialMsgs.push(chatSpawnMsg);
-                }
                 const rec = {
                   callId,
                   targetAgentId: subId,
                   agentLabel: subLabel,
                   prompt: rawPrompt.trim(),
                   spawnEvent: spawnEv,
-                  ...(chatSpawnMsg ? { chatSpawnMsg } : {}),
                 };
                 spawnToolUseMap.set(callId, rec);
                 spawnRecords.push(rec);
@@ -1210,17 +1103,6 @@ export class ClaudeCodeAdapter implements PassiveIdeAdapter {
                   ...(body ? { fullBody: body, inlineBody } : {}),
                   offset: bIdx * 0.0001,
                 });
-                if (includeChat && isNewChatTool) {
-                  chatSpecialMsgs.push({
-                    id: `chat:cc:${agentId}:${i}:msg:${bIdx}`,
-                    ts: toIsoUtc(epoch + (bIdx + 1) * 0.0001),
-                    epoch: epoch + (bIdx + 1) * 0.0001,
-                    agentId,
-                    role: "subagent",
-                    text: capChatText(body || msgSummary),
-                    subagentId: target,
-                  });
-                }
               } else if (tname === "AskUserQuestion") {
                 const parsedQuestions = normalizePendingQuestions(input, {
                   defaultAllowCustomInput: true,
@@ -1265,22 +1147,6 @@ export class ClaudeCodeAdapter implements PassiveIdeAdapter {
                   },
                   offset: bIdx * 0.0001,
                 });
-                if (includeChat && isNewChatTool) {
-                  chatSpecialMsgs.push({
-                    id: `chat:cc:${agentId}:${i}:ask:${bIdx}`,
-                    ts: toIsoUtc(epoch + (bIdx + 1) * 0.0001),
-                    epoch: epoch + (bIdx + 1) * 0.0001,
-                    agentId,
-                    role: "question",
-                    text: capChatText(
-                      formatQuestionsPreview(
-                        parsedQuestions,
-                        qSummary || "Asked user a question",
-                      ),
-                    ),
-                    pendingPromptId: computePendingPromptId(agentId, callId),
-                  });
-                }
               } else {
                 const cmd = String(input.command ?? "");
                 const selfDaemon = isSelfDaemonCommand(
@@ -1298,101 +1164,9 @@ export class ClaudeCodeAdapter implements PassiveIdeAdapter {
                   payload: { input },
                   offset: bIdx * 0.0001,
                 });
-                if (includeChat && isNewChatTool) {
-                  const ref: ChatToolCallRef = {
-                    toolCallId: callId,
-                    toolName: tname,
-                    summary: actionSummary,
-                    status: "running",
-                    inputPreview: capChatText(JSON.stringify(input), 4096),
-                  };
-                  chatTurnTools.push(ref);
-                  chatToolRefById.set(callId, ref);
-                }
               }
             }
           });
-
-          if (includeChat) {
-            const joinedThinking = chatThinkingParts.join("\n\n").trim();
-            const joinedText = chatTextParts.join("\n\n").trim();
-            if (joinedThinking || joinedText || chatTurnTools.length > 0) {
-              const msgId = row.message?.id;
-              const groupKey = msgId ? `${agentId}\0${msgId}` : undefined;
-              const existingMsg = groupKey
-                ? lastAssistantByMsgId.get(groupKey)
-                : undefined;
-
-              if (existingMsg) {
-                if (joinedThinking) {
-                  existingMsg.thinking = capChatText(
-                    mergeStreamingText(existingMsg.thinking, joinedThinking),
-                  );
-                  if (existingMsg.role === "thinking" && !joinedText && chatTurnTools.length === 0) {
-                    existingMsg.text = existingMsg.thinking;
-                  }
-                }
-                if (joinedText) {
-                  const prevProse = groupKey
-                    ? assistantProseByMsgId.get(groupKey)
-                    : undefined;
-                  const mergedProse = mergeStreamingText(prevProse, joinedText);
-                  if (groupKey) {
-                    assistantProseByMsgId.set(groupKey, mergedProse);
-                  }
-                  if (existingMsg.role === "thinking") {
-                    existingMsg.role = "assistant";
-                  }
-                  existingMsg.text = capChatText(mergedProse);
-                }
-                if (chatTurnTools.length > 0) {
-                  if (existingMsg.role === "thinking") {
-                    existingMsg.role = "assistant";
-                    if (!joinedText) {
-                      existingMsg.text =
-                        chatTurnTools.length === 1
-                          ? chatTurnTools[0]!.summary
-                          : `Ran ${chatTurnTools.length} tools`;
-                    }
-                  }
-                  existingMsg.tools = [
-                    ...(existingMsg.tools ?? []),
-                    ...chatTurnTools,
-                  ];
-                }
-              } else {
-                const hasAssistantContent =
-                  joinedText.length > 0 || chatTurnTools.length > 0;
-                const msg: AgentChatMessage = {
-                  id: `chat:cc:${agentId}:${i}:ast`,
-                  ts: toIsoUtc(epoch),
-                  epoch,
-                  agentId,
-                  role: hasAssistantContent ? "assistant" : "thinking",
-                  text: capChatText(
-                    joinedText ||
-                      (chatTurnTools.length > 0
-                        ? chatTurnTools.length === 1
-                          ? chatTurnTools[0]!.summary
-                          : `Ran ${chatTurnTools.length} tools`
-                        : joinedThinking),
-                  ),
-                  ...(joinedThinking
-                    ? { thinking: capChatText(joinedThinking) }
-                    : {}),
-                  ...(chatTurnTools.length > 0 ? { tools: chatTurnTools } : {}),
-                };
-                chatMessages.push(msg);
-                if (groupKey) {
-                  lastAssistantByMsgId.set(groupKey, msg);
-                  if (joinedText) {
-                    assistantProseByMsgId.set(groupKey, joinedText);
-                  }
-                }
-              }
-            }
-            chatMessages.push(...chatSpecialMsgs);
-          }
 
           if (row.message?.stop_reason === "end_turn" && !hasToolUse) {
             const txt = extractTextFromContent(content).trim();
@@ -1488,10 +1262,6 @@ export class ClaudeCodeAdapter implements PassiveIdeAdapter {
               targetAgentId: sub.subId,
             };
           }
-          if (matched.chatSpawnMsg) {
-            matched.chatSpawnMsg.subagentId = sub.subId;
-            matched.chatSpawnMsg.subagentLabel = resolvedLabel;
-          }
         }
 
         parseRowsForAgent(sub.rows, sub.subId, "root", resolvedLabel);
@@ -1546,6 +1316,6 @@ export class ClaudeCodeAdapter implements PassiveIdeAdapter {
       targetEv.payload = { ...(targetEv.payload ?? {}), _usageDelta: usageDelta };
     }
 
-    return { events, chatMessages };
+    return events;
   }
 }

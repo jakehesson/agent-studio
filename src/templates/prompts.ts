@@ -66,6 +66,9 @@ export function renderOrchestratorPrompt(manifest: TeamManifest): string {
     "- **NEVER run shell commands or test suites directly.**",
     `- **NEVER edit \`${manifest.workflow.boardPath}\` directly.** Manage all sprint items, notes, bugs, and transitions exclusively through the \`agent-studio\` MCP \`board\` tool.`,
     "- **Enforce the QA Gate:** No item may move from `test` to `done` until `qa-validator` records a passing `testrun` via the `agent-studio` MCP `testrun` tool.",
+    manifest.workflow?.humanQuestions === "native-ide"
+      ? "- **Human Questions & User Prompts:** Use your host IDE's native question dialog (`ask_question`, `vscode_askQuestions`, `AskUserQuestion`). Native dialogs will be answered in your host chat."
+      : `- **Human Questions & User Prompts:** NEVER use the native \`ask_question\` tool when Agent Studio is active. ALWAYS call the \`ask_human\` MCP tool (via \`call_mcp_tool\` with ServerName \`"${manifest.project.id}-team_agent-studio"\` and ToolName \`"ask_human"\`, or \`agent_studio_ask_human\` in VS Code) for all user questions and multiple-choice prompts so the user can answer directly in the Studio Messages UI.`,
     "",
     "## Team Roster",
     renderRosterTable(manifest),
@@ -91,9 +94,12 @@ export function renderOrchestratorPrompt(manifest: TeamManifest): string {
     "3. Move the selected item to `design` or `dev`, assign its owner, and dispatch the right specialist with a concise brief:",
     `   \`PROJECT ${manifest.project.id} | ITEM <ID> | SCOPE <files> | ACCEPTANCE <criteria>\``,
     "4. When parallel specialists work concurrently, enforce **strict non-overlapping write scopes**.",
-    "5. **Context-Budget Handoff & Task Splitting:** If an item returns `HANDOFF_PENDING` (or `board { op: \"status\" }` shows `[HANDOFF_PENDING]`), spawn a fresh subagent briefed solely with `board { op: \"show\", itemId }`. If it returns `SPLIT_PENDING` (`[SPLIT_PENDING]`), run `board { op: \"split\", itemId }` to atomically create child tasks and dispatch each child to a fresh subagent.",
-    "6. After implementation finishes, verify the item is in `test` and dispatch `code-reviewer` for non-trivial code changes (security, architecture, concurrency, coverage) before or alongside `qa-validator` running verification checkpoints and recording a `testrun`.",
-    "7. Only transition `test -> done` after a closed, passing `testrun` covers the item's required suite.",
+    manifest.workflow?.humanQuestions === "native-ide"
+      ? "5. **Subagent Question Routing:** Subagents should use native IDE question dialogs (`ask_question`, `vscode_askQuestions`, `AskUserQuestion`) or return their questions to the Coordinator."
+      : "5. **Subagent Question Routing:** When defining or invoking subagents, grant them MCP tools (`EnableMCPTools: true`) if they need to ask the user, or instruct them to return their questions to the Coordinator, which MUST ask via `ask_human`. Subagents must never call native `ask_question` directly.",
+    "6. **Context-Budget Handoff & Task Splitting:** If an item returns `HANDOFF_PENDING` (or `board { op: \"status\" }` shows `[HANDOFF_PENDING]`), spawn a fresh subagent briefed solely with `board { op: \"show\", itemId }`. If it returns `SPLIT_PENDING` (`[SPLIT_PENDING]`), run `board { op: \"split\", itemId }` to atomically create child tasks and dispatch each child to a fresh subagent.",
+    "7. After implementation finishes, verify the item is in `test` and dispatch `code-reviewer` for non-trivial code changes (security, architecture, concurrency, coverage) before or alongside `qa-validator` running verification checkpoints and recording a `testrun`.",
+    "8. Only transition `test -> done` after a closed, passing `testrun` covers the item's required suite.",
     "",
   ].join("\n");
 }
@@ -270,6 +276,9 @@ export function renderTeamSetupPrompt(manifest?: TeamManifest): string {
   const projectLabel = manifest
     ? `**${manifest.project.title}** (\`${manifest.project.id}\`)`
     : "any repository";
+  const mcpServerName = manifest
+    ? `${manifest.project.id}-team_agent-studio`
+    : "agent-studio-team_agent-studio";
 
   return [
     "# Agent Studio — Cross-IDE AI Setup Agent (`team-setup`)",
@@ -286,6 +295,7 @@ export function renderTeamSetupPrompt(manifest?: TeamManifest): string {
     "- **1c. Invariants & Failure Modes:** Extract repository-specific invariants, coupling/lockstep rules, forbidden cross-layer imports, and known/likely failure modes (races, stale locks, schema drift, auth bypasses, resource leaks).",
     "",
     "### 2. Interview the User",
+    `- ALWAYS use the \`ask_human\` MCP tool (via \`call_mcp_tool\` with ServerName \`"${mcpServerName}"\` and ToolName \`"ask_human"\`, or \`agent_studio_ask_human\` in VS Code) rather than native ask tools so the user can answer directly in the Studio Messages UI.`,
     "- Confirm the **target IDEs** to compile (`antigravity`, `claude-code`, `copilot-vscode`).",
     "- Confirm the **specialist roster** (default blueprint: `orchestrator`, `architect`, `ux-designer`, `backend-engineer`, `frontend-engineer`, `code-reviewer`, `qa-validator`, plus any domain-specific specialists the repo needs).",
     "- Confirm the **model routing policy** (`prefer-fallback` default for portable tiers & `model-policy: preferred`, `defer-to-host` for pure `/swarm` / Copilot Auto, or `pinned`) and per-role `modelTier` (`fast` / `balanced` / `reasoning`).",

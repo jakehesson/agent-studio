@@ -1,0 +1,2937 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
+  <meta name="color-scheme" content="dark" />
+  <title>Agent Studio — Activity Feed Messages v2 Interactive Mockup</title>
+  <script>
+    // Apply saved mockup theme early to avoid FOUC
+    (function () {
+      try {
+        var saved = localStorage.getItem("agent-studio-mockup:theme");
+        if (saved === "light" || saved === "dark") {
+          document.querySelector('meta[name="color-scheme"]').content = saved;
+          document.documentElement.dataset.theme = saved;
+        } else {
+          document.documentElement.dataset.theme = "dark";
+        }
+      } catch (e) {
+        document.documentElement.dataset.theme = "dark";
+      }
+    })();
+  </script>
+  <style>
+    /* =========================================================================
+       Agent Studio Design Tokens (matches web/src/styles/tokens.css + light mode)
+       ========================================================================= */
+    :root {
+      color-scheme: dark;
+
+      --bg: #070b14;
+      --bg-grad-top: #0b101b;
+      --bg-grad-bot: #070a12;
+      --panel: #0e131f;
+      --panel-2: #141c2e;
+      --panel-3: #1b253d;
+      --panel-elevated: #0a101d;
+      --border: #1e2942;
+      --border-strong: #31446b;
+
+      --text: #e8effa;
+      --text-strong: #f8fafc;
+      --muted: #93a4c2;
+
+      --violet: #a855f7;
+      --thinking: #c084fc;
+      --thinking-bg: rgba(168, 85, 247, 0.10);
+      --thinking-border: rgba(192, 132, 252, 0.34);
+      --thinking-text: #e9d5ff;
+
+      --cyan: #06b6d4;
+      --sky: #38bdf8;
+      --emerald: #10b981;
+      --amber: #f59e0b;
+      --rose: #f43f5e;
+      --indigo: #818cf8;
+      --slate: #64748b;
+
+      --human-accent: #10b981;
+      --human-bg: rgba(16, 185, 129, 0.11);
+      --human-border: rgba(16, 185, 129, 0.38);
+
+      --target-size: 32px;
+      --scrollbar-thumb: #2b3c5e;
+      --scrollbar-track: #0a0f1a;
+      --shadow-elevated: 0 18px 48px rgba(0, 0, 0, 0.55);
+
+      accent-color: var(--cyan);
+      scrollbar-color: var(--scrollbar-thumb) var(--scrollbar-track);
+    }
+
+    :root:has(> head > meta[name="color-scheme"][content="light"]),
+    :root[data-theme="light"] {
+      color-scheme: light;
+
+      --bg: #eef2f8;
+      --bg-grad-top: #f4f7fc;
+      --bg-grad-bot: #eaeff7;
+      --panel: #ffffff;
+      --panel-2: #f4f7fc;
+      --panel-3: #e7eef9;
+      --panel-elevated: #f8fafd;
+      --border: #d4deee;
+      --border-strong: #9fb2d1;
+
+      --text: #1e293b;
+      --text-strong: #0f172a;
+      --muted: #475569;
+
+      --violet: #7e22ce;
+      --thinking: #7e22ce;
+      --thinking-bg: rgba(126, 34, 206, 0.07);
+      --thinking-border: rgba(126, 34, 206, 0.28);
+      --thinking-text: #4c1d95;
+
+      --cyan: #0e7490;
+      --sky: #0284c7;
+      --emerald: #047857;
+      --amber: #b45309;
+      --rose: #be123c;
+      --indigo: #4338ca;
+      --slate: #475569;
+
+      --human-accent: #059669;
+      --human-bg: rgba(5, 150, 105, 0.09);
+      --human-border: rgba(5, 150, 105, 0.35);
+
+      --scrollbar-thumb: #b4c3db;
+      --scrollbar-track: #edf2f8;
+      --shadow-elevated: 0 14px 36px rgba(15, 23, 42, 0.16);
+    }
+
+    *, *::before, *::after {
+      box-sizing: border-box;
+    }
+
+    [hidden] {
+      display: none !important;
+    }
+
+    html {
+      background: var(--bg);
+      color: var(--text);
+      scroll-padding-bottom: calc(88px + env(safe-area-inset-bottom, 0px));
+    }
+
+    body {
+      margin: 0;
+      height: 100dvh;
+      min-height: 100dvh;
+      overflow: hidden;
+      background: var(--bg);
+      color: var(--text);
+      font-family: Inter, "Segoe UI", system-ui, -apple-system, sans-serif;
+      font-size: 13px;
+      line-height: 1.48;
+      display: flex;
+      flex-direction: column;
+      overflow-wrap: break-word;
+    }
+
+    :focus-visible {
+      outline: 2px solid var(--sky);
+      outline-offset: 2px;
+    }
+
+    :where(button, select, input, [role="tab"], [role="radio"], summary) {
+      touch-action: manipulation;
+      font-family: inherit;
+    }
+
+    code, pre {
+      font-family: ui-monospace, SFMono-Regular, Consolas, "Liberation Mono", monospace;
+    }
+
+    @supports not (scrollbar-color: auto) {
+      ::-webkit-scrollbar {
+        width: 9px;
+        height: 9px;
+      }
+      ::-webkit-scrollbar-thumb {
+        background: var(--scrollbar-thumb);
+        border-radius: 99px;
+      }
+      ::-webkit-scrollbar-track {
+        background: var(--scrollbar-track);
+      }
+    }
+
+    /* =========================================================================
+       Top Mockup Sandbox Toolbar
+       ========================================================================= */
+    .mockup-toolbar {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 10px;
+      flex-wrap: wrap;
+      padding: max(8px, env(safe-area-inset-top, 0px)) max(14px, env(safe-area-inset-right, 0px)) 8px max(14px, env(safe-area-inset-left, 0px));
+      background: var(--panel);
+      border-bottom: 1px solid var(--border-strong);
+      flex-shrink: 0;
+      z-index: 20;
+    }
+
+    .toolbar-brand {
+      display: flex;
+      align-items: center;
+      gap: 9px;
+      min-width: 0;
+    }
+
+    .brand-mark {
+      width: 28px;
+      height: 28px;
+      border-radius: 8px;
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      font-weight: 800;
+      font-size: 11px;
+      letter-spacing: 0.04em;
+      color: #ffffff;
+      background: linear-gradient(135deg, var(--violet) 0%, var(--cyan) 100%);
+      box-shadow: 0 2px 10px rgba(168, 85, 247, 0.34);
+      flex-shrink: 0;
+    }
+
+    .toolbar-title-wrap {
+      display: flex;
+      flex-direction: column;
+      min-width: 0;
+    }
+
+    .toolbar-title {
+      margin: 0;
+      font-size: 13px;
+      font-weight: 700;
+      color: var(--text-strong);
+      line-height: 1.2;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+
+    .toolbar-sub {
+      font-size: 11px;
+      color: var(--muted);
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+
+    .toolbar-controls {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      flex-wrap: nowrap;
+      overflow-x: auto;
+      scrollbar-width: none;
+      max-width: 100%;
+      padding-bottom: 1px;
+    }
+    .toolbar-controls::-webkit-scrollbar { display: none; }
+
+    .control-group {
+      display: inline-flex;
+      align-items: center;
+      gap: 3px;
+      padding: 3px;
+      border-radius: 9px;
+      background: var(--panel-elevated);
+      border: 1px solid var(--border);
+      flex-shrink: 0;
+    }
+
+    .control-group-label {
+      font-size: 10px;
+      font-weight: 700;
+      text-transform: uppercase;
+      letter-spacing: 0.05em;
+      color: var(--muted);
+      padding: 0 6px;
+      white-space: nowrap;
+    }
+
+    .seg-btn {
+      border: 1px solid transparent;
+      background: transparent;
+      color: var(--muted);
+      border-radius: 6px;
+      padding: 4px 9px;
+      font-size: 11.5px;
+      font-weight: 600;
+      cursor: pointer;
+      white-space: nowrap;
+      min-block-size: var(--target-size);
+      display: inline-flex;
+      align-items: center;
+      gap: 5px;
+      transition: background 0.14s ease, color 0.14s ease, border-color 0.14s ease;
+    }
+
+    .seg-btn:hover:not(:disabled) {
+      color: var(--text-strong);
+      background: color-mix(in srgb, var(--sky) 10%, transparent);
+    }
+
+    .seg-btn[aria-pressed="true"] {
+      background: color-mix(in srgb, var(--sky) 18%, var(--panel-2));
+      border-color: color-mix(in srgb, var(--sky) 55%, var(--border));
+      color: var(--text-strong);
+    }
+
+    .seg-btn.is-recommended[aria-pressed="true"] {
+      background: color-mix(in srgb, var(--emerald) 18%, var(--panel-2));
+      border-color: color-mix(in srgb, var(--emerald) 55%, var(--border));
+    }
+
+    .seg-btn:disabled {
+      opacity: 0.45;
+      cursor: not-allowed;
+    }
+
+    .rec-dot {
+      width: 6px;
+      height: 6px;
+      border-radius: 50%;
+      background: var(--emerald);
+      flex-shrink: 0;
+    }
+
+    /* =========================================================================
+       Preview Stage (Centers 768px / 390px device frames or fills Desktop)
+       ========================================================================= */
+    .stage-outer {
+      flex: 1;
+      min-height: 0;
+      display: flex;
+      align-items: stretch;
+      justify-content: center;
+      padding: 0;
+      background:
+        radial-gradient(circle at 18% 0%, color-mix(in srgb, var(--violet) 9%, transparent), transparent 46%),
+        radial-gradient(circle at 84% 100%, color-mix(in srgb, var(--cyan) 8%, transparent), transparent 46%),
+        var(--bg);
+      overflow: hidden;
+    }
+
+    .stage-outer[data-viewport="fold-open"],
+    .stage-outer[data-viewport="fold-cover"] {
+      padding: 12px;
+    }
+
+    .preview-frame {
+      flex: 1 1 auto;
+      width: 100%;
+      min-width: 0;
+      min-height: 0;
+      height: 100%;
+      display: flex;
+      flex-direction: column;
+      position: relative;
+      container-type: inline-size;
+      container-name: stage;
+      background: var(--bg);
+      overflow: hidden;
+      transition: max-width 0.22s ease, border-radius 0.22s ease;
+    }
+
+    .stage-outer[data-viewport="fold-open"] .preview-frame {
+      max-width: 768px;
+      border: 2px solid var(--border-strong);
+      border-radius: 20px;
+      box-shadow: var(--shadow-elevated);
+    }
+
+    .stage-outer[data-viewport="fold-cover"] .preview-frame {
+      max-width: 390px;
+      border: 2px solid var(--border-strong);
+      border-radius: 24px;
+      box-shadow: var(--shadow-elevated);
+    }
+
+    /* Subtle visual hinge guide in simulated Fold Open mode */
+    .fold-hinge-guide {
+      display: none;
+      position: absolute;
+      top: 0;
+      bottom: 0;
+      left: 50%;
+      width: 8px;
+      transform: translateX(-50%);
+      pointer-events: none;
+      z-index: 30;
+      background: linear-gradient(
+        90deg,
+        transparent,
+        color-mix(in srgb, var(--border-strong) 45%, transparent) 50%,
+        transparent
+      );
+      border-left: 1px dashed color-mix(in srgb, var(--muted) 35%, transparent);
+      border-right: 1px dashed color-mix(in srgb, var(--muted) 35%, transparent);
+    }
+
+    .stage-outer[data-viewport="fold-open"] .fold-hinge-guide {
+      display: block;
+    }
+
+    /* =========================================================================
+       Studio App Shell inside Preview Frame
+       ========================================================================= */
+    .studio-shell {
+      flex: 1;
+      min-height: 0;
+      display: flex;
+      flex-direction: column;
+      position: relative;
+      overflow: hidden;
+    }
+
+    .studio-ctx-bar {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 10px;
+      padding: 8px 14px;
+      background: var(--panel);
+      border-bottom: 1px solid var(--border);
+      flex-shrink: 0;
+    }
+
+    .ctx-left {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      min-width: 0;
+    }
+
+    .live-badge {
+      display: inline-flex;
+      align-items: center;
+      gap: 5px;
+      padding: 2px 8px;
+      border-radius: 999px;
+      font-size: 10.5px;
+      font-weight: 700;
+      color: var(--emerald);
+      background: color-mix(in srgb, var(--emerald) 14%, transparent);
+      border: 1px solid color-mix(in srgb, var(--emerald) 40%, transparent);
+      flex-shrink: 0;
+    }
+
+    .live-dot {
+      width: 6px;
+      height: 6px;
+      border-radius: 50%;
+      background: var(--emerald);
+      animation: pulseLive 2s ease-in-out infinite;
+    }
+
+    @keyframes pulseLive {
+      0%, 100% { opacity: 1; transform: scale(1); }
+      50% { opacity: 0.45; transform: scale(0.85); }
+    }
+
+    .session-title {
+      font-size: 12px;
+      font-weight: 650;
+      color: var(--text-strong);
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+
+    .ctx-metrics {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      flex-shrink: 0;
+    }
+
+    .ctx-chip {
+      font-size: 11px;
+      padding: 2px 8px;
+      border-radius: 999px;
+      border: 1px solid var(--border);
+      background: var(--panel-2);
+      color: var(--muted);
+      white-space: nowrap;
+    }
+
+    .ctx-chip strong {
+      color: var(--text-strong);
+      font-weight: 700;
+    }
+
+    /* Main Workspace Grid: Desktop (>=1021px) vs Z Fold 7 Open (640-1020px) vs Cover (<640px) */
+    .workspace {
+      flex: 1;
+      min-height: 0;
+      display: grid;
+      grid-template-columns: minmax(260px, 0.85fr) minmax(0, 1.35fr);
+      gap: 12px;
+      padding: 12px;
+      overflow: hidden;
+      position: relative;
+    }
+
+    .workspace.has-side-drawer {
+      grid-template-columns: minmax(220px, 0.65fr) minmax(0, 1.15fr) minmax(320px, 0.92fr);
+    }
+
+    /* Pane Card */
+    .pane-card {
+      background: var(--panel);
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      display: flex;
+      flex-direction: column;
+      min-width: 0;
+      min-height: 0;
+      overflow: hidden;
+    }
+
+    .pane-head {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 8px;
+      padding: 9px 12px;
+      background: var(--panel);
+      border-bottom: 1px solid var(--border);
+      flex-shrink: 0;
+      flex-wrap: wrap;
+    }
+
+    .pane-title-group {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      min-width: 0;
+    }
+
+    .pane-title {
+      margin: 0;
+      font-size: 12.5px;
+      font-weight: 700;
+      color: var(--text-strong);
+      white-space: nowrap;
+    }
+
+    .pane-subtitle {
+      font-size: 11px;
+      color: var(--muted);
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+
+    /* =========================================================================
+       Left Pane: Compact Agent Topology (Interactive Thread Selector)
+       ========================================================================= */
+    .topology-body {
+      flex: 1;
+      min-height: 0;
+      overflow-y: auto;
+      padding: 12px;
+      display: flex;
+      flex-direction: column;
+      gap: 10px;
+      background: linear-gradient(180deg, var(--bg-grad-top), var(--bg-grad-bot));
+    }
+
+    .topo-hint {
+      font-size: 11px;
+      color: var(--muted);
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 8px;
+    }
+
+    .topo-roster {
+      display: flex;
+      flex-direction: column;
+      gap: 7px;
+    }
+
+    .agent-node-btn {
+      width: 100%;
+      text-align: left;
+      border: 1px solid var(--border);
+      background: var(--panel);
+      color: var(--text);
+      border-radius: 10px;
+      padding: 8px 10px;
+      cursor: pointer;
+      display: flex;
+      align-items: center;
+      gap: 9px;
+      min-block-size: 40px;
+      transition: border-color 0.14s ease, background 0.14s ease, transform 0.12s ease;
+      position: relative;
+    }
+
+    .agent-node-btn:hover {
+      border-color: var(--border-strong);
+      background: var(--panel-2);
+    }
+
+    .agent-node-btn[aria-pressed="true"] {
+      border-color: var(--node-color, var(--sky));
+      background: color-mix(in srgb, var(--node-color, var(--sky)) 12%, var(--panel));
+      box-shadow: inset 3px 0 0 var(--node-color, var(--sky));
+    }
+
+    .agent-node-btn.is-sub {
+      margin-left: 14px;
+      width: calc(100% - 14px);
+    }
+
+    .node-dot {
+      width: 9px;
+      height: 9px;
+      border-radius: 50%;
+      background: var(--node-color, var(--sky));
+      flex-shrink: 0;
+    }
+
+    .node-info {
+      flex: 1;
+      min-width: 0;
+      display: flex;
+      flex-direction: column;
+      gap: 1px;
+    }
+
+    .node-name-row {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      flex-wrap: wrap;
+    }
+
+    .node-name {
+      font-weight: 700;
+      font-size: 12px;
+      color: var(--text-strong);
+    }
+
+    .node-role {
+      font-size: 10px;
+      font-weight: 650;
+      padding: 1px 6px;
+      border-radius: 4px;
+      background: var(--panel-2);
+      border: 1px solid var(--border);
+      color: var(--muted);
+    }
+
+    .node-meta {
+      font-size: 11px;
+      color: var(--muted);
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+
+    .node-count {
+      font-size: 10.5px;
+      font-weight: 700;
+      padding: 2px 7px;
+      border-radius: 999px;
+      background: var(--panel-2);
+      border: 1px solid var(--border);
+      color: var(--text);
+      flex-shrink: 0;
+    }
+
+    .silent-workers-card {
+      margin-top: 2px;
+      padding: 8px 10px;
+      border-radius: 9px;
+      border: 1px dashed var(--border-strong);
+      background: color-mix(in srgb, var(--indigo) 6%, var(--panel));
+      font-size: 11px;
+      color: var(--muted);
+      display: flex;
+      flex-direction: column;
+      gap: 4px;
+    }
+
+    .silent-workers-card strong {
+      color: var(--text-strong);
+      font-size: 11.5px;
+    }
+
+    /* =========================================================================
+       Center/Right Pane: Activity Feed (Messages / SMS Stream)
+       ========================================================================= */
+    .feed-filters {
+      display: flex;
+      align-items: center;
+      gap: 4px;
+      overflow-x: auto;
+      scrollbar-width: none;
+    }
+    .feed-filters::-webkit-scrollbar { display: none; }
+
+    .feed-tab {
+      border: 1px solid transparent;
+      background: transparent;
+      color: var(--muted);
+      padding: 4px 9px;
+      border-radius: 7px;
+      font-size: 11.5px;
+      font-weight: 600;
+      cursor: pointer;
+      white-space: nowrap;
+      min-block-size: var(--target-size);
+    }
+
+    .feed-tab:hover {
+      color: var(--text-strong);
+      background: var(--panel-2);
+    }
+
+    .feed-tab[aria-selected="true"] {
+      background: color-mix(in srgb, var(--cyan) 16%, var(--panel-2));
+      border-color: color-mix(in srgb, var(--cyan) 45%, var(--border));
+      color: var(--text-strong);
+    }
+
+    .sms-thread-bar {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 8px;
+      padding: 7px 12px;
+      background: var(--panel-elevated);
+      border-bottom: 1px solid var(--border);
+      flex-shrink: 0;
+      flex-wrap: wrap;
+    }
+
+    .sms-pill-meta {
+      display: flex;
+      align-items: center;
+      gap: 7px;
+      min-width: 0;
+      flex-wrap: wrap;
+    }
+
+    .thread-route-pill {
+      display: inline-flex;
+      align-items: center;
+      gap: 5px;
+      padding: 2px 9px;
+      border-radius: 999px;
+      font-size: 11px;
+      font-weight: 700;
+      color: var(--sky);
+      background: color-mix(in srgb, var(--sky) 13%, transparent);
+      border: 1px solid color-mix(in srgb, var(--sky) 38%, transparent);
+    }
+
+    .thread-stats {
+      font-size: 11px;
+      color: var(--muted);
+    }
+
+    .sms-bar-actions {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      flex-wrap: wrap;
+    }
+
+    .subtle-toggle-pill {
+      display: inline-flex;
+      align-items: center;
+      gap: 5px;
+      padding: 3px 9px;
+      border-radius: 999px;
+      border: 1px solid var(--border);
+      background: var(--panel-2);
+      color: var(--muted);
+      font-size: 10.5px;
+      font-weight: 600;
+      cursor: pointer;
+      min-block-size: 26px;
+    }
+
+    .subtle-toggle-pill:hover {
+      border-color: var(--border-strong);
+      color: var(--text-strong);
+    }
+
+    .subtle-toggle-pill[aria-pressed="true"] {
+      border-color: color-mix(in srgb, var(--amber) 55%, var(--border));
+      background: color-mix(in srgb, var(--amber) 14%, var(--panel-2));
+      color: var(--text-strong);
+    }
+
+    .clear-thread-btn {
+      border: 1px solid var(--border);
+      background: transparent;
+      color: var(--muted);
+      border-radius: 6px;
+      padding: 2px 7px;
+      font-size: 10.5px;
+      font-weight: 600;
+      cursor: pointer;
+    }
+    .clear-thread-btn:hover {
+      color: var(--text-strong);
+      border-color: var(--border-strong);
+    }
+
+    /* Comparison / Critique Banner (Before vs After clarity) */
+    .mode-banner {
+      padding: 7px 12px;
+      font-size: 11.5px;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 10px;
+      flex-wrap: wrap;
+      border-bottom: 1px solid var(--border);
+      flex-shrink: 0;
+    }
+
+    .mode-banner.is-before {
+      background: color-mix(in srgb, var(--rose) 10%, var(--panel));
+      color: var(--text);
+    }
+
+    .mode-banner.is-after {
+      background: color-mix(in srgb, var(--emerald) 8%, var(--panel));
+      color: var(--text);
+    }
+
+    .mode-banner-tag {
+      font-size: 10px;
+      font-weight: 800;
+      text-transform: uppercase;
+      letter-spacing: 0.05em;
+      padding: 2px 6px;
+      border-radius: 4px;
+      margin-right: 6px;
+    }
+
+    .mode-banner.is-before .mode-banner-tag {
+      background: color-mix(in srgb, var(--rose) 20%, transparent);
+      color: var(--rose);
+      border: 1px solid color-mix(in srgb, var(--rose) 45%, transparent);
+    }
+
+    .mode-banner.is-after .mode-banner-tag {
+      background: color-mix(in srgb, var(--emerald) 20%, transparent);
+      color: var(--emerald);
+      border: 1px solid color-mix(in srgb, var(--emerald) 45%, transparent);
+    }
+
+    /* SMS Stream Scroll Body */
+    .sms-body-wrap {
+      position: relative;
+      flex: 1;
+      min-height: 0;
+      display: flex;
+      flex-direction: column;
+    }
+
+    .sms-body {
+      flex: 1;
+      min-height: 0;
+      overflow-y: auto;
+      padding: 14px 14px calc(18px + env(safe-area-inset-bottom, 0px));
+      display: flex;
+      flex-direction: column;
+      gap: 11px;
+      background: linear-gradient(180deg, var(--bg-grad-top) 0%, var(--bg-grad-bot) 100%);
+    }
+
+    .sms-day-divider {
+      flex-shrink: 0;
+      align-self: center;
+      font-size: 10.5px;
+      color: var(--muted);
+      background: var(--panel-2);
+      border: 1px solid var(--border);
+      border-radius: 999px;
+      padding: 2px 11px;
+    }
+
+    /* Message Bubbles */
+    .bubble {
+      flex-shrink: 0;
+      max-width: min(92%, 680px);
+      padding: 10px 12px;
+      border-radius: 13px;
+      border: 1px solid var(--border);
+      display: flex;
+      flex-direction: column;
+      gap: 7px;
+      position: relative;
+      transition: border-color 0.16s ease, box-shadow 0.16s ease;
+    }
+
+    .bubble.inbound {
+      align-self: flex-start;
+      background: color-mix(in srgb, var(--bubble-accent, var(--slate)) 8%, var(--panel-2));
+      border-left: 3px solid var(--bubble-accent, var(--border-strong));
+      border-bottom-left-radius: 4px;
+    }
+
+    .bubble.outbound {
+      align-self: flex-end;
+      background: color-mix(in srgb, var(--bubble-accent, var(--violet)) 11%, var(--panel-2));
+      border-color: color-mix(in srgb, var(--bubble-accent, var(--violet)) 34%, var(--border));
+      border-right: 3px solid var(--bubble-accent, var(--violet));
+      border-bottom-right-radius: 4px;
+    }
+
+    /* Dedicated Human Response Styling — clearly distinct from Coordinator */
+    .bubble.is-human {
+      align-self: flex-end;
+      background: var(--human-bg);
+      border-color: var(--human-border);
+      border-right: 3.5px solid var(--human-accent);
+      border-bottom-right-radius: 4px;
+    }
+
+    /* Highlighted when inspected in Side Sheet or target of jump */
+    .bubble.is-inspected {
+      border-color: var(--sky);
+      box-shadow: 0 0 0 2px color-mix(in srgb, var(--sky) 28%, transparent);
+    }
+
+    .bubble.is-jump-flash {
+      animation: jumpPulse 1.1s ease-out;
+    }
+
+    @keyframes jumpPulse {
+      0% { box-shadow: 0 0 0 4px color-mix(in srgb, var(--amber) 55%, transparent); }
+      100% { box-shadow: 0 0 0 0 transparent; }
+    }
+
+    .bubble-top-row {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 8px;
+      flex-wrap: wrap;
+    }
+
+    .bubble-route {
+      font-size: 10px;
+      font-weight: 700;
+      color: var(--text-strong);
+      background: color-mix(in srgb, var(--bubble-accent, var(--sky)) 15%, transparent);
+      border: 1px solid color-mix(in srgb, var(--bubble-accent, var(--sky)) 40%, var(--border));
+      padding: 1px 7px;
+      border-radius: 999px;
+      display: inline-flex;
+      align-items: center;
+      gap: 4px;
+    }
+
+    .bubble.is-human .bubble-route {
+      background: color-mix(in srgb, var(--human-accent) 18%, transparent);
+      border-color: color-mix(in srgb, var(--human-accent) 46%, transparent);
+    }
+
+    .bubble-head {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 10px;
+      font-size: 11px;
+      color: var(--muted);
+    }
+
+    .bubble-sender {
+      font-weight: 700;
+      color: var(--text-strong);
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      flex-wrap: wrap;
+    }
+
+    .bubble-role {
+      font-size: 10px;
+      font-weight: 650;
+      color: var(--muted);
+      background: var(--panel);
+      border: 1px solid var(--border);
+      padding: 0 5px;
+      border-radius: 4px;
+    }
+
+    .bubble.is-human .bubble-role {
+      color: var(--human-accent);
+      border-color: color-mix(in srgb, var(--human-accent) 40%, transparent);
+      background: color-mix(in srgb, var(--human-accent) 12%, var(--panel));
+    }
+
+    /* Reply Reference Tag on Human Answer */
+    .reply-quote-ref {
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      padding: 4px 8px;
+      border-radius: 7px;
+      background: color-mix(in srgb, var(--panel) 75%, transparent);
+      border: 1px solid var(--border);
+      border-left: 2.5px solid var(--cyan);
+      font-size: 11px;
+      color: var(--muted);
+      cursor: pointer;
+      text-align: left;
+      max-width: 100%;
+      width: fit-content;
+    }
+
+    .reply-quote-ref:hover {
+      border-color: var(--sky);
+      color: var(--text-strong);
+    }
+
+    .reply-quote-ref strong {
+      color: var(--text-strong);
+      font-weight: 650;
+      flex-shrink: 0;
+    }
+
+    .reply-quote-text {
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+      min-width: 0;
+    }
+
+    /* Rich Multi-line Markdown Body + Soft Fade Clamp */
+    .bubble-body-container {
+      position: relative;
+      display: flex;
+      flex-direction: column;
+      gap: 4px;
+    }
+
+    .bubble-text {
+      font-size: 12.5px;
+      line-height: 1.52;
+      color: var(--text);
+      overflow-wrap: anywhere;
+    }
+
+    .bubble-text.is-clamped {
+      max-height: 11.8em; /* ~7–8 comfortable readable lines */
+      overflow: hidden;
+      mask-image: linear-gradient(180deg, #000 72%, transparent 100%);
+      -webkit-mask-image: linear-gradient(180deg, #000 72%, transparent 100%);
+    }
+
+    .bubble-text p {
+      margin: 0 0 6px;
+    }
+    .bubble-text p:last-child {
+      margin-bottom: 0;
+    }
+
+    .bubble-text strong {
+      color: var(--text-strong);
+      font-weight: 700;
+    }
+
+    .bubble-text ul {
+      margin: 4px 0 6px;
+      padding-left: 18px;
+    }
+
+    .bubble-text li {
+      margin: 3px 0;
+    }
+
+    .bubble-text blockquote {
+      margin: 5px 0;
+      padding: 4px 10px;
+      border-left: 2.5px solid var(--bubble-accent, var(--sky));
+      background: color-mix(in srgb, var(--panel) 65%, transparent);
+      border-radius: 0 6px 6px 0;
+      color: var(--muted);
+      font-style: italic;
+    }
+
+    .bubble-text code {
+      background: var(--panel-elevated);
+      border: 1px solid var(--border);
+      color: var(--sky);
+      padding: 0 4px;
+      border-radius: 4px;
+      font-size: 11.5px;
+    }
+
+    .show-more-btn {
+      align-self: flex-start;
+      border: 1px solid var(--border-strong);
+      background: var(--panel);
+      color: var(--sky);
+      border-radius: 999px;
+      padding: 3px 10px;
+      font-size: 11px;
+      font-weight: 650;
+      cursor: pointer;
+      display: inline-flex;
+      align-items: center;
+      gap: 4px;
+      min-block-size: 26px;
+    }
+
+    .show-more-btn:hover {
+      background: color-mix(in srgb, var(--sky) 15%, var(--panel));
+      border-color: var(--sky);
+      color: var(--text-strong);
+    }
+
+    /* Structured Question Card inside A3 - Questioner bubble */
+    .question-options-list {
+      display: flex;
+      flex-direction: column;
+      gap: 5px;
+      margin-top: 2px;
+    }
+
+    .q-option-pill {
+      display: flex;
+      align-items: center;
+      gap: 7px;
+      padding: 5px 9px;
+      border-radius: 8px;
+      border: 1px solid var(--border);
+      background: var(--panel);
+      font-size: 11.5px;
+      color: var(--muted);
+    }
+
+    .q-option-pill.is-chosen {
+      border-color: var(--human-accent);
+      background: color-mix(in srgb, var(--human-accent) 13%, var(--panel));
+      color: var(--text-strong);
+      font-weight: 650;
+    }
+
+    .q-check {
+      width: 16px;
+      height: 16px;
+      border-radius: 50%;
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      font-size: 10px;
+      flex-shrink: 0;
+      border: 1px solid var(--border-strong);
+      color: var(--muted);
+    }
+
+    .q-option-pill.is-chosen .q-check {
+      background: var(--human-accent);
+      border-color: var(--human-accent);
+      color: #ffffff;
+    }
+
+    .q-chosen-tag {
+      margin-left: auto;
+      font-size: 10px;
+      font-weight: 700;
+      color: var(--human-accent);
+    }
+
+    /* NEW: "Behind This Response" Provenance Trigger Bar */
+    .behind-bar {
+      margin-top: 2px;
+      width: 100%;
+      border: 1px solid color-mix(in srgb, var(--thinking) 30%, var(--border));
+      background: color-mix(in srgb, var(--thinking) 7%, var(--panel));
+      color: var(--text);
+      border-radius: 8px;
+      padding: 5px 9px;
+      font-size: 11px;
+      font-weight: 600;
+      cursor: pointer;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 8px;
+      text-align: left;
+      min-block-size: 30px;
+      transition: background 0.14s ease, border-color 0.14s ease;
+    }
+
+    .behind-bar:hover {
+      background: color-mix(in srgb, var(--thinking) 15%, var(--panel));
+      border-color: var(--thinking);
+    }
+
+    .behind-bar[aria-expanded="true"] {
+      background: color-mix(in srgb, var(--sky) 16%, var(--panel));
+      border-color: var(--sky);
+    }
+
+    .behind-summary {
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      flex-wrap: wrap;
+      min-width: 0;
+    }
+
+    .behind-spark {
+      color: var(--thinking);
+      font-weight: 800;
+    }
+
+    .behind-meta-chip {
+      font-size: 10.5px;
+      color: var(--muted);
+      font-weight: 500;
+    }
+
+    .behind-cta {
+      color: var(--sky);
+      font-weight: 700;
+      white-space: nowrap;
+      flex-shrink: 0;
+    }
+
+    .inline-trace-note-removed { display: none; }
+
+    /* BEFORE Mode: Noisy standalone tool burst strips + old footer */
+    .tool-burst-strip {
+      flex-shrink: 0;
+      max-width: 92%;
+      display: flex;
+      flex-direction: column;
+      gap: 4px;
+      padding: 2px 0;
+      align-self: flex-start;
+    }
+
+    .tool-strip-header {
+      display: flex;
+      align-items: center;
+      flex-wrap: wrap;
+      gap: 6px;
+    }
+
+    .tool-strip-meta {
+      display: inline-flex;
+      align-items: center;
+      gap: 5px;
+      font-size: 10.5px;
+      color: var(--muted);
+    }
+
+    .tool-strip-dot {
+      width: 7px;
+      height: 7px;
+      border-radius: 50%;
+      background: var(--bubble-accent, var(--sky));
+    }
+
+    .tool-strip-agent {
+      font-weight: 650;
+      color: var(--text);
+    }
+
+    .tool-badge-btn {
+      font-size: 10.5px;
+      padding: 2px 7px;
+      border-radius: 6px;
+      background: color-mix(in srgb, var(--sky) 12%, transparent);
+      border: 1px solid color-mix(in srgb, var(--sky) 35%, transparent);
+      color: var(--sky);
+      cursor: pointer;
+      display: inline-flex;
+      align-items: center;
+      gap: 4px;
+    }
+
+    .read-full-btn {
+      margin-left: auto;
+      border: 1px solid color-mix(in srgb, var(--sky) 38%, transparent);
+      background: color-mix(in srgb, var(--sky) 10%, transparent);
+      color: var(--sky);
+      border-radius: 6px;
+      padding: 2px 8px;
+      font-size: 11px;
+      font-weight: 650;
+      cursor: pointer;
+    }
+
+    .bubble-foot-old {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 8px;
+      margin-top: 2px;
+    }
+
+    /* Optional Raw Audit Strip in After Mode when user toggles "Background steps" */
+    .silent-worker-inline-note {
+      align-self: center;
+      font-size: 10.5px;
+      color: var(--muted);
+      background: color-mix(in srgb, var(--indigo) 8%, var(--panel));
+      border: 1px dashed color-mix(in srgb, var(--indigo) 38%, var(--border));
+      border-radius: 999px;
+      padding: 3px 11px;
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      cursor: pointer;
+    }
+
+    .silent-worker-inline-note:hover {
+      border-color: var(--indigo);
+      color: var(--text-strong);
+    }
+
+    /* =========================================================================
+       "Behind This Response" Inspector Side Sheet Drawer (Desktop / Fold / Cover)
+       ========================================================================= */
+    .inspector-pane {
+      background: var(--panel);
+      border: 1px solid var(--border-strong);
+      border-radius: 12px;
+      display: flex;
+      flex-direction: column;
+      min-width: 0;
+      min-height: 0;
+      overflow: hidden;
+      box-shadow: var(--shadow-elevated);
+    }
+
+    .inspector-head {
+      padding: 10px 12px;
+      background: var(--panel-2);
+      border-bottom: 1px solid var(--border);
+      display: flex;
+      flex-direction: column;
+      gap: 6px;
+      flex-shrink: 0;
+    }
+
+    .inspector-head-top {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 8px;
+    }
+
+    .inspector-kicker {
+      font-size: 10px;
+      font-weight: 800;
+      letter-spacing: 0.06em;
+      text-transform: uppercase;
+      color: var(--thinking);
+    }
+
+    .inspector-title {
+      margin: 0;
+      font-size: 13px;
+      font-weight: 700;
+      color: var(--text-strong);
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      flex-wrap: wrap;
+    }
+
+    .inspector-nav-row {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 6px;
+      font-size: 11px;
+      color: var(--muted);
+    }
+
+    .nav-step-group {
+      display: inline-flex;
+      align-items: center;
+      gap: 4px;
+    }
+
+    .btn-ghost-sm {
+      border: 1px solid var(--border-strong);
+      background: var(--panel);
+      color: var(--text);
+      border-radius: 6px;
+      padding: 3px 8px;
+      font-size: 11px;
+      font-weight: 600;
+      cursor: pointer;
+      min-block-size: 28px;
+    }
+
+    .btn-ghost-sm:hover:not(:disabled) {
+      border-color: var(--sky);
+      color: var(--text-strong);
+    }
+
+    .btn-ghost-sm:disabled {
+      opacity: 0.4;
+      cursor: not-allowed;
+    }
+
+    .inspector-body {
+      flex: 1;
+      min-height: 0;
+      overflow-y: auto;
+      padding: 12px;
+      display: flex;
+      flex-direction: column;
+      gap: 12px;
+      background: linear-gradient(180deg, var(--bg-grad-top), var(--bg-grad-bot));
+    }
+
+    .trace-section-label {
+      font-size: 10.5px;
+      font-weight: 800;
+      text-transform: uppercase;
+      letter-spacing: 0.05em;
+      color: var(--muted);
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 8px;
+    }
+
+    .trace-timeline {
+      display: flex;
+      flex-direction: column;
+      gap: 9px;
+      position: relative;
+      padding-left: 14px;
+      border-left: 2px solid var(--border);
+      margin-left: 5px;
+    }
+
+    .thought-card {
+      position: relative;
+      border-radius: 9px;
+      padding: 8px 10px;
+      background: var(--thinking-bg);
+      border: 1px solid var(--thinking-border);
+      display: flex;
+      flex-direction: column;
+      gap: 4px;
+    }
+
+    .thought-card::before,
+    .tool-step-details::before {
+      content: "";
+      position: absolute;
+      left: -20px;
+      top: 12px;
+      width: 9px;
+      height: 9px;
+      border-radius: 50%;
+      border: 2px solid var(--panel);
+    }
+
+    .thought-card::before {
+      background: var(--thinking);
+    }
+
+    .thought-card-head {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 8px;
+      font-size: 10.5px;
+      font-weight: 700;
+      color: var(--thinking);
+    }
+
+    .thought-card-body {
+      font-size: 12px;
+      line-height: 1.48;
+      color: var(--thinking-text);
+    }
+
+    .tool-step-details {
+      position: relative;
+      border-radius: 9px;
+      border: 1px solid var(--border);
+      background: var(--panel);
+      padding: 6px 9px;
+    }
+
+    .tool-step-details::before {
+      background: var(--sky);
+    }
+
+    .tool-step-details summary {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      cursor: pointer;
+      list-style: none;
+      font-size: 11.5px;
+      color: var(--text);
+      flex-wrap: wrap;
+    }
+
+    .tool-step-details summary::-webkit-details-marker {
+      display: none;
+    }
+
+    .tool-name-pill {
+      font-family: ui-monospace, Consolas, monospace;
+      font-size: 11px;
+      font-weight: 700;
+      color: var(--sky);
+      background: color-mix(in srgb, var(--sky) 13%, transparent);
+      border: 1px solid color-mix(in srgb, var(--sky) 35%, transparent);
+      padding: 1px 6px;
+      border-radius: 5px;
+    }
+
+    .tool-ok-pill {
+      font-size: 10px;
+      font-weight: 700;
+      color: var(--emerald);
+      background: color-mix(in srgb, var(--emerald) 14%, transparent);
+      padding: 1px 6px;
+      border-radius: 999px;
+    }
+
+    .tool-latency {
+      margin-left: auto;
+      font-family: ui-monospace, Consolas, monospace;
+      font-size: 10.5px;
+      color: var(--muted);
+    }
+
+    .tool-step-summary-txt {
+      width: 100%;
+      font-size: 11px;
+      color: var(--muted);
+      margin-top: 2px;
+    }
+
+    .tool-io-block {
+      margin-top: 7px;
+      padding-top: 7px;
+      border-top: 1px dashed var(--border);
+      display: flex;
+      flex-direction: column;
+      gap: 5px;
+    }
+
+    .tool-io-pre {
+      margin: 0;
+      padding: 6px 8px;
+      border-radius: 6px;
+      background: var(--panel-elevated);
+      border: 1px solid var(--border);
+      font-size: 11px;
+      color: var(--text);
+      white-space: pre-wrap;
+      overflow-x: auto;
+      max-height: 150px;
+    }
+
+    .response-sent-divider {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      margin-top: 4px;
+      padding: 2px 0;
+      font-size: 10.5px;
+      font-weight: 700;
+      letter-spacing: 0.06em;
+      text-transform: lowercase;
+      color: var(--emerald);
+    }
+
+    .response-sent-divider::before,
+    .response-sent-divider::after {
+      content: "";
+      flex: 1;
+      height: 0;
+      border-top: 1px dashed color-mix(in srgb, var(--emerald) 55%, var(--border-strong));
+    }
+
+    .inspector-foot {
+      padding: 9px 12px;
+      background: var(--panel-2);
+      border-top: 1px solid var(--border);
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      flex-wrap: wrap;
+      flex-shrink: 0;
+    }
+
+    .inspector-foot .btn-primary-sm {
+      flex: 1 1 auto;
+      justify-content: center;
+    }
+
+    .btn-primary-sm {
+      border: 1px solid color-mix(in srgb, var(--sky) 65%, var(--border));
+      background: color-mix(in srgb, var(--sky) 20%, var(--panel-2));
+      color: var(--text-strong);
+      border-radius: 7px;
+      padding: 5px 10px;
+      font-size: 11.5px;
+      font-weight: 700;
+      cursor: pointer;
+      display: inline-flex;
+      align-items: center;
+      gap: 5px;
+      min-block-size: 32px;
+    }
+
+    .btn-primary-sm:hover {
+      background: color-mix(in srgb, var(--sky) 30%, var(--panel-2));
+      border-color: var(--sky);
+    }
+
+    /* Bottom Nav (Shown on Z Fold 7 Open <= 1020px and Cover < 640px; hidden on Desktop >= 1021px) */
+    .cover-bottom-nav {
+      display: none;
+    }
+
+    /* Toast Notification */
+    .toast-banner {
+      position: fixed;
+      bottom: max(18px, env(safe-area-inset-bottom, 0px));
+      left: 50%;
+      transform: translateX(-50%);
+      z-index: 60;
+      padding: 8px 14px;
+      border-radius: 999px;
+      background: var(--panel-3);
+      border: 1px solid var(--sky);
+      color: var(--text-strong);
+      font-size: 12px;
+      font-weight: 650;
+      box-shadow: var(--shadow-elevated);
+      pointer-events: none;
+    }
+
+    /* =========================================================================
+       Three-Tier Responsive Ergonomics (Galaxy Z Fold 7 + Desktop)
+       Works BOTH via @container stage (for preview switcher) AND @media!
+       ========================================================================= */
+
+    /* Tier 1 & Tier 2 shared: Z Fold 7 Open (640px-1020px) & Cover (< 640px) use bottom nav menu */
+    @container stage (max-width: 1020px) {
+      .feed-filters {
+        display: none;
+      }
+      .ctx-chip.is-desktop-only {
+        display: none;
+      }
+      .cover-bottom-nav {
+        display: grid;
+        grid-template-columns: repeat(5, minmax(0, 1fr));
+        gap: 5px;
+        padding: 6px max(8px, env(safe-area-inset-right, 0px)) max(8px, env(safe-area-inset-bottom, 0px)) max(8px, env(safe-area-inset-left, 0px));
+        background: var(--panel);
+        border-top: 1px solid var(--border-strong);
+        flex-shrink: 0;
+      }
+      .cover-nav-btn {
+        border: 1px solid var(--border);
+        background: var(--panel-2);
+        color: var(--muted);
+        border-radius: 9px;
+        padding: 7px 3px;
+        font-size: 11px;
+        font-weight: 700;
+        min-block-size: 40px;
+        cursor: pointer;
+        white-space: nowrap;
+        overflow: hidden;
+        text-overflow: ellipsis;
+      }
+      .cover-nav-btn:hover {
+        color: var(--text-strong);
+        border-color: var(--border-strong);
+      }
+      .cover-nav-btn[aria-selected="true"] {
+        background: color-mix(in srgb, var(--sky) 18%, var(--panel-2));
+        border-color: var(--sky);
+        color: var(--text-strong);
+      }
+    }
+
+    /* Tier 2: Z Fold 7 Open / Unfolded (640px – 1020px): 1fr 1fr hinge split + bottom nav */
+    @container stage (min-width: 640px) and (max-width: 1020px) {
+      .workspace,
+      .workspace.has-side-drawer {
+        grid-template-columns: 1fr 1fr;
+        gap: 18px; /* Clean center crease clearance */
+      }
+      /* Side sheet overlays cleanly over the left Topology half so Feed stays visible beside the hinge! */
+      .inspector-pane {
+        position: absolute;
+        top: 12px;
+        bottom: 12px;
+        left: 12px;
+        width: calc(50% - 21px);
+        z-index: 15;
+      }
+    }
+
+    /* Tier 1: Z Fold 7 Cover (< 640px): single-screen 100dvh + bottom nav + bottom sheet */
+    @container stage (max-width: 639px) {
+      .studio-ctx-bar {
+        padding: 7px 10px;
+      }
+      .ctx-metrics {
+        display: none;
+      }
+      .workspace,
+      .workspace.has-side-drawer {
+        grid-template-columns: 1fr;
+        padding: 8px;
+        gap: 8px;
+      }
+      .studio-shell[data-cover-tab="messages"] .topology-pane {
+        display: none;
+      }
+      .studio-shell[data-cover-tab="topology"] .feed-pane {
+        display: none;
+      }
+      .bubble {
+        max-width: 96%;
+      }
+      /* Side sheet becomes a mobile Bottom Sheet overlay */
+      .inspector-backdrop {
+        position: absolute;
+        inset: 0;
+        background: rgba(2, 6, 16, 0.68);
+        z-index: 14;
+      }
+      .inspector-pane {
+        position: absolute;
+        left: 0;
+        right: 0;
+        bottom: 0;
+        max-height: 86%;
+        border-radius: 16px 16px 0 0;
+        border-left: none;
+        border-right: none;
+        border-bottom: none;
+        z-index: 16;
+        padding-bottom: env(safe-area-inset-bottom, 0px);
+      }
+    }
+
+    /* Native device media queries for real Z Fold 7 & mobile viewports */
+    @media (max-width: 1020px) {
+      .feed-filters {
+        display: none;
+      }
+      .cover-bottom-nav {
+        display: grid;
+        grid-template-columns: repeat(5, minmax(0, 1fr));
+        gap: 5px;
+        padding: 6px max(8px, env(safe-area-inset-right, 0px)) max(8px, env(safe-area-inset-bottom, 0px)) max(8px, env(safe-area-inset-left, 0px));
+        background: var(--panel);
+        border-top: 1px solid var(--border-strong);
+        flex-shrink: 0;
+      }
+      .cover-nav-btn {
+        border: 1px solid var(--border);
+        background: var(--panel-2);
+        color: var(--muted);
+        border-radius: 9px;
+        padding: 7px 3px;
+        font-size: 11px;
+        font-weight: 700;
+        min-block-size: 40px;
+        cursor: pointer;
+        white-space: nowrap;
+        overflow: hidden;
+        text-overflow: ellipsis;
+      }
+      .cover-nav-btn[aria-selected="true"] {
+        background: color-mix(in srgb, var(--sky) 18%, var(--panel-2));
+        border-color: var(--sky);
+        color: var(--text-strong);
+      }
+    }
+
+    @media (max-width: 1020px) and (min-width: 640px) {
+      .workspace,
+      .workspace.has-side-drawer {
+        grid-template-columns: 1fr 1fr;
+        gap: 18px;
+      }
+      .inspector-pane {
+        position: absolute;
+        top: 12px;
+        bottom: 12px;
+        left: 12px;
+        width: calc(50% - 21px);
+        z-index: 15;
+      }
+    }
+
+    @media (horizontal-viewport-segments: 2) {
+      .workspace {
+        grid-template-columns: env(viewport-segment-width 0 0, 1fr) 1fr;
+        gap: calc(env(viewport-segment-left 1 0, 50%) - env(viewport-segment-right 0 0, 50%));
+      }
+    }
+
+    @media (max-width: 639px) {
+      .toolbar-sub,
+      .control-group[data-viewport-picker] {
+        display: none;
+      }
+      .workspace,
+      .workspace.has-side-drawer {
+        grid-template-columns: 1fr;
+        padding: 8px;
+      }
+    }
+
+    @media (pointer: coarse) {
+      .seg-btn,
+      .feed-tab,
+      .behind-bar,
+      .show-more-btn,
+      .btn-ghost-sm,
+      .btn-primary-sm,
+      .subtle-toggle-pill,
+      .cover-nav-btn {
+        min-block-size: 44px;
+      }
+      .agent-node-btn {
+        min-block-size: 46px;
+      }
+    }
+
+    @media (prefers-reduced-motion: reduce) {
+      .live-dot,
+      .bubble.is-jump-flash {
+        animation: none !important;
+      }
+      * {
+        transition-duration: 0.01ms !important;
+        scroll-behavior: auto !important;
+      }
+    }
+
+    @media (forced-colors: active) {
+      .pane-card,
+      .bubble,
+      .behind-bar,
+      .inspector-pane,
+      .seg-btn[aria-pressed="true"],
+      .q-option-pill.is-chosen {
+        border: 1px solid CanvasText;
+      }
+      .seg-btn[aria-pressed="true"],
+      .feed-tab[aria-selected="true"],
+      .agent-node-btn[aria-pressed="true"] {
+        outline: 2px solid Highlight;
+      }
+    }
+  </style>
+</head>
+<body>
+  <!-- =======================================================================
+       Mockup Controls Sandbox Toolbar
+       ======================================================================= -->
+  <header class="mockup-toolbar" aria-label="Interactive mockup controls">
+    <div class="toolbar-brand">
+      <div class="brand-mark" aria-hidden="true">AS</div>
+      <div class="toolbar-title-wrap">
+        <h1 class="toolbar-title">Activity Feed · Messages v2 UX Mockup</h1>
+        <span class="toolbar-sub">Before/After comparison + Side Sheet "Behind This Response" drill-down</span>
+      </div>
+    </div>
+
+    <div class="toolbar-controls">
+      <div class="control-group" role="group" aria-label="Comparison mode">
+        <span class="control-group-label">View</span>
+        <button type="button" class="seg-btn is-recommended" data-mode-btn="after" aria-pressed="true">
+          <span class="rec-dot" aria-hidden="true"></span>
+          Proposed (After)
+        </button>
+        <button type="button" class="seg-btn" data-mode-btn="before" aria-pressed="false">
+          Current UI (Before)
+        </button>
+      </div>
+
+      <div class="control-group" data-viewport-picker role="group" aria-label="Viewport preview size">
+        <span class="control-group-label">Screen</span>
+        <button type="button" class="seg-btn" data-vp-btn="desktop" aria-pressed="true">Desktop</button>
+        <button type="button" class="seg-btn" data-vp-btn="fold-open" aria-pressed="false">Fold Open (768px)</button>
+        <button type="button" class="seg-btn" data-vp-btn="fold-cover" aria-pressed="false">Fold Cover (390px)</button>
+      </div>
+
+      <div class="control-group" role="group" aria-label="Color theme">
+        <button type="button" class="seg-btn" id="themeToggleBtn" aria-pressed="false" aria-label="Switch to light theme">
+          ☀ Light
+        </button>
+      </div>
+    </div>
+  </header>
+
+  <!-- =======================================================================
+       Viewport Preview Stage
+       ======================================================================= -->
+  <div class="stage-outer" id="stageOuter" data-viewport="desktop">
+    <div class="preview-frame" id="previewFrame">
+      <div class="fold-hinge-guide" aria-hidden="true"></div>
+
+      <div class="studio-shell" id="studioShell" data-cover-tab="messages">
+        <!-- Studio Session Context Bar -->
+        <div class="studio-ctx-bar">
+          <div class="ctx-left">
+            <span class="live-badge"><span class="live-dot" aria-hidden="true"></span>Live · Antigravity</span>
+            <span class="session-title">Sauron &amp; Morgoth Debate · Multi-Agent Run</span>
+          </div>
+          <div class="ctx-metrics">
+            <span class="ctx-chip is-desktop-only"><strong>6</strong> actors</span>
+            <span class="ctx-chip"><strong>1</strong> human reply</span>
+            <span class="ctx-chip is-desktop-only"><strong>2</strong> silent workers</span>
+          </div>
+        </div>
+
+        <!-- Main Workspace -->
+        <main class="workspace" id="workspaceGrid">
+          <!-- Left Pane: Topology / Thread Picker -->
+          <section class="pane-card topology-pane" aria-label="Agent topology and thread filter">
+            <div class="pane-head">
+              <div class="pane-title-group">
+                <h2 class="pane-title">Agent Topology</h2>
+                <span class="pane-subtitle">Click actor to filter stream</span>
+              </div>
+              <button type="button" class="clear-thread-btn" id="resetThreadBtn" hidden>Show All</button>
+            </div>
+
+            <div class="topology-body">
+              <div class="topo-hint">
+                <span>Active conversation threads</span>
+                <span id="topoFilterStatus">All Session Messages</span>
+              </div>
+
+              <div class="topo-roster" id="topoRoster" role="list">
+                <!-- Populated dynamically -->
+              </div>
+
+              <div class="silent-workers-card" id="silentWorkersCard">
+                <strong>Background Silent Workers (2)</strong>
+                <span>
+                  <code>A4 - Waiter</code> &amp; <code>A5 - Waiter</code> only ran internal polling tools with no messages. In Proposed mode, their noisy rows stay hidden from Messages and roll into <strong>Coordinator</strong>'s trace.
+                </span>
+              </div>
+            </div>
+          </section>
+
+          <!-- Center/Right Pane: Activity Feed (Messages Stream) -->
+          <section class="pane-card feed-pane" aria-label="Activity Feed Messages stream">
+            <div class="pane-head">
+              <div class="pane-title-group">
+                <h2 class="pane-title">Activity Feed</h2>
+                <span class="pane-subtitle" id="feedCountLabel">7 msgs</span>
+              </div>
+              <div class="feed-filters" role="tablist" aria-label="Activity feed filters">
+                <button type="button" class="feed-tab" data-mock-tab="All" role="tab" aria-selected="false">All</button>
+                <button type="button" class="feed-tab" data-mock-tab="Messages" role="tab" aria-selected="true">Messages</button>
+                <button type="button" class="feed-tab" data-mock-tab="Board" role="tab" aria-selected="false">Board</button>
+                <button type="button" class="feed-tab" data-mock-tab="Errors" role="tab" aria-selected="false">Errors</button>
+                <button type="button" class="feed-tab" data-mock-tab="Usage" role="tab" aria-selected="false">Usage</button>
+              </div>
+            </div>
+
+            <div class="sms-thread-bar">
+              <div class="sms-pill-meta">
+                <span class="thread-route-pill" id="activeRoutePill">All Session Messages</span>
+                <span class="thread-stats" id="threadStatsLabel">Chronological · Conversation only</span>
+              </div>
+              <div class="sms-bar-actions">
+                <button
+                  type="button"
+                  class="subtle-toggle-pill"
+                  id="rawToolsToggleBtn"
+                  aria-pressed="false"
+                  title="Optional audit mode for background tool-only agents"
+                >
+                  Raw tool steps: Hidden
+                </button>
+              </div>
+            </div>
+
+            <div class="mode-banner is-after" id="modeBanner">
+              <div>
+                <span class="mode-banner-tag" id="modeBannerTag">Redesign</span>
+                <span id="modeBannerText">Human answers appear inline, Morgoth renders ~7 readable lines, and bare tool lines move behind each response.</span>
+              </div>
+            </div>
+
+            <div class="sms-body-wrap">
+              <div class="sms-body" id="smsStreamEl" role="log" aria-live="polite" aria-label="Messages stream">
+                <!-- Populated dynamically -->
+              </div>
+            </div>
+          </section>
+
+          <!-- Mobile backdrop for bottom sheet -->
+          <div class="inspector-backdrop" id="inspectorBackdrop" hidden></div>
+
+          <!-- Right / Overlay Pane: "Behind This Response" Side Sheet Drawer -->
+          <aside
+            class="inspector-pane"
+            id="inspectorDrawer"
+            aria-label="Behind this response reasoning and tool trace"
+            hidden
+          >
+            <!-- Populated dynamically -->
+          </aside>
+        </main>
+
+        <!-- Cover & Z Fold 7 Open (<= 1020px) Bottom Nav Menu -->
+        <nav class="cover-bottom-nav" aria-label="Foldable &amp; mobile navigation">
+          <button type="button" class="cover-nav-btn" data-cover-nav="topology" aria-selected="false">
+            Topology
+          </button>
+          <button type="button" class="cover-nav-btn" data-cover-nav="messages" aria-selected="true">
+            Messages
+          </button>
+          <button type="button" class="cover-nav-btn" data-mock-tab="Board" aria-selected="false">
+            Board
+          </button>
+          <button type="button" class="cover-nav-btn" data-mock-tab="Errors" aria-selected="false">
+            Errors
+          </button>
+          <button type="button" class="cover-nav-btn" data-mock-tab="Usage" aria-selected="false">
+            Usage
+          </button>
+        </nav>
+      </div>
+    </div>
+  </div>
+
+  <div class="toast-banner" id="toastEl" role="status" aria-live="polite" hidden></div>
+
+  <script>
+    (function () {
+      "use strict";
+
+      /* =======================================================================
+         Grounded Scenario Dataset (Coordinator, A1-A5, & Human Reply)
+         ======================================================================= */
+      const ACTORS = [
+        { id: "all", name: "All Session Messages", role: "Stream", color: "#38bdf8", meta: "6 actors · full conversation", isSub: false },
+        { id: "root", name: "Coordinator", role: "Orchestrator", color: "#a855f7", meta: "Dispatched A1–A5", isSub: false },
+        { id: "human", name: "You (Human)", role: "User", color: "#10b981", meta: "Answered A3 question", isSub: false },
+        { id: "a1", name: "A1 - Sauron", role: "DONE", color: "#06b6d4", meta: "Drafted opening thesis", isSub: true },
+        { id: "a2", name: "A2 - Morgoth", role: "DONE", color: "#f59e0b", meta: "Honest critique + thoughts", isSub: true },
+        { id: "a3", name: "A3 - Questioner", role: "DONE", color: "#38bdf8", meta: "Asked user debate tone", isSub: true },
+        { id: "a4", name: "A4 - Waiter", role: "WORKING", color: "#818cf8", meta: "Silent tool poll only (1 tool)", isSub: true, silentWorker: true },
+        { id: "a5", name: "A5 - Waiter", role: "WORKING", color: "#818cf8", meta: "Silent tool poll only (1 tool)", isSub: true, silentWorker: true }
+      ];
+
+      const MESSAGES = [
+        {
+          id: "m1",
+          fromId: "root",
+          toId: "a1",
+          dir: "outbound",
+          fromLabel: "Coordinator",
+          roleBadge: "Orchestrator · DISPATCH",
+          routeLabel: "Coordinator → A1 - Sauron & A2 - Morgoth",
+          time: "18:54:58",
+          accent: "#a855f7",
+          shortBefore: "Spawned A1 - Sauron and A2 - Morgoth to draft and critique the debate opening.",
+          bodyMd: [
+            "Spawned **A1 - Sauron** and **A2 - Morgoth** in parallel, plus **A3 - Questioner** to confirm the user's preferred debate tone.",
+            "• `A1 - Sauron`: Write a concise opening paragraph defending Order as the highest virtue.",
+            "• `A2 - Morgoth`: Deliver an unfiltered critique of Sauron's opening once received."
+          ].join("\n\n"),
+          duration: "1.4s",
+          behind: {
+            thoughts: [
+              {
+                ts: "18:54:57",
+                dur: "0.9s",
+                text: "I should spin up Sauron and Morgoth together, have A3 check with the human on debate tone, and keep A4/A5 watching background state silently so they don't block the main turn."
+              }
+            ],
+            tools: [
+              {
+                name: "invoke_subagent",
+                dur: "140ms",
+                summary: "Spawned A1 - Sauron (Opening Thesis)",
+                input: '{ "TypeName": "A1 - Sauron", "Role": "Debate Opponent" }',
+                output: '{ "status": "spawned", "convId": "agy-a1-9f2c" }'
+              },
+              {
+                name: "invoke_subagent",
+                dur: "135ms",
+                summary: "Spawned A2 - Morgoth (Honest Critic)",
+                input: '{ "TypeName": "A2 - Morgoth", "Role": "Honest Critic" }',
+                output: '{ "status": "spawned", "convId": "agy-a2-41de" }'
+              },
+              {
+                name: "invoke_subagent",
+                dur: "128ms",
+                summary: "Spawned A4 - Waiter & A5 - Waiter (silent background watchers)",
+                input: '{ "workers": ["A4 - Waiter", "A5 - Waiter"], "mode": "silent_poll" }',
+                output: '{ "status": "running", "note": "No user-facing messages emitted yet" }'
+              }
+            ]
+          }
+        },
+        {
+          id: "m2",
+          fromId: "a1",
+          toId: "root",
+          dir: "inbound",
+          fromLabel: "A1 - Sauron",
+          roleBadge: "Subagent · DONE",
+          routeLabel: "A1 - Sauron → Coordinator",
+          time: "18:55:12",
+          accent: "#06b6d4",
+          shortBefore: "Opening paragraph on Order:",
+          hasReadFullBefore: true,
+          bodyMd: [
+            "**Opening paragraph on Order:**",
+            "> \"Chaos is merely the laziness of unshaped iron. True mercy is not leaving mortals to stumble in fragmented kingdoms—it is forging every realm into one lucid, enduring design where waste and rebellion cannot take root.\"",
+            "Delivered my opening statement for Morgoth's review. Kept the diction measured and bureaucratic rather than overtly tyrannical."
+          ].join("\n\n"),
+          duration: "3.1s",
+          behind: {
+            thoughts: [
+              {
+                ts: "18:55:09",
+                dur: "2.1s",
+                text: "Sauron never sees himself as a cartoon villain; he believes tyranny is administrative perfection. I'll frame domination as 'craft' and 'mercy against chaos' so Morgoth has real ideological hypocrisy to attack."
+              }
+            ],
+            tools: [
+              {
+                name: "read_file",
+                dur: "22ms",
+                summary: "Checked debate_prompt.md guidelines",
+                input: '{ "Path": "notes/debate_prompt.md", "StartLine": 1, "EndLine": 40 }',
+                output: "Goal: Compare Sauron's vision of Order vs Morgoth's critique."
+              },
+              {
+                name: "send_message",
+                dur: "48ms",
+                summary: "Sent opening paragraph to Coordinator",
+                input: '{ "Recipient": "Coordinator", "Message": "Opening paragraph on Order..." }',
+                output: '{ "delivered": true }'
+              }
+            ]
+          }
+        },
+        {
+          id: "m3",
+          fromId: "a2",
+          toId: "root",
+          dir: "inbound",
+          fromLabel: "A2 - Morgoth",
+          roleBadge: "Subagent · DONE",
+          routeLabel: "A2 - Morgoth → Coordinator",
+          time: "18:55:18",
+          accent: "#f59e0b",
+          /* EXACT issue #2 from screenshot: 1st line only! */
+          shortBefore: "Real thoughts (Morgoth's honest critique of Sauron's paragraph):",
+          hasReadFullBefore: true,
+          bodyMd: [
+            "**Real thoughts (Morgoth's honest critique of Sauron's paragraph):**",
+            "Sauron dresses up petty micromanagement as cosmic necessity, and the euphemisms barely hide the insecurity underneath:",
+            "• **False neutrality:** Calling conquest \"shaping unshaped iron\" pretends the metal volunteered for the anvil. It's domination wearing a clerk's collar.",
+            "• **Fear of entropy:** He hates chaos not because it harms mortals, but because anything unplanned reminds him he isn't the First Voice—just a lieutenant obsessed with spreadsheets.",
+            "• **Rhetorical dodge:** Notice how he invokes *\"mercy\"* right before justifying total control, never once naming what happens to anyone who refuses his design.",
+            "> \"You want a clockwork cage and expect the gears to thank you for oiling them.\"",
+            "If we escalate to full rebuttal, I'd push straight at his Númenor hubris: every time his \"enduring design\" collides with reality, it collapses under its own rigidity.",
+            "**Verdict:** Strong theatrical voice for the debate, philosophically hollow at its core—ready for round two whenever the user confirms tone."
+          ].join("\n\n"),
+          duration: "4.2s",
+          behind: {
+            thoughts: [
+              {
+                ts: "18:55:14",
+                dur: "2.3s",
+                text: "Sauron's paragraph is slick—he uses words like 'lucid' and 'mercy' to sanitize subjugation. If I write a gentle literary review, I'll miss the core tension between us: I want ruin without pretense, while he wants slavery disguised as architecture."
+              },
+              {
+                ts: "18:55:16",
+                dur: "1.5s",
+                text: "Let me double-check his exact phrasing ('unshaped iron', 'enduring design') and structure my honest critique into crisp bullets so Coordinator and the user can read the real punch immediately."
+              }
+            ],
+            tools: [
+              {
+                name: "read_agent",
+                dur: "18ms",
+                summary: "Read A1 - Sauron's latest opening paragraph",
+                input: '{ "agentId": "a1-sauron", "limit": 1 }',
+                output: 'Read 1 message ("Chaos is merely the laziness of unshaped iron...")'
+              },
+              {
+                name: "send_message",
+                dur: "42ms",
+                summary: "Delivered honest critique to Coordinator",
+                input: '{ "Recipient": "Coordinator", "Message": "Real thoughts (Morgoth\'s honest critique...)" }',
+                output: '{ "delivered": true }'
+              }
+            ]
+          }
+        },
+        {
+          id: "m4",
+          fromId: "a3",
+          toId: "human",
+          dir: "inbound",
+          fromLabel: "A3 - Questioner",
+          roleBadge: "Subagent · ASKED USER",
+          routeLabel: "A3 - Questioner → You",
+          time: "18:55:24",
+          accent: "#38bdf8",
+          shortBefore: "Which tone should Sauron and Morgoth use for the debate?",
+          bodyMd: "Before round two begins, **which tone should Sauron and Morgoth use for the debate?**",
+          questionOptions: [
+            { label: "Sharp philosophical debate", chosen: true },
+            { label: "Dramatic First Age lore monologue", chosen: false },
+            { label: "Concise bullet-point duel", chosen: false }
+          ],
+          duration: "1.8s",
+          behind: {
+            thoughts: [
+              {
+                ts: "18:55:22",
+                dur: "1.4s",
+                text: "Both opening drafts are strong, but the user hasn't picked whether round two should lean philosophical, dramatic, or terse. I should ask directly with clear options rather than guessing."
+              }
+            ],
+            tools: [
+              {
+                name: "ask_question",
+                dur: "38ms",
+                summary: "Prompted user with 3 debate-tone options (blocked until reply)",
+                input: '{ "question": "Which tone should Sauron and Morgoth use for the debate?", "options": ["Sharp philosophical debate", "Dramatic First Age lore monologue", "Concise bullet-point duel"] }',
+                output: '{ "selectedOption": "Sharp philosophical debate", "customText": "keep Morgoth brutally honest about Sauron\'s hypocrisy..." }'
+              }
+            ]
+          }
+        },
+        {
+          id: "m5",
+          fromId: "human",
+          toId: "a3",
+          dir: "outbound",
+          isHuman: true,
+          replyToId: "m4",
+          replyToSummary: "A3 - Questioner: \"Which tone should Sauron and Morgoth use for the debate?\"",
+          fromLabel: "You",
+          roleBadge: "Answered Question",
+          routeLabel: "You → A3 - Questioner",
+          time: "18:55:29",
+          accent: "#10b981",
+          hideInBefore: true, /* Reproduces issue #1 in Before mode! */
+          bodyMd: "**Sharp philosophical debate** — keep Morgoth brutally honest about Sauron's hypocrisy, and limit each rebuttal to two focused paragraphs.",
+          duration: null,
+          behind: null
+        },
+        {
+          id: "m6",
+          fromId: "a3",
+          toId: "root",
+          dir: "inbound",
+          fromLabel: "A3 - Questioner",
+          roleBadge: "Subagent · DONE",
+          routeLabel: "A3 - Questioner → Coordinator",
+          time: "18:55:35",
+          accent: "#38bdf8",
+          shortBefore: "User selected \"Sharp philosophical debate\" (2-paragraph cap). Signaling A1 & A2.",
+          bodyMd: [
+            "User selected **Sharp philosophical debate** with a **2-paragraph rebuttal cap** and explicit emphasis on exposing Sauron's ideological hypocrisy.",
+            "Ready to trigger Round 2 with those constraints."
+          ].join("\n\n"),
+          duration: "1.2s",
+          behind: {
+            thoughts: [
+              {
+                ts: "18:55:33",
+                dur: "0.9s",
+                text: "The human picked 'Sharp philosophical debate' and added a 2-paragraph constraint. I'll relay the exact preference back to Coordinator so round two stays tightly scoped."
+              }
+            ],
+            tools: [
+              {
+                name: "send_message",
+                dur: "34ms",
+                summary: "Relayed human answer & 2-paragraph constraint to Coordinator",
+                input: '{ "Recipient": "Coordinator", "Message": "User selected Sharp philosophical debate..." }',
+                output: '{ "delivered": true }'
+              }
+            ]
+          }
+        }
+      ];
+
+      /* Exact noisy tool-only rows shown in Before screenshots */
+      const BEFORE_TOOL_BURSTS = [
+        { afterMsgId: "m3", agentId: "a3", agentLabel: "A3 - Questioner", time: "18:55:23", color: "#38bdf8", chip: "Tools · 1", detail: "ask_question · Preparing prompt options" },
+        { afterMsgId: "m4", agentId: "a4", agentLabel: "A4 - Waiter", time: "18:55:23", color: "#818cf8", chip: "Tools · 1", detail: "wait_for_signal · Polling background turn" },
+        { afterMsgId: "m4", agentId: "a5", agentLabel: "A5 - Waiter", time: "18:55:24", color: "#818cf8", chip: "Tools · 1", detail: "wait_for_signal · Polling background turn" }
+      ];
+
+      /* =======================================================================
+         State
+         ======================================================================= */
+      const state = {
+        mode: "after",        // "after" | "before"
+        viewport: "desktop",  // "desktop" | "fold-open" | "fold-cover"
+        theme: document.documentElement.dataset.theme || "dark",
+        activeActor: "all",
+        showRawTools: false,
+        coverTab: "messages",
+        expandedBodies: new Set(),
+        inspectedMsgId: "m3",
+        beforeBurstExpanded: new Set(),
+        lastOpenerBtn: null
+      };
+
+      /* =======================================================================
+         Minimal Safe Markdown Renderer (mirrors web/src/utils/markdown.ts)
+         ======================================================================= */
+      function escHtml(s) {
+        return String(s ?? "")
+          .replace(/&/g, "&amp;")
+          .replace(/</g, "&lt;")
+          .replace(/>/g, "&gt;")
+          .replace(/"/g, "&quot;");
+      }
+
+      function renderInlineMd(raw) {
+        let s = escHtml(raw);
+        s = s.replace(/`([^`]+)`/g, "<code>$1</code>");
+        s = s.replace(/\*\*([^*]+)\*\*/g, "<strong>$1</strong>");
+        s = s.replace(/\*([^*]+)\*/g, "<em>$1</em>");
+        return s;
+      }
+
+      function renderRichMd(md) {
+        const blocks = String(md || "").split(/\n\n+/);
+        return blocks.map((blk) => {
+          const lines = blk.split(/\n/);
+          if (lines.every((l) => /^•\s+/.test(l.trim()))) {
+            return "<ul>" + lines.map((l) => "<li>" + renderInlineMd(l.trim().replace(/^•\s+/, "")) + "</li>").join("") + "</ul>";
+          }
+          if (lines.every((l) => /^>\s?/.test(l.trim()))) {
+            return "<blockquote>" + lines.map((l) => renderInlineMd(l.trim().replace(/^>\s?/, ""))).join("<br>") + "</blockquote>";
+          }
+          return "<p>" + lines.map(renderInlineMd).join("<br>") + "</p>";
+        }).join("");
+      }
+
+      function showToast(msg) {
+        const el = document.getElementById("toastEl");
+        el.textContent = msg;
+        el.hidden = false;
+        clearTimeout(showToast._t);
+        showToast._t = setTimeout(() => { el.hidden = true; }, 2400);
+      }
+
+      /* =======================================================================
+         Filtering Helpers
+         ======================================================================= */
+      function getVisibleMessages() {
+        return MESSAGES.filter((m) => {
+          if (state.mode === "before" && m.hideInBefore) return false;
+          if (state.activeActor === "all") return true;
+          return m.fromId === state.activeActor || m.toId === state.activeActor;
+        });
+      }
+
+      function getInspectableMessages() {
+        return getVisibleMessages().filter((m) => Boolean(m.behind));
+      }
+
+      /* =======================================================================
+         Render Topology Roster
+         ======================================================================= */
+      function renderTopology() {
+        const roster = document.getElementById("topoRoster");
+        const statusEl = document.getElementById("topoFilterStatus");
+        const resetBtn = document.getElementById("resetThreadBtn");
+
+        const activeObj = ACTORS.find((a) => a.id === state.activeActor) || ACTORS[0];
+        statusEl.textContent = activeObj.name;
+        resetBtn.hidden = state.activeActor === "all";
+
+        roster.innerHTML = ACTORS.map((a) => {
+          const isSelected = state.activeActor === a.id;
+          const msgCount = a.id === "all"
+            ? getVisibleMessages().length
+            : MESSAGES.filter((m) => !(state.mode === "before" && m.hideInBefore) && (m.fromId === a.id || m.toId === a.id)).length;
+
+          const subBadge = a.silentWorker
+            ? (state.mode === "after" ? "Folded" : "1 tool row")
+            : `${msgCount} ${msgCount === 1 ? "msg" : "msgs"}`;
+
+          return `
+            <button
+              type="button"
+              class="agent-node-btn ${a.isSub ? "is-sub" : ""}"
+              style="--node-color:${escHtml(a.color)}"
+              data-actor-select="${escHtml(a.id)}"
+              aria-pressed="${isSelected ? "true" : "false"}"
+            >
+              <span class="node-dot" aria-hidden="true"></span>
+              <span class="node-info">
+                <span class="node-name-row">
+                  <span class="node-name">${escHtml(a.name)}</span>
+                  <span class="node-role">${escHtml(a.role)}</span>
+                </span>
+                <span class="node-meta">${escHtml(a.meta)}</span>
+              </span>
+              <span class="node-count">${escHtml(subBadge)}</span>
+            </button>
+          `;
+        }).join("");
+      }
+
+      /* =======================================================================
+         Render "Behind This Response" Content (shared between Side Sheet & Inline)
+         ======================================================================= */
+      function renderTraceTimelineHtml(msg) {
+        const b = msg.behind;
+        if (!b) return "";
+
+        const thoughtsHtml = (b.thoughts || []).map((t, idx) => `
+          <div class="thought-card">
+            <div class="thought-card-head">
+              <span>✦ Self-Thought ${b.thoughts.length > 1 ? `#${idx + 1}` : ""} · Private Reasoning</span>
+              <span>${escHtml(t.ts)} · ${escHtml(t.dur)}</span>
+            </div>
+            <div class="thought-card-body">${renderRichMd(t.text)}</div>
+          </div>
+        `).join("");
+
+        const toolsHtml = (b.tools || []).map((tc, idx) => `
+          <details class="tool-step-details" ${idx === 0 ? "open" : ""}>
+            <summary>
+              <span class="tool-name-pill">${escHtml(tc.name)}</span>
+              <span class="tool-ok-pill">✓ OK</span>
+              <span class="tool-latency">${escHtml(tc.dur)}</span>
+              <div class="tool-step-summary-txt">${escHtml(tc.summary)}</div>
+            </summary>
+            <div class="tool-io-block">
+              <div>
+                <div class="trace-section-label">Input</div>
+                <pre class="tool-io-pre">${escHtml(tc.input)}</pre>
+              </div>
+              <div>
+                <div class="trace-section-label">Result</div>
+                <pre class="tool-io-pre">${escHtml(tc.output)}</pre>
+              </div>
+            </div>
+          </details>
+        `).join("");
+
+        return `
+          <div class="trace-section-label">
+            <span>Reasoning &amp; Preceding Work</span>
+            <span>${b.thoughts.length} ${b.thoughts.length === 1 ? "thought" : "thoughts"} · ${b.tools.length} ${b.tools.length === 1 ? "tool" : "tools"} · ${escHtml(msg.duration)}</span>
+          </div>
+          <div class="trace-timeline">
+            ${thoughtsHtml}
+            ${toolsHtml}
+          </div>
+          <div class="response-sent-divider" aria-label="Response sent at ${escHtml(msg.time)}">
+            <span>response sent · ${escHtml(msg.time)}</span>
+          </div>
+        `;
+      }
+
+      /* =======================================================================
+         Render Messages Stream (Before vs After)
+         ======================================================================= */
+      function renderStream() {
+        const streamEl = document.getElementById("smsStreamEl");
+        const countLabel = document.getElementById("feedCountLabel");
+        const routePill = document.getElementById("activeRoutePill");
+        const statsLabel = document.getElementById("threadStatsLabel");
+        const rawBtn = document.getElementById("rawToolsToggleBtn");
+        const banner = document.getElementById("modeBanner");
+        const bannerTag = document.getElementById("modeBannerTag");
+        const bannerText = document.getElementById("modeBannerText");
+
+        const activeObj = ACTORS.find((a) => a.id === state.activeActor) || ACTORS[0];
+        routePill.textContent = activeObj.name;
+
+        const visibleMsgs = getVisibleMessages();
+
+        if (state.mode === "before") {
+          banner.className = "mode-banner is-before";
+          bannerTag.textContent = "Current UI";
+          bannerText.textContent = "Notice: human answer to A3 is missing, Morgoth cuts off at 1 line, and bare tool strips clutter the feed.";
+          rawBtn.hidden = true;
+          countLabel.textContent = `${visibleMsgs.length} msgs · 3 bursts`;
+          statsLabel.textContent = "Legacy stream · raw tool bursts inline";
+        } else {
+          banner.className = "mode-banner is-after";
+          bannerTag.textContent = "Redesign";
+          bannerText.textContent = "Click any 'Behind this response' bar to inspect thoughts & tools in the Side Sheet without losing scroll.";
+          rawBtn.hidden = false;
+          rawBtn.setAttribute("aria-pressed", state.showRawTools ? "true" : "false");
+          rawBtn.textContent = state.showRawTools ? "Raw tool steps: Shown" : "Raw tool steps: Hidden";
+          countLabel.textContent = `${visibleMsgs.length} msgs`;
+          statsLabel.textContent = "Conversation only · thoughts & tools behind responses";
+        }
+
+        const chunks = [`<div class="sms-day-divider">${escHtml(activeObj.name)} · Chronological Stream</div>`];
+
+        if (visibleMsgs.length === 0) {
+          chunks.push(`
+            <div class="silent-workers-card" style="margin:auto;max-width:340px;text-align:center;">
+              <strong>No conversation messages for ${escHtml(activeObj.name)}</strong>
+              <span>This worker only executed silent background polling tools. Inspect Coordinator's dispatch trace or switch back to All Session Messages.</span>
+            </div>
+          `);
+        }
+
+        visibleMsgs.forEach((m) => {
+          if (state.mode === "before") {
+            chunks.push(`
+              <article class="bubble ${m.dir}" style="--bubble-accent:${escHtml(m.accent)}">
+                <span class="bubble-route">${escHtml(m.routeLabel)}</span>
+                <div class="bubble-head">
+                  <span class="bubble-sender">${escHtml(m.fromLabel)} <span class="bubble-role">${escHtml(m.roleBadge)}</span></span>
+                  <span>${escHtml(m.time)}</span>
+                </div>
+                <div class="bubble-text">${renderInlineMd(m.shortBefore || m.bodyMd)}</div>
+                ${m.hasReadFullBefore ? `
+                  <div class="bubble-foot-old">
+                    <span></span>
+                    <button type="button" class="read-full-btn" data-before-read-full="${escHtml(m.id)}">Read full →</button>
+                  </div>
+                ` : ""}
+              </article>
+            `);
+
+            BEFORE_TOOL_BURSTS.filter((b) => b.afterMsgId === m.id && (state.activeActor === "all" || state.activeActor === b.agentId)).forEach((b, idx) => {
+              const bKey = `${b.agentId}:${idx}`;
+              const open = state.beforeBurstExpanded.has(bKey);
+              chunks.push(`
+                <div class="tool-burst-strip" style="--bubble-accent:${escHtml(b.color)}">
+                  <div class="tool-strip-header">
+                    <div class="tool-strip-meta">
+                      <span class="tool-strip-dot" aria-hidden="true"></span>
+                      <span class="tool-strip-agent">${escHtml(b.agentLabel)}</span>
+                      <span>${escHtml(b.time)}</span>
+                    </div>
+                    <button type="button" class="tool-badge-btn" data-before-burst="${escHtml(bKey)}" aria-expanded="${open ? "true" : "false"}">
+                      ${escHtml(b.chip)} ${open ? "▾" : "▸"}
+                    </button>
+                  </div>
+                  ${open ? `<div style="font-size:11px;color:var(--muted);padding:4px 8px;border:1px solid var(--border);border-radius:7px;background:var(--panel);">${escHtml(b.detail)}</div>` : ""}
+                </div>
+              `);
+            });
+            return;
+          }
+
+          /* PROPOSED REDESIGN (AFTER) */
+          const isInspected = state.inspectedMsgId === m.id;
+          const isLong = m.bodyMd.length > 460;
+          const isBodyExpanded = state.expandedBodies.has(m.id);
+          const clampClass = isLong && !isBodyExpanded ? "is-clamped" : "";
+
+          const optionsHtml = m.questionOptions ? `
+            <div class="question-options-list" aria-label="Question options">
+              ${m.questionOptions.map((opt) => `
+                <div class="q-option-pill ${opt.chosen ? "is-chosen" : ""}">
+                  <span class="q-check" aria-hidden="true">${opt.chosen ? "✓" : ""}</span>
+                  <span>${escHtml(opt.label)}</span>
+                  ${opt.chosen ? `<span class="q-chosen-tag">Selected by user</span>` : ""}
+                </div>
+              `).join("")}
+            </div>
+          ` : "";
+
+          const replyQuoteHtml = m.replyToId ? `
+            <button type="button" class="reply-quote-ref" data-jump-msg="${escHtml(m.replyToId)}" title="Jump to question bubble">
+              <strong>↳ Re:</strong>
+              <span class="reply-quote-text">${escHtml(m.replyToSummary)}</span>
+            </button>
+          ` : "";
+
+          const behindCountSummary = m.behind
+            ? `${m.behind.thoughts.length} ${m.behind.thoughts.length === 1 ? "thought" : "thoughts"} · ${m.behind.tools.length} ${m.behind.tools.length === 1 ? "tool" : "tools"} · ${m.duration}`
+            : "";
+
+          chunks.push(`
+            <article
+              class="bubble ${m.dir} ${m.isHuman ? "is-human" : ""} ${isInspected ? "is-inspected" : ""}"
+              data-msg-id="${escHtml(m.id)}"
+              style="--bubble-accent:${escHtml(m.accent)}"
+            >
+              <span class="bubble-route">${escHtml(m.routeLabel)}</span>
+
+              <div class="bubble-head">
+                <span class="bubble-sender">
+                  ${escHtml(m.fromLabel)}
+                  <span class="bubble-role">${escHtml(m.roleBadge)}</span>
+                </span>
+                <time>${escHtml(m.time)}</time>
+              </div>
+
+              ${replyQuoteHtml}
+
+              <div class="bubble-body-container">
+                <div class="bubble-text ${clampClass}">${renderRichMd(m.bodyMd)}</div>
+                ${isLong ? `
+                  <button
+                    type="button"
+                    class="show-more-btn"
+                    data-toggle-body="${escHtml(m.id)}"
+                    aria-expanded="${isBodyExpanded ? "true" : "false"}"
+                  >
+                    ${isBodyExpanded ? "Show less ▴" : "Show full critique (4 more lines) ▾"}
+                  </button>
+                ` : ""}
+              </div>
+
+              ${optionsHtml}
+
+              ${m.behind ? `
+                <button
+                  type="button"
+                  class="behind-bar"
+                  data-behind-btn="${escHtml(m.id)}"
+                  aria-expanded="${isInspected ? "true" : "false"}"
+                >
+                  <span class="behind-summary">
+                    <span class="behind-spark" aria-hidden="true">✦</span>
+                    <span>Behind this response</span>
+                    <span class="behind-meta-chip">· ${escHtml(behindCountSummary)}</span>
+                  </span>
+                  <span class="behind-cta">${isInspected ? "Inspecting →" : "Trace →"}</span>
+                </button>
+              ` : ""}
+            </article>
+          `);
+
+          /* Subtle silent-workers summary pill right after Coordinator dispatch (or raw lines if toggled) */
+          if (m.id === "m1" && state.activeActor === "all") {
+            if (state.showRawTools) {
+              BEFORE_TOOL_BURSTS.filter((b) => b.agentId === "a4" || b.agentId === "a5").forEach((b) => {
+                chunks.push(`
+                  <div class="tool-burst-strip" style="--bubble-accent:${escHtml(b.color)};opacity:0.85;">
+                    <div class="tool-strip-header">
+                      <div class="tool-strip-meta">
+                        <span class="tool-strip-dot" aria-hidden="true"></span>
+                        <span class="tool-strip-agent">${escHtml(b.agentLabel)}</span>
+                        <span>${escHtml(b.time)}</span>
+                      </div>
+                      <span class="tool-badge-btn" style="cursor:default;">${escHtml(b.detail)}</span>
+                    </div>
+                  </div>
+                `);
+              });
+            } else {
+              chunks.push(`
+                <button type="button" class="silent-worker-inline-note" data-behind-btn="m1" title="Inspect background worker launches inside Coordinator">
+                  <span>⚙ 2 silent background workers (<code>A4 - Waiter</code>, <code>A5 - Waiter</code>) folded into Coordinator trace</span>
+                </button>
+              `);
+            }
+          }
+        });
+
+        streamEl.innerHTML = chunks.join("");
+      }
+
+      /* =======================================================================
+         Render Side Sheet Inspector Drawer
+         ======================================================================= */
+      function renderDrawer() {
+        const drawer = document.getElementById("inspectorDrawer");
+        const backdrop = document.getElementById("inspectorBackdrop");
+        const grid = document.getElementById("workspaceGrid");
+
+        const shouldShow = state.mode === "after" && Boolean(state.inspectedMsgId);
+
+        const msg = shouldShow
+          ? MESSAGES.find((m) => m.id === state.inspectedMsgId && m.behind)
+          : null;
+
+        if (!msg) {
+          drawer.hidden = true;
+          backdrop.hidden = true;
+          grid.classList.remove("has-side-drawer");
+          return;
+        }
+
+        const inspectable = getInspectableMessages();
+        const curIdx = inspectable.findIndex((m) => m.id === msg.id);
+        const prevMsg = curIdx > 0 ? inspectable[curIdx - 1] : null;
+        const nextMsg = curIdx >= 0 && curIdx < inspectable.length - 1 ? inspectable[curIdx + 1] : null;
+
+        drawer.hidden = false;
+        backdrop.hidden = !(state.viewport === "fold-cover" || window.innerWidth < 640);
+        grid.classList.add("has-side-drawer");
+
+        drawer.innerHTML = `
+          <div class="inspector-head">
+            <div class="inspector-head-top">
+              <div>
+                <div class="inspector-kicker">✦ Behind This Response</div>
+                <h2 class="inspector-title">
+                  <span>${escHtml(msg.fromLabel)}</span>
+                  <span class="bubble-role">${escHtml(msg.time)}</span>
+                </h2>
+              </div>
+              <button type="button" class="btn-ghost-sm" id="closeDrawerBtn" aria-label="Close inspector drawer">
+                ✕ Close
+              </button>
+            </div>
+            <div class="inspector-nav-row">
+              <span>${escHtml(msg.routeLabel)}</span>
+              <div class="nav-step-group">
+                <button type="button" class="btn-ghost-sm" data-step-msg="${prevMsg ? escHtml(prevMsg.id) : ""}" ${prevMsg ? "" : "disabled"}>← Prev</button>
+                <button type="button" class="btn-ghost-sm" data-step-msg="${nextMsg ? escHtml(nextMsg.id) : ""}" ${nextMsg ? "" : "disabled"}>Next →</button>
+              </div>
+            </div>
+          </div>
+          <div class="inspector-body">
+            ${renderTraceTimelineHtml(msg)}
+          </div>
+          <div class="inspector-foot">
+            <button type="button" class="btn-primary-sm" data-open-chat="${escHtml(msg.fromLabel)}">
+              Open ${escHtml(msg.fromLabel)} Chat Tab ↗
+            </button>
+          </div>
+        `;
+      }
+
+      /* =======================================================================
+         Render All + Sync Controls
+         ======================================================================= */
+      function renderAll() {
+        document.querySelectorAll("[data-mode-btn]").forEach((btn) => {
+          btn.setAttribute("aria-pressed", btn.dataset.modeBtn === state.mode ? "true" : "false");
+        });
+        document.querySelectorAll("[data-vp-btn]").forEach((btn) => {
+          btn.setAttribute("aria-pressed", btn.dataset.vpBtn === state.viewport ? "true" : "false");
+        });
+
+        const stageOuter = document.getElementById("stageOuter");
+        stageOuter.dataset.viewport = state.viewport;
+
+        const shell = document.getElementById("studioShell");
+        shell.dataset.coverTab = state.coverTab;
+        document.querySelectorAll("[data-cover-nav]").forEach((btn) => {
+          btn.setAttribute("aria-selected", btn.dataset.coverNav === state.coverTab ? "true" : "false");
+        });
+
+        renderTopology();
+        renderStream();
+        renderDrawer();
+      }
+
+      function closeDrawer(restoreFocus) {
+        state.inspectedMsgId = null;
+        renderAll();
+        if (restoreFocus && state.lastOpenerBtn && document.contains(state.lastOpenerBtn)) {
+          state.lastOpenerBtn.focus();
+        }
+      }
+
+      /* =======================================================================
+         Event Wiring
+         ======================================================================= */
+      document.addEventListener("click", (e) => {
+        const modeBtn = e.target.closest("[data-mode-btn]");
+        if (modeBtn) {
+          state.mode = modeBtn.dataset.modeBtn;
+          if (state.mode === "after" && !state.inspectedMsgId && state.viewport === "desktop") {
+            state.inspectedMsgId = "m3";
+          }
+          renderAll();
+          return;
+        }
+
+        const vpBtn = e.target.closest("[data-vp-btn]");
+        if (vpBtn) {
+          state.viewport = vpBtn.dataset.vpBtn;
+          if (state.viewport === "fold-cover") {
+            state.inspectedMsgId = null; // On small phone cover, start cleanly on stream until tapped
+          }
+          renderAll();
+          return;
+        }
+
+        const coverNav = e.target.closest("[data-cover-nav]");
+        if (coverNav) {
+          state.coverTab = coverNav.dataset.coverNav;
+          if (state.coverTab === "topology" && (state.viewport === "fold-open" || (window.innerWidth >= 640 && window.innerWidth <= 1020))) {
+            state.inspectedMsgId = null; // Reveal Topology on left side of Fold Open split
+          }
+          renderAll();
+          return;
+        }
+
+        const actorBtn = e.target.closest("[data-actor-select]");
+        if (actorBtn) {
+          state.activeActor = actorBtn.dataset.actorSelect;
+          if (state.viewport === "fold-cover") state.coverTab = "messages";
+          renderAll();
+          return;
+        }
+
+        if (e.target.closest("#resetThreadBtn")) {
+          state.activeActor = "all";
+          renderAll();
+          return;
+        }
+
+        if (e.target.closest("#rawToolsToggleBtn")) {
+          state.showRawTools = !state.showRawTools;
+          renderAll();
+          return;
+        }
+
+        const toggleBodyBtn = e.target.closest("[data-toggle-body]");
+        if (toggleBodyBtn) {
+          const id = toggleBodyBtn.dataset.toggleBody;
+          if (state.expandedBodies.has(id)) state.expandedBodies.delete(id);
+          else state.expandedBodies.add(id);
+          renderAll();
+          return;
+        }
+
+        const behindBtn = e.target.closest("[data-behind-btn]");
+        if (behindBtn) {
+          const id = behindBtn.dataset.behindBtn;
+          state.lastOpenerBtn = behindBtn;
+          const nextId = state.inspectedMsgId === id ? null : id;
+          state.inspectedMsgId = nextId;
+          renderAll();
+          if (nextId && (state.viewport === "fold-cover" || window.innerWidth < 640)) {
+            document.getElementById("closeDrawerBtn")?.focus();
+          }
+          return;
+        }
+
+        const mockTabBtn = e.target.closest("[data-mock-tab]");
+        if (mockTabBtn) {
+          const tab = mockTabBtn.dataset.mockTab;
+          if (tab !== "Messages") {
+            showToast(`Mockup is scoped to the Messages view (${tab} tab unchanged)`);
+          }
+          return;
+        }
+
+        const stepBtn = e.target.closest("[data-step-msg]");
+        if (stepBtn && !stepBtn.disabled) {
+          const id = stepBtn.dataset.stepMsg;
+          if (id) {
+            state.inspectedMsgId = id;
+            renderAll();
+            const target = document.querySelector(`[data-msg-id="${CSS.escape(id)}"]`);
+            target?.scrollIntoView({ block: "nearest", behavior: "smooth" });
+          }
+          return;
+        }
+
+        if (e.target.closest("#closeDrawerBtn") || e.target.closest("#inspectorBackdrop")) {
+          closeDrawer(true);
+          return;
+        }
+
+        const beforeReadBtn = e.target.closest("[data-before-read-full]");
+        if (beforeReadBtn) {
+          showToast("Old UI required 'Read full →' just to see line 2+ — switch to Proposed (After) to read inline");
+          return;
+        }
+
+        const jumpBtn = e.target.closest("[data-jump-msg]");
+        if (jumpBtn) {
+          const target = document.querySelector(`[data-msg-id="${CSS.escape(jumpBtn.dataset.jumpMsg)}"]`);
+          if (target) {
+            target.scrollIntoView({ block: "center", behavior: "smooth" });
+            target.classList.remove("is-jump-flash");
+            void target.offsetWidth;
+            target.classList.add("is-jump-flash");
+          }
+          return;
+        }
+
+        const chatBtn = e.target.closest("[data-open-chat]");
+        if (chatBtn) {
+          showToast(`Opened "${chatBtn.dataset.openChat}" full Agent Chat tab (simulated)`);
+          return;
+        }
+
+        const burstBtn = e.target.closest("[data-before-burst]");
+        if (burstBtn) {
+          const k = burstBtn.dataset.beforeBurst;
+          if (state.beforeBurstExpanded.has(k)) state.beforeBurstExpanded.delete(k);
+          else state.beforeBurstExpanded.add(k);
+          renderAll();
+        }
+      });
+
+      /* Theme Toggle */
+      const themeBtn = document.getElementById("themeToggleBtn");
+      function syncThemeBtn() {
+        const isLight = state.theme === "light";
+        themeBtn.textContent = isLight ? "🌙 Dark" : "☀ Light";
+        themeBtn.setAttribute("aria-pressed", isLight ? "true" : "false");
+        themeBtn.setAttribute("aria-label", isLight ? "Switch to dark theme" : "Switch to light theme");
+      }
+      themeBtn.addEventListener("click", () => {
+        state.theme = state.theme === "dark" ? "light" : "dark";
+        document.querySelector('meta[name="color-scheme"]').content = state.theme;
+        document.documentElement.dataset.theme = state.theme;
+        try { localStorage.setItem("agent-studio-mockup:theme", state.theme); } catch (e) {}
+        syncThemeBtn();
+      });
+
+      /* Escape closes Side Sheet Drawer when open */
+      document.addEventListener("keydown", (e) => {
+        if (e.key === "Escape" && state.mode === "after" && state.inspectedMsgId) {
+          e.preventDefault();
+          closeDrawer(true);
+        }
+      });
+
+      syncThemeBtn();
+      renderAll();
+    })();
+  </script>
+</body>
+</html>

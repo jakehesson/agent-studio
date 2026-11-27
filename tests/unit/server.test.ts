@@ -591,6 +591,24 @@ describe("Unified Single-Port HTTP & SSE Server", () => {
       assert.ok(vscBackendDef);
       assert.ok((vscBackendDef.modelFallbacks?.length ?? 0) >= 2);
       assert.equal(vscBackendDef.modelPolicy, "preferred");
+
+      // PATCH /api/team/routing with humanQuestions: "native-ide"
+      const patchQuestions = await fetch(`${base}/api/team/routing`, {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          project: "studio-demo",
+          sync: true,
+          workflow: { humanQuestions: "native-ide" },
+        }),
+      });
+      assert.equal(patchQuestions.status, 200);
+      const teamAfterQuestions = await fetch(`${base}/api/team?project=studio-demo`);
+      assert.equal(teamAfterQuestions.status, 200);
+      const teamQuestionsData = (await teamAfterQuestions.json()) as {
+        workflow?: { humanQuestions?: string };
+      };
+      assert.equal(teamQuestionsData.workflow?.humanQuestions, "native-ide");
     } finally {
       await srv.close();
     }

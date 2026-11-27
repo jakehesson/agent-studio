@@ -87,11 +87,7 @@ export function activate(context: vscode.ExtensionContext): void {
             ? raw.sessionId.trim()
             : undefined;
         const openWaiting = raw.openWaiting === true ? true : undefined;
-        const openChatAgentId =
-          typeof raw.openChatAgentId === "string" && raw.openChatAgentId.trim()
-            ? raw.openChatAgentId.trim()
-            : undefined;
-        return openView("studio", { sessionId, openWaiting, openChatAgentId });
+        return openView("studio", { sessionId, openWaiting });
       }
       return openView("studio");
     }),

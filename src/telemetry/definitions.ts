@@ -27,6 +27,7 @@ import {
   parseTeamYaml,
   type CheckpointDefinition,
   type ContextThresholds,
+  type HumanQuestionsMode,
   type IdeModelOverride,
   type IdeTarget,
   type TeamManifest,
@@ -125,6 +126,7 @@ export interface TeamDetails {
     };
     suites: Record<string, string[]>;
     checkpoints: Record<string, CheckpointDefinition>;
+    humanQuestions?: HumanQuestionsMode;
   };
   modelRouting?: WorkflowRoutingSummary;
   modelIndexSummary?: ModelIndexSummary;
@@ -790,6 +792,7 @@ export async function discoverTeamDetails(
       },
       suites: manifest ? { ...manifest.workflow.suites } : {},
       checkpoints: manifest ? { ...manifest.workflow.checkpoints } : {},
+      humanQuestions: manifest?.workflow.humanQuestions ?? "studio-mcp",
     },
     ...(manifest ? { modelRouting: buildWorkflowRoutingSummary(manifest) } : {}),
     modelIndexSummary,

@@ -2089,6 +2089,68 @@
   min-width: 0;
 }
 
+.pill-toggle-group {
+  display: inline-flex;
+  align-items: center;
+  background: var(--surface-bg, rgba(255, 255, 255, 0.04));
+  border: 1px solid var(--border-color, rgba(255, 255, 255, 0.1));
+  border-radius: 8px;
+  padding: 2px;
+  gap: 2px;
+}
+
+.pill-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  padding: 6px 12px;
+  min-height: 32px;
+  font-size: 12px;
+  font-weight: 500;
+  border-radius: 6px;
+  border: none;
+  background: transparent;
+  color: var(--text-muted, #8b949e);
+  cursor: pointer;
+  transition: all 0.15s ease-in-out;
+  white-space: nowrap;
+}
+
+.pill-btn:hover:not(:disabled) {
+  color: var(--text-normal, #c9d1d9);
+  background: var(--surface-hover, rgba(255, 255, 255, 0.06));
+}
+
+.pill-btn.active {
+  background: var(--accent-bg, #1f6feb);
+  color: #fff;
+  font-weight: 600;
+}
+
+.pill-btn:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+@media (pointer: coarse) {
+  .pill-btn {
+    min-height: 44px;
+    padding: 8px 14px;
+  }
+}
+
+@media (max-width: 639px) {
+  .pill-toggle-group {
+    display: flex;
+    flex-direction: column;
+    width: 100%;
+  }
+  .pill-btn {
+    width: 100%;
+    min-height: 44px;
+  }
+}
+
 /* Per-Role Model Controls on .roster-card */
 .roster-model-box {
   background: #0a0f1a;

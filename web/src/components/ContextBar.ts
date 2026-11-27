@@ -455,7 +455,7 @@ export class ContextBar {
         const first = pendingList[0]!;
         waitingPill.setAttribute(
           "aria-label",
-          `${pendingList.length} ${pendingList.length === 1 ? "agent" : "agents"} waiting for input — open chat with ${first.agentLabel || first.agentId}`
+          `${pendingList.length} ${pendingList.length === 1 ? "agent" : "agents"} waiting for input — open messages for ${first.agentLabel || first.agentId}`
         );
         waitingPill.title = `${first.agentLabel || first.agentId}: ${first.title}`;
       } else {

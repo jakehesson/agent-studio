@@ -1,10 +1,7 @@
 import type {
-  AgentChatMessage,
-  AgentChatResponse,
   BoardApiResponse,
   BoardData,
   BoardItem,
-  ChatToolCallRef,
   CheckStatus,
   ConnectionState,
   DoctorApiResponse,
@@ -75,15 +72,8 @@ const MCP_MAX_CONCURRENT = 2;
 let mcpInFlight = 0;
 const mcpWaitQueue: Array<() => void> = [];
 
-export type McpChatLoader = (params: FetchAgentChatParams) => Promise<unknown>;
-let mcpChatLoader: McpChatLoader | null = null;
-
 export function setMcpAppTransport(client: McpAppClientLike | null): void {
   mcpTransport = client;
-}
-
-export function setMcpChatLoader(loader: McpChatLoader | null): void {
-  mcpChatLoader = loader;
 }
 
 export function isMcpAppTransportActive(): boolean {
@@ -301,153 +291,6 @@ export async function fetchState(opts: {
         })}`
       );
   return normalizeServerSnapshot(raw);
-}
-
-export interface FetchAgentChatParams {
-  session?: string;
-  agent?: string;
-  ide?: IdeFilter | IdeSource | string;
-  project?: string;
-  workspace?: string;
-  limit?: number;
-  before?: string;
-}
-
-function normalizeChatToolRef(raw: unknown): ChatToolCallRef | null {
-  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return null;
-  const r = raw as Record<string, unknown>;
-  const toolName = typeof r.toolName === "string" ? r.toolName : "";
-  if (!toolName) return null;
-  const status =
-    r.status === "running" ||
-    r.status === "ok" ||
-    r.status === "error" ||
-    r.status === "denied"
-      ? r.status
-      : undefined;
-  return {
-    toolCallId: typeof r.toolCallId === "string" ? r.toolCallId : undefined,
-    toolName,
-    summary: typeof r.summary === "string" ? r.summary : toolName,
-    status,
-    inputPreview: typeof r.inputPreview === "string" ? r.inputPreview : undefined,
-    output: typeof r.output === "string" ? r.output : undefined,
-  };
-}
-
-function normalizeChatMessage(raw: unknown, defaultAgentId: string): AgentChatMessage | null {
-  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return null;
-  const r = raw as Record<string, unknown>;
-  const id = typeof r.id === "string" ? r.id : "";
-  const rawRole = r.role;
-  const role: AgentChatMessage["role"] =
-    rawRole === "user" ||
-    rawRole === "assistant" ||
-    rawRole === "thinking" ||
-    rawRole === "tool" ||
-    rawRole === "question" ||
-    rawRole === "subagent"
-      ? rawRole
-      : "assistant";
-  const tools = Array.isArray(r.tools)
-    ? r.tools.map(normalizeChatToolRef).filter((t): t is ChatToolCallRef => t !== null)
-    : undefined;
-  return {
-    id: id || `msg-${Math.random().toString(36).slice(2, 8)}`,
-    ts: typeof r.ts === "string" ? r.ts : "",
-    epoch: typeof r.epoch === "number" && Number.isFinite(r.epoch) ? r.epoch : 0,
-    agentId: typeof r.agentId === "string" ? r.agentId : defaultAgentId,
-    role,
-    text: typeof r.text === "string" ? r.text : "",
-    thinking: typeof r.thinking === "string" ? r.thinking : undefined,
-    tools: tools && tools.length > 0 ? tools : undefined,
-    pendingPromptId:
-      typeof r.pendingPromptId === "string" ? r.pendingPromptId : undefined,
-    subagentId: typeof r.subagentId === "string" ? r.subagentId : undefined,
-    subagentLabel: typeof r.subagentLabel === "string" ? r.subagentLabel : undefined,
-  };
-}
-
-export function normalizeAgentChatResponse(
-  raw: unknown,
-  fallbackParams: FetchAgentChatParams
-): AgentChatResponse {
-  const obj = asRecord(raw);
-  if (obj.ok === false) {
-    throw new Error(
-      typeof obj.error === "string" && obj.error
-        ? obj.error
-        : "Unable to load agent conversation"
-    );
-  }
-  const agentId =
-    typeof obj.agentId === "string" && obj.agentId
-      ? obj.agentId
-      : fallbackParams.agent || "";
-  const rawMsgs = Array.isArray(obj.messages) ? obj.messages : [];
-  const messages = rawMsgs
-    .map((m) => normalizeChatMessage(m, agentId))
-    .filter((m): m is AgentChatMessage => m !== null);
-
-  return {
-    ok: true,
-    sessionId:
-      typeof obj.sessionId === "string"
-        ? obj.sessionId
-        : fallbackParams.session || "",
-    agentId,
-    agentLabel:
-      typeof obj.agentLabel === "string" && obj.agentLabel
-        ? obj.agentLabel
-        : agentId || "Agent",
-    ide:
-      typeof obj.ide === "string"
-        ? obj.ide
-        : typeof fallbackParams.ide === "string"
-          ? fallbackParams.ide
-          : "unknown",
-    messages,
-    totalMessages:
-      typeof obj.totalMessages === "number" && Number.isFinite(obj.totalMessages)
-        ? obj.totalMessages
-        : messages.length,
-    hasMore: Boolean(obj.hasMore),
-    nextCursor:
-      typeof obj.nextCursor === "string" && obj.nextCursor
-        ? obj.nextCursor
-        : undefined,
-    pendingPrompt: normalizePendingHumanPrompt(obj.pendingPrompt),
-  };
-}
-
-export async function fetchAgentChat(
-  params: FetchAgentChatParams
-): Promise<AgentChatResponse> {
-  const raw = mcpChatLoader
-    ? await mcpChatLoader(params)
-    : mcpTransport
-      ? await callMcpToolJson<unknown>("app_get_chat", {
-          session: params.session,
-          agent: params.agent,
-          ide: params.ide && params.ide !== "all" ? params.ide : undefined,
-          project: params.project,
-          workspace: params.workspace,
-          limit: params.limit,
-          before: params.before,
-        })
-      : await fetchJson<unknown>(
-          `/api/chat${qs({
-            session: params.session || undefined,
-            agent: params.agent || undefined,
-            ide: params.ide && params.ide !== "all" ? String(params.ide) : undefined,
-            project: params.project || undefined,
-            workspace: params.workspace || undefined,
-            limit: params.limit !== undefined ? String(params.limit) : undefined,
-            before: params.before || undefined,
-          })}`
-        );
-
-  return normalizeAgentChatResponse(raw, params);
 }
 
 export function extractMcpResultPayload<T>(
@@ -1144,7 +987,9 @@ export async function patchTeamRouting(payload: {
   project?: string;
   workspace?: string;
   sync?: boolean;
-  workflow?: Partial<WorkflowModelRouting>;
+  workflow?: Partial<WorkflowModelRouting> & {
+    humanQuestions?: "studio-mcp" | "native-ide";
+  };
   role?: {
     id: string;
     modelTier?: ModelTier | null;

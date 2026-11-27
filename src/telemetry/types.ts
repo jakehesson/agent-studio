@@ -2,16 +2,12 @@ import { createHash } from "node:crypto";
 import path from "node:path";
 import type {
   AgentBreakdownEntry,
-  AgentChatMessage,
-  AgentChatResponse,
   AgentEdgeSnapshot,
   AgentNodeSnapshot,
   AgentStatus,
   AgentUsageMetrics,
   BreakdownAttribution,
   CategoryUsageBucket,
-  ChatMessageRole,
-  ChatToolCallRef,
   EfficiencyInsight,
   EventKind,
   IdeSource,
@@ -39,16 +35,12 @@ import type {
 
 export type {
   AgentBreakdownEntry,
-  AgentChatMessage,
-  AgentChatResponse,
   AgentEdgeSnapshot,
   AgentNodeSnapshot,
   AgentStatus,
   AgentUsageMetrics,
   BreakdownAttribution,
   CategoryUsageBucket,
-  ChatMessageRole,
-  ChatToolCallRef,
   EfficiencyInsight,
   EventKind,
   IdeSource,
@@ -422,11 +414,6 @@ export interface ParseSessionOptions {
   onFullBody?: (eventId: string, body: string) => void;
 }
 
-export interface ParseChatOptions {
-  agentId?: string;
-  agentAliases?: string[];
-}
-
 export interface PassiveIdeAdapter {
   readonly ide: IdeSource;
   getHealth(): Promise<AdapterHealth>;
@@ -438,10 +425,6 @@ export interface PassiveIdeAdapter {
     session: DiscoveredSession,
     opts?: ParseSessionOptions,
   ): Promise<EnrichedEvent[]>;
-  parseChat?(
-    session: DiscoveredSession,
-    opts?: ParseChatOptions,
-  ): Promise<AgentChatMessage[]>;
 }
 
 export const PALETTE = [
@@ -1554,41 +1537,6 @@ export function prettifyModelName(raw: string): string {
   return formatted.join(" ") + suffix;
 }
 
-export const CHAT_FIELD_MAX_BYTES = 128 * 1024;
-
-export function capChatText(
-  raw: string,
-  maxBytes = CHAT_FIELD_MAX_BYTES,
-): string {
-  if (!raw) return "";
-  const buf = Buffer.from(raw, "utf8");
-  if (buf.byteLength <= maxBytes) return raw;
-  let end = Math.max(0, maxBytes);
-  while (end > 0 && end < buf.byteLength && (buf[end]! & 0xc0) === 0x80) {
-    end -= 1;
-  }
-  return buf.subarray(0, end).toString("utf8");
-}
-
-export function resolveEmptyFileLinks(text: string): string {
-  if (!text) return "";
-  return text.replace(/\[\]\(([^)]+)\)/g, (_m, url: string) => {
-    const rawTarget = (url ?? "").trim().split(/[?#]/)[0] ?? "";
-    let decoded = rawTarget;
-    try {
-      decoded = decodeURIComponent(rawTarget);
-    } catch {
-      decoded = rawTarget;
-    }
-    const cleanPath = decoded
-      .replace(/^[a-zA-Z][a-zA-Z0-9+.-]*:\/\//, "")
-      .replace(/\\/g, "/")
-      .replace(/\/+$/, "");
-    const base = path.posix.basename(cleanPath) || "link";
-    return `[${base}](${url})`;
-  });
-}
-
 const RECOMMENDED_RE = /\s*\(recommended\)\s*/i;
 
 export function normalizePendingOption(
@@ -1791,20 +1739,4 @@ export function computePendingPromptId(
     return `prompt:${agentId}:${toolCallId.trim()}`;
   }
   return `prompt:${agentId}:${eventId ?? "pending"}`;
-}
-
-export function formatQuestionsPreview(
-  questions: PendingQuestionItem[],
-  fallback = "Waiting for user answer",
-): string {
-  if (questions.length === 0) return fallback;
-  return questions
-    .map((q) => {
-      if (q.options.length === 0) return q.question;
-      const opts = q.options
-        .map((o) => (o.recommended ? `${o.label} (Recommended)` : o.label))
-        .join(", ");
-      return `${q.question} [${opts}]`;
-    })
-    .join("\n");
 }

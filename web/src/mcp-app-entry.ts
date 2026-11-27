@@ -12,11 +12,7 @@ import {
   type McpUiHostContext,
 } from "@modelcontextprotocol/ext-apps";
 import {
-  cleanMcpArgs,
-  extractMcpResultPayload,
   setMcpAppTransport,
-  setMcpChatLoader,
-  withMcpConcurrencySlot,
   type McpAppClientLike,
 } from "./api.js";
 import { AgentStudioApp, type StudioExternalDirective } from "./app.js";
@@ -49,25 +45,8 @@ async function bootMcpApp(): Promise<void> {
   const mountEl = document.getElementById("app");
   if (!mountEl) return;
 
-  const mcpApp = new App({ name: "Agent Studio", version: "0.15.0" }, {});
+  const mcpApp = new App({ name: "Agent Studio", version: "0.16.0" }, {});
   setMcpAppTransport(mcpApp as unknown as McpAppClientLike);
-  setMcpChatLoader(async (params) =>
-    withMcpConcurrencySlot(async () => {
-      const res = await mcpApp.callServerTool({
-        name: "app_get_chat",
-        arguments: cleanMcpArgs({
-          session: params.session,
-          agent: params.agent,
-          ide: params.ide && params.ide !== "all" ? params.ide : undefined,
-          project: params.project,
-          workspace: params.workspace,
-          limit: params.limit,
-          before: params.before,
-        }),
-      });
-      return extractMcpResultPayload<unknown>(res, "app_get_chat");
-    })
-  );
 
   let studioApp: AgentStudioApp | null = null;
   let pendingDirective: StudioExternalDirective = {};

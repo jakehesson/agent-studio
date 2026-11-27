@@ -216,50 +216,6 @@ export interface PendingHumanPrompt {
   ide?: IdeSource;
 }
 
-export type ChatMessageRole =
-  | "user"
-  | "assistant"
-  | "thinking"
-  | "tool"
-  | "question"
-  | "subagent";
-
-export interface ChatToolCallRef {
-  toolCallId?: string;
-  toolName: string;
-  summary: string;
-  status?: "running" | "ok" | "error" | "denied";
-  inputPreview?: string;
-  output?: string;
-}
-
-export interface AgentChatMessage {
-  id: string;
-  ts: string;
-  epoch: number;
-  agentId: string;
-  role: ChatMessageRole;
-  text: string;
-  thinking?: string;
-  tools?: ChatToolCallRef[];
-  pendingPromptId?: string;
-  subagentId?: string;
-  subagentLabel?: string;
-}
-
-export interface AgentChatResponse {
-  ok: true;
-  sessionId: string;
-  agentId: string;
-  agentLabel: string;
-  ide: string;
-  messages: AgentChatMessage[];
-  totalMessages: number;
-  hasMore: boolean;
-  nextCursor?: string;
-  pendingPrompt: PendingHumanPrompt | null;
-}
-
 export interface ReplyToHostRequest {
   sessionId?: string;
   agentId: string;
@@ -752,6 +708,21 @@ export interface TeamDefinitionEntry {
   preview: string;
 }
 
+export type HumanQuestionsMode = "studio-mcp" | "native-ide";
+
+export interface WorkflowConfig {
+  boardPath: string;
+  stages: string[];
+  enforcement: {
+    orchestratorReadOnly: boolean;
+    qaGateRequired: boolean;
+    blockDirectBoardEdits: boolean;
+  };
+  suites: Record<string, string[]>;
+  checkpoints: Record<string, TeamCheckpoint>;
+  humanQuestions?: HumanQuestionsMode;
+}
+
 export interface TeamDetailsResponse {
   project: {
     id: string;
@@ -761,17 +732,7 @@ export interface TeamDetailsResponse {
   };
   hasManifest: boolean;
   targets: string[];
-  workflow: {
-    boardPath: string;
-    stages: string[];
-    enforcement: {
-      orchestratorReadOnly: boolean;
-      qaGateRequired: boolean;
-      blockDirectBoardEdits: boolean;
-    };
-    suites: Record<string, string[]>;
-    checkpoints: Record<string, TeamCheckpoint>;
-  };
+  workflow: WorkflowConfig;
   roster: TeamRosterEntry[];
   skills: TeamSkillEntry[];
   definitions: TeamDefinitionEntry[];
@@ -787,7 +748,7 @@ export interface TeamDetailsResponse {
   server_time: string;
 }
 
-export type PrimaryView = "studio" | "team" | "board" | "mockups" | "doctor" | "chat";
+export type PrimaryView = "studio" | "team" | "board" | "mockups" | "doctor";
 export type CoverPane = "studio" | "feed" | "team" | "board" | "mockups" | "doctor";
 export type ConnectionState = "connecting" | "live" | "reconnecting" | "offline";
 

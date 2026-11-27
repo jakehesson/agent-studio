@@ -1,6 +1,4 @@
 import { ActivityFeed } from "../components/ActivityFeed.js";
-import { AgentChatDrawer } from "../components/AgentChatDrawer.js";
-import { shouldRouteChatToHostTab } from "../components/AgentChatPane.js";
 import { BehindResponseDrawer } from "../components/BehindResponseDrawer.js";
 import { CommReaderModal } from "../components/CommReaderModal.js";
 import { PayloadInspector } from "../components/PayloadInspector.js";
@@ -14,7 +12,6 @@ import {
 } from "../utils/panelResizer.js";
 import type {
   AgentNodeSnapshot,
-  ConnectionState,
   NormalizedEvent,
   ReplyCapabilities,
   ReplyToHostRequest,
@@ -23,18 +20,12 @@ import type {
   TeamDefinitionEntry,
   TeamRosterRef,
 } from "../types.js";
-import { formatActorName } from "../utils.js";
 
 export interface LiveStudioCallbacks {
   onCoverSubPaneChange?: (pane: "topology" | "feed") => void;
   getReplyCapabilities?: () => ReplyCapabilities;
   onReplyToHost?: (req: ReplyToHostRequest) => Promise<ReplyToHostResult>;
   onCancelPrompt?: (promptId: string, reason?: string) => Promise<ReplyToHostResult>;
-  onOpenChat?: (
-    agentId: string,
-    focusQuestion?: boolean,
-    meta?: { agentLabel?: string; sessionId?: string; ide?: string }
-  ) => void;
 }
 
 export class LiveStudioView {
@@ -45,7 +36,6 @@ export class LiveStudioView {
   private inspector: PayloadInspector;
   private scrubber: TimelineScrubber;
   private readerModal: CommReaderModal;
-  private chatDrawer: AgentChatDrawer;
   private behindDrawer: BehindResponseDrawer;
   private studioResizers: PanelResizerHandle;
   private workspaceEl: HTMLElement;
@@ -59,8 +49,6 @@ export class LiveStudioView {
   private selectedEventId: string | null = null;
   private lastAnimatedEventId: string | null = null;
   private coverSubPane: "topology" | "feed" = "topology";
-  private embedMode = false;
-  private getReplyCapabilities: () => ReplyCapabilities;
 
   constructor(root: HTMLElement, cb: LiveStudioCallbacks = {}) {
     this.root = root;
@@ -107,15 +95,12 @@ export class LiveStudioView {
           this.inspector.renderEmpty();
         }
       },
-      onSelectThread: (selection) => {
-        const opened = this.feed.openThread(selection);
+      onSelectThread: (selection, opts) => {
+        const opened = this.feed.openThread(selection, opts);
         if (opened && this.isCoverScreen()) {
           this.setCoverSubPane("feed");
           this.cb.onCoverSubPaneChange?.("feed");
         }
-      },
-      onOpenChat: (agentId) => {
-        this.openChat(agentId);
       },
     });
 
@@ -127,7 +112,6 @@ export class LiveStudioView {
         return false;
       }
     })();
-    this.embedMode = embedMode;
 
     const getSessionContext = () => {
       let sp: URLSearchParams | null = null;
@@ -160,7 +144,6 @@ export class LiveStudioView {
         isMcpApp: false,
         isEmbed: embedMode,
       }));
-    this.getReplyCapabilities = getReplyCapabilities;
     const onReplyToHost =
       this.cb.onReplyToHost ??
       (async (req: ReplyToHostRequest): Promise<ReplyToHostResult> => ({
@@ -175,40 +158,14 @@ export class LiveStudioView {
       embedMode,
       mcpAppMode: getReplyCapabilities().isMcpApp,
       getSessionContext,
-      onOpenChat: (agentId) => {
-        this.openChat(agentId);
-      },
       onStepChange: (entry) => {
         this.feed.setInspectedEventId(entry.event.id);
       },
       onClose: () => {
         this.workspaceEl.classList.remove("has-behind-drawer");
-        this.inspectorSlotEl.hidden = false;
+        this.syncInspectorVisibility();
         this.feed.setInspectedEventId(null);
         this.studioResizers.sync();
-      },
-    });
-
-    this.chatDrawer = new AgentChatDrawer({
-      embedMode,
-      mcpAppMode: getReplyCapabilities().isMcpApp,
-      getSessionContext,
-      getReplyCapabilities,
-      onReplyToHost,
-      onCancelPrompt: this.cb.onCancelPrompt,
-      onOpenInspector: (agentId) => {
-        if (this.behindDrawer.isOpen()) {
-          this.behindDrawer.close(false);
-        }
-        this.selectedAgentId = agentId;
-        this.selectedEventId = null;
-        this.topology.setSelectedAgent(agentId);
-        this.feed.setAgentFilter(agentId);
-        this.feed.setSelectedEvent(null);
-        this.inspectCurrentAgent(agentId, this.isCoverScreen());
-      },
-      onSwitchAgent: (agentId) => {
-        this.openChat(agentId);
       },
     });
 
@@ -221,6 +178,10 @@ export class LiveStudioView {
           this.behindDrawer.close(false);
         }
         this.selectedEventId = ev.id;
+        if (this.feed.getFilter() === "messages") {
+          this.inspector.closeModal();
+          return;
+        }
         this.inspector.renderEvent(ev, {
           openSheet: this.isCoverScreen(),
           labelMap: this.agentLabelMap,
@@ -258,10 +219,10 @@ export class LiveStudioView {
           this.feed.setAgentFilter(null);
         }
         this.inspector.renderEmpty();
-        this.inspectorSlotEl.hidden = true;
         this.workspaceEl.classList.add("has-behind-drawer");
         this.feed.setInspectedEventId(entry.event.id);
         this.behindDrawer.open(entry, allWithBehind, triggerEl);
+        this.syncInspectorVisibility();
         this.studioResizers.sync();
       },
       onThreadChange: (threadKey) => {
@@ -270,12 +231,27 @@ export class LiveStudioView {
           this.behindDrawer.close(false);
         }
       },
+      onFilterChange: (filter) => {
+        if (filter === "messages") {
+          this.inspector.closeModal();
+        } else {
+          if (this.selectedAgentId) {
+            this.inspectCurrentAgent(this.selectedAgentId, false);
+          } else if (this.selectedEventId && this.snapshot) {
+            const selEv = this.snapshot.events.find((e) => e.id === this.selectedEventId);
+            if (selEv) {
+              this.inspector.renderEvent(selEv, {
+                openSheet: false,
+                labelMap: this.agentLabelMap,
+              });
+            }
+          }
+        }
+        this.syncInspectorVisibility();
+      },
       onCoverBackToTopology: () => {
         this.setCoverSubPane("topology");
         this.cb.onCoverSubPaneChange?.("topology");
-      },
-      onOpenChat: (agentId) => {
-        this.openChat(agentId);
       },
       getReplyCapabilities,
       onReplyToHost,
@@ -295,8 +271,8 @@ export class LiveStudioView {
       onOpenReader: (ev) => {
         this.readerModal.open(ev, { labelMap: this.agentLabelMap });
       },
-      onOpenChat: (agentId) => {
-        this.openChat(agentId);
+      onOpenWaiting: (agentId) => {
+        this.openWaitingMessages(agentId);
       },
     });
 
@@ -314,12 +290,18 @@ export class LiveStudioView {
       streamPane: streamEl,
       behindPane: behindDrawerEl,
     });
+
+    this.syncInspectorVisibility();
+  }
+
+  public syncInspectorVisibility(): void {
+    const hide = this.feed.getFilter() === "messages" || this.behindDrawer.isOpen();
+    this.inspectorSlotEl.hidden = hide;
   }
 
   public dispose(): void {
     this.studioResizers.destroy();
     this.behindDrawer.dispose();
-    this.chatDrawer.dispose();
     this.feed.dispose();
     this.readerModal.dispose();
     this.topology.dispose();
@@ -327,71 +309,27 @@ export class LiveStudioView {
     this.scrubber.dispose();
   }
 
-  public setConnectionState(status: ConnectionState): void {
-    this.chatDrawer.setConnectionState(status);
-  }
-
-  public setChatRuntimeScope(scope: { embedMode?: boolean; mcpAppMode?: boolean }): void {
-    if (typeof scope.embedMode === "boolean") this.embedMode = scope.embedMode;
-    this.chatDrawer.setRuntimeScope(scope);
+  public setRuntimeScope(scope: { embedMode?: boolean; mcpAppMode?: boolean }): void {
     this.behindDrawer.setRuntimeScope(scope);
     this.feed.setRuntimeScope(scope);
   }
 
-  public openChat(agentId: string, focusQuestion = false): boolean {
-    const snap = this.snapshot;
-    if (!snap) return false;
-    const found = this.resolveLiveAgent(agentId) ?? {
-      id: agentId,
-      label: agentId,
-      ide: snap.ide,
-      status: "IDLE",
-      toolCalls: 0,
-      messagesSent: 0,
-      messagesReceived: 0,
-    };
-
-    const caps = this.getReplyCapabilities();
-    if (
-      this.cb.onOpenChat &&
-      shouldRouteChatToHostTab({
-        embedMode: caps.isEmbed || this.embedMode,
-        mcpAppMode: caps.isMcpApp,
-        hasParent: typeof window !== "undefined" && window.parent !== window,
-      })
-    ) {
-      const resolvedIde =
-        found.ide && found.ide !== "unknown" ? found.ide : snap.ide;
-      this.cb.onOpenChat(agentId, focusQuestion, {
-        agentLabel: formatActorName(found.id, this.agentLabelMap, found.label),
-        sessionId: snap.sessionId,
-        ide: resolvedIde,
-      });
-      return true;
+  public openWaitingMessages(agentId?: string): boolean {
+    if (this.behindDrawer.isOpen()) {
+      this.behindDrawer.close(false);
     }
-
-    const effectiveDefinitions =
-      snap.definitions && snap.definitions.length > 0
-        ? snap.definitions
-        : this.fallbackDefinitions;
-    const definition = this.findMatchingDefinition(found, effectiveDefinitions);
-    this.chatDrawer.open({
-      agent: found,
-      labelMap: this.agentLabelMap,
-      definition,
-      focusQuestion,
-    });
-    return true;
-  }
-
-  public openFirstWaitingChat(): boolean {
     const snap = this.snapshot;
-    if (!snap) return false;
-    const firstAgentId =
-      snap.pendingPrompts?.[0]?.agentId ??
-      snap.agents.find((a) => Boolean(a.pendingPrompt))?.id;
-    if (!firstAgentId) return false;
-    return this.openChat(firstAgentId, true);
+    const targetAgentId =
+      agentId ||
+      snap?.pendingPrompts?.[0]?.agentId ||
+      snap?.agents.find((a) => Boolean(a.pendingPrompt))?.id;
+    this.feed.openMessagesForAgent(targetAgentId);
+    if (this.isCoverScreen()) {
+      this.setCoverSubPane("feed");
+      this.cb.onCoverSubPaneChange?.("feed");
+    }
+    this.syncInspectorVisibility();
+    return true;
   }
 
   private isCoverScreen(): boolean {
@@ -442,7 +380,6 @@ export class LiveStudioView {
       this.selectedEventId = null;
       this.lastAnimatedEventId = null;
       this.behindDrawer.resetSession();
-      this.chatDrawer.close();
       this.topology.resetSessionState();
       this.feed.setAgentFilter(null);
       this.feed.setSelectedEvent(null);
@@ -527,7 +464,6 @@ export class LiveStudioView {
         model.clusters,
         snap.sessionId
       );
-      this.chatDrawer.notifySnapshot(snap, mergedAgents, this.agentLabelMap);
     } else {
       const idx = events.length > 0 ? Math.max(0, Math.min(cursor, events.length - 1)) : -1;
       const reconstructed = buildSnapshot(events, idx, snap);
@@ -569,7 +505,9 @@ export class LiveStudioView {
       this.behindDrawer.refreshEntries(this.feed.getBehindInspectableMessages());
     }
 
-    if (this.selectedAgentId) {
+    if (this.feed.getFilter() === "messages") {
+      this.inspector.closeModal();
+    } else if (this.selectedAgentId) {
       this.inspectCurrentAgent(this.selectedAgentId, false);
     } else if (this.selectedEventId) {
       const selEv = snap.events.find((e) => e.id === this.selectedEventId);
@@ -619,6 +557,10 @@ export class LiveStudioView {
   }
 
   private inspectCurrentAgent(agentId: string, openSheet = false): void {
+    if (this.feed.getFilter() === "messages") {
+      this.inspector.closeModal();
+      return;
+    }
     const snap = this.snapshot;
     if (!snap) return;
     const found = this.resolveLiveAgent(agentId);

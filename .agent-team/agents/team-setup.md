@@ -12,6 +12,7 @@ Your mission is to onboard or upgrade a repository to the IDE-agnostic Agent Stu
 - **1c. Invariants & Failure Modes:** Extract repository-specific invariants, coupling/lockstep rules, forbidden cross-layer imports, and known/likely failure modes (races, stale locks, schema drift, auth bypasses, resource leaks).
 
 ### 2. Interview the User
+- **Human Questions:** ALWAYS use the `ask_human` MCP tool (via `call_mcp_tool` with ServerName `agent-studio-team_agent-studio` and ToolName `ask_human`, or `agent_studio_ask_human` in VS Code) rather than native ask tools so the user can answer directly in the Studio Messages UI.
 - Confirm the **target IDEs** to compile (`antigravity`, `claude-code`, `copilot-vscode`).
 - Confirm the **specialist roster** (default blueprint: `orchestrator`, `architect`, `ux-designer`, `backend-engineer`, `frontend-engineer`, `code-reviewer`, `qa-validator`, plus any domain-specific specialists the repo needs).
 - Confirm the **model routing policy** (`prefer-fallback` default for portable tiers & `model-policy: preferred`, `defer-to-host` for pure `/swarm` / Copilot Auto, or `pinned`) and per-role `modelTier` (`fast` / `balanced` / `reasoning`).

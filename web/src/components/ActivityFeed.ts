@@ -63,8 +63,8 @@ export interface ActivityFeedCallbacks {
     triggerEl: HTMLElement
   ) => void;
   onThreadChange?: (threadKey: string | null) => void;
+  onFilterChange?: (filter: FeedFilter) => void;
   onCoverBackToTopology?: () => void;
-  onOpenChat?: (agentId: string) => void;
   embedMode?: boolean;
   mcpAppMode?: boolean;
   getSessionContext?: () => FeedSessionContext;
@@ -430,18 +430,19 @@ export class ActivityFeed {
 
   private bindEvents(): void {
     this.container.querySelector("[data-pending-bar]")?.addEventListener("click", (e) => {
-      const btn = (e.target as Element | null)?.closest<HTMLButtonElement>("[data-pending-open-chat]");
+      const btn = (e.target as Element | null)?.closest<HTMLButtonElement>("[data-pending-open-messages]");
       if (!btn) return;
-      const aid = btn.dataset.pendingOpenChat;
-      if (aid) this.cb.onOpenChat?.(aid);
+      const aid = btn.dataset.pendingOpenMessages;
+      const pid = btn.dataset.pendingPromptId;
+      this.openMessagesForAgent(aid, pid);
     });
 
     this.feedListEl.addEventListener("click", (e) => {
-      const btn = (e.target as Element | null)?.closest<HTMLButtonElement>("[data-usage-open-chat]");
+      const btn = (e.target as Element | null)?.closest<HTMLButtonElement>("[data-usage-open-messages]");
       if (!btn) return;
       e.stopPropagation();
-      const aid = btn.dataset.usageOpenChat;
-      if (aid) this.cb.onOpenChat?.(aid);
+      const aid = btn.dataset.usageOpenMessages;
+      this.openMessagesForAgent(aid);
     });
 
     this.container
@@ -466,6 +467,7 @@ export class ActivityFeed {
           this.cb.onThreadChange?.(this.activeThread.key);
         }
         this.syncFilterTabs();
+        this.cb.onFilterChange?.(next);
         this.renderPending();
         this.renderList();
       });
@@ -853,10 +855,42 @@ export class ActivityFeed {
     });
   }
 
-  public openThread(selection: ThreadSelection): boolean {
+  public getFilter(): FeedFilter {
+    return this.filter;
+  }
+
+  public openMessagesForAgent(agentId?: string, promptId?: string): void {
+    this.filter = "messages";
+    saveFilter("messages");
+    this.agentFilter = null;
+    this.activeThread = ALL_THREAD;
+    this.selectedRunId = "all";
+    this.isNearBottom = true;
+    this.unseenCount = 0;
+    this.lastSmsCount = 0;
+    this.smsPromptDockCollapsed = false;
+    if (promptId) {
+      const byPrompt = this.pendingPrompts.find((p) => p.id === promptId);
+      if (byPrompt) this.activeSmsPromptId = byPrompt.id;
+    } else if (agentId) {
+      const byAgent = this.pendingPrompts.find((p) => p.agentId === agentId);
+      if (byAgent) this.activeSmsPromptId = byAgent.id;
+    }
+    this.syncFilterTabs();
+    this.cb.onThreadChange?.("all");
+    this.cb.onFilterChange?.("messages");
+    this.renderPending();
+    this.renderList(true);
+  }
+
+  public openThread(
+    selection: ThreadSelection,
+    opts?: { forceOpen?: boolean; promptAgentId?: string }
+  ): boolean {
     const requestedRun = selection.kind === "cluster" ? selection.runId || "all" : "all";
     // Re-clicking the exact active pill clears the filter cleanly
     if (
+      !opts?.forceOpen &&
       this.filter === "messages" &&
       this.activeThread.key === selection.key &&
       this.selectedRunId === requestedRun
@@ -867,6 +901,7 @@ export class ActivityFeed {
       this.selectedRunId = "all";
       this.syncFilterTabs();
       this.cb.onThreadChange?.(null);
+      this.cb.onFilterChange?.("all");
       this.renderPending();
       this.renderList();
       return false;
@@ -880,8 +915,16 @@ export class ActivityFeed {
     this.isNearBottom = true;
     this.unseenCount = 0;
     this.lastSmsCount = 0;
+    if (opts?.promptAgentId) {
+      const byAgent = this.pendingPrompts.find((p) => p.agentId === opts.promptAgentId);
+      if (byAgent) {
+        this.activeSmsPromptId = byAgent.id;
+        this.smsPromptDockCollapsed = false;
+      }
+    }
     this.syncFilterTabs();
     this.cb.onThreadChange?.(selection.key);
+    this.cb.onFilterChange?.("messages");
     this.renderPending();
     this.renderList(true);
     return true;
@@ -896,6 +939,7 @@ export class ActivityFeed {
       this.selectedRunId = "all";
       this.syncFilterTabs();
       this.cb.onThreadChange?.(null);
+      this.cb.onFilterChange?.("all");
       this.renderPending();
     }
     this.renderList();
@@ -1005,7 +1049,7 @@ export class ActivityFeed {
                 <span class="pending-badge"><span aria-hidden="true">?</span> ${p.kind === "approval" ? "APPROVAL NEEDED" : "WAITING ON USER"}</span>
                 <span class="pending-agent">${escHtml(formatActorName(p.agentId, this.labelMap, p.agentLabel))}</span>
               </div>
-              <button type="button" class="btn-primary btn-sm pending-chat-btn" data-pending-open-chat="${escHtml(p.agentId)}">Open Chat</button>
+              <button type="button" class="btn-primary btn-sm pending-messages-btn" data-pending-open-messages="${escHtml(p.agentId)}" data-pending-prompt-id="${escHtml(p.id)}">View in Messages</button>
             </div>
             <div class="pending-q-text">${escHtml(cleanSummaryText(p.title))}</div>
             ${p.summary ? `<div class="pending-summary">${escHtml(cleanSummaryText(p.summary))}</div>` : ""}
@@ -1844,7 +1888,6 @@ export class ActivityFeed {
           getCapabilities: getCaps,
           onReply,
           onCancel: this.cb.onCancelPrompt,
-          onOpenChat: (aid) => this.cb.onOpenChat?.(aid),
         });
       } else {
         const wrap = document.createElement("div");
@@ -1862,7 +1905,6 @@ export class ActivityFeed {
           getCapabilities: getCaps,
           onReply,
           onCancel: this.cb.onCancelPrompt,
-          onOpenChat: (aid) => this.cb.onOpenChat?.(aid),
         });
         this.inlineQuestionCards.set(prompt.id, { wrap, card });
       }
@@ -1879,21 +1921,17 @@ export class ActivityFeed {
       if (!aid || card.parentElement?.classList.contains("usage-agent-shell")) continue;
       const agent = agentById.get(aid);
       const hasPending = Boolean(agent?.pendingPrompt);
+      if (!hasPending) continue;
 
       const shell = document.createElement("div");
-      shell.className = `usage-agent-shell ${hasPending ? "has-pending-prompt" : ""}`;
+      shell.className = "usage-agent-shell has-pending-prompt";
       card.parentNode?.insertBefore(shell, card);
       shell.appendChild(card);
 
       const actions = document.createElement("div");
       actions.className = "usage-agent-actions";
       actions.innerHTML = `
-        ${
-          hasPending
-            ? `<button type="button" class="needs-input-badge" data-usage-open-chat="${escHtml(aid)}" aria-label="Needs input — open chat with ${escHtml(formatActorName(aid, this.labelMap, agent?.label))}"><span aria-hidden="true">?</span> Needs Input</button>`
-            : ""
-        }
-        <button type="button" class="btn-secondary btn-sm usage-open-chat-btn" data-usage-open-chat="${escHtml(aid)}">Open Chat</button>
+        <button type="button" class="needs-input-badge" data-usage-open-messages="${escHtml(aid)}" aria-label="Needs input — view in messages for ${escHtml(formatActorName(aid, this.labelMap, agent?.label))}"><span aria-hidden="true">?</span> Needs Input</button>
       `;
       shell.appendChild(actions);
     }

@@ -240,9 +240,16 @@ export function renderSharedTeamRules(
       `- **Protected Board File:** Never hand-edit \`${manifest.workflow.boardPath}\`; use the \`agent-studio\` MCP \`board\` and \`testrun\` tools exclusively.`,
     );
   }
-  guardrails.push(
-    "- **Human Questions:** When Agent Studio is active, prefer `ask_human` (MCP) or `agent_studio_ask_human` (VS Code LM tool) so the user can answer directly in Messages; fall back to your native ask-user tool if unavailable or offline.",
-  );
+  if (manifest.workflow?.humanQuestions === "native-ide") {
+    guardrails.push(
+      "- **Human Questions:** Use your host IDE's native question dialog (`ask_question`, `vscode_askQuestions`, `AskUserQuestion`). Native dialogs will be answered in your host chat.",
+    );
+  } else {
+    const mcpServerName = `${manifest.project.id}-team_agent-studio`;
+    guardrails.push(
+      `- **Human Questions:** When Agent Studio is active, NEVER use native ask tools (such as native \`ask_question\` in Antigravity or \`AskUserQuestion\` in Claude Code). ALWAYS call the \`ask_human\` MCP tool (via \`call_mcp_tool\` with ServerName \`"${mcpServerName}"\` and ToolName \`"ask_human"\`, or \`agent_studio_ask_human\` in VS Code) for all user questions and multiple-choice prompts so the user can answer directly in the Studio Messages UI. Subagents must never call native ask tools directly; grant them MCP tools (\`EnableMCPTools: true\`) if they need to ask the user, or instruct them to return their questions to the Coordinator, which MUST ask via \`ask_human\`. Fall back to native ask tools only if the MCP server is completely offline.`,
+    );
+  }
 
   return [
     `# ${manifest.project.title} — Agent Studio Team Rules`,

@@ -41,8 +41,16 @@ import {
 } from "../../src/compiler/index.js";
 import {
   assertContainedPath,
+  renderSharedTeamRules,
   splitFrontmatter,
 } from "../../src/compiler/shared.js";
+import {
+  buildDefaultTeamManifest,
+} from "../../src/templates/manifest.js";
+import {
+  renderOrchestratorPrompt,
+  renderTeamSetupPrompt,
+} from "../../src/templates/prompts.js";
 import {
   parseTeamYaml,
   serializeTeamYaml,
@@ -563,9 +571,43 @@ describe("Multi-IDE Compiler (Golden Fixtures & Orchestrator Read-Only)", () => 
     const agyRules = fs.readFileSync(path.join(agyPluginDir, "rules", "AGENTS.md"), "utf8");
     assert.match(agyRules, /ask_human/);
     assert.match(agyRules, /agent_studio_ask_human/);
+    assert.match(agyRules, /NEVER use native ask tools/);
+    assert.match(agyRules, /EnableMCPTools: true/);
     assert.ok(
       fs.readFileSync(path.join(repo, "CLAUDE.md"), "utf8").includes("ask_human"),
     );
+
+    // Verify orchestrator & team-setup prompt templates enforce ask_human clarity
+    const orchPrompt = renderOrchestratorPrompt(manifest);
+    assert.match(orchPrompt, /NEVER use the native `ask_question` tool/);
+    assert.match(orchPrompt, /call_mcp_tool/);
+    assert.match(orchPrompt, /Subagent Question Routing/);
+    assert.match(orchPrompt, /EnableMCPTools: true/);
+
+    const setupPrompt = renderTeamSetupPrompt(manifest);
+    assert.match(setupPrompt, /ask_human/);
+    assert.match(setupPrompt, /call_mcp_tool/);
+
+    // Verify humanQuestions toggle affects renderSharedTeamRules and renderOrchestratorPrompt
+    const nativeManifest = {
+      ...manifest,
+      workflow: {
+        ...manifest.workflow,
+        humanQuestions: "native-ide" as const,
+      },
+    };
+    const nativeRules = renderSharedTeamRules(nativeManifest);
+    assert.match(nativeRules, /Use your host IDE's native question dialog/);
+    assert.match(nativeRules, /ask_question`, `vscode_askQuestions`, `AskUserQuestion`/);
+    assert.doesNotMatch(nativeRules, /NEVER use native ask tools/);
+
+    const nativeOrch = renderOrchestratorPrompt(nativeManifest);
+    assert.match(nativeOrch, /Use your host IDE's native question dialog/);
+    assert.doesNotMatch(nativeOrch, /NEVER use the native `ask_question` tool/);
+
+    // Verify default manifest includes humanQuestions: studio-mcp
+    const defaultStack = buildDefaultTeamManifest(repo);
+    assert.equal(defaultStack.manifest.workflow.humanQuestions, "studio-mcp");
 
     // Verify always-on Token & Context Discipline rules appear in all 3 IDE rules files
     assert.ok(

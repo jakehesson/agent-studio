@@ -5,8 +5,7 @@ export type StudioView =
   | "board"
   | "team"
   | "mockups"
-  | "doctor"
-  | "chat";
+  | "doctor";
 
 export function detectHostIdeFromAppName(appName: string | undefined): HostIde {
   if (appName && /antigravity|agy/i.test(appName)) {
@@ -31,10 +30,7 @@ export interface BuildScopedViewUrlInput {
   view?: StudioView;
   projectId?: string;
   sessionId?: string;
-  agentId?: string;
-  focusQuestion?: boolean;
   openWaiting?: boolean;
-  openChatAgentId?: string;
   embed?: boolean;
   hostIde?: HostIde;
   workspaceRoot?: string;
@@ -61,17 +57,8 @@ export function buildScopedViewUrl(input: BuildScopedViewUrlInput): string {
   if (input.sessionId) {
     params.set("session", input.sessionId);
   }
-  if (input.agentId && input.agentId.trim()) {
-    params.set("agent", input.agentId.trim());
-  }
-  if (input.focusQuestion === true) {
-    params.set("focusQuestion", "1");
-  }
   if (input.openWaiting) {
     params.set("openWaiting", "1");
-  }
-  if (input.openChatAgentId && input.openChatAgentId.trim()) {
-    params.set("openChat", input.openChatAgentId.trim());
   }
   const qs = params.toString();
   return `${input.baseUrl.replace(/\/+$/, "")}/${qs ? `?${qs}` : ""}`;
@@ -79,20 +66,14 @@ export function buildScopedViewUrl(input: BuildScopedViewUrlInput): string {
 
 export function appendDeepLinkParams(
   rawUrl: string,
-  opts?: { openWaiting?: boolean; openChatAgentId?: string },
+  opts?: { openWaiting?: boolean },
 ): string {
   const hasWaiting = Boolean(opts?.openWaiting);
-  const chatAgent = opts?.openChatAgentId?.trim();
-  if (!hasWaiting && !chatAgent) {
+  if (!hasWaiting) {
     return rawUrl;
   }
   const parsed = new URL(rawUrl);
-  if (hasWaiting) {
-    parsed.searchParams.set("openWaiting", "1");
-  }
-  if (chatAgent) {
-    parsed.searchParams.set("openChat", chatAgent);
-  }
+  parsed.searchParams.set("openWaiting", "1");
   return parsed.toString();
 }
 

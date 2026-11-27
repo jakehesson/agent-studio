@@ -1045,6 +1045,7 @@ export async function runHookEmit(
       if (
         !denyReason &&
         lowTool === "vscode_askquestions" &&
+        manifest?.workflow?.humanQuestions !== "native-ide" &&
         process.env.AGENT_STUDIO_DISABLE_ASK_REDIRECT !== "1"
       ) {
         try {

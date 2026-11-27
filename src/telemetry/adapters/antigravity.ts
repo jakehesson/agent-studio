@@ -2,13 +2,10 @@ import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import {
-  capChatText,
   cleanHumanSummary,
   computeDeterministicEventId,
   computeMergeKey,
-  computePendingPromptId,
   extractProviderUsageDetails,
-  formatQuestionsPreview,
   isBoardMutationToolCall,
   isSelfDaemonCommand,
   normalizePendingQuestions,
@@ -20,13 +17,10 @@ import {
   toIsoUtc,
   unquoteArg,
   type AdapterHealth,
-  type AgentChatMessage,
   type AgentStatus,
-  type ChatToolCallRef,
   type DiscoveredSession,
   type EnrichedEvent,
   type ModelSource,
-  type ParseChatOptions,
   type ParseSessionOptions,
   type PassiveIdeAdapter,
   type UsageDelta,
@@ -591,39 +585,10 @@ export class AntigravityAdapter implements PassiveIdeAdapter {
     session: DiscoveredSession,
     opts?: ParseSessionOptions,
   ): Promise<EnrichedEvent[]> {
-    const res = await this.parseSessionInternal(session, opts);
-    return res.events;
-  }
-
-  async parseChat(
-    session: DiscoveredSession,
-    opts?: ParseChatOptions,
-  ): Promise<AgentChatMessage[]> {
-    const res = await this.parseSessionInternal(session, { includeChat: true });
-    const reqAgent = opts?.agentId?.trim();
-    const filtered = reqAgent
-      ? res.chatMessages.filter((m) =>
-          reqAgent === "root"
-            ? m.agentId === res.rootId || m.agentId === "root"
-            : m.agentId === reqAgent,
-        )
-      : res.chatMessages;
-    filtered.sort((a, b) => a.epoch - b.epoch);
-    return filtered;
-  }
-
-  private async parseSessionInternal(
-    session: DiscoveredSession,
-    opts?: ParseSessionOptions & { includeChat?: boolean },
-  ): Promise<{
-    events: EnrichedEvent[];
-    chatMessages: AgentChatMessage[];
-    rootId: string;
-  }> {
     const rootCid = session.sessionId;
     const rootRows = await readJsonlRows(session.filePath);
     if (rootRows.length === 0) {
-      return { events: [], chatMessages: [], rootId: "root" };
+      return [];
     }
 
     const knownProjects = getKnownProjects();
@@ -695,11 +660,6 @@ export class AntigravityAdapter implements PassiveIdeAdapter {
     const queue: string[] = [rootCid];
     const rawEvents: EnrichedEvent[] = [];
     const fullBodies = new Map<EnrichedEvent, string>();
-    const includeChat = Boolean(opts?.includeChat);
-    const chatMessages: AgentChatMessage[] = [];
-    const spawnToolCallToChild = new Map<string, string>();
-    const chatSpawnRefMap = new Map<string, AgentChatMessage>();
-    const chatPromptToolCallIds = new Map<AgentChatMessage, string>();
 
     const sampleWorkspaces = (): string[] => {
       const all = [...session.workspaces];
@@ -833,20 +793,11 @@ export class AntigravityAdapter implements PassiveIdeAdapter {
         questionPrompt?: string;
         blockedOnUser?: boolean;
       }> = [];
-      const openChatToolRefs: Array<{
-        ref: ChatToolCallRef;
-        isNotify?: boolean;
-      }> = [];
       const pruneStaleNotify = (): void => {
         for (let oi = openToolCalls.length - 1; oi >= 0; oi--) {
           const tname = openToolCalls[oi]!.toolName;
           if (tname === "notify_user" || tname === "ask_question") {
             openToolCalls.splice(oi, 1);
-          }
-        }
-        for (let oi = openChatToolRefs.length - 1; oi >= 0; oi--) {
-          if (openChatToolRefs[oi]!.isNotify) {
-            openChatToolRefs.splice(oi, 1);
           }
         }
       };
@@ -1106,9 +1057,6 @@ export class AntigravityAdapter implements PassiveIdeAdapter {
               }
             }
             if (spawnEvent && resolvedChildId) {
-              if (spawnEvent.toolCallId) {
-                spawnToolCallToChild.set(spawnEvent.toolCallId, resolvedChildId);
-              }
               spawnEvent.targetAgentId = resolvedChildId;
               spawnEvent.id = computeDeterministicEventId({
                 ide: this.ide,
@@ -1174,16 +1122,6 @@ export class AntigravityAdapter implements PassiveIdeAdapter {
               }),
             );
           }
-          if (includeChat) {
-            chatMessages.push({
-              id: `chat:agy:${cid}:${idx}:user`,
-              ts: toIsoUtc(epoch),
-              epoch,
-              agentId: senderId,
-              role: "user",
-              text: capChatText(content.trim()),
-            });
-          }
         }
 
         // 3. SYSTEM_MESSAGE: detect canceled subagent OR incoming peer/parent message wake
@@ -1202,17 +1140,6 @@ export class AntigravityAdapter implements PassiveIdeAdapter {
                 payload: { canceled: true, source: rsource, conv: cid },
               }),
             );
-            if (includeChat) {
-              chatMessages.push({
-                id: `chat:agy:${cid}:${idx}:cancel`,
-                ts: toIsoUtc(epoch),
-                epoch,
-                agentId: senderId,
-                role: "subagent",
-                subagentId: canceledCid,
-                text: "Subagent canceled by user",
-              });
-            }
           } else {
             const mContent = /content=(.+)/s.exec(content);
             const snippet = cleanHumanSummary(mContent?.[1] ?? content, 90);
@@ -1227,22 +1154,6 @@ export class AntigravityAdapter implements PassiveIdeAdapter {
                 payload: { source: rsource, conv: cid },
               }),
             );
-            if (includeChat) {
-              const rawMsgBody = (mContent?.[1] ?? content).trim();
-              if (rawMsgBody) {
-                const mSender = /sender=([^\s\]]+)/i.exec(content);
-                const senderRef = mSender?.[1];
-                chatMessages.push({
-                  id: `chat:agy:${cid}:${idx}:sys`,
-                  ts: toIsoUtc(epoch),
-                  epoch,
-                  agentId: senderId,
-                  role: senderRef ? "subagent" : "user",
-                  text: capChatText(rawMsgBody),
-                  ...(senderRef ? { subagentId: senderRef } : {}),
-                });
-              }
-            }
           }
         }
 
@@ -1324,35 +1235,6 @@ export class AntigravityAdapter implements PassiveIdeAdapter {
               }),
             );
           }
-
-          if (includeChat && rstatus !== "RUNNING") {
-            if (openChatToolRefs.length > 0) {
-              const poppedRef = openChatToolRefs.shift()!;
-              if (!poppedRef.isNotify) {
-                poppedRef.ref.status = rstatus === "ERROR" ? "error" : "ok";
-                if (content.trim()) {
-                  poppedRef.ref.output = capChatText(content.trim());
-                }
-              }
-            } else if (rstatus === "ERROR" && content.trim()) {
-              chatMessages.push({
-                id: `chat:agy:${cid}:${idx}:err`,
-                ts: toIsoUtc(epoch),
-                epoch,
-                agentId: senderId,
-                role: "tool",
-                text: capChatText(content.trim()),
-                tools: [
-                  {
-                    toolName: "tool",
-                    summary: cleanHumanSummary(content, 120) || "Tool error",
-                    status: "error",
-                    output: capChatText(content.trim()),
-                  },
-                ],
-              });
-            }
-          }
         }
 
         // 5. PLANNER_RESPONSE tool calls & prose/thinking
@@ -1377,8 +1259,6 @@ export class AntigravityAdapter implements PassiveIdeAdapter {
 
         if (toolCalls.length > 0) {
           pruneStaleNotify();
-          const turnTools: ChatToolCallRef[] = [];
-          const deferredSpecialChatMsgs: AgentChatMessage[] = [];
 
           for (let tcIdx = 0; tcIdx < toolCalls.length; tcIdx++) {
             const tc = toolCalls[tcIdx]!;
@@ -1428,20 +1308,6 @@ export class AntigravityAdapter implements PassiveIdeAdapter {
                 requestedModel: requestedModel || undefined,
                 spawnEvent,
               });
-              if (includeChat) {
-                const subMsg: AgentChatMessage = {
-                  id: `chat:agy:${cid}:${idx}:sub:${tcIdx}`,
-                  ts: toIsoUtc(epoch + (tcIdx + 1) * 0.0001),
-                  epoch: epoch + (tcIdx + 1) * 0.0001,
-                  agentId: senderId,
-                  role: "subagent",
-                  text: capChatText(prompt || spawnSummary),
-                  subagentId: targetSlug,
-                  subagentLabel: role || prettifyAgentLabel(targetSlug),
-                };
-                chatSpawnRefMap.set(toolCallId, subMsg);
-                deferredSpecialChatMsgs.push(subMsg);
-              }
             } else if (tname === "manage_subagents") {
               const action = unquoteArg(
                 args.Action ?? args.action ?? args.Operation ?? args.operation,
@@ -1475,17 +1341,6 @@ export class AntigravityAdapter implements PassiveIdeAdapter {
                     payload: { canceled: true, action: action || "cancel", conv: cid },
                   }),
                 );
-                if (includeChat) {
-                  deferredSpecialChatMsgs.push({
-                    id: `chat:agy:${cid}:${idx}:cancel:${tcIdx}`,
-                    ts: toIsoUtc(epoch + (tcIdx + 1) * 0.0001),
-                    epoch: epoch + (tcIdx + 1) * 0.0001,
-                    agentId: senderId,
-                    role: "subagent",
-                    subagentId: targetCid,
-                    text: "Canceled subagent",
-                  });
-                }
               } else {
                 rawEvents.push(
                   makeEvent({
@@ -1504,17 +1359,6 @@ export class AntigravityAdapter implements PassiveIdeAdapter {
                   summary: actionText,
                   isSelfDaemon: false,
                 });
-                if (includeChat) {
-                  const ref: ChatToolCallRef = {
-                    toolCallId,
-                    toolName: tname,
-                    summary: actionText,
-                    status: "running",
-                    inputPreview: capChatText(JSON.stringify(args), 4096),
-                  };
-                  turnTools.push(ref);
-                  openChatToolRefs.push({ ref });
-                }
               }
             } else if (tname === "send_message") {
               const recipientRaw = unquoteArg(args.Recipient);
@@ -1544,17 +1388,6 @@ export class AntigravityAdapter implements PassiveIdeAdapter {
                   inlineBody,
                 }),
               );
-              if (includeChat) {
-                deferredSpecialChatMsgs.push({
-                  id: `chat:agy:${cid}:${idx}:msg:${tcIdx}`,
-                  ts: toIsoUtc(epoch + (tcIdx + 1) * 0.0001),
-                  epoch: epoch + (tcIdx + 1) * 0.0001,
-                  agentId: senderId,
-                  role: "subagent",
-                  text: capChatText(body || msgSummary),
-                  ...(recipientRaw ? { subagentId: recipientRaw } : {}),
-                });
-              }
             } else if (tname === "notify_user") {
               const body = unquoteArg(args.Message) || "Updated user";
               const blockedOnUser =
@@ -1612,27 +1445,6 @@ export class AntigravityAdapter implements PassiveIdeAdapter {
                   blockedOnUser: true,
                 });
               }
-              if (includeChat) {
-                const msg: AgentChatMessage = {
-                  id: `chat:agy:${cid}:${idx}:notify:${tcIdx}`,
-                  ts: toIsoUtc(epoch + (tcIdx + 1) * 0.0001),
-                  epoch: epoch + (tcIdx + 1) * 0.0001,
-                  agentId: senderId,
-                  role: blockedOnUser ? "question" : "assistant",
-                  text: capChatText(body),
-                  ...(blockedOnUser
-                    ? { pendingPromptId: computePendingPromptId(senderId, toolCallId) }
-                    : {}),
-                };
-                if (blockedOnUser) {
-                  chatPromptToolCallIds.set(msg, toolCallId);
-                  openChatToolRefs.push({
-                    ref: { toolCallId, toolName: tname, summary: notifySummary },
-                    isNotify: true,
-                  });
-                }
-                deferredSpecialChatMsgs.push(msg);
-              }
             } else if (tname === "ask_question") {
               const parsedQuestions = normalizePendingQuestions(
                 args.questions ?? args,
@@ -1677,27 +1489,6 @@ export class AntigravityAdapter implements PassiveIdeAdapter {
                 questionPrompt,
                 blockedOnUser: true,
               });
-              if (includeChat) {
-                const qText = formatQuestionsPreview(
-                  parsedQuestions,
-                  qSummary || "Asked user a question",
-                );
-                const qMsg: AgentChatMessage = {
-                  id: `chat:agy:${cid}:${idx}:ask:${tcIdx}`,
-                  ts: toIsoUtc(epoch + (tcIdx + 1) * 0.0001),
-                  epoch: epoch + (tcIdx + 1) * 0.0001,
-                  agentId: senderId,
-                  role: "question",
-                  text: capChatText(qText),
-                  pendingPromptId: computePendingPromptId(senderId, toolCallId),
-                };
-                chatPromptToolCallIds.set(qMsg, toolCallId);
-                deferredSpecialChatMsgs.push(qMsg);
-                openChatToolRefs.push({
-                  ref: { toolCallId, toolName: tname, summary: qSummary || "Asked user a question" },
-                  isNotify: true,
-                });
-              }
             } else {
               const cmdLine = unquoteArg(args.CommandLine);
               const selfDaemon = isSelfDaemonCommand(
@@ -1731,55 +1522,7 @@ export class AntigravityAdapter implements PassiveIdeAdapter {
                 summary: actionText,
                 isSelfDaemon: selfDaemon,
               });
-              if (includeChat) {
-                const previewArgs = Object.fromEntries(
-                  Object.entries(args).map(([k, v]) => [k, unquoteArg(v).slice(0, 500)]),
-                );
-                const ref: ChatToolCallRef = {
-                  toolCallId,
-                  toolName: tname,
-                  summary: actionText,
-                  status: "running",
-                  inputPreview: capChatText(JSON.stringify(previewArgs), 4096),
-                };
-                turnTools.push(ref);
-                openChatToolRefs.push({ ref });
-              }
             }
-          }
-
-          if (includeChat) {
-            const prose = content.trim();
-            const thinking =
-              typeof row.thinking === "string" ? row.thinking.trim() : "";
-            if (prose || turnTools.length > 0) {
-              chatMessages.push({
-                id: `chat:agy:${cid}:${idx}:ast`,
-                ts: toIsoUtc(epoch),
-                epoch,
-                agentId: senderId,
-                role: "assistant",
-                text: capChatText(
-                  prose ||
-                    (turnTools.length === 1
-                      ? turnTools[0]!.summary
-                      : `Ran ${turnTools.length} tools`),
-                ),
-                ...(thinking ? { thinking: capChatText(thinking) } : {}),
-                ...(turnTools.length > 0 ? { tools: turnTools } : {}),
-              });
-            } else if (thinking) {
-              chatMessages.push({
-                id: `chat:agy:${cid}:${idx}:thk`,
-                ts: toIsoUtc(epoch),
-                epoch,
-                agentId: senderId,
-                role: "thinking",
-                text: capChatText(thinking),
-                thinking: capChatText(thinking),
-              });
-            }
-            chatMessages.push(...deferredSpecialChatMsgs);
           }
         } else if (rtype === "PLANNER_RESPONSE" && (content.trim() || plannerThinking)) {
           pruneStaleNotify();
@@ -1799,32 +1542,6 @@ export class AntigravityAdapter implements PassiveIdeAdapter {
                 inlineBody,
               }),
             );
-          }
-          if (includeChat) {
-            const prose = content.trim();
-            const thinking =
-              typeof row.thinking === "string" ? row.thinking.trim() : "";
-            if (prose) {
-              chatMessages.push({
-                id: `chat:agy:${cid}:${idx}:ast`,
-                ts: toIsoUtc(epoch),
-                epoch,
-                agentId: senderId,
-                role: "assistant",
-                text: capChatText(prose),
-                ...(thinking ? { thinking: capChatText(thinking) } : {}),
-              });
-            } else if (thinking) {
-              chatMessages.push({
-                id: `chat:agy:${cid}:${idx}:thk`,
-                ts: toIsoUtc(epoch),
-                epoch,
-                agentId: senderId,
-                role: "thinking",
-                text: capChatText(thinking),
-                thinking: capChatText(thinking),
-              });
-            }
           }
         }
       }
@@ -1925,35 +1642,6 @@ export class AntigravityAdapter implements PassiveIdeAdapter {
       }
     }
 
-    if (includeChat) {
-      for (const [tcId, resolvedChild] of spawnToolCallToChild.entries()) {
-        const subMsg = chatSpawnRefMap.get(tcId);
-        if (subMsg) {
-          subMsg.subagentId = resolvedChild;
-          subMsg.subagentLabel =
-            agentLabels.get(resolvedChild) ?? subMsg.subagentLabel;
-        }
-      }
-      for (const msg of chatMessages) {
-        if (convToAgent.has(msg.agentId)) {
-          msg.agentId = convToAgent.get(msg.agentId)!;
-        } else if (UUID_RE.test(msg.agentId)) {
-          msg.agentId = `agent-${msg.agentId.slice(0, 6)}`;
-        }
-        if (msg.subagentId && convToAgent.has(msg.subagentId)) {
-          msg.subagentId = convToAgent.get(msg.subagentId)!;
-          msg.subagentLabel =
-            agentLabels.get(msg.subagentId) ?? msg.subagentLabel;
-        } else if (msg.subagentId && UUID_RE.test(msg.subagentId)) {
-          msg.subagentId = `agent-${msg.subagentId.slice(0, 6)}`;
-        }
-        const pTcId = chatPromptToolCallIds.get(msg);
-        if (pTcId) {
-          msg.pendingPromptId = computePendingPromptId(msg.agentId, pTcId);
-        }
-      }
-    }
-
-    return { events: rawEvents, chatMessages, rootId };
+    return rawEvents;
   }
 }

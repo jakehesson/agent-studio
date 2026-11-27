@@ -200,8 +200,6 @@ export class ServerManager implements vscode.Disposable {
     opts?: {
       embed?: boolean;
       sessionId?: string;
-      agentId?: string;
-      focusQuestion?: boolean;
     },
   ): string {
     const resolvedProject = projectId ?? this.detectWorkspaceProjectId();
@@ -210,8 +208,6 @@ export class ServerManager implements vscode.Disposable {
       view,
       projectId: resolvedProject,
       sessionId: opts?.sessionId,
-      agentId: opts?.agentId,
-      focusQuestion: opts?.focusQuestion,
       embed: opts?.embed,
       hostIde: this.detectHostIde(),
       workspaceRoot: this.getNormalizedWorkspaceRoot(),

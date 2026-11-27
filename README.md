@@ -2,7 +2,7 @@
 
 [![CI](https://github.com/jakehesson/agent-studio/actions/workflows/ci.yml/badge.svg)](https://github.com/jakehesson/agent-studio/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
-[![Version](https://img.shields.io/badge/version-0.14.0-emerald.svg)](CHANGELOG.md)
+[![Version](https://img.shields.io/badge/version-0.16.0-emerald.svg)](CHANGELOG.md)
 [![Node.js >= 20](https://img.shields.io/badge/node-%3E%3D20.0.0-brightgreen.svg)](package.json)
 
 **IDE-agnostic multi-agent orchestration, QA-gated Agile Board MCP, and unified live monitoring studio** for **Antigravity**, **Claude Code**, and **GitHub Copilot / VS Code**.
@@ -158,7 +158,7 @@ flowchart LR
 | [AI Setup Agent & Customization Guide](docs/SETUP_AGENT.md) | Global/project onboarding with `team-setup`, customizing `.agent-team/team.yaml`, drift checks, and `doctor`. |
 | [Telemetry & API Specification](docs/TELEMETRY_SPEC.md) | `NormalizedEvent` schema, passive IDE adapters, deduplication, 6-state machine, and HTTP/SSE API contracts. |
 | [Model Routing & Index Spec](docs/specs/model-routing-and-index.md) | Technical specification for 3-layer `model-index.json`, per-role model policies, and host compatibility. |
-| [Changelog](CHANGELOG.md) | Release history and version notes (`0.14.0`). |
+| [Changelog](CHANGELOG.md) | Release history and version notes (`0.16.0`). |
 | [Contributing](CONTRIBUTING.md) | Development setup, verification checkpoints, and pull request guidelines. |
 | [Security Policy](SECURITY.md) | Vulnerability reporting and local-first security posture. |
 | [License](LICENSE) | MIT License (`Jake Hesson`). |

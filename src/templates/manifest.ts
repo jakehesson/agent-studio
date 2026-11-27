@@ -73,6 +73,7 @@ export function buildDefaultTeamManifest(
         qaGateRequired: true,
         blockDirectBoardEdits: true,
       },
+      humanQuestions: "studio-mcp",
       suites: detected.suites,
       checkpoints: detected.checkpoints,
       modelRouting: {

@@ -47,6 +47,7 @@ import {
   type ModelTier,
 } from "../../schema/model-index.js";
 import {
+  HumanQuestionsModeSchema,
   IdeTargetSchema,
   type IdeModelOverride,
   type IdeTarget,
@@ -564,6 +565,34 @@ export async function runModelsCli(
       );
     }
 
+    case "set-questions": {
+      const modeRaw = positionals[1] ?? flagStr(flags, "mode");
+      if (!modeRaw) {
+        throw new Error(
+          "Usage: agent-studio models set-questions <studio-mcp|native-ide> [--sync]",
+        );
+      }
+      const mode = HumanQuestionsModeSchema.parse(modeRaw.trim());
+      const syncFlag = flagBool(flags, "sync") ?? false;
+
+      const teamYamlPath = getTeamYamlPath(projectRoot);
+      const updatedMode = await withTeamYamlLock(teamYamlPath, (manifest) => {
+        manifest.workflow.humanQuestions = mode;
+        return manifest.workflow.humanQuestions;
+      });
+
+      const compileResult = maybeSync(projectRoot, syncFlag);
+      return emit(
+        { ok: true, humanQuestions: updatedMode, compileResult },
+        [
+          `[agent-studio] Set workflow humanQuestions -> ${updatedMode}`,
+          ...(compileResult
+            ? [`  Synced ${compileResult.totalFiles} IDE files.`]
+            : []),
+        ],
+      );
+    }
+
     case "upsert": {
       const ideRaw = flagStr(flags, "ide");
       const id = flagStr(flags, "id")?.trim();
@@ -778,7 +807,7 @@ export async function runModelsCli(
 
     default:
       throw new Error(
-        `Unknown models subcommand "${op}". Expected show|set-tier|set-role|set-policy|upsert|discover|adopt|reset.`,
+        `Unknown models subcommand "${op}". Expected show|set-tier|set-role|set-policy|set-questions|upsert|discover|adopt|reset.`,
       );
   }
 }

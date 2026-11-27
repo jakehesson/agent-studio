@@ -1231,6 +1231,8 @@ export class TeamView {
       wf.selectionPriority ?? this.modelIndex?.effective.selectionPriority
     );
     const cliPolicyCmd = `agent-studio models set-policy ${wf.policy} --respect-host ${wf.respectBuiltInOrchestrators ? "true" : "false"} --sync`;
+    const humanQuestionsMode = team.workflow?.humanQuestions ?? "studio-mcp";
+    const cliQuestionsCmd = `agent-studio models set-questions ${humanQuestionsMode === "studio-mcp" ? "native-ide" : "studio-mcp"} --sync`;
 
     return `
       <section
@@ -1265,10 +1267,17 @@ export class TeamView {
                   <span class="pill ${wf.respectBuiltInOrchestrators ? "ok" : "tool"}">
                     ${wf.respectBuiltInOrchestrators ? "✓" : "○"} ${escHtml(respectLabel)}
                   </span>
+                  <span class="pill ${humanQuestionsMode === "studio-mcp" ? "ok" : "tool"}">
+                    Questions: ${humanQuestionsMode === "studio-mcp" ? "Studio Direct (ask_human)" : "Native IDE"}
+                  </span>
                 </div>
                 <div class="mi-cli-row">
                   <div class="code-scroll cp-cmd-scroll" role="region" tabindex="0" aria-label="Set model routing policy CLI command"><code>${escHtml(cliPolicyCmd)}</code></div>
                   <button type="button" class="guide-copy-btn" data-mr-copy-cli="${escHtml(cliPolicyCmd)}">Copy CLI</button>
+                </div>
+                <div class="mi-cli-row">
+                  <div class="code-scroll cp-cmd-scroll" role="region" tabindex="0" aria-label="Set human questions mode CLI command"><code>${escHtml(cliQuestionsCmd)}</code></div>
+                  <button type="button" class="guide-copy-btn" data-mr-copy-cli="${escHtml(cliQuestionsCmd)}">Copy CLI</button>
                 </div>
               `
               : `
@@ -1279,6 +1288,14 @@ export class TeamView {
                     <option value="defer-to-host" ${wf.policy === "defer-to-host" ? "selected" : ""}>${escHtml(getPolicyOptionLabel("defer-to-host", lockedIde))}</option>
                     <option value="pinned" ${wf.policy === "pinned" ? "selected" : ""}>${escHtml(getPolicyOptionLabel("pinned", lockedIde))}</option>
                   </select>
+                </div>
+
+                <div class="mr-field">
+                  <label>Human Questions</label>
+                  <div class="pill-toggle-group" role="group" aria-label="Human Questions Mode">
+                    <button type="button" class="pill-btn ${humanQuestionsMode === "studio-mcp" ? "active" : ""}" data-action="set-human-questions" data-mode="studio-mcp" ${this.savingRouting ? "disabled" : ""}>Studio Direct (ask_human)</button>
+                    <button type="button" class="pill-btn ${humanQuestionsMode === "native-ide" ? "active" : ""}" data-action="set-human-questions" data-mode="native-ide" ${this.savingRouting ? "disabled" : ""}>Native IDE</button>
+                  </div>
                 </div>
 
                 <div class="mr-toggles">
@@ -1906,6 +1923,20 @@ export class TeamView {
           checked ? `Enabled ${label}.` : `Disabled ${label}.`,
           "[data-mr-respect-host]"
         );
+      });
+
+    this.root
+      .querySelectorAll<HTMLButtonElement>("[data-action='set-human-questions']")
+      .forEach((btn) => {
+        btn.addEventListener("click", () => {
+          const mode = btn.dataset.mode as "studio-mcp" | "native-ide";
+          if (!mode) return;
+          void this.mutateRouting(
+            { workflow: { humanQuestions: mode } },
+            `Set human questions mode to "${mode === "studio-mcp" ? "Studio Direct (ask_human)" : "Native IDE"}".`,
+            `[data-action='set-human-questions'][data-mode='${mode}']`
+          );
+        });
       });
 
     this.root

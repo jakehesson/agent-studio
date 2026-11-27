@@ -104,7 +104,7 @@ function resolveServerVersion(): string {
   } catch {
     // Fall through to default version
   }
-  return "0.15.0";
+  return "0.16.0";
 }
 
 export const MCP_PROTOCOL_VERSION = "2024-11-05";
@@ -695,29 +695,6 @@ export const MCP_TOOLS = [
         workspace: { type: "string" },
       },
       required: ["session", "event"],
-    },
-    _meta: {
-      ui: {
-        visibility: ["app"],
-      },
-    },
-  },
-  {
-    name: "app_get_chat",
-    description:
-      "App-only data bridge returning full paginated per-agent chat transcript and active pending human prompt.",
-    inputSchema: {
-      type: "object",
-      properties: {
-        session: { type: "string" },
-        agent: { type: "string" },
-        ide: { type: "string" },
-        project: { type: "string" },
-        workspace: { type: "string" },
-        limit: { type: "number" },
-        before: { type: "string" },
-      },
-      required: ["session"],
     },
     _meta: {
       ui: {
@@ -1986,91 +1963,6 @@ async function executeAppGetEventBodyTool(
   };
 }
 
-async function executeAppGetChatTool(
-  args: Record<string, unknown>,
-  options: McpServerOptions,
-): Promise<McpToolCallResult> {
-  const aggregator = options.aggregator ?? getMcpAggregator();
-  aggregator.touchMcpAppClient();
-  const session = str(args.session);
-  if (!session) {
-    const errPayload: Record<string, unknown> = {
-      ok: false,
-      error: "Missing session parameter",
-    };
-    return {
-      isError: true,
-      content: [{ type: "text", text: JSON.stringify(errPayload) }],
-      structuredContent: errPayload,
-    };
-  }
-
-  const chatRes = await aggregator.getAgentChat({
-    sessionId: session,
-    agentId: str(args.agent) ?? "root",
-    ide: str(args.ide),
-    project: str(args.project) ?? options.defaultProject,
-    workspace: str(args.workspace),
-    limit: num(args.limit),
-    before: str(args.before),
-  });
-
-  if (!chatRes) {
-    const errPayload: Record<string, unknown> = {
-      ok: false,
-      error: "Session not found",
-    };
-    return {
-      isError: true,
-      content: [{ type: "text", text: JSON.stringify(errPayload) }],
-      structuredContent: errPayload,
-    };
-  }
-
-  const structuredContent = chatRes as unknown as Record<string, unknown>;
-  if (
-    process.env.AGENT_STUDIO_MCP_NO_HTTP !== "1" &&
-    !options.aggregator &&
-    (!chatRes.pendingPrompt || !chatRes.pendingPrompt.directReply)
-  ) {
-    try {
-      const qs = new URLSearchParams();
-      qs.set("session", session);
-      const chatIde = str(args.ide);
-      const chatWs = str(args.workspace);
-      if (chatIde) qs.set("ide", chatIde);
-      if (chatWs) qs.set("workspace", chatWs);
-      const res = await fetch(
-        `${getStudioHttpBaseUrl()}/api/prompts?${qs.toString()}`,
-        { signal: AbortSignal.timeout(80) },
-      );
-      if (res.ok) {
-        const data = (await res.json()) as { prompts?: PendingHumanPrompt[] };
-        const httpPrompts = Array.isArray(data.prompts) ? data.prompts : [];
-        const match = httpPrompts.find(
-          (p) =>
-            (!p.sessionId || p.sessionId === chatRes.sessionId) &&
-            p.agentId === chatRes.agentId,
-        );
-        if (match) {
-          structuredContent.pendingPrompt = match;
-        }
-      }
-    } catch {
-      // HTTP server offline or timed out; return local chat cleanly.
-    }
-  }
-  return {
-    content: [
-      {
-        type: "text",
-        text: `Loaded ${chatRes.messages.length} chat message(s) for ${chatRes.agentId} in ${chatRes.sessionId}.`,
-      },
-    ],
-    structuredContent,
-  };
-}
-
 async function executeAppGetBoardTool(
   args: Record<string, unknown>,
   options: McpServerOptions,
@@ -2842,8 +2734,6 @@ export async function dispatchToolCall(
         return await executeAppGetStateTool(args, options);
       case "app_get_event_body":
         return await executeAppGetEventBodyTool(args, options);
-      case "app_get_chat":
-        return await executeAppGetChatTool(args, options);
       case "app_get_board":
         return await executeAppGetBoardTool(args, options);
       case "app_get_team":

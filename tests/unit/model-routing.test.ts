@@ -503,6 +503,29 @@ describe("Per-Role Model Routing, 3-Layer Model Index & Compilers", () => {
       "handoffs[].model emitted in legacy-local mode when copilotHandoffModels is true",
     );
 
+    // 4. agent-studio models set-questions toggles mode and syncs IDE rules
+    await runModelsCli(["set-questions", "native-ide", "--project", repo, "--sync", "--quiet"]);
+    const manifestNative = parseTeamYaml(
+      fs.readFileSync(path.join(repo, ".agent-team", "team.yaml"), "utf8"),
+    );
+    assert.equal(manifestNative.workflow.humanQuestions, "native-ide");
+    const rulesNative = fs.readFileSync(
+      path.join(repo, ".agents", "plugins", "policy-app-team", "rules", "AGENTS.md"),
+      "utf8",
+    );
+    assert.match(rulesNative, /Use your host IDE's native question dialog/);
+
+    await runModelsCli(["set-questions", "studio-mcp", "--project", repo, "--sync", "--quiet"]);
+    const manifestMcp = parseTeamYaml(
+      fs.readFileSync(path.join(repo, ".agent-team", "team.yaml"), "utf8"),
+    );
+    assert.equal(manifestMcp.workflow.humanQuestions, "studio-mcp");
+    const rulesMcp = fs.readFileSync(
+      path.join(repo, ".agents", "plugins", "policy-app-team", "rules", "AGENTS.md"),
+      "utf8",
+    );
+    assert.match(rulesMcp, /NEVER use native ask tools/);
+
     // 4. Direct resolveRoleModel precedence check (override { omit: true } and per-IDE policy)
     const manifest = parseTeamYaml(fs.readFileSync(getTeamYamlPath(repo), "utf8"));
     const backend = manifest.roster.find((r) => r.id === "backend-engineer")!;

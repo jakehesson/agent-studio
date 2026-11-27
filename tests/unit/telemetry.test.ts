@@ -5942,14 +5942,6 @@ describe("Hybrid Telemetry Adapters, Deduplication, State Machine & hook-emit", 
     assert.ok(snapA.agents.some((a) => a.id === "ext:web"));
     assert.ok(snapA.agents.some((a) => a.id === "ext:fs"));
     assert.ok(snapA.agents.some((a) => a.id === "explore" && a.status === "DONE"));
-
-    // Verify parseChat + validateTranscriptPath accept $COPILOT_HOME/session-state/*/events.jsonl
-    const chatRes = await agg.getAgentChat({
-      sessionId: "11111111-aaaa-4aaa-8aaa-111111111111",
-      workspace: wsA,
-    });
-    assert.ok(chatRes && chatRes.messages.length > 0);
-    assert.ok(chatRes.messages.some((m) => m.role === "question"));
   });
 
   it("BUG-29 security: hook-emit blocks apply_patch/multiedit/TargetFile/path-traversal, shell bypasses, malformed/truncated stdin (fail-closed), and roster-named orchestrator", async () => {

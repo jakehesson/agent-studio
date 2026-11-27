@@ -45,6 +45,7 @@ import {
   type ModelIndex,
 } from "../schema/model-index.js";
 import {
+  HumanQuestionsModeSchema,
   IdeModelOverrideSchema,
   IdeTargetSchema,
   type IdeTarget,
@@ -133,6 +134,7 @@ const PatchTeamRoutingSchema = z.object({
       respectBuiltInOrchestrators: z.boolean().optional(),
       allowSubagentModelHints: z.boolean().optional(),
       copilotHandoffModels: z.boolean().optional(),
+      humanQuestions: HumanQuestionsModeSchema.optional(),
       idePolicies: z
         .object({
           antigravity: ModelRoutingPolicySchema.nullable().optional(),
@@ -1293,62 +1295,6 @@ export function createStudioServer(
       return;
     }
 
-    // 2c. GET /api/chat and GET /api/sessions/:id/chat
-    const isSessionChatRoute =
-      method === "GET" &&
-      pathname.startsWith("/api/sessions/") &&
-      pathname.endsWith("/chat");
-    if ((method === "GET" && pathname === "/api/chat") || isSessionChatRoute) {
-      let sessionParam = url.searchParams.get("session")?.trim();
-      if (isSessionChatRoute) {
-        const rawId = pathname
-          .slice("/api/sessions/".length, -"/chat".length)
-          .trim();
-        if (
-          !rawId ||
-          rawId.includes("/") ||
-          rawId.includes("\\") ||
-          rawId.includes("..")
-        ) {
-          sendJson(res, 404, {
-            ok: false,
-            error: "Session not found",
-          });
-          return;
-        }
-        sessionParam = rawId;
-      }
-      if (!sessionParam) {
-        sendJson(res, 400, {
-          ok: false,
-          error: "Missing session query parameter",
-        });
-        return;
-      }
-      const rawLimitParam = url.searchParams.get("limit");
-      const parsedLimit = rawLimitParam
-        ? Number.parseInt(rawLimitParam, 10)
-        : 80;
-      const chatRes = await aggregator.getAgentChat({
-        sessionId: sessionParam,
-        agentId: url.searchParams.get("agent")?.trim() || "root",
-        ide: url.searchParams.get("ide") ?? undefined,
-        project: url.searchParams.get("project") ?? undefined,
-        workspace: url.searchParams.get("workspace") ?? undefined,
-        limit: Number.isFinite(parsedLimit) ? parsedLimit : 80,
-        before: url.searchParams.get("before")?.trim() || undefined,
-      });
-      if (!chatRes) {
-        sendJson(res, 404, {
-          ok: false,
-          error: "Session not found",
-        });
-        return;
-      }
-      sendJson(res, 200, chatRes);
-      return;
-    }
-
     // 3. GET /api/stream (SSE)
     if (method === "GET" && pathname === "/api/stream") {
       res.writeHead(200, {
@@ -1776,6 +1722,10 @@ export function createStudioServer(
       try {
         await withTeamYamlLock(teamYamlPath, (manifest) => {
           if (input.workflow) {
+            const wf = input.workflow;
+            if (wf.humanQuestions !== undefined) {
+              manifest.workflow.humanQuestions = wf.humanQuestions;
+            }
             const mr = (manifest.workflow.modelRouting ??= {
               policy: "prefer-fallback",
               respectBuiltInOrchestrators: true,
@@ -1783,7 +1733,6 @@ export function createStudioServer(
               copilotHandoffModels: false,
               selectionPriority: ["accuracy", "cost", "speed"],
             });
-            const wf = input.workflow;
             if (wf.policy !== undefined) {
               mr.policy = wf.policy;
             }
@@ -2112,6 +2061,12 @@ export function createStudioServer(
         accepted: result.accepted,
         event: testEvent,
       });
+      return;
+    }
+
+    // Reject unmatched /api/* routes as 404 JSON instead of falling through to SPA HTML
+    if (pathname === "/api" || pathname.startsWith("/api/")) {
+      sendJson(res, 404, { ok: false, error: "Not found" });
       return;
     }
 

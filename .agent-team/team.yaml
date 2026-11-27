@@ -22,6 +22,7 @@ workflow:
     orchestratorReadOnly: true
     qaGateRequired: true
     blockDirectBoardEdits: true
+  humanQuestions: studio-mcp
   suites:
     smoke:
       - CP0

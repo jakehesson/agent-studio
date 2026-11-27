@@ -136,7 +136,7 @@ function printHelp(): void {
       "  init [--ides ...] [--global] [--project <dir>]   Scaffold .agent-team/, board.json, and compile IDE adapters",
       "  sync [--check] [--force] [--use-global-index]    Compile .agent-team/ into Antigravity, Claude Code & VS Code",
       "  upgrade [--dry-run] [--diff] [--force] [--global] Safely upgrade .agent-team/, models & IDE adapters",
-      "  models <op> [options]                            Manage Model Index & routing (show|set-tier|set-role|set-policy|upsert|discover|adopt|reset)",
+      "  models <op> [options]                            Manage Model Index & routing (show|set-tier|set-role|set-policy|set-questions|upsert|discover|adopt|reset)",
       "  doctor [--project <id|dir>] [--json]             Validate schemas, drift hashes, MCP configs & IDE hooks",
       "  serve [--port 8767] [--host 127.0.0.1] [--open]  Launch unified single-port Web Studio (Live, Board, Mockups, Doctor)",
       "  mcp [--project <id|path>]                        Run stdio MCP server (JSON-RPC 2.0)",

@@ -5,15 +5,10 @@ import path from "node:path";
 import { afterEach, beforeEach, describe, it } from "node:test";
 import { initBoardFile, registerProject } from "../../src/board/index.js";
 import { runHookEmit } from "../../src/cli/commands/hook-emit.js";
-import { dispatchToolCall } from "../../src/mcp/server.js";
-import {
-  AgentChatResponseSchema,
-  PendingHumanPromptSchema,
-} from "../../src/schema/telemetry.js";
+import { PendingHumanPromptSchema } from "../../src/schema/telemetry.js";
 import { createStudioServer } from "../../src/server/index.js";
 import {
   AntigravityAdapter,
-  CHAT_FIELD_MAX_BYTES,
   ClaudeCodeAdapter,
   CopilotVSCodeAdapter,
   TelemetryAggregator,
@@ -21,7 +16,7 @@ import {
   type EnrichedEvent,
 } from "../../src/telemetry/index.js";
 
-describe("S1-66: Pending Human Prompts, Per-Agent Chat Transcripts, /api/chat & app_get_chat", () => {
+describe("S1-66: Pending Human Prompts & Waiting Detection", () => {
   let tmpDir: string;
   let origHome: string | undefined;
 
@@ -200,44 +195,6 @@ describe("S1-66: Pending Human Prompts, Per-Agent Chat Transcripts, /api/chat & 
       { label: "WebSocket" },
       { label: "Long polling" },
     ]);
-
-    // Verify full chat extraction for root without inflating snapshot.events
-    const rootChat = await adapter.parseChat(discovered[0]!, { agentId: "root" });
-    assert.equal(rootChat.some((m) => m.role === "user"), true);
-    const preToolAst = rootChat.find(
-      (m) =>
-        m.role === "assistant" &&
-        m.text.includes("Reading schema and delegating backend tasks."),
-    );
-    assert.ok(preToolAst, "captures PLANNER_RESPONSE.content even when tool_calls.length > 0");
-    assert.ok(preToolAst.thinking?.includes("read the schema first"));
-    assert.equal(preToolAst.tools?.length, 1);
-    assert.equal(preToolAst.tools?.[0]?.toolName, "view_file");
-    assert.equal(preToolAst.tools?.[0]?.status, "ok");
-    assert.equal(preToolAst.tools?.[0]?.output, bigOutput);
-    assert.ok(
-      rootChat.some(
-        (m) => m.role === "subagent" && m.subagentId === "backend-engineer",
-      ),
-    );
-    const qMsg = rootChat.find((m) => m.role === "question");
-    assert.ok(qMsg);
-    assert.equal(qMsg.pendingPromptId, prompt.id);
-
-    // Subagent chat
-    const subChat = await adapter.parseChat(discovered[0]!, {
-      agentId: "backend-engineer",
-    });
-    assert.ok(subChat.some((m) => m.text.includes("Build /api/chat endpoint")));
-    assert.ok(
-      subChat.some(
-        (m) =>
-          m.role === "assistant" &&
-          m.text.includes("Adding /api/chat handler.") &&
-          m.thinking?.includes("http-server.ts"),
-      ),
-    );
-    assert.ok(subChat.some((m) => m.role === "subagent" && m.text.includes("API route implemented")));
 
     // notify_user with BlockedOnUser: "true" -> waitingReason: "user" + single text question
     const notifyCid = "33333333-aaaa-bbbb-cccc-333333333333";
@@ -443,24 +400,6 @@ describe("S1-66: Pending Human Prompts, Per-Agent Chat Transcripts, /api/chat & 
     assert.equal(prompt.questions[0]?.type, "single_select");
     assert.equal(prompt.questions[0]?.allowCustomInput, true);
     assert.equal(prompt.questions[0]?.options[0]?.description, "Default security posture");
-
-    const rootChat = await adapter.parseChat(discovered[0]!, { agentId: "root" });
-    const astMsg = rootChat.find(
-      (m) =>
-        m.role === "assistant" &&
-        m.text.includes("Checking auth.ts and spawning reviewer."),
-    );
-    assert.ok(astMsg, "captures pre-tool assistant text blocks");
-    assert.ok(astMsg.thinking?.includes("inspect auth.ts first"));
-    assert.equal(astMsg.tools?.[0]?.toolName, "Read");
-    assert.equal(astMsg.tools?.[0]?.status, "ok");
-    assert.equal(astMsg.tools?.[0]?.output, "export const TTL = 3600;");
-    assert.ok(rootChat.some((m) => m.role === "subagent" && m.subagentId === "agent-rev1"));
-    assert.ok(rootChat.some((m) => m.role === "question" && m.pendingPromptId === prompt.id));
-
-    const subChat = await adapter.parseChat(discovered[0]!, { agentId: "agent-rev1" });
-    assert.ok(subChat.some((m) => m.role === "user" && m.text.includes("Audit token TTL")));
-    assert.ok(subChat.some((m) => m.role === "assistant" && m.text.includes("3600s")));
 
     // hook-emit PreToolUse fix for AskUserQuestion / ask_question / vscode_askQuestions / ask_questions
     const hookDir = path.join(tmpDir, "hook-proj");
@@ -738,15 +677,6 @@ describe("S1-66: Pending Human Prompts, Per-Agent Chat Transcripts, /api/chat & 
     assert.equal(appSnap.waitingOn, "tool_approval");
     assert.equal(appSnap.pendingPrompts?.[0]?.kind, "approval");
 
-    // Verify chat extraction on merged session ([](file:///...) basename extraction)
-    const mergedChat = await adapter.parseChat(dMerged, { agentId: "root" });
-    assert.ok(mergedChat[0]?.text.includes("[db.ts]("));
-    assert.equal(mergedChat.filter((m) => m.role === "question").length, 1);
-    assert.equal(
-      mergedChat.find((m) => m.role === "question")?.pendingPromptId,
-      mergedPrompt.id,
-    );
-
     // Verify events.jsonl ask_questions clears on tool.execution_complete
     const trOpenSnap = buildSessionSnapshot(await adapter.parseSession(dTrAsk), {
       sessionId: "vsc-tr-ask",
@@ -773,10 +703,10 @@ describe("S1-66: Pending Human Prompts, Per-Agent Chat Transcripts, /api/chat & 
     assert.equal(trClosedSnap.waitingOn, null);
     assert.equal(trClosedSnap.pendingPrompts?.length ?? 0, 0);
 
-    // Root guard on parseTranscriptChat
+    // Root guard on parseTranscriptFile
     const outsidePath = path.join(tmpDir, "outside-secret.jsonl");
     await fs.writeFile(outsidePath, JSON.stringify({ type: "user.message", data: { content: "secret" } }) + "\n", "utf8");
-    const blocked = await adapter.parseTranscriptChat(outsidePath, "vsc-tr-ask");
+    const blocked = await adapter.parseTranscriptFile(outsidePath, "vsc-tr-ask");
     assert.deepEqual(blocked, []);
   });
 
@@ -874,23 +804,17 @@ describe("S1-66: Pending Human Prompts, Per-Agent Chat Transcripts, /api/chat & 
     assert.equal(snap2.agents.find((a) => a.id === "backend")?.pendingPrompt, null);
   });
 
-  it("HTTP /api/chat, /api/sessions/:id/chat pagination, scoping security, 128 KB cap, PushBus synthesis, and MCP app_get_chat", async () => {
+  it("HTTP /api/sessions waiting metadata and removed /api/chat routes return 404", async () => {
     const projDir = path.join(tmpDir, "demo-proj");
-    const otherProjDir = path.join(tmpDir, "other-proj");
     await initBoardFile(path.join(projDir, "pipeline", "board.json"), {
       projectId: "demo-proj",
     });
-    await initBoardFile(path.join(otherProjDir, "pipeline", "board.json"), {
-      projectId: "other-proj",
-    });
     registerProject({ root: projDir, id: "demo-proj", title: "Demo Proj", setDefault: true });
-    registerProject({ root: otherProjDir, id: "other-proj", title: "Other Proj" });
 
     const claudeDir = path.join(tmpDir, "claude-http");
     const folder = path.join(claudeDir, "demo-proj-enc");
     await fs.mkdir(folder, { recursive: true });
     const sessId = "eeee1111-2222-3333-4444-555566667777";
-    const hugeText = "Z".repeat(200 * 1024); // > 128 KB
     const rows = [
       {
         type: "user",
@@ -904,18 +828,6 @@ describe("S1-66: Pending Human Prompts, Per-Agent Chat Transcripts, /api/chat & 
         uuid: "a1",
         timestamp: "2026-11-26T13:00:01Z",
         message: { id: "m1", role: "assistant", stop_reason: "end_turn", content: [{ type: "text", text: "Message 2" }] },
-      },
-      {
-        type: "user",
-        uuid: "u2",
-        timestamp: "2026-11-26T13:00:02Z",
-        message: { role: "user", content: "Message 3" },
-      },
-      {
-        type: "assistant",
-        uuid: "a2",
-        timestamp: "2026-11-26T13:00:03Z",
-        message: { id: "m2", role: "assistant", stop_reason: "end_turn", content: [{ type: "text", text: hugeText }] },
       },
       {
         type: "assistant",
@@ -946,40 +858,14 @@ describe("S1-66: Pending Human Prompts, Per-Agent Chat Transcripts, /api/chat & 
       brainDir: path.join(tmpDir, "empty-brain"),
       claudeDir,
       vscodeDir: path.join(tmpDir, "empty-vsc"),
-      extraWorkspaces: [projDir, otherProjDir],
+      extraWorkspaces: [projDir],
       includeGlobalTelemetryFile: false,
     });
-
-    // Also ingest a PushBus-only session
-    aggregator.ingest([
-      {
-        sessionId: "push-only-1",
-        ide: "mcp",
-        workspacePath: projDir,
-        projectId: "demo-proj",
-        agentId: "root",
-        kind: "user_input",
-        summary: "Human: Push question",
-        payload: { body: "Push question full body" },
-        epoch: 1_795_200_000,
-      },
-      {
-        sessionId: "push-only-1",
-        ide: "mcp",
-        workspacePath: projDir,
-        projectId: "demo-proj",
-        agentId: "root",
-        kind: "assistant_turn_end",
-        summary: "Push answer",
-        payload: { body: "Push answer full body" },
-        epoch: 1_795_200_005,
-      },
-    ]);
 
     const srv = createStudioServer({
       aggregator,
       webDir: path.join(tmpDir, "empty-web"),
-      extraWorkspaces: [projDir, otherProjDir],
+      extraWorkspaces: [projDir],
       includeGlobalTelemetryFile: false,
     });
     const { port } = await srv.listen(0, "127.0.0.1");
@@ -1002,73 +888,18 @@ describe("S1-66: Pending Human Prompts, Per-Agent Chat Transcripts, /api/chat & 
       assert.equal(claudeEntry?.pendingQuestionCount, 1);
       assert.equal(claudeEntry?.waitingSummary, "Ship now?");
 
-      // Paginated GET /api/chat (limit=2)
-      const p1Resp = await fetch(
-        `${base}/api/chat?session=${sessId}&workspace=${encodeURIComponent(projDir)}&limit=2`,
-      );
-      assert.equal(p1Resp.status, 200);
-      const p1 = AgentChatResponseSchema.parse(await p1Resp.json());
-      assert.equal(p1.totalMessages, 5);
-      assert.equal(p1.messages.length, 2);
-      assert.equal(p1.hasMore, true);
-      assert.ok(p1.nextCursor);
-      assert.equal(p1.pendingPrompt?.questions[0]?.question, "Ship now?");
-      // Verify 128 KB field cap on message 4 (index 3, first item of page 1)
-      assert.ok(Buffer.byteLength(p1.messages[0]!.text, "utf8") <= CHAT_FIELD_MAX_BYTES);
-
-      // Next page using before=nextCursor
-      const p2Resp = await fetch(
-        `${base}/api/sessions/${sessId}/chat?workspace=${encodeURIComponent(projDir)}&limit=2&before=${encodeURIComponent(p1.nextCursor!)}`,
-      );
-      assert.equal(p2Resp.status, 200);
-      const p2 = AgentChatResponseSchema.parse(await p2Resp.json());
-      assert.equal(p2.messages.length, 2);
-      assert.equal(p2.messages[0]?.text, "Message 2");
-      assert.equal(p2.hasMore, true);
-
-      // Scoping enforcement: requesting demo-proj session under otherProjDir must 404
-      const outOfScopeResp = await fetch(
-        `${base}/api/chat?session=${sessId}&workspace=${encodeURIComponent(otherProjDir)}`,
-      );
-      assert.equal(outOfScopeResp.status, 404);
-      const outJson = (await outOfScopeResp.json()) as { ok: boolean; error: string };
-      assert.equal(outJson.ok, false);
-      assert.equal(outJson.error, "Session not found");
-
-      // Path traversal attempt on /api/sessions/:id/chat
-      const travResp = await fetch(`${base}/api/sessions/..%2F..%2Fetc%2Fpasswd/chat`);
-      assert.equal(travResp.status, 404);
-
-      // PushBus fallback synthesis via HTTP
-      const pushResp = await fetch(
-        `${base}/api/chat?session=push-only-1&workspace=${encodeURIComponent(projDir)}`,
-      );
-      assert.equal(pushResp.status, 200);
-      const pushChat = AgentChatResponseSchema.parse(await pushResp.json());
-      assert.equal(pushChat.messages.length, 2);
-      assert.equal(pushChat.messages[0]?.role, "user");
-      assert.equal(pushChat.messages[0]?.text, "Push question full body");
-      assert.equal(pushChat.messages[1]?.role, "assistant");
-      assert.equal(pushChat.messages[1]?.text, "Push answer full body");
-
-      // MCP app_get_chat tool
-      const mcpRes = await dispatchToolCall(
-        "app_get_chat",
-        { session: sessId, agent: "root", workspace: projDir, limit: 3 },
-        { aggregator, cwd: projDir },
-      );
-      assert.notEqual(mcpRes.isError, true);
-      const mcpStructured = AgentChatResponseSchema.parse(mcpRes.structuredContent);
-      assert.equal(mcpStructured.messages.length, 3);
-      assert.equal(mcpStructured.pendingPrompt?.questions[0]?.question, "Ship now?");
-
-      const mcpOutOfScope = await dispatchToolCall(
-        "app_get_chat",
-        { session: sessId, workspace: otherProjDir },
-        { aggregator, cwd: otherProjDir },
-      );
-      assert.equal(mcpOutOfScope.isError, true);
-      assert.equal(mcpOutOfScope.structuredContent?.error, "Session not found");
+      // Removed Chat endpoints must return 404 JSON (never fall through to SPA HTML)
+      for (const removedUrl of [
+        `${base}/api/chat?session=${sessId}&workspace=${encodeURIComponent(projDir)}`,
+        `${base}/api/sessions/${sessId}/chat?workspace=${encodeURIComponent(projDir)}`,
+      ]) {
+        const res = await fetch(removedUrl);
+        assert.equal(res.status, 404, `Expected 404 for ${removedUrl}`);
+        assert.match(res.headers.get("content-type") ?? "", /application\/json/i);
+        const body = (await res.json()) as { ok: boolean; error: string };
+        assert.equal(body.ok, false);
+        assert.equal(body.error, "Not found");
+      }
     } finally {
       await srv.close();
     }
@@ -1241,12 +1072,8 @@ describe("S1-66: Pending Human Prompts, Per-Agent Chat Transcripts, /api/chat & 
     const ccDisc = await claudeAdapter.discoverSessions();
     assert.equal(ccDisc[0]?.waitingOn, null);
     assert.notEqual(ccDisc[0]?.status, "WAITING", "tool_result answering AskUserQuestion clears tailStatus");
-    const ccChat = await claudeAdapter.parseChat(ccDisc[0]!, { agentId: "root" });
-    const streamAst = ccChat.find((m) => m.role === "assistant");
-    assert.equal(streamAst?.thinking, "Step 1", "identical streaming thinking chunks deduplicated");
-    assert.equal(streamAst?.text, "Checking config.ts now.", "prefix snapshot streaming text deduplicated");
 
-    // 3. Copilot: canceled toolInvocationSerialized approval + child transcript slug/alias matching + ask_questions dedup + completed ask/carousel merge
+    // 3. Copilot: canceled toolInvocationSerialized approval + child transcript ask_questions dedup + completed ask/carousel merge
     const storageDir = path.join(tmpDir, "vsc-rev");
     const wsHash = path.join(storageDir, "ws-rev");
     const chatDir = path.join(wsHash, "chatSessions");
@@ -1405,29 +1232,11 @@ describe("S1-66: Pending Human Prompts, Per-Agent Chat Transcripts, /api/chat & 
     assert.notEqual(vscCanceledSnap.status, "WAITING", "canceled approval request must NOT stay WAITING");
     assert.equal(vscCanceledSnap.pendingPrompts?.length ?? 0, 0);
 
-    const vscRootChat = await vscAgg.getAgentChat({
-      sessionId: "vsc-child-chat",
-      agentId: "root",
-    });
+    const vscChildSnap = (await vscAgg.getSessionSnapshot("vsc-child-chat")).snapshot;
     assert.equal(
-      vscRootChat?.messages.filter((m) => m.role === "question").length,
-      1,
-      "completed vscode_askQuestions + questionCarousel should merge without duplicate question messages",
-    );
-
-    const vscSubChat = await vscAgg.getAgentChat({
-      sessionId: "vsc-child-chat",
-      agentId: "hook-sub-uuid-1",
-    });
-    assert.ok(vscSubChat);
-    assert.ok(
-      vscSubChat.messages.some((m) => m.text.includes("Verify endpoints")),
-      "reconciled hook subagent ID must resolve slugified Copilot child transcript via aliases",
-    );
-    assert.equal(
-      vscSubChat.messages.filter((m) => m.role === "question").length,
-      1,
-      "assistant.message + tool.execution_start for same ask_questions toolCallId must not duplicate",
+      vscChildSnap.pendingPrompts?.filter((p) => p.agentId === "root").length ?? 0,
+      0,
+      "completed vscode_askQuestions + questionCarousel should remain closed",
     );
 
     // 4. Antigravity: pruneStaleNotify prunes ask_question symmetrically so later run_command's GENERIC closes run_command, not ask_question
@@ -1489,9 +1298,7 @@ describe("S1-66: Pending Human Prompts, Per-Agent Chat Transcripts, /api/chat & 
     const agyEvents = await agyAdapter.parseSession(agyDisc);
     const toolEnd = agyEvents.find((e) => e.kind === "tool_end");
     assert.equal(toolEnd?.toolName, "run_command", "GENERIC must close run_command rather than stale ask_question");
-    const agyChat = await agyAdapter.parseChat(agyDisc, { agentId: "root" });
-    const cmdAst = agyChat.find((m) => m.role === "assistant" && m.tools?.[0]?.toolName === "run_command");
-    assert.equal(cmdAst?.tools?.[0]?.output, "All 110 tests passed");
+    assert.match(String(toolEnd?.payload?.outputPreview ?? ""), /All 110 tests passed/);
   });
 
   it("S1-76: extracts human question replies (Antigravity Path A+B, Claude AskUserQuestion, Copilot events+chatSessions) and bounded self-thoughts (isThought, <= 800 inline + EventBodyStore)", async () => {
@@ -1977,6 +1784,46 @@ describe("S1-66: Pending Human Prompts, Per-Agent Chat Transcripts, /api/chat & 
         process.env.AGENT_STUDIO_DISABLE_ASK_REDIRECT = prevDisable;
       }
     }
+
+    // 4b. workflow.humanQuestions === "native-ide" prevents redirect even when active UI is present
+    const nativeWsDir = path.join(tmpDir, "ws-native-ide");
+    await fs.mkdir(path.join(nativeWsDir, ".agent-team"), { recursive: true });
+    await fs.writeFile(
+      path.join(nativeWsDir, ".agent-team", "team.yaml"),
+      `schemaVersion: 1
+project:
+  id: native-test
+  title: Native Test
+  description: Test
+targets: [copilot-vscode]
+workflow:
+  humanQuestions: native-ide
+roster:
+  - id: orchestrator
+    name: Orchestrator
+    roleType: orchestrator
+    boardRole: orchestrator
+    promptFile: agents/orchestrator.md
+    capabilities: [read]
+skills: []
+`,
+      "utf8",
+    );
+    const nativeHookRes = await runHookEmit(
+      ["--ide", "copilot-vscode", "--event", "preToolUse", "--cwd", nativeWsDir],
+      {
+        stdinText: JSON.stringify({
+          session_id: "cop-redir-native",
+          tool_name: "vscode_askquestions",
+          tool_use_id: "tc-native",
+          tool_input: { questions: [{ question: "Proceed?" }] },
+        }),
+        stdout: () => {},
+        stderr: () => {},
+        fetchImpl: activeUiFetch,
+      },
+    );
+    assert.equal(nativeHookRes.denied, false);
 
     // 5. Never redirect ask_human or agent_studio_ask_human even when active UI is present
     for (const toolName of ["ask_human", "agent_studio_ask_human"]) {

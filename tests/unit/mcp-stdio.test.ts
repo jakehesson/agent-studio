@@ -223,7 +223,6 @@ describe("MCP stdio server (node dist/cli/index.js mcp)", () => {
           "ask_human",
           "app_get_state",
           "app_get_event_body",
-          "app_get_chat",
           "app_get_board",
           "app_get_team",
           "app_get_doctor",
@@ -248,7 +247,6 @@ describe("MCP stdio server (node dist/cli/index.js mcp)", () => {
       for (const appOnlyName of [
         "app_get_state",
         "app_get_event_body",
-        "app_get_chat",
         "app_get_board",
         "app_get_team",
         "app_get_doctor",
@@ -603,39 +601,6 @@ describe("MCP stdio server (node dist/cli/index.js mcp)", () => {
         JSON.parse(missingBodyRes.content?.[0]?.text ?? "{}").error,
         "Event body not found",
       );
-
-      // Verify app_get_chat returns structured error for unknown session and works on active session
-      const missingChatResp = await client.request("tools/call", {
-        name: "app_get_chat",
-        arguments: { session: "does-not-exist" },
-      });
-      const missingChatRes = missingChatResp.result as {
-        isError?: boolean;
-        structuredContent?: { ok?: boolean; error?: string };
-      };
-      assert.equal(missingChatRes.isError, true);
-      assert.equal(missingChatRes.structuredContent?.ok, false);
-      assert.equal(missingChatRes.structuredContent?.error, "Session not found");
-
-      const chatResp = await client.request("tools/call", {
-        name: "app_get_chat",
-        arguments: { session: "doctor-probe", agent: "doctor" },
-      });
-      const chatRes = chatResp.result as {
-        isError?: boolean;
-        structuredContent?: {
-          ok?: boolean;
-          sessionId?: string;
-          agentId?: string;
-          messages?: Array<{ text?: string }>;
-          pendingPrompt?: unknown;
-        };
-      };
-      assert.notEqual(chatRes.isError, true);
-      assert.equal(chatRes.structuredContent?.ok, true);
-      assert.equal(chatRes.structuredContent?.sessionId, "doctor-probe");
-      assert.ok((chatRes.structuredContent?.messages?.length ?? 0) >= 1);
-      assert.equal(chatRes.structuredContent?.pendingPrompt, null);
 
       // 11. Verify every single line on stdout was valid JSON-RPC 2.0
       for (const line of client.rawStdoutLines) {

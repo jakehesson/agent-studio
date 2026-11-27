@@ -22,7 +22,7 @@ import {
 export interface PayloadInspectorCallbacks {
   onClose?: () => void;
   onOpenReader?: (event: NormalizedEvent) => void;
-  onOpenChat?: (agentId: string) => void;
+  onOpenWaiting?: (agentId: string) => void;
 }
 
 export interface InspectRenderOptions {
@@ -57,10 +57,9 @@ export class PayloadInspector {
   private cb: PayloadInspectorCallbacks;
   private dialog: HTMLDialogElement;
   private dlgReaderBtn: HTMLButtonElement | null = null;
-  private dlgChatBtn: HTMLButtonElement | null = null;
   private dlgRespondBtn: HTMLButtonElement | null = null;
   private currentEvent: NormalizedEvent | null = null;
-  private currentChatAgentId: string | null = null;
+  private currentWaitingAgentId: string | null = null;
   private currentHasPendingPrompt = false;
   private currentTargetKey: string | null = null;
   private lastCopyText = "";
@@ -74,7 +73,6 @@ export class PayloadInspector {
     headerTitleHtml: string;
     bodyHtml: string;
     hasEvent: boolean;
-    chatAgentId: string | null;
     hasPending: boolean;
   } | null = null;
   private lastRenderedDialog: {
@@ -97,8 +95,7 @@ export class PayloadInspector {
         <div class="insp-sheet-head">
           <div class="insp-title-row" id="inspectorDialogTitle" data-dlg-title>Details</div>
           <div class="insp-head-actions">
-            <button type="button" class="btn-primary btn-sm insp-respond-btn" data-dlg-respond hidden><span aria-hidden="true">?</span> Respond</button>
-            <button type="button" class="copy-btn insp-chat-btn" data-dlg-open-chat hidden>Open Chat</button>
+            <button type="button" class="btn-primary btn-sm insp-respond-btn" data-dlg-respond hidden><span aria-hidden="true">?</span> View in Messages</button>
             <button type="button" class="copy-btn reader-launch-btn" data-open-reader hidden>Reader View</button>
             <button type="button" class="copy-btn" data-dlg-copy>Copy JSON</button>
             <button type="button" class="insp-icon-btn" data-dlg-close aria-label="Close details">✕</button>
@@ -134,25 +131,23 @@ export class PayloadInspector {
       if (this.dialog.open) this.dialog.close();
       this.cb.onOpenReader?.(ev);
     });
-    this.dlgChatBtn = dlg.querySelector<HTMLButtonElement>("[data-dlg-open-chat]");
     this.dlgRespondBtn = dlg.querySelector<HTMLButtonElement>("[data-dlg-respond]");
-    const handleDlgOpenChat = () => {
-      const aid = this.currentChatAgentId;
+    const handleOpenWaiting = () => {
+      const aid = this.currentWaitingAgentId;
       if (!aid) return;
       if (this.dialog.open) this.dialog.close();
-      this.cb.onOpenChat?.(aid);
+      this.cb.onOpenWaiting?.(aid);
     };
-    this.dlgChatBtn?.addEventListener("click", handleDlgOpenChat);
-    this.dlgRespondBtn?.addEventListener("click", handleDlgOpenChat);
+    this.dlgRespondBtn?.addEventListener("click", handleOpenWaiting);
     dlg.addEventListener("click", (e) => {
       if ((e.target as Element | null)?.closest("[data-insp-respond-body]")) {
-        handleDlgOpenChat();
+        handleOpenWaiting();
       }
     });
     this.container.addEventListener("click", (e) => {
       if ((e.target as Element | null)?.closest("[data-insp-respond-body]")) {
-        const aid = this.currentChatAgentId;
-        if (aid) this.cb.onOpenChat?.(aid);
+        const aid = this.currentWaitingAgentId;
+        if (aid) this.cb.onOpenWaiting?.(aid);
       }
     });
     const dlgCopy = dlg.querySelector<HTMLButtonElement>("[data-dlg-copy]");
@@ -184,11 +179,10 @@ export class PayloadInspector {
 
   public renderEmpty(): void {
     this.currentEvent = null;
-    this.currentChatAgentId = null;
+    this.currentWaitingAgentId = null;
     this.currentHasPendingPrompt = false;
     this.currentTargetKey = null;
     if (this.dlgReaderBtn) this.dlgReaderBtn.hidden = true;
-    if (this.dlgChatBtn) this.dlgChatBtn.hidden = true;
     if (this.dlgRespondBtn) this.dlgRespondBtn.hidden = true;
     this.lastCopyText = "";
     this.lastMarkup = null;
@@ -209,15 +203,10 @@ export class PayloadInspector {
   public renderEvent(ev: NormalizedEvent, opts: InspectRenderOptions = {}): void {
     const targetKey = `ev:${ev.id}`;
     this.currentEvent = ev;
-    const isAiAgent =
-      Boolean(ev.agentId) &&
-      !ev.agentId.startsWith("ext:") &&
-      ev.agentId !== "human";
-    this.currentChatAgentId = isAiAgent ? ev.agentId : null;
+    this.currentWaitingAgentId = null;
     this.currentHasPendingPrompt = false;
     this.currentTargetKey = targetKey;
     if (this.dlgReaderBtn) this.dlgReaderBtn.hidden = false;
-    if (this.dlgChatBtn) this.dlgChatBtn.hidden = !this.currentChatAgentId;
     if (this.dlgRespondBtn) this.dlgRespondBtn.hidden = true;
     const ide = getIdeMeta(ev.ide);
     const cls = classifyEventReadable(ev);
@@ -274,11 +263,10 @@ export class PayloadInspector {
     const targetKey = `agent:${agent.id}`;
     this.currentEvent = null;
     const isAiAgent = (agent.nodeType ?? "agent") === "agent";
-    this.currentChatAgentId = isAiAgent ? agent.id : null;
     this.currentHasPendingPrompt = Boolean(isAiAgent && agent.pendingPrompt);
+    this.currentWaitingAgentId = this.currentHasPendingPrompt ? agent.id : null;
     this.currentTargetKey = targetKey;
     if (this.dlgReaderBtn) this.dlgReaderBtn.hidden = true;
-    if (this.dlgChatBtn) this.dlgChatBtn.hidden = !this.currentChatAgentId;
     if (this.dlgRespondBtn) this.dlgRespondBtn.hidden = !this.currentHasPendingPrompt;
     const ide = getIdeMeta(agent.ide);
     const st = getStatusStyle(agent.status);
@@ -383,7 +371,7 @@ export class PayloadInspector {
         <div class="insp-waiting-callout">
           <div class="insp-waiting-head">
             <span class="needs-input-pill"><span aria-hidden="true">?</span> ${agent.pendingPrompt.kind === "approval" ? "Approval Needed" : "Needs Input"}</span>
-            <button type="button" class="btn-primary btn-sm" data-insp-respond-body>Respond in Chat</button>
+            <button type="button" class="btn-primary btn-sm" data-insp-respond-body>View in Messages</button>
           </div>
           <div class="insp-waiting-title">${escHtml(cleanSummaryText(agent.pendingPrompt.title))}</div>
         </div>
@@ -472,7 +460,6 @@ export class PayloadInspector {
 
   private renderInline(headerTitleHtml: string, bodyHtml: string, targetKey: string): void {
     const hasEvent = this.currentEvent !== null;
-    const chatAgentId = this.currentChatAgentId;
     const hasPending = this.currentHasPendingPrompt;
     const isOpen = this.container.getAttribute("data-inspector-state") === "open";
     const prev = this.lastRenderedInline;
@@ -482,7 +469,6 @@ export class PayloadInspector {
       prev &&
       prev.targetKey === targetKey &&
       prev.hasEvent === hasEvent &&
-      prev.chatAgentId === chatAgentId &&
       prev.hasPending === hasPending &&
       prev.headerTitleHtml === headerTitleHtml &&
       prev.bodyHtml === bodyHtml
@@ -500,7 +486,6 @@ export class PayloadInspector {
       isOpen &&
       prev &&
       prev.hasEvent === hasEvent &&
-      prev.chatAgentId === chatAgentId &&
       prev.hasPending === hasPending &&
       existingTitle &&
       existingBody
@@ -525,7 +510,6 @@ export class PayloadInspector {
         headerTitleHtml,
         bodyHtml,
         hasEvent,
-        chatAgentId,
         hasPending,
       };
       return;
@@ -539,8 +523,7 @@ export class PayloadInspector {
       <div class="insp-head">
         <div class="insp-title-row">${headerTitleHtml}</div>
         <div class="insp-head-actions">
-          ${hasPending ? `<button type="button" class="btn-primary btn-sm insp-respond-btn" data-insp-respond><span aria-hidden="true">?</span> Respond</button>` : ""}
-          ${chatAgentId ? `<button type="button" class="copy-btn insp-chat-btn" data-insp-open-chat>Open Chat</button>` : ""}
+          ${hasPending ? `<button type="button" class="btn-primary btn-sm insp-respond-btn" data-insp-respond><span aria-hidden="true">?</span> View in Messages</button>` : ""}
           ${hasEvent ? `<button type="button" class="copy-btn reader-launch-btn" data-open-reader>Reader View</button>` : ""}
           <button type="button" class="copy-btn" data-copy-payload>Copy JSON</button>
           <button type="button" class="insp-icon-btn" data-expand-payload title="Expand full payload viewer" aria-label="Expand payload viewer">⤢</button>
@@ -550,12 +533,11 @@ export class PayloadInspector {
       <div class="insp-inline-body">${bodyHtml}</div>
     `;
 
-    const triggerOpenChat = () => {
-      const aid = this.currentChatAgentId;
-      if (aid) this.cb.onOpenChat?.(aid);
+    const triggerOpenWaiting = () => {
+      const aid = this.currentWaitingAgentId;
+      if (aid) this.cb.onOpenWaiting?.(aid);
     };
-    this.container.querySelector("[data-insp-open-chat]")?.addEventListener("click", triggerOpenChat);
-    this.container.querySelector("[data-insp-respond]")?.addEventListener("click", triggerOpenChat);
+    this.container.querySelector("[data-insp-respond]")?.addEventListener("click", triggerOpenWaiting);
     this.container.querySelector("[data-open-reader]")?.addEventListener("click", () => {
       const ev = this.currentEvent;
       if (!ev) return;
@@ -587,7 +569,6 @@ export class PayloadInspector {
       headerTitleHtml,
       bodyHtml,
       hasEvent,
-      chatAgentId,
       hasPending,
     };
   }

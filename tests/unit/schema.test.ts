@@ -8,6 +8,7 @@ import {
   NormalizedEventSchema,
   SessionSnapshotSchema,
   TeamManifestSchema,
+  WorkflowConfigSchema,
   createDeterministicEventId,
   parseBoardJson,
   parseTeamYaml,
@@ -272,5 +273,43 @@ skills: []
         summary: "invalid",
       }),
     );
+  });
+
+  it("validates WorkflowConfigSchema humanQuestions defaults, parsing, and round-trip", () => {
+    const defWf = WorkflowConfigSchema.parse({});
+    assert.equal(defWf.humanQuestions, "studio-mcp");
+
+    const mcpWf = WorkflowConfigSchema.parse({ humanQuestions: "studio-mcp" });
+    assert.equal(mcpWf.humanQuestions, "studio-mcp");
+
+    const nativeWf = WorkflowConfigSchema.parse({ humanQuestions: "native-ide" });
+    assert.equal(nativeWf.humanQuestions, "native-ide");
+
+    assert.throws(() => {
+      WorkflowConfigSchema.parse({ humanQuestions: "invalid-mode" });
+    });
+
+    const yamlText = `schemaVersion: 1
+project:
+  id: sample-proj
+  title: Sample Proj
+  description: Testing
+targets: [antigravity]
+workflow:
+  humanQuestions: native-ide
+roster:
+  - id: orchestrator
+    name: Orchestrator
+    roleType: orchestrator
+    boardRole: orchestrator
+    promptFile: agents/orchestrator.md
+    capabilities: [read]
+skills: []
+`;
+    const parsed = parseTeamYaml(yamlText);
+    assert.equal(parsed.workflow.humanQuestions, "native-ide");
+    const serialized = serializeTeamYaml(parsed);
+    assert.match(serialized, /humanQuestions: native-ide/);
+    assert.deepEqual(parseTeamYaml(serialized), parsed);
   });
 });

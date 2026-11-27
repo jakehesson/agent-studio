@@ -764,16 +764,7 @@ body {
   color: #881337;
 }
 
-/* Light theme adaptation for AgentChatDrawer, QuestionCard & Waiting Indicators */
-:root[data-theme="light"] .chat-drawer-dialog {
-  background: var(--panel);
-  color: var(--text);
-  border-left-color: var(--border-strong);
-}
-
-:root[data-theme="light"] .chat-drawer-head,
-:root[data-theme="light"] .chat-controls-bar,
-:root[data-theme="light"] .chat-prompt-dock,
+/* Light theme adaptation for QuestionCard, Messages Prompts & Waiting Indicators */
 :root[data-theme="light"] .sms-prompt-dock,
 :root[data-theme="light"] .usage-agent-actions {
   background: var(--panel-2);
@@ -812,59 +803,6 @@ body {
   border-block-end-color: #0284c7;
 }
 
-:root[data-theme="light"] .chat-tab-shell {
-  background: var(--panel);
-  color: var(--text);
-}
-
-:root[data-theme="light"] .chat-search-input {
-  background: var(--panel);
-  color: var(--text);
-  border-color: var(--border-strong);
-}
-
-:root[data-theme="light"] .chat-search-input::placeholder,
-:root[data-theme="light"] .chat-search-clear {
-  color: var(--muted);
-}
-
-:root[data-theme="light"] .chat-focus-feedback {
-  color: #047857;
-}
-
-:root[data-theme="light"] .chat-focus-feedback.is-err {
-  color: #be123c;
-}
-
-:root[data-theme="light"] .chat-skeleton-card {
-  background: linear-gradient(90deg, var(--panel-2) 25%, #e2e8f0 50%, var(--panel-2) 75%);
-  background-size: 200% 100%;
-}
-
-:root[data-theme="light"] .chat-body {
-  background: var(--bg);
-}
-
-:root[data-theme="light"] .chat-turn {
-  background: var(--panel);
-  color: var(--text);
-  border-color: var(--border-strong);
-}
-
-:root[data-theme="light"] .chat-turn.role-user {
-  background: #dbeafe;
-  border-color: #60a5fa;
-  color: #0f172a;
-}
-
-:root[data-theme="light"] .chat-turn.role-thinking,
-:root[data-theme="light"] .chat-turn.role-tool,
-:root[data-theme="light"] .chat-tool-chip {
-  background: var(--panel-2);
-  color: var(--text);
-}
-
-:root[data-theme="light"] .chat-turn.role-question,
 :root[data-theme="light"] .qc-card,
 :root[data-theme="light"] .pending-card,
 :root[data-theme="light"] .insp-waiting-callout {
@@ -915,35 +853,23 @@ body {
   border-color: #0284c7;
 }
 
-:root[data-theme="light"] .qc-textarea,
-:root[data-theme="light"] .chat-tool-pre,
-:root[data-theme="light"] .chat-turn-prose pre,
-:root[data-theme="light"] .chat-turn-prose code {
+:root[data-theme="light"] .qc-textarea {
   background: var(--panel);
   color: var(--text);
   border-color: var(--border-strong);
-}
-
-:root[data-theme="light"] .chat-thinking-body {
-  background: rgba(168, 85, 247, 0.08);
-  border-color: rgba(107, 33, 168, 0.35);
-  color: #4c1d95;
 }
 
 :root[data-theme="light"] .waiting-alert-pill,
 :root[data-theme="light"] .needs-input-badge,
 :root[data-theme="light"] .needs-input-pill,
 :root[data-theme="light"] .qc-waiting-badge,
-:root[data-theme="light"] .chat-prompt-pill,
 :root[data-theme="light"] .sms-prompt-pill,
-:root[data-theme="light"] .chat-jump-q-btn,
 :root[data-theme="light"] .pending-badge {
   background: rgba(245, 158, 11, 0.18);
   border-color: rgba(180, 83, 9, 0.55);
   color: #78350f;
 }
 
-:root[data-theme="light"] .card-chat-btn,
 :root[data-theme="light"] .qc-custom-toggle {
   background: rgba(2, 132, 199, 0.1);
   border-color: rgba(2, 132, 199, 0.35);
@@ -1029,22 +955,6 @@ body {
   background: rgba(244, 63, 94, 0.14);
   border-color: rgba(190, 18, 60, 0.45);
   color: #9f1239;
-}
-
-:root[data-theme="light"] .chat-thinking-details summary {
-  color: #6d28d9;
-}
-
-:root[data-theme="light"] .chat-subagent-chip {
-  background: rgba(79, 70, 229, 0.12);
-  border-color: rgba(67, 56, 202, 0.42);
-  color: #3730a3;
-}
-
-:root[data-theme="light"] .chat-subagent-chip:hover {
-  background: rgba(79, 70, 229, 0.22);
-  border-color: #4338ca;
-  color: #1e1b4b;
 }
 
 /* Light theme adaptation for Messages v2 (Human Q&A, Inline Markdown, Behind Drawer & Nav) */
